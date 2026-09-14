@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <ESPAsyncWebServer.h>
+#include <Update.h>
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -111,13 +112,6 @@ void sendError(AsyncWebServerRequest *request, int code, const std::string &mess
   sendJson(request, code, doc);
 }
 
-void sendNotImplemented(AsyncWebServerRequest *request) {
-  JsonDocument doc;
-  doc["error"] = "not implemented in this firmware skeleton";
-  doc["path"] = request->url().c_str();
-  sendJson(request, 501, doc);
-}
-
 // Reboots shortly after the current request's response has had a chance to
 // go out - calling ESP.restart() directly inside the handler risks cutting
 // the HTTP response off mid-flight.
@@ -217,6 +211,54 @@ void handlePostWifiReset(AsyncWebServerRequest *request) {
   // wifi_portal::connectWifiOrPortal() finds nothing to reconnect with and opens the setup AP.
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
+  scheduleRestart();
+}
+
+// DESIGN.md SS7/SS12: "POST /api/ota; multipart `firmware` field; reboots on success." Refuses to
+// even start when free heap is below kMinOtaFreeHeap - flashing a new image needs a contiguous
+// scratch buffer plus everything else already running (LVGL, Wi-Fi/TLS, the poller), and starting
+// anyway just to fail partway through is worse than refusing up front. State is file-scope
+// (single AsyncWebServer, one OTA at a time in practice - a LAN device, not a fleet) rather than
+// per-request, since ArUploadHandlerFunction has no natural place to stash it across calls other
+// than the request object itself, and this is simpler.
+constexpr size_t kMinOtaFreeHeap = 60 * 1024;
+bool g_ota_ok = true;
+std::string g_ota_error;
+
+void handleOtaUpload(AsyncWebServerRequest * /*request*/, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
+  if (index == 0) {
+    g_ota_ok = true;
+    g_ota_error.clear();
+    log_w("web_server: OTA upload starting: %s", filename.c_str());
+    if (ESP.getFreeHeap() < kMinOtaFreeHeap) {
+      g_ota_ok = false;
+      g_ota_error = "refusing OTA: free heap below 60KB";
+    } else if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      g_ota_ok = false;
+      g_ota_error = Update.errorString();
+    }
+  }
+  if (!g_ota_ok) return;  // still drains the rest of the upload; just ignores the bytes
+
+  if (Update.write(data, len) != len) {
+    g_ota_ok = false;
+    g_ota_error = Update.errorString();
+    return;
+  }
+  if (final && !Update.end(true)) {
+    g_ota_ok = false;
+    g_ota_error = Update.errorString();
+  }
+}
+
+void handlePostOta(AsyncWebServerRequest *request) {
+  if (!g_ota_ok) {
+    sendError(request, 500, g_ota_error.empty() ? "OTA failed" : g_ota_error);
+    return;
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  sendJson(request, 200, doc);
   scheduleRestart();
 }
 
@@ -365,9 +407,7 @@ void startWebServer(std::function<void()> onConfigChanged) {
   // "/api/log/<file>.csv" - matched with a regex-free prefix check in onNotFound below instead of
   // a wildcard pattern, to keep the matcher simple.
 
-  // DESIGN.md SS7 routes not implemented in this skeleton.
-  g_server.on("/api/ota", HTTP_GET, sendNotImplemented);
-  g_server.on("/api/ota", HTTP_POST, sendNotImplemented);
+  g_server.on("/api/ota", HTTP_POST, handlePostOta, handleOtaUpload);
 
 #ifdef TRANSIT_HAVE_WEB_ASSETS
   registerWebAssets();
