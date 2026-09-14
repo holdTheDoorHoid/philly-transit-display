@@ -26,7 +26,11 @@ namespace {
 constexpr size_t kBodyCap = 32 * 1024;
 constexpr uint32_t kFetchTimeoutMs = 15000;
 constexpr UBaseType_t kQueueLen = 4;
-constexpr uint32_t kWorkerStackBytes = 8192;
+// StatsAggregator alone can be just under 8KB (its own size assertion in test_stats), so this
+// must comfortably clear that plus the rest of runStatsJob()'s frame (JsonDocument, String,
+// lambdas) even with it heap-allocated rather than a local - a smaller stack here silently
+// corrupts memory instead of failing loudly, so err generous.
+constexpr uint32_t kWorkerStackBytes = 16384;
 constexpr int kDefaultStatsDays = 30;
 constexpr int kMaxStatsDays = 365;
 
@@ -113,11 +117,15 @@ void runStatsJob(const ProxyJob &job) {
   transit::Epoch window_end = now;
   transit::Epoch window_start = now - (transit::Epoch)job.days * 86400;
 
-  transit_stats::StatsAggregator agg(job.param, window_start, window_end);
+  // Heap-allocated, not a local: StatsAggregator's own size assertion (test_stats) puts it just
+  // under 8KB, too large to risk on this task's stack alongside everything else in this call
+  // chain (see kWorkerStackBytes's comment) - same reasoning as net_poller.cpp's
+  // computeStopSummary().
+  auto agg = std::make_unique<transit_stats::StatsAggregator>(job.param, window_start, window_end);
   for (const std::string &month : transit_stats::monthsInWindow(window_start, window_end)) {
     std::string filename = month + ".csv";
     streamLogLines(filename, [&](const char *line, size_t len) {
-      agg.feedLine(line, len);
+      agg->feedLine(line, len);
       return true;
     });
   }
@@ -125,7 +133,7 @@ void runStatsJob(const ProxyJob &job) {
   if (!requestStillAlive(job)) return;  // client disconnected while we were reading the SD card
 
   JsonDocument doc;
-  agg.toJson(doc);
+  agg->toJson(doc);
   String body;
   serializeJson(doc, body);
   job.request->send(200, "application/json", body);
