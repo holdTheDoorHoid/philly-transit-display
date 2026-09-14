@@ -1,0 +1,13 @@
+# PlatformIO
+firmware/.pio/
+firmware/.vscode/
+.pio/
+# Node
+node_modules/
+web/dist/
+# OS / editors
+.DS_Store
+*.swp
+# local secrets / device-specific
+*.local.ini
+firmware/secrets.h
