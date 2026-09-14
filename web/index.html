@@ -1,0 +1,22 @@
+<title>Philly Transit Display</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="Configure and monitor your Philly Transit Display.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+
+<header id="topbar">
+  <h1>Transit Display</h1>
+  <nav id="mainnav" aria-label="Main">
+    <a href="#/now" data-route="now">Now</a>
+    <a href="#/stops" data-route="stops">Stops</a>
+    <a href="#/stats" data-route="stats">Stats</a>
+    <a href="#/settings" data-route="settings">Settings</a>
+  </nav>
+</header>
+
+<main id="view" role="main" aria-live="polite"></main>
+
+<footer class="hint">Philly Transit Display &middot; served from your device on the LAN</footer>
+
+<script src="/app.js" defer></script>

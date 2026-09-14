@@ -1,0 +1,133 @@
+#!/usr/bin/env node
+// Builds firmware/src/generated/web_assets.h from the web/ assets.
+// Node built-ins only (node:fs, node:zlib, node:path, node:crypto). No npm deps.
+//
+// Usage:
+//   node web/build.mjs           # (re)generate the header
+//   node web/build.mjs --check   # exit non-zero if the committed header is stale (for CI)
+
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const webDir = __dirname;
+const outPath = path.join(__dirname, '..', 'firmware', 'src', 'generated', 'web_assets.h');
+
+const ASSETS = [
+  { file: 'index.html', name: 'INDEX_HTML', urlPath: '/', contentType: 'text/html; charset=utf-8' },
+  { file: 'app.js', name: 'APP_JS', urlPath: '/app.js', contentType: 'application/javascript; charset=utf-8' },
+  { file: 'app.css', name: 'APP_CSS', urlPath: '/app.css', contentType: 'text/css; charset=utf-8' },
+  { file: 'favicon.svg', name: 'FAVICON_SVG', urlPath: '/favicon.svg', contentType: 'image/svg+xml' },
+];
+
+function gzipBytes(buf) {
+  return zlib.gzipSync(buf, { level: 9 });
+}
+
+function toCArray(buf) {
+  const parts = [];
+  for (let i = 0; i < buf.length; i++) parts.push('0x' + buf[i].toString(16).padStart(2, '0'));
+  // Wrap lines to keep the generated header readable and diff-friendly.
+  const lines = [];
+  for (let i = 0; i < parts.length; i += 20) lines.push('  ' + parts.slice(i, i + 20).join(', ') + (i + 20 < parts.length ? ',' : ''));
+  return lines.join('\n');
+}
+
+function buildHeader() {
+  const compiled = ASSETS.map((a) => {
+    const raw = fs.readFileSync(path.join(webDir, a.file));
+    const gz = gzipBytes(raw);
+    return { ...a, raw, gz };
+  });
+
+  const hashInput = compiled.map((a) => a.raw).reduce((acc, b) => Buffer.concat([acc, b]), Buffer.alloc(0));
+  const etag = crypto.createHash('sha256').update(hashInput).digest('hex').slice(0, 16);
+
+  const totalRaw = compiled.reduce((n, a) => n + a.raw.length, 0);
+  const totalGz = compiled.reduce((n, a) => n + a.gz.length, 0);
+
+  const lines = [];
+  lines.push('// GENERATED FILE — do not edit by hand.');
+  lines.push('// Produced by web/build.mjs from web/index.html, web/app.js, web/app.css, web/favicon.svg.');
+  lines.push('// Run `node web/build.mjs` to regenerate; `node web/build.mjs --check` verifies freshness (used by CI).');
+  lines.push('//');
+  lines.push(`// Source sizes: ${compiled.map((a) => `${a.file}=${a.raw.length}B`).join(', ')} (total ${totalRaw}B)`);
+  lines.push(`// Gzip sizes:   ${compiled.map((a) => `${a.file}=${a.gz.length}B`).join(', ')} (total ${totalGz}B)`);
+  lines.push('#pragma once');
+  lines.push('#include <stddef.h>');
+  lines.push('#include <stdint.h>');
+  lines.push('');
+  lines.push('// Arduino headers define PROGMEM; on the host build (native tests, this script) it is a no-op');
+  lines.push('// so the same header compiles both on ESP32 and on a desktop toolchain.');
+  lines.push('#ifndef PROGMEM');
+  lines.push('#define PROGMEM');
+  lines.push('#endif');
+  lines.push('');
+  lines.push('namespace transit_web {');
+  lines.push('');
+
+  for (const a of compiled) {
+    lines.push(`// ${a.file} — ${a.raw.length} bytes raw, ${a.gz.length} bytes gzip`);
+    lines.push(`static const uint8_t ${a.name}_GZ[] PROGMEM = {`);
+    lines.push(toCArray(a.gz));
+    lines.push('};');
+    lines.push(`static const size_t ${a.name}_GZ_LEN = ${a.gz.length};`);
+    lines.push('');
+  }
+
+  lines.push('struct WebAsset {');
+  lines.push('  const char* path;');
+  lines.push('  const char* content_type;');
+  lines.push('  const uint8_t* data;');
+  lines.push('  size_t len;');
+  lines.push('};');
+  lines.push('');
+  lines.push('static const WebAsset WEB_ASSETS[] = {');
+  for (const a of compiled) {
+    lines.push(`  { "${a.urlPath}", "${a.contentType}", ${a.name}_GZ, ${a.name}_GZ_LEN },`);
+  }
+  lines.push('};');
+  lines.push('static const size_t WEB_ASSETS_COUNT = sizeof(WEB_ASSETS) / sizeof(WEB_ASSETS[0]);');
+  lines.push('');
+  lines.push(`static const char WEB_ASSETS_ETAG[] = "${etag}";`);
+  lines.push('');
+  lines.push('}  // namespace transit_web');
+  lines.push('');
+
+  return { text: lines.join('\n'), compiled, totalRaw, totalGz };
+}
+
+function main() {
+  const checkMode = process.argv.includes('--check');
+  const { text, compiled, totalRaw, totalGz } = buildHeader();
+
+  if (checkMode) {
+    if (!fs.existsSync(outPath)) {
+      console.error(`web/build.mjs --check: ${outPath} does not exist. Run "node web/build.mjs" first.`);
+      process.exit(1);
+    }
+    const existing = fs.readFileSync(outPath, 'utf8');
+    if (existing !== text) {
+      console.error('web/build.mjs --check: firmware/src/generated/web_assets.h is stale. Run "node web/build.mjs" and commit the result.');
+      process.exit(1);
+    }
+    console.log('web/build.mjs --check: web_assets.h is up to date.');
+    for (const a of compiled) console.log(`  ${a.file}: ${a.raw.length}B raw -> ${a.gz.length}B gzip`);
+    console.log(`  total: ${totalRaw}B raw -> ${totalGz}B gzip`);
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, text);
+  console.log(`Wrote ${outPath}`);
+  for (const a of compiled) console.log(`  ${a.file}: ${a.raw.length}B raw -> ${a.gz.length}B gzip`);
+  console.log(`  total: ${totalRaw}B raw -> ${totalGz}B gzip (budget: 60000B gzip)`);
+  if (totalGz > 60000) {
+    console.error(`WARNING: total gzip size ${totalGz}B exceeds the 60KB budget in DESIGN.md §10.`);
+  }
+}
+
+main();
