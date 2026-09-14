@@ -262,11 +262,11 @@
 
     /*1: Enable print timestamp;
      *0: Disable print timestamp*/
-    #define LV_LOG_USE_TIMESTAMP 1
+    #define LV_LOG_USE_TIMESTAMP 0  /*flash: no timestamp code in the log path*/
 
     /*1: Print file and line number of the log;
      *0: Do not print file and line number of the log*/
-    #define LV_LOG_USE_FILE_LINE 1
+    #define LV_LOG_USE_FILE_LINE 0  /*flash: __FILE__ strings at every warn/error site cost KBs*/
 
     /*Enable/disable LV_LOG_TRACE in modules that produces a huge number of logs*/
     #define LV_LOG_TRACE_MEM        1
@@ -568,7 +568,7 @@
 
 #define LV_USE_LABEL      1
 #if LV_USE_LABEL
-    #define LV_LABEL_TEXT_SELECTION 1 /*Enable selecting text of the label*/
+    #define LV_LABEL_TEXT_SELECTION 0 /*flash: no text selection on a read-only display*/
     #define LV_LABEL_LONG_TXT_HINT 1  /*Store some extra info in labels to speed up drawing of very long texts*/
     #define LV_LABEL_WAIT_CHAR_COUNT 3  /*The count of wait chart*/
 #endif

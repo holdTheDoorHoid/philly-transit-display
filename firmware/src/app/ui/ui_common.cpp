@@ -220,13 +220,16 @@ std::string crowdingIcons(const std::string &seats, const std::string &style) {
   return out;
 }
 
-const lv_font_t *fontBig(int32_t h) {
+const lv_font_t *fontBig(int32_t /*h*/) {
+  // Compile-time per board, not per rotation: the 320x240 boards (2.4"/2.8", which define
+  // LV_FONT_MONTSERRAT_20) use 20 px in both orientations. Choosing 28 for portrait at runtime
+  // kept both fonts linked and pushed the 2.4" capacitive build 2 KB past its 1.9 MB slot;
+  // Montserrat 28 alone is ~32 KB of flash (firmware/README.md).
 #if LV_FONT_MONTSERRAT_20
-  if (h < 320) return &lv_font_montserrat_20;  // 240-tall panels (2.4"/2.8" boards)
+  return &lv_font_montserrat_20;
 #else
-  (void)h;
-#endif
   return &lv_font_montserrat_28;
+#endif
 }
 const lv_font_t *fontBody(int32_t h) {
   // Flash diet: only Montserrat 14/20/28 are enabled (lv_conf.h) - this used to be 16 on the

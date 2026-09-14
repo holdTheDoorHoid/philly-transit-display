@@ -36,7 +36,7 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
 
-Flash headroom is about 42 KB. `platformio.ini`'s comment and `include/lv_conf.h` list the
+Flash headroom is about 36 KB on the 3.5" boards and 40 KB on the 2.4" capacitive board (2026-09-14, after the crowding icons). `platformio.ini`'s comment and `include/lv_conf.h` list the
 knobs (fonts, LVGL features, debug level); do not grow the app slots without dropping OTA.
 Trims made 2026-09-14, first when the weather feature pushed the image to 99.9 % and again when
 the interview features did:
@@ -48,6 +48,11 @@ the interview features did:
   rectangle with a radius (it only logs a warning), so every style keeps radius 0. ~12 KB.
 - `CORE_DEBUG_LEVEL` 1: the project's own `[tag]` lines are plain `Serial.printf` and stay. ~4 KB.
 - No `sscanf` anywhere (transit_core, weather_core parse by hand): drops newlib's float scanf.
+- The big minutes font is chosen per board at compile time (2026-09-14, after the crowding icon
+  font pushed the 2.4" capacitive build 2 KB over the slot): the 320x240 boards use Montserrat 20
+  in both orientations and no longer link Montserrat 28 (~32 KB) just for portrait.
+- `LV_LOG_USE_FILE_LINE` and `LV_LOG_USE_TIMESTAMP` are 0 (no `__FILE__` string at every LVGL
+  warn/error site) and `LV_LABEL_TEXT_SELECTION` is 0. A few KB on every board.
   ~9 KB.
 - The big-digits font is a 21-glyph subset (`src/fonts/README.md`), ~13 KB instead of ~60.
 `LV_MEM_SIZE` is 36 KB (was 32; the night page, bike strip and crowding labels took the pool to

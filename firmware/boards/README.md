@@ -89,8 +89,10 @@ only for a variant verified to render inverted; users can override it at runtime
 
 The 240-tall boards (`esp32-2432S028R`, `esp32-2432S028Rv3`, `esp32-2432S024R`,
 `esp32-2432S024C`) pass `-D LV_FONT_MONTSERRAT_20=1` because `ui_common.cpp`'s `fontBig()` uses
-size 20 for the big minutes on panels under 320 px tall. `lv_conf.h` defaults it to 0, which
-keeps ~22 KB of glyph bitmaps out of the 3.5" build (firmware/README.md "Memory and flash budget").
+size 20 for the big minutes on those boards, in both orientations; the 3.5" boards use 28. The
+choice is made at compile time so each board links only one big font: `lv_conf.h` defaults 20 to
+0, which keeps ~22 KB out of the 3.5" build, and the small boards drop the ~32 KB Montserrat 28
+(firmware/README.md "Memory and flash budget").
 
 ## `LVGL_BUFFER_PIXELS` on the 3.5" boards
 
