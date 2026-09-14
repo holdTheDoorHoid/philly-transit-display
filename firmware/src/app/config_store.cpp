@@ -139,6 +139,15 @@ bool validateConfig(const Config &cfg, ConfigError &err) {
     err = {"ticker_show must be both, alerts, detours, or off", "device.ticker_show"};
     return false;
   }
+  if (cfg.device.crowding != "off" && cfg.device.crowding != "words" && cfg.device.crowding != "icons" &&
+      cfg.device.crowding != "both") {
+    err = {"crowding must be off, words, icons, or both", "device.crowding"};
+    return false;
+  }
+  if (cfg.device.crowding_icons != "seats" && cfg.device.crowding_icons != "crowd") {
+    err = {"crowding_icons must be seats or crowd", "device.crowding_icons"};
+    return false;
+  }
   if (cfg.device.ticker_lines < 1 || cfg.device.ticker_lines > 8) {
     err = {"ticker_lines must be between 1 and 8", "device.ticker_lines"};
     return false;
@@ -287,7 +296,8 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
   header["wifi"] = cfg.device.header.wifi;
   header["updated"] = cfg.device.header.updated;
   device["large_text"] = cfg.device.large_text;
-  device["show_crowding"] = cfg.device.show_crowding;
+  device["crowding"] = cfg.device.crowding;
+  device["crowding_icons"] = cfg.device.crowding_icons;
   JsonObject quiet = device["quiet"].to<JsonObject>();
   quiet["enabled"] = cfg.device.quiet.enabled;
   quiet["start"] = cfg.device.quiet.start;
@@ -385,7 +395,13 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   result.device.header.wifi = header["wifi"] | true;
   result.device.header.updated = header["updated"] | true;
   result.device.large_text = device["large_text"] | false;
-  result.device.show_crowding = device["show_crowding"] | true;
+  // v0.1.0 configs stored a boolean show_crowding; honour it when the newer string is absent.
+  if (device["crowding"].is<const char *>()) {
+    result.device.crowding = std::string(device["crowding"].as<const char *>());
+  } else {
+    result.device.crowding = (device["show_crowding"] | true) ? "words" : "off";
+  }
+  result.device.crowding_icons = std::string(device["crowding_icons"] | "seats");
   JsonVariantConst quiet = device["quiet"];
   result.device.quiet.enabled = quiet["enabled"] | false;
   result.device.quiet.start = std::string(quiet["start"] | "23:00");

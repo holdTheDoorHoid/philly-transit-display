@@ -100,7 +100,11 @@ struct DeviceConfig {
   bool logging = true;
   HeaderConfig header;
   bool large_text = false;     // two rows per stop, 48 px minutes (ui_common.cpp fontBig)
-  bool show_crowding = true;   // SEPTA seat availability next to the destination
+  // SEPTA seat availability next to the destination: off | words | icons | both, and which icon
+  // scheme: seats (chairs then people) | crowd (people only). Older configs carried a boolean
+  // show_crowding; fromJson still reads it (DESIGN.md SS6).
+  std::string crowding = "words";
+  std::string crowding_icons = "seats";
   QuietConfig quiet;
   NightConfig night;
 };

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Crowding: the word for SEPTA's "many seats" level is now `open` (it used to be a bare `seats`,
+  which read as a truncated label). `device.show_crowding` becomes `device.crowding` (off / words /
+  icons / both) plus `device.crowding_icons` (seats = chairs then people, crowd = people only); old
+  configs are migrated on load. The web Now page shows the same word or meter.
+- Flasher page lists every service the firmware talks to.
+
 ## v0.1.0 - 2026-09-14
 
 First release. Verified on an ESP32-3248S035R (3.5" resistive Cheap Yellow Display); the other

@@ -231,13 +231,21 @@ main#view {
 }
 .arrival-row {
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  grid-template-columns: auto 1fr auto auto auto;
   align-items: center;
   gap: .6rem;
   padding: .4rem 0;
   border-top: 1px solid var(--border);
 }
 .arrival-row:first-of-type { border-top: none; }
+
+/* Fixed columns so a row without a crowding element (mode off, or an arrival with no
+   seats data) still lines up with rows that have one. */
+.route-badge { grid-column: 1; }
+.arrival-dest { grid-column: 2; }
+.arrival-crowd { grid-column: 3; }
+.arrival-minutes { grid-column: 4; }
+.status-badge { grid-column: 5; }
 
 .route-badge {
   display: inline-flex;
@@ -252,6 +260,9 @@ main#view {
   font-size: .85rem;
 }
 .arrival-dest { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.arrival-crowd { display: inline-flex; align-items: center; gap: .3rem; white-space: nowrap; }
+.crowd-icons { display: inline-flex; align-items: center; gap: 1px; }
+.crowd-icons svg { display: block; }
 .arrival-minutes { font-size: 1.4rem; font-weight: 700; text-align: right; min-width: 2.2em; }
 .status-badge {
   border-radius: 999px;
@@ -357,4 +368,5 @@ footer.hint { text-align: center; color: var(--text-muted); font-size: .8rem; pa
 
 @media (max-width: 359px) {
   #topbar h1 { display: none; }
+  .arrival-row { gap: .35rem; }
 }

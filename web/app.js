@@ -210,15 +210,27 @@ function renderNow(root) {
   root.append(wrap);
 
   let stopped = false;
+  // Fetched once (not per poll tick); every tick awaits this promise, so it's ready by
+  // the first render. Falls back to words/seats on fetch failure or old firmware.
+  let crowdMode = 'words';
+  let crowdScheme = 'seats';
+  const configPromise = api.config().then((cfg) => {
+    const cd = (cfg && cfg.device) || {};
+    crowdMode = cd.crowding || (cd.show_crowding === false ? 'off' : 'words');
+    crowdScheme = cd.crowding_icons || 'seats';
+  }).catch(() => {});
+
   async function tick() {
     if (stopped) return;
     try {
+      await configPromise;
+      if (stopped) return;
       const state = await api.state();
       if (stopped) return;
       renderStatusStrip(strip, state);
       renderStaleBanner(banner, state);
       renderProfileLine(profileLine, state);
-      renderStopPanels(stops, state.stops || []);
+      renderStopPanels(stops, state.stops || [], crowdMode, crowdScheme);
       renderBikeCard(bike, state.bike);
       renderAlerts(alerts, state.alerts || []);
     } catch (e) {
@@ -292,7 +304,57 @@ function badgeFor(a) {
   return { cls: 'on-time', text: 'on time', aria: 'On time' };
 }
 
-function renderStopPanels(container, stopSnaps) {
+// ---- Crowding: device.crowding off/words/icons/both, device.crowding_icons seats/crowd.
+// arrivals[].seats is SEPTA's raw estimated_seat_availability string; word mapping below
+// must match the firmware exactly. Unrecognized/blank seats -> no element.
+const CROWD_WORDS = {
+  EMPTY: 'empty', MANY_SEATS_AVAILABLE: 'open', FEW_SEATS_AVAILABLE: 'few seats',
+  STANDING_ROOM_ONLY: 'standing', CRUSHED_STANDING_ROOM_ONLY: 'packed', FULL: 'full',
+};
+// Three-slot icon recipes, left to right: [glyph, tone]. 'dim' keeps unused slots visible.
+const CROWD_ICONS_SEATS = {
+  EMPTY: [['chair', 'green'], ['chair', 'green'], ['chair', 'green']],
+  MANY_SEATS_AVAILABLE: [['chair', 'green'], ['chair', 'green'], ['chair', 'dim']],
+  FEW_SEATS_AVAILABLE: [['chair', 'amber'], ['chair', 'dim'], ['chair', 'dim']],
+  STANDING_ROOM_ONLY: [['person', 'amber'], ['person', 'dim'], ['person', 'dim']],
+  CRUSHED_STANDING_ROOM_ONLY: [['person', 'red'], ['person', 'red'], ['person', 'dim']],
+  FULL: [['person', 'red'], ['person', 'red'], ['person', 'red']],
+};
+const CROWD_ICONS_CROWD = {
+  EMPTY: [['person', 'green'], ['person', 'dim'], ['person', 'dim']],
+  MANY_SEATS_AVAILABLE: [['person', 'green'], ['person', 'dim'], ['person', 'dim']],
+  FEW_SEATS_AVAILABLE: [['person', 'amber'], ['person', 'amber'], ['person', 'dim']],
+  STANDING_ROOM_ONLY: [['person', 'amber'], ['person', 'amber'], ['person', 'dim']],
+  CRUSHED_STANDING_ROOM_ONLY: [['person', 'red'], ['person', 'red'], ['person', 'red']],
+  FULL: [['person', 'red'], ['person', 'red'], ['person', 'red']],
+};
+// Original 14x14 pictograms (not traced from any icon set).
+const CROWD_TONE_VAR = { green: '--on-time-fg', amber: '--warn', red: '--late-fg', dim: '--text-muted' };
+function crowdIcon(kind, tone) {
+  const parts = kind === 'chair'
+    ? [hs('rect', { x: 2, y: 1, width: 2, height: 8 }), hs('rect', { x: 2, y: 7, width: 9, height: 2 }),
+       hs('rect', { x: 2, y: 9, width: 2, height: 4 }), hs('rect', { x: 9, y: 9, width: 2, height: 4 })]
+    : [hs('circle', { cx: 7, cy: 3, r: 2.1 }), hs('rect', { x: 4, y: 6.3, width: 6, height: 7.2, rx: 2.6 })];
+  return hs('svg', {
+    viewBox: '0 0 14 14', width: 13, height: 13, fill: 'currentColor', 'aria-hidden': 'true',
+    style: `color:var(${CROWD_TONE_VAR[tone]})`,
+  }, ...parts);
+}
+function crowdElement(seats, mode, scheme) {
+  if (!mode || mode === 'off') return null;
+  const word = CROWD_WORDS[seats];
+  if (!word) return null;
+  const label = `Crowding: ${word}`;
+  const span = h('span', { class: 'arrival-crowd', title: label, 'aria-label': label });
+  if (mode === 'icons' || mode === 'both') {
+    const recipe = (scheme === 'crowd' ? CROWD_ICONS_CROWD : CROWD_ICONS_SEATS)[seats] || [];
+    span.append(h('span', { class: 'crowd-icons' }, ...recipe.map(([k, t]) => crowdIcon(k, t))));
+  }
+  if (mode === 'words' || mode === 'both') span.append(h('span', { class: 'small muted' }, word));
+  return span;
+}
+
+function renderStopPanels(container, stopSnaps, crowdMode, crowdScheme) {
   clear(container);
   if (!stopSnaps.length) {
     container.append(h('div', { class: 'card muted' }, 'No stops configured yet. Add one from the Stops tab.'));
@@ -313,6 +375,7 @@ function renderStopPanels(container, stopSnaps) {
         panel.append(h('div', { class: 'arrival-row' },
           h('span', { class: 'route-badge' }, s.route || (s.mode === 'rail' ? 'RR' : '?')),
           h('span', { class: 'arrival-dest' }, a.destination || s.headsign || ''),
+          crowdElement(a.seats, crowdMode, crowdScheme),
           h('span', { class: 'arrival-minutes' }, fmtEta(a)),
           h('span', { class: `status-badge ${badge.cls}`, title: badge.aria, 'aria-label': badge.aria }, badge.text),
         ));
@@ -1360,11 +1423,20 @@ async function renderSettings(root) {
     'Disabling certificate verification lets a device on the network impersonate SEPTA and send fake arrival times. Only turn this off for troubleshooting.');
   tlsInput.addEventListener('change', () => tlsWarn.classList.toggle('hidden', tlsInput.checked));
 
-  // ---- Display extras (device.large_text / device.show_crowding) ----
+  // ---- Display extras ----
   const largeTextInput = h('input', { type: 'checkbox', id: 'set-large-text' });
   largeTextInput.checked = !!d.large_text;
-  const crowdingInput = h('input', { type: 'checkbox', id: 'set-crowding' });
-  crowdingInput.checked = d.show_crowding ?? true;
+  const crowdingMode = d.crowding || (d.show_crowding === false ? 'off' : 'words');
+  const CROWDING_MODES = [['off', 'Off'], ['words', 'Words'], ['icons', 'Icons'], ['both', 'Icons + word']];
+  const crowdingSelect = h('select', { id: 'set-crowding' },
+    ...CROWDING_MODES.map(([v, label]) => h('option', { value: v, selected: v === crowdingMode || undefined }, label)));
+  const CROWDING_ICON_SCHEMES = [['seats', 'Seats then people'], ['crowd', 'Crowd meter (people only)']];
+  const crowdingIconsSelect = h('select', { id: 'set-crowding-icons' },
+    ...CROWDING_ICON_SCHEMES.map(([v, label]) => h('option', { value: v, selected: v === (d.crowding_icons || 'seats') || undefined }, label)));
+  crowdingIconsSelect.disabled = !(crowdingMode === 'icons' || crowdingMode === 'both');
+  crowdingSelect.addEventListener('change', () => {
+    crowdingIconsSelect.disabled = !(crowdingSelect.value === 'icons' || crowdingSelect.value === 'both');
+  });
 
   // ---- Quiet hours (device.quiet) ----
   const quiet = d.quiet || {};
@@ -1485,7 +1557,10 @@ async function renderSettings(root) {
 
     h('h2', {}, 'Display extras'),
     h('label', { class: 'inline' }, largeTextInput, ' Large text (two rows per stop, big numbers)'),
-    h('label', { class: 'inline' }, crowdingInput, ' Show crowding (SEPTA’s seat availability)'),
+    h('label', { for: 'set-crowding' }, 'Crowding'), crowdingSelect,
+    h('label', { for: 'set-crowding-icons' }, 'Crowding icons'), crowdingIconsSelect,
+    h('p', { class: 'small muted' },
+      '"Seats then people" shows chairs while there’s room to sit and switches to person icons once it’s standing room only; "Crowd meter" always shows people, with more filled-in icons meaning more crowded. In words: open, few seats, standing, packed, full.'),
 
     h('h2', {}, 'Quiet hours'),
     h('label', { class: 'inline' }, quietEnabled, ' Enable quiet hours'),
@@ -1524,10 +1599,11 @@ async function renderSettings(root) {
     h('label', { class: 'inline' }, alertsInput, ' Show service alerts'),
     h('div', { style: 'margin-top:1rem' }, h('button', { class: 'primary', onclick: async () => {
       const tz = tzSelect.value === '__custom__' ? tzCustom.value.trim() : tzSelect.value;
+      const { show_crowding: _legacyShowCrowding, ...dRest } = d;
       const next = {
         ...cfg,
         device: {
-          ...d, name: nameInput.value.trim(), tz, poll_seconds: Number(pollInput.value),
+          ...dRest, name: nameInput.value.trim(), tz, poll_seconds: Number(pollInput.value),
           brightness: Number(brightInput.value), rotation: Number(rotSelect.value),
           theme: themeSelect.value, invert_colors: invertInput.checked,
           ticker_lines: Number(tickerLinesSelect.value), ticker_speed: Number(tickerSpeedInput.value),
@@ -1535,7 +1611,8 @@ async function renderSettings(root) {
           use_https: httpsInput.checked, tls_verify: tlsInput.checked, logging: loggingInput.checked,
           header: Object.fromEntries(Object.entries(headerInputs).map(([k, cb]) => [k, cb.checked])),
           large_text: largeTextInput.checked,
-          show_crowding: crowdingInput.checked,
+          crowding: crowdingSelect.value,
+          crowding_icons: crowdingIconsSelect.value,
           quiet: {
             enabled: quietEnabled.checked, start: quietStart.value, end: quietEnd.value,
             brightness: Number(quietBrightness.value), wake_seconds: Number(quietWake.value),

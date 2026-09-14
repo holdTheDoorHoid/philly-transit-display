@@ -135,10 +135,21 @@ checkbox further down in Settings, which controls whether alerts are fetched fro
 SEPTA at all — a muted note under the select says so.
 
 The Settings view additionally covers, in order after the alert ticker section: large
-text / crowding display extras, quiet hours (backlight dims on a schedule, touch wakes
-it), the night clock, "time to leave" LED/screen/chime alerts, and up to 4
-schedule-based **profiles** (each with a name, days, a time window, and its own
-ordered stop list — checkboxes plus ↑/↓ reordering, built from the configured stops).
+text, quiet hours (backlight dims on a schedule, touch wakes it), the night clock, "time
+to leave" LED/screen/chime alerts, and up to 4 schedule-based **profiles** (each with a
+name, days, a time window, and its own ordered stop list — checkboxes plus ↑/↓
+reordering, built from the configured stops).
+
+Also in that section, a **Crowding** select (`device.crowding`: `off`, `words`, `icons`,
+or `both` (default `words`)) picks how SEPTA's per-bus seat estimate shows up next to
+each arrival on the Now page — nothing, a word (open / few seats / standing / packed /
+full), a three-slot icon meter, or icons followed by the word. A second **Crowding
+icons** select (`device.crowding_icons`: `seats` (default) or `crowd`) picks the icon
+scheme and is disabled except when Crowding is Icons or Icons + word. Old firmware that
+only knows the boolean `device.show_crowding` still works: the UI reads `crowding` when
+present and otherwise treats `show_crowding === false` as `off`, anything else as
+`words`; it never sends `show_crowding` back. On the Now page, an arrival with no
+recognized seats value (blank or `NOT_AVAILABLE`) shows no crowding element at all.
 
 ## Assumptions made (DESIGN.md §7/§9.3 didn't fully pin these down)
 

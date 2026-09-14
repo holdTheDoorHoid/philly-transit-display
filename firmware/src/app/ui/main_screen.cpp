@@ -32,7 +32,8 @@ namespace {
 struct RowWidgets {
   lv_obj_t *route_badge;
   lv_obj_t *destination;
-  lv_obj_t *crowding;  // "few seats" etc. (device.show_crowding), hidden when unknown
+  lv_obj_t *crowd_icons;  // three-slot chair/person meter (device.crowding icons|both), hidden when unknown
+  lv_obj_t *crowding;     // "few seats" etc. (device.crowding words|both), hidden when unknown
   lv_obj_t *minutes;
   lv_obj_t *status_badge;
 };
@@ -303,6 +304,12 @@ lv_obj_t *createMainScreen(const Config &cfg) {
       lv_obj_set_flex_grow(rw.destination, 1);
       lv_label_set_long_mode(rw.destination, LV_LABEL_LONG_DOT);
 
+      rw.crowd_icons = makeLabel(row, fontIcons(), colorSubtext());
+      lv_label_set_recolor(rw.crowd_icons, true);  // crowdingIcons() colours each slot inline
+      lv_obj_set_style_text_letter_space(rw.crowd_icons, 2, 0);
+      lv_label_set_text(rw.crowd_icons, "");
+      lv_obj_add_flag(rw.crowd_icons, LV_OBJ_FLAG_HIDDEN);
+
       rw.crowding = makeLabel(row, fontSmall(h), colorSubtext());
       lv_label_set_text(rw.crowding, "");
       lv_obj_add_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
@@ -500,7 +507,17 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
       lv_label_set_text(rw.route_badge, pw.route.c_str());
       lv_label_set_text(rw.destination, a.destination.c_str());
 
-      std::string crowd = cfg.device.show_crowding ? crowdingText(a.seats) : std::string();
+      const std::string &cmode = cfg.device.crowding;
+      bool want_icons = (cmode == "icons" || cmode == "both");
+      bool want_words = (cmode == "words" || cmode == "both");
+      std::string icons = want_icons ? crowdingIcons(a.seats, cfg.device.crowding_icons) : std::string();
+      if (icons.empty()) {
+        lv_obj_add_flag(rw.crowd_icons, LV_OBJ_FLAG_HIDDEN);
+      } else {
+        lv_label_set_text(rw.crowd_icons, icons.c_str());
+        lv_obj_remove_flag(rw.crowd_icons, LV_OBJ_FLAG_HIDDEN);
+      }
+      std::string crowd = want_words ? crowdingText(a.seats) : std::string();
       if (crowd.empty()) {
         lv_obj_add_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
       } else {

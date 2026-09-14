@@ -4,6 +4,7 @@
 #include <ctime>
 
 LV_FONT_DECLARE(lv_font_montserrat_48_digits)
+LV_FONT_DECLARE(lv_font_fa_crowding_16)
 
 namespace transit_app::ui {
 
@@ -111,6 +112,10 @@ int rowsPerStop(int32_t h, bool large_text) {
   return h >= 320 ? 3 : 2;
 }
 
+const lv_font_t *fontIcons() {
+  return &lv_font_fa_crowding_16;
+}
+
 const lv_font_t *fontHuge() {
   return &lv_font_montserrat_48_digits;
 }
@@ -155,14 +160,64 @@ std::string panelTitle(const transit::StopConfig &s) {
   return title;
 }
 
+// SEPTA's six crowding levels in order, 0 = emptiest. -1 when there is no estimate.
+static int crowdingLevel(const std::string &seats) {
+  if (seats == "EMPTY") return 0;
+  if (seats == "MANY_SEATS_AVAILABLE") return 1;
+  if (seats == "FEW_SEATS_AVAILABLE") return 2;
+  if (seats == "STANDING_ROOM_ONLY") return 3;
+  if (seats == "CRUSHED_STANDING_ROOM_ONLY") return 4;
+  if (seats == "FULL") return 5;
+  return -1;
+}
+
 std::string crowdingText(const std::string &seats) {
-  if (seats == "MANY_SEATS_AVAILABLE") return "seats";
-  if (seats == "FEW_SEATS_AVAILABLE") return "few seats";
-  if (seats == "STANDING_ROOM_ONLY") return "standing";
-  if (seats == "CRUSHED_STANDING_ROOM_ONLY") return "packed";
-  if (seats == "FULL") return "full";
-  if (seats == "EMPTY") return "empty";
-  return "";
+  // "seats" alone for MANY_SEATS_AVAILABLE read as a truncated label on the panel, so the
+  // scale is now open / few seats / standing / packed / full (plus SEPTA's rare "empty").
+  static const char *const kWords[] = {"empty", "open", "few seats", "standing", "packed", "full"};
+  int level = crowdingLevel(seats);
+  return level < 0 ? std::string() : kWords[level];
+}
+
+std::string crowdingIcons(const std::string &seats, const std::string &style) {
+  int level = crowdingLevel(seats);
+  if (level < 0) return "";
+  static const char kChair[] = "\xEF\x9B\x80";   // U+F6C0 chair
+  static const char kPerson[] = "\xEF\x86\x83";  // U+F183 standing person
+  const char *glyph = kPerson;
+  int lit = 3;
+  uint32_t color;
+  const uint32_t green = g_dark ? 0x3DCB55 : 0x1B7F3B;   // == colorOnTime()
+  const uint32_t amber = g_dark ? 0xF5A030 : 0xB45309;   // == colorSkipped()
+  const uint32_t red = g_dark ? 0xF05654 : 0xC62828;     // == colorLate()
+  const uint32_t dim = g_dark ? 0x3E464E : 0xC9D0D6;     // unused slots
+  if (style == "crowd") {
+    lit = level <= 1 ? 1 : (level <= 3 ? 2 : 3);
+    color = lit == 1 ? green : (lit == 2 ? amber : red);
+  } else {
+    switch (level) {
+      case 0: glyph = kChair; lit = 3; color = green; break;
+      case 1: glyph = kChair; lit = 2; color = green; break;
+      case 2: glyph = kChair; lit = 1; color = amber; break;
+      case 3: lit = 1; color = amber; break;
+      case 4: lit = 2; color = red; break;
+      default: lit = 3; color = red; break;
+    }
+  }
+  // LVGL recolor syntax: '#' + six hex digits + ' ' + text + '#'; commands may follow each other.
+  char hex[8];
+  std::string out;
+  snprintf(hex, sizeof hex, "#%06x ", (unsigned)color);
+  out += hex;
+  for (int i = 0; i < lit; ++i) out += glyph;
+  out += '#';
+  if (lit < 3) {
+    snprintf(hex, sizeof hex, "#%06x ", (unsigned)dim);
+    out += hex;
+    for (int i = lit; i < 3; ++i) out += glyph;
+    out += '#';
+  }
+  return out;
 }
 
 const lv_font_t *fontBig(int32_t h) {

@@ -247,7 +247,8 @@ ESP Web Tools `manifest.json` under `flasher/` for GitHub Pages (offsets 0x1000 
     "logging": true,
     "header": { "name": false, "clock": true, "weather": true, "wifi": true, "updated": true },
     "large_text": false,
-    "show_crowding": true,
+    "crowding": "words",
+    "crowding_icons": "seats",
     "quiet": { "enabled": false, "start": "23:00", "end": "06:00", "brightness": 0, "wake_seconds": 30 },
     "night": { "enabled": true, "after_min": 60 }
   },
@@ -309,8 +310,15 @@ Fields added 2026-09-14 (all optional; absent means the default shown above):
   key is `alt_of` has no arrival within `alt_after_min` minutes (or no data). Otherwise its panel is
   hidden and the others take the space. Alternatives still poll and log normally.
 - `device.large_text`: two rows per stop with the minutes in a 48 px digits font (readable across a
-  room). `device.show_crowding`: SEPTA's estimated seat availability next to the destination
-  (`seats`, `few seats`, `standing`, `packed`, `full`, `empty`).
+  room). `device.crowding`: SEPTA's estimated seat availability next to the destination as
+  `off`, `words` (`open`, `few seats`, `standing`, `packed`, `full`, and SEPTA's rare `empty`),
+  `icons`, or `both`. `device.crowding_icons` picks the icon meter: `seats` (three slots that fill
+  with green chairs while you can sit: 3 empty / 2 open / 1 amber few seats; then people once you
+  stand: 1 amber standing / 2 red packed / 3 red full) or `crowd` (people only, 1 green / 2 amber /
+  3 red, more people = more crowded). Unused slots stay dim so the meter keeps its width. The
+  glyphs are a 16 px chair + person subset of FontAwesome (`src/fonts/`, ~1.5 KB) coloured per slot
+  with LVGL's inline recolor. v0.1.0 stored a boolean `show_crowding`; it is still read (false ->
+  `off`) but no longer written.
 - `device.quiet`: between `start` and `end` (local, may cross midnight) the backlight drops to
   `brightness` percent (0 = off); a touch restores it for `wake_seconds` and does not change page.
   Chimes are suppressed in quiet hours.
@@ -387,8 +395,9 @@ Main screen (portrait by default; every size derives from the runtime resolution
   (ellipsized), big minutes right-aligned (`12`, `Due` when < 1 min, `Now` when 0, the clock time
   `1:14a` from 60 min out so an overnight or wrong-day schedule row never reads "958"), and a badge:
   green `on time` (−1..+5 min, SEPTA's own on-time definition), red `+13`, blue `−2`, grey `sched`,
-  orange `skip`. With `show_crowding`, SEPTA's seat estimate sits after the destination (`few
-  seats`, `standing`, `packed`). While a bus is within `due.minutes` its minutes blink red
+  orange `skip`. With `device.crowding`, SEPTA's seat estimate sits after the destination as a
+  word (`open`, `few seats`, `standing`, `packed`, `full`), a three-slot chair/person meter, or
+  both (SS6). While a bus is within `due.minutes` its minutes blink red
   (`due.screen`), the LED blinks green (`due.led`) and, once per live trip, the speaker beeps twice
   (`due.chime`, silenced in quiet hours).
 - An alternative panel (`alt_of`) is hidden until its primary stop has nothing within

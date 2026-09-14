@@ -78,7 +78,8 @@ function defaultConfig() {
       logging: true,
       header: { name: false, clock: true, weather: true, wifi: true, updated: true },
       large_text: false,
-      show_crowding: true,
+      crowding: 'words',
+      crowding_icons: 'seats',
       quiet: { enabled: false, start: '23:00', end: '06:00', brightness: 0, wake_seconds: 30 },
       night: { enabled: true, after_min: 60 },
     },
@@ -131,7 +132,14 @@ function validateConfig(cfg) {
   if (typeof d.tls_verify !== 'boolean') return { error: 'tls_verify must be a boolean', path: 'device.tls_verify' };
   if (typeof d.logging !== 'boolean') return { error: 'logging must be a boolean', path: 'device.logging' };
   if (d.large_text !== undefined && typeof d.large_text !== 'boolean') return { error: 'large_text must be a boolean', path: 'device.large_text' };
-  if (d.show_crowding !== undefined && typeof d.show_crowding !== 'boolean') return { error: 'show_crowding must be a boolean', path: 'device.show_crowding' };
+  if (d.crowding !== undefined && !['off', 'words', 'icons', 'both'].includes(d.crowding)) {
+    return { error: 'crowding must be off, words, icons, or both', path: 'device.crowding' };
+  }
+  if (d.crowding_icons !== undefined && !['seats', 'crowd'].includes(d.crowding_icons)) {
+    return { error: 'crowding_icons must be seats or crowd', path: 'device.crowding_icons' };
+  }
+  // Note: legacy show_crowding (boolean) is accepted and folded onto crowding before
+  // validateConfig ever runs (see the PUT /api/config handler), so it never reaches here.
   const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
   if (d.quiet !== undefined) {
     const q = d.quiet;
@@ -460,15 +468,22 @@ function buildBusSnapshot(cfgStop, now) {
       late_min: vehicle.late || 0, late_known: true, status: 'live', seats: vehicle.estimated_seat_availability || '',
     });
   }
+  // Synthetic seats values on the scheduled/skipped slots (SEPTA doesn't send crowding
+  // for these anyway) so the Now page's crowding UI can be exercised end to end: the two
+  // configured bus stops' six slots together cover every seats value the firmware knows
+  // about (the live slot's value comes from the transitview fixture — EMPTY southbound,
+  // FEW_SEATS_AVAILABLE northbound).
   const schedFallback = schedEntries[0] || {};
   arrivals.push({
     trip: schedFallback.trip_id || '000000', vehicle: '', destination: schedFallback.DirectionDesc || cfgStop.headsign,
-    predicted: 0, scheduled: now + 1500, eta_s: 1500, late_min: 0, late_known: false, status: 'scheduled', seats: '',
+    predicted: 0, scheduled: now + 1500, eta_s: 1500, late_min: 0, late_known: false, status: 'scheduled',
+    seats: isSouth ? 'MANY_SEATS_AVAILABLE' : 'STANDING_ROOM_ONLY',
   });
   const lastTrip = schedEntries[schedEntries.length - 1] || {};
   arrivals.push({
     trip: lastTrip.trip_id || '000001', vehicle: '', destination: lastTrip.DirectionDesc || cfgStop.headsign,
-    predicted: 0, scheduled: now + 2200, eta_s: 2200, late_min: 0, late_known: false, status: 'skipped', seats: '',
+    predicted: 0, scheduled: now + 2200, eta_s: 2200, late_min: 0, late_known: false, status: 'skipped',
+    seats: isSouth ? 'FULL' : 'CRUSHED_STANDING_ROOM_ONLY',
   });
   arrivals.sort((a, b) => (a.predicted || a.scheduled) - (b.predicted || b.scheduled));
 
@@ -495,10 +510,13 @@ function buildRailSnapshot(cfgStop, now) {
     const delaySec = Math.round((dep - sched) / 1000);
     const scheduled = now + 240 + i * 480;
     const predicted = scheduled + delaySec;
+    // Regional Rail doesn't carry SEPTA's bus-style seat estimate; NOT_AVAILABLE on the
+    // first train and '' (blank) on the rest both map to "no crowding element" on the Now
+    // page, but NOT_AVAILABLE also exercises that legacy/unknown-string code path.
     return {
       trip: t.train_id, vehicle: t.train_id, destination: t.destination,
       predicted, scheduled, eta_s: predicted - now,
-      late_min: Math.round(delaySec / 60), late_known: true, status: 'live', seats: '',
+      late_min: Math.round(delaySec / 60), late_known: true, status: 'live', seats: i === 0 ? 'NOT_AVAILABLE' : '',
     };
   });
 
@@ -662,6 +680,15 @@ const server = http.createServer(async (req, res) => {
       const { buf } = await readBody(req);
       let parsed;
       try { parsed = JSON.parse(buf.toString('utf8') || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'Invalid JSON body', path: '' }); }
+      // Legacy clients send show_crowding (boolean) instead of crowding (string). Mirror
+      // the real firmware: accept it on read, fold it onto crowding, never persist it.
+      if (parsed && typeof parsed.device === 'object' && parsed.device !== null) {
+        const pd = parsed.device;
+        if (pd.crowding === undefined && pd.show_crowding !== undefined) {
+          pd.crowding = pd.show_crowding === false ? 'off' : 'words';
+        }
+        delete pd.show_crowding;
+      }
       const err = validateConfig(parsed);
       if (err) return sendJSON(res, 400, err);
       config = parsed;

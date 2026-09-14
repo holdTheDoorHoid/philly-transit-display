@@ -35,7 +35,8 @@ Alpha. As of 2026-09-14:
   an umbrella, say so on that stop's panel. Weather data by [Open-Meteo.com](https://open-meteo.com/)
   (CC BY 4.0), no account needed.
 - Tell you when to leave: when a bus is a few minutes out the row blinks, the LED blinks, and the
-  board can beep twice. Show how crowded each bus is (SEPTA's seat estimate).
+  board can beep twice. Show how crowded each bus is (SEPTA's seat estimate) as a word or a
+  three-slot chair/person meter.
 - Fit your day: commute profiles pick which stops show on weekday mornings vs evenings; an
   alternative stop appears only when your usual one is running late; quiet hours dim the screen
   overnight; a night clock with the first departures replaces the empty panels when nothing is

@@ -139,7 +139,13 @@ roundtrip('header all off', lambda c: c['device'].update(header={'name': False, 
 roundtrip('header all on', lambda c: c['device'].update(header={'name': True, 'clock': True, 'weather': True, 'wifi': True, 'updated': True}), lambda g: all(g['device']['header'].values()))
 roundtrip('large text on', lambda c: c['device'].update(large_text=True), lambda g: g['device']['large_text'] is True)
 roundtrip('large text off', lambda c: c['device'].update(large_text=False), lambda g: g['device']['large_text'] is False)
-roundtrip('crowding off', lambda c: c['device'].update(show_crowding=False), lambda g: g['device']['show_crowding'] is False)
+roundtrip('crowding icons/crowd', lambda c: c['device'].update(crowding='icons', crowding_icons='crowd'), lambda g: g['device']['crowding'] == 'icons' and g['device']['crowding_icons'] == 'crowd')
+roundtrip('crowding both/seats', lambda c: c['device'].update(crowding='both', crowding_icons='seats'), lambda g: g['device']['crowding'] == 'both' and g['device']['crowding_icons'] == 'seats')
+roundtrip('crowding off', lambda c: c['device'].update(crowding='off'), lambda g: g['device']['crowding'] == 'off')
+def _legacy_crowding(c):
+    c['device'].pop('crowding', None); c['device']['show_crowding'] = False
+roundtrip('crowding legacy show_crowding=false -> off', _legacy_crowding, lambda g: g['device']['crowding'] == 'off' and 'show_crowding' not in g['device'])
+roundtrip('crowding words', lambda c: c['device'].update(crowding='words'), lambda g: g['device']['crowding'] == 'words')
 roundtrip('night off', lambda c: c['device']['night'].update(enabled=False, after_min=240), lambda g: g['device']['night'] == {'enabled': False, 'after_min': 240})
 roundtrip('title styles', lambda c: (c['stops'][0].update(title_style='label'), c['stops'][1].update(title_style='custom', title_text='Uptown bus')), lambda g: g['stops'][0]['title_style'] == 'label' and g['stops'][1]['title_text'] == 'Uptown bus')
 roundtrip('title route_dest_stop', lambda c: c['stops'][0].update(title_style='route_dest_stop'), lambda g: g['stops'][0]['title_style'] == 'route_dest_stop')
@@ -174,6 +180,8 @@ invalid('alt_of unknown', lambda c: c['stops'][0].update(alt_of='nope'), 'stops[
 invalid('alt_after_min 4', lambda c: c['stops'][0].update(alt_of=c['stops'][1]['key'], alt_after_min=4), 'stops[0].alt_after_min')
 invalid('rotation 45', lambda c: c['device'].update(rotation=45), 'device.rotation')
 invalid('theme blue', lambda c: c['device'].update(theme='blue'), 'device.theme')
+invalid('crowding bad mode', lambda c: c['device'].update(crowding='sometimes'), 'device.crowding')
+invalid('crowding bad icons', lambda c: c['device'].update(crowding_icons='cats'), 'device.crowding_icons')
 invalid('ticker_show sometimes', lambda c: c['device'].update(ticker_show='sometimes'), 'device.ticker_show')
 invalid('ticker_lines 9', lambda c: c['device'].update(ticker_lines=9), 'device.ticker_lines')
 invalid('ticker_speed 4', lambda c: c['device'].update(ticker_speed=4), 'device.ticker_speed')
