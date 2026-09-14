@@ -11,3 +11,5 @@ web/dist/
 # local secrets / device-specific
 *.local.ini
 firmware/secrets.h
+# Claude Code local launch config
+.claude/
