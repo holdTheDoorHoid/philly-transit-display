@@ -27,68 +27,47 @@ unconditional call site to `buildDemoSnapshot()` measurably shrank `firmware.bin
 
 ## Memory and flash budget
 
+Measured on the owner's ESP32-3248S035R (classic ESP32, 4 MB flash, no PSRAM) on 2026-09-14.
 The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) per OTA slot.
-Numbers below are from `pio run -e cyd-3248S035R`'s own size report, recorded after each
-milestone of the SS13 feature work (all figures against the current, full feature set):
 
-| Milestone | Flash (bytes) | Flash % | RAM (bytes) | RAM % |
-|---|---:|---:|---:|---:|
-| Skeleton (starting point) | 1,863,762 | 98.1% | 118,932 | 36.3% |
-| Flash diet (drop WiFiManager, `CORE_DEBUG_LEVEL=2`, trim `lv_conf.h`) | 1,742,906 | 91.7% | 118,132 | 36.1% |
-| 1. Serve embedded web UI | 1,762,270 | 92.7% | 118,132 | 36.1% |
-| 2. Real SEPTA data (net_poller rewrite) | 1,830,438 | 96.3% | 118,268 | 36.1% |
-| 3+4. Real `/api/state` + setup-wizard proxies | 1,837,098 | 96.7% | 118,260 | 36.1% |
-| 5. Logging, stats, log downloads | 1,855,438 | 97.6% | 118,268 | 36.1% |
-| 6. OTA (`POST /api/ota`) | 1,862,054 | 98.0% | 118,508 | 36.2% |
-| 7. Real Snapshot on screen (main/stats UI) | 1,859,018 | 97.8% | 118,508 | 36.2% |
-| 8. Brightness control | 1,859,126 | 97.8% | 118,508 | 36.2% |
-| Fix: heap-allocate `/api/stats`' StatsAggregator (**final**) | **1,858,902** | **97.8%** | **118,508** | **36.2%** |
+| Build | Flash | Static RAM |
+|---|---:|---:|
+| Full feature set (current) | 1,866,782 B (98.2 %) | 89,940 B (27.4 %) |
 
-**Final headroom: 41,642 bytes (≈40.7 KB, 2.2%) — under the 64 KB target by about 23.9 KB.**
-RAM is not a concern (36.2%, no changes needed there beyond heap-allocating the two objects
-noted below).
+Flash headroom is about 34 KB. `platformio.ini`'s comment and `include/lv_conf.h` list the
+knobs (fonts, LVGL features, debug level); do not grow the app slots without dropping OTA.
 
-The flash diet alone recovered 120,856 bytes (WiFiManager removal was the overwhelming majority
-of that; see the "Flash diet" commit). Every feature milestone after it added real functionality
-(transit_core's GTFS-RT decoder/SEPTA parsers, the stats aggregator, `Update.h`, the real UI) and
-correspondingly cost flash; none of those increases reflect waste as far as I could find - see
-"what I'd cut next" below for the concrete, measured options if getting under 64 KB matters more
-than shipping all eight features in this pass.
+### Heap, stage by stage (`[heap]` lines on the serial console at boot)
 
-**Two RAM (not flash) fixes were needed along the way**, both from declaring a "finished
-library" object as a plain global rather than heap-allocating it: `transit_stats::ArrivalTracker`
-(its own header docs put `sizeof()` at ~14-16 KB) and `transit_stats::StatsAggregator` (~8 KB)
-both overflowed the ESP32's fixed `.bss`/`.data` budget ("DRAM segment data does not fit") when
-declared as file-scope objects; both are now heap-allocated (`net_poller.cpp`) instead. This is
-a general trap worth remembering: DESIGN.md's SS5 RAM budget is about the *heap*, and the two
-libraries' own "long-lived singleton" framing invites a plain global, but the ESP32's static
-budget is much smaller and separate from the heap.
+| After | Free | Largest block |
+|---|---:|---:|
+| display (LVGL + 19 KB draw buffer) | 216 KB | 110 KB |
+| config + arrival tracker (~12 KB) + poller task stack (10 KB) | 178 KB | 110 KB |
+| Wi-Fi connected | 127 KB | 86 KB |
+| web server, mDNS, SNTP | 100 KB | 61 KB |
+| SD card mounted | 69 KB | 32 KB |
+| UI screens built | 68 KB | 31 KB |
+| steady state while polling | ~86 KB | ~43 KB |
 
-### What I'd cut next, if 64 KB of headroom is required in this pass
+Rules that fell out of this, all learned the hard way (each one was a boot loop first):
 
-Ranked by how much flash each measurably added (so, roughly, how much cutting it would give
-back), from smallest/least-disruptive to largest/most-disruptive:
+- Anything large and long-lived (the tracker, task stacks) is allocated before Wi-Fi starts,
+  while the heap is one contiguous block. Every `new` of a big object is `nothrow` and checked:
+  with exceptions disabled a failed plain `new` calls `std::terminate()`.
+- No TLS by default (`device.use_https=false`). A TLS session needs ~40 KB with two 16 KB
+  contiguous buffers; SEPTA serves identical bytes over plain HTTP.
+- No second worker task: the poller drains the web job queue between polls. The AsyncTCP task
+  stack is capped at 8 KB (`CONFIG_ASYNC_TCP_STACK_SIZE`; the library default is 16 KB).
+- Proxied SEPTA bodies (stop lists up to ~18 KB) stream into a LittleFS temp file and are served
+  from it; nothing network-sized is ever held in a growing buffer.
+- LVGL's static pool is 32 KB (`LV_MEM_SIZE`); the draw buffer is 1/16 of the screen in RGB565
+  (`LVGL_BUFFER_PIXELS` in `boards/*.json`). The `[lvmem]` boot line shows pool usage.
+- The ESP32's static `.bss` budget is separate from, and much smaller than, the heap: a ~14 KB
+  object declared at file scope fails to link ("DRAM segment data does not fit").
 
-1. **Gate OTA behind an opt-in build flag** (`-DENABLE_OTA`, same pattern as `-DDEMO_DATA`),
-   default off. Recovers roughly the milestone 6 delta, ~6.6 KB. The device is still fully
-   flashable over USB (`docs/hardware.md` "Flashing") without it; OTA becomes something you
-   turn on for a specific build rather than something every device carries by default.
-2. **Gate the setup-wizard proxies** (`GET /api/proxy/stops`, `GET /api/proxy/schedule`,
-   `proxy_worker.cpp`) the same way. Recovers most of the milestone 3+4 delta (~6-7 KB minus the
-   trivial `/api/rail/stations` handler, which should stay). The web UI's Add Stop wizard would
-   need a manual stop-ID entry fallback instead of the live SEPTA lookup/map flow (`web/README.md`
-   already documents a manual-entry fallback for subway, so the wizard has precedent for this).
-3. **Trade away `LV_DRAW_SW_COMPLEX`** (`lv_conf.h`) for `LV_DRAW_SW_COMPLEX 0`. I did not apply
-   this: LVGL's own comment on the flag says `0` restricts drawing to "simple rectangles with
-   gradient, images, texts, and straight lines only" - dropping rounded corners app-wide (every
-   panel and route badge in `ui_common.cpp`/`main_screen.cpp` uses `lv_obj_set_style_radius()`),
-   a visible design change I didn't think was mine to make silently. I don't have a measured
-   number for this one; it's a real lever if the owner is fine with square corners.
-4. **Defer `GET /api/stats`/on-device stats entirely** to a follow-up release. This is the
-   single largest lever measured (milestone 5's +18.3 KB), and also the one I'd recommend against
-   cutting: DESIGN.md SS8/SS9 treat stats as core to the product ("logs predictions... computes
-   statistics"), not an add-on, and the SD logging itself (which has its own, smaller cost) would
-   become pointless without a way to read it back.
+### Verifying a change
 
-None of these need touching `firmware/partitions.csv` (the task's hard constraint) - they're all
-about which optional pieces of the DESIGN.md SS7 API surface ship in a given build.
+`pio run -e cyd-3248S035R -t upload`, then watch the serial console for `[heap]`, `[lvmem]`,
+`[net_poller] free_heap=... largest_block=...` and `[proxy]` lines while hitting the API from the
+LAN (stop-list proxies for several routes, `/api/stats`, a CSV download). A healthy device shows
+no `rst:` lines and a largest block above ~30 KB between polls.

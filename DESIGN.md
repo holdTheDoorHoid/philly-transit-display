@@ -127,7 +127,7 @@ alerts use `bus_route_<id>` including the T, G, D, and K letter routes.
 |---|---|---|
 | GTFS-RT TripUpdates | 30 s (15 s when an arrival is < 3 min out) | One TLS session; close after. |
 | TransitView per configured route | same cycle, right after TripUpdates | Reuse the connection if keep-alive works. |
-| BusSchedules per stop | 10 min | Also on config change. |
+| BusSchedules per stop | 10 min | Also on config change. Buffered (~1 KB) and retried up to 4 times on SEPTA's `{"error"}` body. |
 | Alerts per route | 5 min | |
 | Rail Arrivals per station | 30 s | |
 Open, GET, parse, close. Never hold a TLS socket across the idle gap. Back off exponentially on
@@ -164,7 +164,9 @@ firmware/
 ```
 
 Tasks and cores: LVGL tick/handler runs on core 1 with a 5 ms cadence and must never block on
-network or SD. Network polling runs on core 0. Shared state is a `Snapshot` guarded by a mutex,
+network or SD. Network polling runs on core 0, and the same task drains the web server's deferred
+job queue (setup-wizard proxies, statistics) between polls; there is no separate worker task because
+its stack did not fit (see `firmware/README.md`, Memory and flash budget). Shared state is a `Snapshot` guarded by a mutex,
 swapped whole (never mutated in place). SD writes happen from a low-priority logger task fed by a
 FreeRTOS queue. Web handlers only read the Snapshot and the config; stats requests stream the CSV
 through the aggregator inside the handler in chunks small enough to keep the heap flat.

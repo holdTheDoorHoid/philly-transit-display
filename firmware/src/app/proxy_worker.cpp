@@ -99,62 +99,81 @@ void runFetchJob(const ProxyJob &job) {
 
   const char *path = kProxyFiles[g_proxy_file_idx];
   g_proxy_file_idx ^= 1;  // alternate so a response still being streamed is not overwritten
-  File out = LittleFS.open(path, "w");
-  if (!out) {
-    if (auto r = lockRequest(job)) sendError(r.get(), 500, "could not open temp file");
-    return;
-  }
 
+  int status = -1;
   size_t written = 0;
-  bool overflowed = false, write_failed = false;
+  bool overflowed = false, write_failed = false, open_failed = false;
   uint8_t head[8] = {0};
   // Coalesce the ~1.4 KB TCP-sized chunks into 4 KB LittleFS writes: each write() is a flash
   // program cycle, and per-chunk writes made a 12 KB Stops list take 16 s end to end.
   static uint8_t wbuf[4096];
-  size_t wlen = 0;
-  auto flushBuf = [&]() {
-    if (wlen == 0) return true;
-    bool ok = out.write(wbuf, wlen) == wlen;
-    wlen = 0;
-    return ok;
-  };
-  uint32_t t0 = millis();
-  int status = transit_app::get(
-      url.c_str(),
-      [&](const uint8_t *data, size_t n) {
-        if (written < sizeof(head)) {
-          size_t take = std::min(sizeof(head) - written, n);
-          memcpy(head + written, data, take);
-        }
-        if (written + n > kProxyFileCap) {
-          overflowed = true;
-          return false;
-        }
-        while (n > 0) {
-          size_t take = std::min(sizeof(wbuf) - wlen, n);
-          memcpy(wbuf + wlen, data, take);
-          wlen += take; data += take; n -= take; written += take;
-          if (wlen == sizeof(wbuf) && !flushBuf()) {
-            write_failed = true;
+
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    File out = LittleFS.open(path, "w");
+    if (!out) {
+      open_failed = true;
+      break;
+    }
+    written = 0;
+    overflowed = write_failed = false;
+    memset(head, 0, sizeof(head));
+    size_t wlen = 0;
+    auto flushBuf = [&]() {
+      if (wlen == 0) return true;
+      bool ok = out.write(wbuf, wlen) == wlen;
+      wlen = 0;
+      return ok;
+    };
+    uint32_t t0 = millis();
+    status = transit_app::get(
+        url.c_str(),
+        [&](const uint8_t *data, size_t n) {
+          if (written < sizeof(head)) {
+            size_t take = std::min(sizeof(head) - written, n);
+            memcpy(head + written, data, take);
+          }
+          if (written + n > kProxyFileCap) {
+            overflowed = true;
             return false;
           }
-        }
-        return true;
-      },
-      kFetchTimeoutMs, tls_verify);
-  if (!write_failed && !flushBuf()) write_failed = true;
-  out.close();
-  Serial.printf("[proxy] %s -> HTTP %d, %u bytes in %u ms, heap %u\n", url.c_str(), status, (unsigned)written, (unsigned)(millis() - t0), (unsigned)ESP.getFreeHeap());
+          while (n > 0) {
+            size_t take = std::min(sizeof(wbuf) - wlen, n);
+            memcpy(wbuf + wlen, data, take);
+            wlen += take;
+            data += take;
+            n -= take;
+            written += take;
+            if (wlen == sizeof(wbuf) && !flushBuf()) {
+              write_failed = true;
+              return false;
+            }
+          }
+          return true;
+        },
+        kFetchTimeoutMs, tls_verify);
+    if (!write_failed && !flushBuf()) write_failed = true;
+    out.close();
+    Serial.printf("[proxy] %s -> HTTP %d, %u bytes in %u ms, heap %u\n", url.c_str(), status, (unsigned)written, (unsigned)(millis() - t0), (unsigned)ESP.getFreeHeap());
+
+    // SEPTA's flaky {"error":...} answers for valid ids (transit_core/NOTES.md): retry a few
+    // times before giving up. Anything else is final.
+    const bool error_shape = written >= 8 && memcmp(head, "{\"error\"", 8) == 0;
+    if (!(error_shape && written < 256)) break;
+    vTaskDelay(pdMS_TO_TICKS(400 * (attempt + 1)));
+  }
 
   auto req = lockRequest(job);
   if (!req) return;  // client disconnected while the fetch was in flight
 
+  if (open_failed) {
+    sendError(req.get(), 500, "could not open temp file");
+    return;
+  }
   if (overflowed || write_failed) {
     sendError(req.get(), 502, overflowed ? "upstream response exceeded 64KB" : "temp file write failed");
     return;
   }
-  // SEPTA intermittently answers 400/501 with a perfectly valid body (transit_core/NOTES.md), so
-  // judge the body: forward anything that looks like JSON and is not its {"error": ...} shape.
+  // Judge the body, not the status: SEPTA sometimes labels a valid body HTTP 400/501.
   const bool looks_json = written > 0 && (head[0] == '{' || head[0] == '[') && memcmp(head, "{\"error\"", 8) != 0;
   if (!looks_json) {
     sendError(req.get(), 502, "upstream HTTP " + std::to_string(status));

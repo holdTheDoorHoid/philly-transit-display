@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 
+#include <cstring>
 #include <new>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
@@ -153,8 +154,38 @@ AlertCacheEntry &findOrCreateAlertsEntry(const std::string &url) {
 // transit_core's HttpGet glue: http_fetch.cpp owns retry/backoff/TLS (DESIGN.md SS5), this just
 // adapts its `const char*` signature to transit::HttpGet's `std::string` one and threads
 // config.device.tls_verify through.
+// True for SEPTA's {"error": ...} bodies (transit_core/NOTES.md): BusSchedules answers a valid
+// stop_id with HTTP 400 + that body a few times in ten, then succeeds on retry.
+bool isSeptaErrorBody(const std::vector<uint8_t> &b) {
+  return b.size() >= 8 && memcmp(b.data(), "{\"error\"", 8) == 0;
+}
+
 transit::HttpGet makeHttpGet(bool tls_verify) {
   return [tls_verify](const std::string &url, std::function<bool(const uint8_t *, size_t)> onData) -> int {
+    // BusSchedules is tiny (~1 KB) and flaky, so buffer it and retry on the error shape before
+    // handing the consumer a single clean delivery; everything else streams straight through.
+    if (url.find("BusSchedules") != std::string::npos) {
+      int status = -1;
+      for (int attempt = 0; attempt < 4; ++attempt) {
+        std::vector<uint8_t> body;
+        bool overflow = false;
+        status = transit_app::get(
+            url.c_str(),
+            [&](const uint8_t *d, size_t n) {
+              if (body.size() + n > 4096) { overflow = true; return false; }
+              body.insert(body.end(), d, d + n);
+              return true;
+            },
+            kFetchTimeoutMs, tls_verify);
+        if (overflow || (!body.empty() && !isSeptaErrorBody(body))) {
+          if (!body.empty()) onData(body.data(), body.size());
+          return status;
+        }
+        if (body.empty() && status > 0) return status;  // empty non-error reply: nothing to retry for
+        vTaskDelay(pdMS_TO_TICKS(400 * (attempt + 1)));
+      }
+      return status;
+    }
     return transit_app::get(url.c_str(), std::move(onData), kFetchTimeoutMs, tls_verify);
   };
 }
