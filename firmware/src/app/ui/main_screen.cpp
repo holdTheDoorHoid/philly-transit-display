@@ -544,7 +544,8 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
     }
   }
 
-  std::string ticker = tickerText(snap.alerts, ctx->ticker_lines > 1, ctx->ticker_show);
+  // cfg.alerts off clears the ticker now rather than after the next poll drops the cached alerts.
+  std::string ticker = cfg.alerts ? tickerText(snap.alerts, ctx->ticker_lines > 1, ctx->ticker_show) : std::string();
   if (ticker.empty()) {
     if (!ctx->ticker_text.empty()) {
       lv_anim_delete(ctx->ticker_label, nullptr);

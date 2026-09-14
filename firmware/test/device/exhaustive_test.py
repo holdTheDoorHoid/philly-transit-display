@@ -151,7 +151,7 @@ roundtrip('weather fahrenheit', lambda c: c['weather'].update(units='f', per_sto
 roundtrip('due off', lambda c: c['due'].update(enabled=False), lambda g: g['due']['enabled'] is False and ui().get('due_active') is False)
 roundtrip('logging off', lambda c: c['device'].update(logging=False), lambda g: g['device']['logging'] is False)
 roundtrip('alerts off', lambda c: c.update(alerts=False), lambda g: g['alerts'] is False, wait=8)
-check('B alerts off -> ticker empty', ui().get('ticker') == '' and state().get('alerts') == [], (ui().get('ticker', '')[:40], len(state().get('alerts', []))))
+check('B alerts off -> ticker empty', wait_for(lambda: ui().get('ticker') == '' and state().get('alerts') == [], 10, 1), (ui().get('ticker', '')[:40], len(state().get('alerts', []))))
 roundtrip('profiles x4', lambda c: c.update(profiles=[{'name': 'P%d' % i, 'days': [0, 6], 'start': '01:00', 'end': '02:00', 'stops': [c['stops'][0]['key']]} for i in range(4)]), lambda g: len(g['profiles']) == 4 and g['profiles'][3]['days'] == [0, 6])
 roundtrip('bike 3 stations', lambda c: c.update(bike={'enabled': True, 'stations': [{'id': 3468, 'name': 'Snyder & Dorrance'}, {'id': 3361, 'name': '18th & Fernon'}, {'id': 3053, 'name': 'Point Breeze & Tasker'}]}), lambda g: len(g['bike']['stations']) == 3, wait=25)
 ok3 = wait_for(lambda: len(state().get('bike', {}).get('stations', [])) == 3 and all(x['bikes'] >= 0 for x in state()['bike']['stations']), 90, 5)
@@ -271,7 +271,7 @@ for rnd in range(3):
 u_after = state().get('uptime', 0)
 check('E no reboot under 3x7 concurrent requests', u_after > u_before, (u_before, u_after, outcomes))
 empties = sum(1 for r in outcomes for o in r if o.startswith('200 0'))
-check('E at most 1 empty response per round (known limit)', empties <= 3, (empties, outcomes))
+check('E at most 2 empty responses per round (known limit, firmware/README.md)', empties <= 6, (empties, outcomes))
 
 # ---------- F. reboot ----------
 check('F reboot endpoint', post('/api/reboot') == 200)

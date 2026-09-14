@@ -159,6 +159,7 @@ void serializeSnapshot(const Snapshot &snap, JsonObject out) {
   }
   JsonArray alerts = out["alerts"].to<JsonArray>();
   for (const Alert &al : snap.alerts) {
+    if (!cfg.alerts) break;  // the config, not the last poll
     JsonObject ao = alerts.add<JsonObject>();
     ao["route"] = al.route;
     ao["text"] = al.text;
