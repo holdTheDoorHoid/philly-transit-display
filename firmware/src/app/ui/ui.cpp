@@ -9,9 +9,13 @@
 #include <ctime>
 
 #include "../demo_data.h"
+#include "../due_alert.h"
 #include "../net_poller.h"
+#include "../profiles.h"
+#include "daypart_core/daypart.h"
 #include "device_info_screen.h"
 #include "main_screen.h"
+#include "night_screen.h"
 #include "stats_screen.h"
 #include "ui_common.h"
 
@@ -19,7 +23,7 @@ namespace transit_app::ui {
 
 namespace {
 
-enum class Page { Main, Stats, DeviceInfo };
+enum class Page { Main, Stats, DeviceInfo };  // Main is either the arrivals page or the night clock
 
 // DESIGN.md SS3: the demo Snapshot is kept for screen work with no Wi-Fi/SEPTA reachable
 // (-DDEMO_DATA, off by default - see web_server.cpp's GET /api/state, which gates the same way).
@@ -32,6 +36,7 @@ transit::Snapshot currentSnapshot() {
 }
 
 lv_obj_t *g_main_screen = nullptr;
+lv_obj_t *g_night_screen = nullptr;
 lv_obj_t *g_stats_screen = nullptr;
 lv_obj_t *g_device_info_screen = nullptr;
 lv_obj_t *g_wifi_setup_screen = nullptr;
@@ -39,6 +44,12 @@ lv_obj_t *g_wifi_setup_ssid_label = nullptr;
 Config g_cfg;
 Page g_page = Page::Main;
 bool g_initialized = false;
+bool g_night = false;             // night clock is up instead of the arrivals page
+int g_active_profile = -2;        // profiles.h index, -2 = not yet evaluated
+bool g_dimmed = false;            // quiet hours have the backlight down
+uint32_t g_wake_until_ms = 0;     // touch during quiet hours: normal brightness until then
+bool g_swallow_click = false;     // the press that woke the screen must not change page
+int g_applied_brightness = -1;
 
 // Config handed over from another task (web server); applied on the LVGL task in tick().
 SemaphoreHandle_t g_pending_mutex = nullptr;
@@ -46,6 +57,7 @@ Config g_pending_cfg;
 bool g_pending = false;
 
 void onScreenTapped(lv_event_t *e);
+void onScreenPressed(lv_event_t *e);
 
 lv_display_rotation_t rotationEnum(uint16_t degrees) {
   switch (degrees) {
@@ -57,12 +69,56 @@ lv_display_rotation_t rotationEnum(uint16_t degrees) {
 }
 
 void buildScreens() {
+  g_active_profile = activeProfileIndex(g_cfg, time(nullptr));
   g_main_screen = createMainScreen(g_cfg);
+  g_night_screen = createNightScreen(g_cfg);
   g_stats_screen = createStatsScreen(g_cfg);
   g_device_info_screen = createDeviceInfoScreen(g_cfg);
-  lv_obj_add_event_cb(g_main_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
-  lv_obj_add_event_cb(g_stats_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
-  lv_obj_add_event_cb(g_device_info_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
+  for (lv_obj_t *scr : {g_main_screen, g_night_screen, g_stats_screen, g_device_info_screen}) {
+    lv_obj_add_event_cb(scr, onScreenPressed, LV_EVENT_PRESSED, nullptr);
+    lv_obj_add_event_cb(scr, onScreenTapped, LV_EVENT_CLICKED, nullptr);
+  }
+}
+
+// The keys of the stops the arrivals page currently shows (profiles.h), for the due alert.
+std::vector<std::string> shownStopKeys() {
+  std::vector<std::string> keys;
+  for (const transit::StopConfig &s : visibleStops(g_cfg, time(nullptr))) keys.push_back(s.key);
+  return keys;
+}
+
+// Loads the arrivals page or the night clock, whichever the data calls for (Page::Main only).
+void showMainOrNight(const transit::Snapshot &snap) {
+  bool night = nightConditionMet(g_cfg, snap, (transit::Epoch)time(nullptr));
+  lv_obj_t *want = night ? g_night_screen : g_main_screen;
+  if (lv_screen_active() != want) lv_screen_load(want);
+  g_night = night;
+  if (night) {
+    refreshNightScreen(g_night_screen, g_cfg, snap);
+  } else {
+    refreshMainScreen(g_main_screen, g_cfg, snap);
+  }
+}
+
+// DESIGN.md SS6 "quiet": backlight schedule with wake-on-touch. Returns true while dimmed.
+bool applyQuietHours() {
+  const QuietConfig &q = g_cfg.device.quiet;
+  bool quiet = false;
+  if (q.enabled) {
+    time_t now = time(nullptr);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    quiet = now >= 1700000000 && daypart::inWindow(lt.tm_hour * 60 + lt.tm_min, daypart::parseClock(q.start), daypart::parseClock(q.end));
+  }
+  bool awake = (int32_t)(millis() - g_wake_until_ms) < 0;
+  bool dim = quiet && !awake;
+  int target = dim ? q.brightness : g_cfg.device.brightness;
+  if (target != g_applied_brightness) {
+    applyBrightness((uint8_t)target);
+    g_applied_brightness = target;
+  }
+  g_dimmed = dim;
+  return dim;
 }
 
 // Tears down and recreates every screen (rotation, theme, ticker or stop list changed). A blank
@@ -73,17 +129,33 @@ void rebuildScreens() {
   lv_obj_set_style_bg_color(blank, colorBg(), 0);
   lv_screen_load(blank);
   if (g_main_screen) lv_obj_delete(g_main_screen);
+  if (g_night_screen) lv_obj_delete(g_night_screen);
   if (g_stats_screen) lv_obj_delete(g_stats_screen);
   if (g_device_info_screen) lv_obj_delete(g_device_info_screen);
   buildScreens();
   g_page = Page::Main;
-  refreshMainScreen(g_main_screen, g_cfg, currentSnapshot());
-  lv_screen_load(g_main_screen);
+  showMainOrNight(currentSnapshot());
   lv_obj_delete(blank);
+}
+
+void onScreenPressed(lv_event_t *e) {
+  (void)e;
+  if (g_dimmed) {
+    // Wake for wake_seconds; the click that follows this press must not cycle pages.
+    g_wake_until_ms = millis() + (uint32_t)g_cfg.device.quiet.wake_seconds * 1000u;
+    g_swallow_click = true;
+    applyQuietHours();
+  } else if ((int32_t)(millis() - g_wake_until_ms) < 0) {
+    g_wake_until_ms = millis() + (uint32_t)g_cfg.device.quiet.wake_seconds * 1000u;  // keep it awake
+  }
 }
 
 void onScreenTapped(lv_event_t *e) {
   (void)e;
+  if (g_swallow_click) {
+    g_swallow_click = false;
+    return;
+  }
   switch (g_page) {
     case Page::Main:
       g_page = Page::Stats;
@@ -97,7 +169,7 @@ void onScreenTapped(lv_event_t *e) {
       break;
     case Page::DeviceInfo:
       g_page = Page::Main;
-      lv_screen_load(g_main_screen);
+      showMainOrNight(currentSnapshot());
       break;
   }
 }
@@ -112,8 +184,7 @@ void init(const Config &cfg) {
   buildScreens();
 
   g_page = Page::Main;
-  refreshMainScreen(g_main_screen, g_cfg, currentSnapshot());
-  lv_screen_load(g_main_screen);
+  showMainOrNight(currentSnapshot());
   g_initialized = true;
 }
 
@@ -179,12 +250,24 @@ void tick() {
     setTheme(g_cfg.device.theme);  // rebuildScreens() below re-reads every colour
     if (rotate) applyRotation(g_cfg.device.rotation);
     if (invert) applyInvert(g_cfg.device.invert_colors);
-    applyBrightness(g_cfg.device.brightness);
+    g_applied_brightness = -1;  // applyQuietHours() below re-applies whichever brightness applies
     rebuildScreens();
   }
+
+  // Commute profiles (profiles.h): the visible stop list changed -> rebuild the pages.
+  int profile = activeProfileIndex(g_cfg, time(nullptr));
+  if (profile != g_active_profile) {
+    g_active_profile = profile;
+    rebuildScreens();
+  }
+
+  bool dimmed = applyQuietHours();
+  transit::Snapshot snap = currentSnapshot();
+  dueAlertTick(g_cfg, snap, shownStopKeys(), dimmed, (transit::Epoch)time(nullptr));
+
   switch (g_page) {
     case Page::Main:
-      refreshMainScreen(g_main_screen, g_cfg, currentSnapshot());
+      showMainOrNight(snap);
       break;
     case Page::DeviceInfo:
       refreshDeviceInfoScreen(g_device_info_screen);

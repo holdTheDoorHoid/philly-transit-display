@@ -31,6 +31,51 @@ struct HeaderConfig {
   bool updated = true;
 };
 
+// DESIGN.md SS6 "quiet": backlight schedule; a touch wakes the screen for wake_seconds.
+struct QuietConfig {
+  bool enabled = false;
+  std::string start = "23:00";  // local "HH:MM"
+  std::string end = "06:00";    // may be earlier than start (crosses midnight)
+  uint8_t brightness = 0;       // 0..50 percent, 0 = off
+  uint16_t wake_seconds = 30;
+};
+
+// DESIGN.md SS6 "night": clock page when nothing is due within after_min.
+struct NightConfig {
+  bool enabled = true;
+  uint16_t after_min = 60;
+};
+
+// DESIGN.md SS6 "due": time-to-leave alert when an arrival first comes within `minutes`.
+struct DueConfig {
+  bool enabled = true;
+  uint8_t minutes = 3;
+  bool led = true;
+  bool screen = true;
+  bool chime = false;
+};
+
+// DESIGN.md SS6 "profiles": which stops the main page shows during a time window.
+struct ProfileConfig {
+  std::string name;
+  uint8_t days = 0;  // bitmask, bit 0 = Sunday .. bit 6 = Saturday
+  std::string start = "05:30";
+  std::string end = "10:00";
+  std::vector<std::string> stops;  // StopConfig::key, in display order
+};
+constexpr size_t kMaxProfiles = 4;
+
+// DESIGN.md SS6 "bike" / SS4.9: Indego stations to show.
+struct BikeStation {
+  int id = 0;
+  std::string name;
+};
+struct BikeConfig {
+  bool enabled = false;
+  std::vector<BikeStation> stations;  // at most kMaxBikeStations
+};
+constexpr size_t kMaxBikeStations = 3;
+
 // DESIGN.md SS4.8: Open-Meteo forecasts for the configured stops' locations.
 struct WeatherConfig {
   bool enabled = true;
@@ -52,6 +97,10 @@ struct DeviceConfig {
   bool use_https = false;  // see http_fetch.h: TLS is a 40 KB luxury this board cannot afford by default
   bool logging = true;
   HeaderConfig header;
+  bool large_text = false;     // two rows per stop, 48 px minutes (ui_common.cpp fontBig)
+  bool show_crowding = true;   // SEPTA seat availability next to the destination
+  QuietConfig quiet;
+  NightConfig night;
 };
 
 struct Config {
@@ -60,6 +109,9 @@ struct Config {
   std::vector<transit::StopConfig> stops;
   bool alerts = true;
   WeatherConfig weather;
+  DueConfig due;
+  std::vector<ProfileConfig> profiles;
+  BikeConfig bike;
 };
 
 // { "error": "...", "path": "stops[1].stop_id" } - DESIGN.md SS6's shape for

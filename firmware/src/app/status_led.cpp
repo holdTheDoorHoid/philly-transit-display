@@ -32,6 +32,18 @@ void setStatusLed(LedState state) {
   applyState(state);
 }
 
+void ledOverrideGreen(bool on) {
+#ifdef BOARD_HAS_RGB_LED
+  if (on) {
+    smartdisplay_led_set_rgb(false, true, false);
+  } else {
+    applyState(g_state);
+  }
+#else
+  (void)on;
+#endif
+}
+
 void flashPollOk(uint32_t on_ms) {
 #ifdef BOARD_HAS_RGB_LED
   smartdisplay_led_set_rgb(false, true, false);  // green

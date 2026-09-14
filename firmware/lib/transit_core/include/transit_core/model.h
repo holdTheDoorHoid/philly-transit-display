@@ -35,6 +35,10 @@ struct StopConfig {
   uint8_t show = 3;       // arrival rows to display, 1..4
   double lat = 0;         // stop coordinates from SEPTA's Stops API, for weather (DESIGN.md 4.8);
   double lng = 0;         // 0/0 = unknown (older configs, Regional Rail)
+  std::string title_style = "label_dest";  // DESIGN.md 6: label_dest | label | route_dest_stop | custom
+  std::string title_text;                  // used when title_style == "custom"
+  std::string alt_of;                      // key of the stop this one is an alternative to, "" = always shown
+  uint8_t alt_after_min = 15;              // show while alt_of's next arrival is >= this many minutes out
 };
 
 // One upcoming vehicle at one configured stop.

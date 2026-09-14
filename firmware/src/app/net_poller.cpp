@@ -26,6 +26,7 @@
 #include "transit_stats/log_window.h"
 #include "transit_stats/tracker.h"
 #include "weather_service.h"
+#include "bike_service.h"
 
 using transit::Alert;
 using transit::Mode;
@@ -464,6 +465,7 @@ void pollOnce() {
   combined.stops.insert(combined.stops.end(), rail_snap.stops.begin(), rail_snap.stops.end());
   combined.alerts = collectAlerts(cfg.stops, cfg.alerts, http);
   refreshWeather(cfg, http);  // DESIGN.md SS4.8: 10 min cadence per location, no-op otherwise
+  refreshBikes(cfg, http);    // DESIGN.md SS4.9: 5 min cadence, streams the 400 KB feed
 
   // DESIGN.md SS9: feed every StopSnapshot to the tracker and append any resulting LogEvents to
   // the current month's CSV. Done before the mutex swap below so a slow SD write never holds up
@@ -593,6 +595,7 @@ void startNetPoller(uint32_t poll_seconds) {
 void requestRepoll() {
   g_invalidate_sched_cache = true;
   invalidateWeather();
+  invalidateBikes();
   if (g_wake_sem != nullptr) {
     xSemaphoreGive(g_wake_sem);
   }

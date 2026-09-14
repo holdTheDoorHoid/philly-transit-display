@@ -58,6 +58,29 @@ int64_t transitionNaiveEpoch(int year, const DstTransitionRule& rule) {
   return days * 86400 + static_cast<int64_t>(rule.hour) * 3600;
 }
 
+// Reads up to `max_digits` decimal digits at *p into `out`; advances p. False if none.
+bool readInt(const char*& p, int& out, int max_digits) {
+  int n = 0, digits = 0;
+  while (*p >= '0' && *p <= '9' && digits < max_digits) {
+    n = n * 10 + (*p - '0');
+    ++p;
+    ++digits;
+  }
+  if (digits == 0) return false;
+  out = n;
+  return true;
+}
+
+bool expect(const char*& p, char c) {
+  if (*p != c) return false;
+  ++p;
+  return true;
+}
+
+void skipSpaces(const char*& p) {
+  while (*p == ' ' || *p == '\t') ++p;
+}
+
 }  // namespace
 
 const TimeZoneRule kUsEastern = {
@@ -85,20 +108,28 @@ Epoch localToEpoch(int year, int month, int day, int hour, int minute, int secon
   return static_cast<Epoch>(naive - offset);
 }
 
+// Hand-rolled rather than sscanf(): newlib's scanf family costs ~15 KB of flash on the ESP32 and
+// these are the only callers in the firmware.
 Epoch parseBusScheduleTime(const std::string& s, bool* ok) {
   int mm = 0, dd = 0, yy = 0, hh = 0, mi = 0;
-  char ampm[8] = {0};
-  int n = std::sscanf(s.c_str(), "%d/%d/%d %d:%d %7s", &mm, &dd, &yy, &hh, &mi, ampm);
-  if (n != 6 || mm < 1 || mm > 12 || dd < 1 || dd > 31 || hh < 1 || hh > 12 || mi < 0 ||
-      mi > 59) {
+  const char* p = s.c_str();
+  skipSpaces(p);
+  bool good = readInt(p, mm, 2) && expect(p, '/') && readInt(p, dd, 2) && expect(p, '/') && readInt(p, yy, 4);
+  if (good) {
+    skipSpaces(p);
+    good = readInt(p, hh, 2) && expect(p, ':') && readInt(p, mi, 2);
+  }
+  if (good) skipSpaces(p);
+  if (!good || mm < 1 || mm > 12 || dd < 1 || dd > 31 || hh < 1 || hh > 12 || mi < 0 || mi > 59) {
     if (ok) *ok = false;
     return 0;
   }
-  for (char* p = ampm; *p; ++p) *p = static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
+  char a = static_cast<char>(std::tolower(static_cast<unsigned char>(p[0])));
+  char m = p[0] ? static_cast<char>(std::tolower(static_cast<unsigned char>(p[1]))) : '\0';
   bool is_pm;
-  if (std::strncmp(ampm, "pm", 2) == 0) {
+  if (a == 'p' && m == 'm') {
     is_pm = true;
-  } else if (std::strncmp(ampm, "am", 2) == 0) {
+  } else if (a == 'a' && m == 'm') {
     is_pm = false;
   } else {
     if (ok) *ok = false;
@@ -114,8 +145,14 @@ Epoch parseBusScheduleTime(const std::string& s, bool* ok) {
 
 Epoch parseArrivalsTime(const std::string& s, bool* ok) {
   int year = 0, month = 0, day = 0, hh = 0, mi = 0, se = 0;
-  int n = std::sscanf(s.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hh, &mi, &se);
-  if (n != 6 || month < 1 || month > 12 || day < 1 || day > 31 || hh < 0 || hh > 23 || mi < 0 ||
+  const char* p = s.c_str();
+  skipSpaces(p);
+  bool good = readInt(p, year, 4) && expect(p, '-') && readInt(p, month, 2) && expect(p, '-') && readInt(p, day, 2);
+  if (good) {
+    skipSpaces(p);
+    good = readInt(p, hh, 2) && expect(p, ':') && readInt(p, mi, 2) && expect(p, ':') && readInt(p, se, 2);
+  }
+  if (!good || month < 1 || month > 12 || day < 1 || day > 31 || hh < 0 || hh > 23 || mi < 0 ||
       mi > 59 || se < 0 || se > 60) {
     if (ok) *ok = false;
     return 0;

@@ -15,6 +15,8 @@
 #include "demo_data.h"
 #include "net_poller.h"
 #include "weather_service.h"
+#include "bike_service.h"
+#include "profiles.h"
 #include "proxy_worker.h"
 #include "sd_logger.h"
 #include "transit_core/rail_stations.h"
@@ -123,6 +125,22 @@ void serializeSnapshot(const Snapshot &snap, JsonObject out) {
       ho["prob"] = h.precip_prob;
       ho["temp"] = h.temp;
     }
+  }
+  int prof = activeProfileIndex(cfg, (time_t)now);
+  out["active_profile"] = prof >= 0 ? cfg.profiles[(size_t)prof].name : "";
+  BikeView bv = getBikes();
+  JsonObject bike = out["bike"].to<JsonObject>();
+  bike["enabled"] = bv.enabled;
+  bike["age_s"] = bv.fetched_epoch > 0 ? (int64_t)now - (int64_t)bv.fetched_epoch : -1;
+  JsonArray bstations = bike["stations"].to<JsonArray>();
+  for (const indego::Station &st : bv.stations) {
+    JsonObject so = bstations.add<JsonObject>();
+    so["id"] = st.id;
+    so["name"] = st.name;
+    so["bikes"] = st.bikes;
+    so["ebikes"] = st.ebikes;
+    so["docks"] = st.docks;
+    so["active"] = st.active;
   }
   JsonArray alerts = out["alerts"].to<JsonArray>();
   for (const Alert &al : snap.alerts) {

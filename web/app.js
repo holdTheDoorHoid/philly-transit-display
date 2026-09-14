@@ -82,6 +82,14 @@ function debounce(fn, ms) {
   let t;
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
+function haversineMiles(lat1, lng1, lat2, lng2) {
+  const R = 3958.8;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
 
 /* ======================== API layer (DESIGN.md §7) ======================== */
 
@@ -193,10 +201,12 @@ function renderNow(root) {
   const wrap = h('div', { class: 'stack' });
   const banner = h('div', { id: 'now-banner' });
   const strip = h('div', { id: 'status-strip', class: 'card' }, 'Loading device status…');
+  const profileLine = h('div', { id: 'now-profile' });
   const stops = h('div', { id: 'now-stops', class: 'stack' });
+  const bike = h('div', { id: 'now-bike' });
   const alerts = h('div', { id: 'now-alerts', class: 'card hidden' },
     h('h2', {}, 'Service alerts'), h('div', { id: 'alerts-list' }));
-  wrap.append(banner, strip, stops, alerts);
+  wrap.append(banner, strip, profileLine, stops, bike, alerts);
   root.append(wrap);
 
   let stopped = false;
@@ -207,7 +217,9 @@ function renderNow(root) {
       if (stopped) return;
       renderStatusStrip(strip, state);
       renderStaleBanner(banner, state);
+      renderProfileLine(profileLine, state);
       renderStopPanels(stops, state.stops || []);
+      renderBikeCard(bike, state.bike);
       renderAlerts(alerts, state.alerts || []);
     } catch (e) {
       clear(banner);
@@ -217,6 +229,23 @@ function renderNow(root) {
   tick();
   const timer = setInterval(tick, 15000);
   activeCleanup = () => { stopped = true; clearInterval(timer); };
+}
+
+function renderProfileLine(box, state) {
+  clear(box);
+  if (state.active_profile) box.append(h('div', { class: 'muted small' }, `Profile: ${state.active_profile}`));
+}
+
+function renderBikeCard(box, bike) {
+  clear(box);
+  if (!bike || !bike.enabled || !bike.stations || !bike.stations.length) return;
+  const card = h('div', { class: 'card' }, h('h2', {}, 'Indego'));
+  for (const st of bike.stations) {
+    card.append(h('div', { class: 'row between' },
+      h('span', {}, `${st.name}: ${st.bikes} bikes (${st.ebikes} electric), ${st.docks} docks`),
+      st.active === false && h('span', { class: 'muted small' }, '(offline)')));
+  }
+  box.append(card);
 }
 
 function renderStaleBanner(banner, state) {
@@ -424,6 +453,32 @@ function stopTitle(s) {
   return `${s.label || s.route} — ${s.route} → ${s.headsign || '?'} · ${s.stop_name || s.stop_id}`;
 }
 
+// Options for stops[].title_style (DESIGN.md §6, "Fields added 2026-09-14").
+const TITLE_STYLES = [
+  ['label_dest', 'Label → destination'],
+  ['label', 'Label only'],
+  ['route_dest_stop', 'Route → destination • stop'],
+  ['custom', 'Custom text'],
+];
+
+function directionWord(s) {
+  return s.direction === 'N' ? 'Northbound' : s.direction === 'S' ? 'Southbound' : 'Both';
+}
+
+// Preview of the on-screen title for a stop, mirroring how the firmware will render it
+// per DESIGN.md §6 "Fields added 2026-09-14".
+function stopTitlePreview(s) {
+  const style = s.title_style || 'label_dest';
+  if (style === 'custom') return s.title_text || '';
+  if (style === 'label') return s.label || (s.mode === 'rail' ? s.station : s.route) || s.key;
+  if (s.mode === 'rail') {
+    if (style === 'route_dest_stop') return `${s.line || 'Regional Rail'} → ${directionWord(s)} • ${s.station || ''}`;
+    return `${s.label || 'Regional Rail'} (${directionWord(s)})`;
+  }
+  if (style === 'route_dest_stop') return `${s.route || ''} → ${s.headsign || ''} • ${s.stop_name || ''}`;
+  return `${s.label || s.route || ''} → ${s.headsign || ''}`;
+}
+
 function drawStopList() {
   const card = h('div', { class: 'card' });
   card.append(h('div', { class: 'row between' },
@@ -438,10 +493,13 @@ function drawStopList() {
   const list = h('div', {});
   liveConfig.stops.forEach((s, i) => {
     if (editingIndex === i) { list.append(drawEditForm(s, i)); return; }
+    const altTarget = s.alt_of ? liveConfig.stops.find((o) => o.key === s.alt_of) : null;
     list.append(h('div', { class: 'stop-list-item' },
       h('div', { class: 'meta' },
         h('div', { class: 'name' }, stopTitle(s)),
-        h('div', { class: 'small muted' }, `key: ${s.key} · shows ${s.show} row${s.show === 1 ? '' : 's'}`)),
+        h('div', { class: 'small muted' }, `key: ${s.key} · shows ${s.show} row${s.show === 1 ? '' : 's'}`),
+        h('div', { class: 'small muted' }, `On screen: “${stopTitlePreview(s)}”`),
+        altTarget && h('div', { class: 'small muted' }, `alternative to ${altTarget.label} after ${s.alt_after_min ?? 15} min`)),
       h('div', { class: 'actions' },
         h('button', { class: 'icon', title: 'Move up', 'aria-label': `Move ${s.label} up`, disabled: i === 0, onclick: () => moveStop(i, -1) }, '↑'),
         h('button', { class: 'icon', title: 'Move down', 'aria-label': `Move ${s.label} down`, disabled: i === liveConfig.stops.length - 1, onclick: () => moveStop(i, 1) }, '↓'),
@@ -460,9 +518,27 @@ function drawEditForm(s, i) {
   const labelInput = h('input', { type: 'text', value: s.label, id: `edit-label-${i}` });
   const showInput = h('select', { id: `edit-show-${i}` },
     ...[1, 2, 3, 4].map((n) => h('option', { value: n, selected: n === s.show || undefined }, `${n} row${n === 1 ? '' : 's'}`)));
+
+  const titleStyleSelect = h('select', { id: `edit-title-style-${i}` },
+    ...TITLE_STYLES.map(([v, lbl]) => h('option', { value: v, selected: (s.title_style || 'label_dest') === v || undefined }, lbl)));
+  const titleTextInput = h('input', { type: 'text', id: `edit-title-text-${i}`, maxlength: 40, value: s.title_text || s.label || '' });
+  const titleTextWrap = h('div', { class: (s.title_style || 'label_dest') === 'custom' ? '' : 'hidden' },
+    h('label', { for: `edit-title-text-${i}` }, 'Custom text'), titleTextInput);
+  titleStyleSelect.addEventListener('change', () => titleTextWrap.classList.toggle('hidden', titleStyleSelect.value !== 'custom'));
+
+  const otherStops = liveConfig.stops.filter((o) => o.key !== s.key);
+  const altOfSelect = h('select', { id: `edit-alt-of-${i}` },
+    h('option', { value: '', selected: !s.alt_of || undefined }, 'Always show (not an alternative)'),
+    ...otherStops.map((o) => h('option', { value: o.key, selected: s.alt_of === o.key || undefined }, o.label)));
+  const altAfterInput = h('input', { type: 'number', id: `edit-alt-after-${i}`, min: 5, max: 60, value: s.alt_after_min ?? 15, disabled: !s.alt_of });
+  altOfSelect.addEventListener('change', () => { altAfterInput.disabled = !altOfSelect.value; });
+
   const fields = [
     h('label', { for: `edit-label-${i}` }, 'Label'), labelInput,
     h('label', { for: `edit-show-${i}` }, 'Rows to show'), showInput,
+    h('label', { for: `edit-title-style-${i}` }, 'Title on screen'), titleStyleSelect, titleTextWrap,
+    h('label', { for: `edit-alt-of-${i}` }, 'Show only as an alternative to'), altOfSelect,
+    h('label', { for: `edit-alt-after-${i}` }, "when that stop's next bus is more than N minutes away"), altAfterInput,
   ];
   if (s.mode === 'rail') {
     const dirSel = h('select', { id: `edit-dir-${i}` },
@@ -477,7 +553,15 @@ function drawEditForm(s, i) {
   const form = h('div', { class: 'card' }, h('h3', {}, `Edit: ${s.label}`), ...fields,
     h('div', { class: 'row', style: 'margin-top:.6rem' },
       h('button', { class: 'primary', onclick: async () => {
-        const updated = { ...s, label: labelInput.value.trim() || s.label, show: Number(showInput.value) };
+        const updated = {
+          ...s,
+          label: labelInput.value.trim() || s.label,
+          show: Number(showInput.value),
+          title_style: titleStyleSelect.value,
+          title_text: titleTextInput.value.trim(),
+          alt_of: altOfSelect.value,
+          alt_after_min: Number(altAfterInput.value),
+        };
         if (s.mode === 'rail') { updated.direction = fields._dirSel.value; updated.line = fields._lineInput.value.trim(); }
         const next = liveConfig.stops.slice();
         next[i] = updated;
@@ -1150,6 +1234,199 @@ async function renderSettings(root) {
     'Disabling certificate verification lets a device on the network impersonate SEPTA and send fake arrival times. Only turn this off for troubleshooting.');
   tlsInput.addEventListener('change', () => tlsWarn.classList.toggle('hidden', tlsInput.checked));
 
+  // ---- Display extras (device.large_text / device.show_crowding) ----
+  const largeTextInput = h('input', { type: 'checkbox', id: 'set-large-text' });
+  largeTextInput.checked = !!d.large_text;
+  const crowdingInput = h('input', { type: 'checkbox', id: 'set-crowding' });
+  crowdingInput.checked = d.show_crowding ?? true;
+
+  // ---- Quiet hours (device.quiet) ----
+  const quiet = d.quiet || {};
+  const quietEnabled = h('input', { type: 'checkbox', id: 'set-quiet-enabled' });
+  quietEnabled.checked = !!quiet.enabled;
+  const quietStart = h('input', { type: 'time', id: 'set-quiet-start', value: quiet.start || '23:00' });
+  const quietEnd = h('input', { type: 'time', id: 'set-quiet-end', value: quiet.end || '06:00' });
+  const quietBrightness = h('input', { type: 'range', id: 'set-quiet-bright', min: 0, max: 50, value: quiet.brightness ?? 0 });
+  const quietBrightVal = h('span', { class: 'small muted' }, `${quiet.brightness ?? 0}% (0 = screen off)`);
+  quietBrightness.addEventListener('input', () => { quietBrightVal.textContent = `${quietBrightness.value}% (0 = screen off)`; });
+  const quietWake = h('input', { type: 'number', id: 'set-quiet-wake', min: 5, max: 300, value: quiet.wake_seconds ?? 30 });
+
+  // ---- Night clock (device.night) ----
+  const night = d.night || {};
+  const nightEnabled = h('input', { type: 'checkbox', id: 'set-night-enabled' });
+  nightEnabled.checked = night.enabled ?? true;
+  const nightAfter = h('input', { type: 'number', id: 'set-night-after', min: 15, max: 240, value: night.after_min ?? 60 });
+
+  // ---- Time to leave (top-level due) ----
+  const due = cfg.due || {};
+  const dueEnabled = h('input', { type: 'checkbox', id: 'set-due-enabled' });
+  dueEnabled.checked = due.enabled ?? true;
+  const dueMinutes = h('input', { type: 'number', id: 'set-due-minutes', min: 1, max: 15, value: due.minutes ?? 3 });
+  const dueLed = h('input', { type: 'checkbox', id: 'set-due-led' });
+  dueLed.checked = due.led ?? true;
+  const dueScreen = h('input', { type: 'checkbox', id: 'set-due-screen' });
+  dueScreen.checked = due.screen ?? true;
+  const dueChime = h('input', { type: 'checkbox', id: 'set-due-chime' });
+  dueChime.checked = !!due.chime;
+
+  // ---- Profiles (top-level profiles, max 4) ----
+  const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const profiles = (cfg.profiles || []).map((p) => ({
+    name: p.name || '', days: [...(p.days || [])], start: p.start || '05:30', end: p.end || '10:00',
+    order: [...(p.stops || []), ...cfg.stops.map((s) => s.key).filter((k) => !(p.stops || []).includes(k))],
+    included: new Set(p.stops || []),
+  }));
+  const profilesCard = h('div', {});
+
+  function profileCard(p, pi) {
+    const nameInput2 = h('input', { type: 'text', value: p.name, placeholder: `Profile ${pi + 1}` });
+    nameInput2.addEventListener('input', () => { p.name = nameInput2.value; });
+    const dayBoxes = DAY_LABELS.map((lbl, di) => {
+      const cb = h('input', { type: 'checkbox' });
+      cb.checked = p.days.includes(di);
+      cb.addEventListener('change', () => {
+        p.days = cb.checked ? [...new Set([...p.days, di])] : p.days.filter((x) => x !== di);
+      });
+      return h('label', { class: 'inline' }, cb, ` ${lbl}`);
+    });
+    const startInput = h('input', { type: 'time', value: p.start });
+    startInput.addEventListener('change', () => { p.start = startInput.value; });
+    const endInput = h('input', { type: 'time', value: p.end });
+    endInput.addEventListener('change', () => { p.end = endInput.value; });
+
+    const stopListDiv = h('div', {});
+    function renderStopList() {
+      clear(stopListDiv);
+      if (!cfg.stops.length) { stopListDiv.append(h('p', { class: 'small muted' }, 'No stops configured yet.')); return; }
+      p.order.forEach((key, oi) => {
+        const stop = cfg.stops.find((st) => st.key === key);
+        if (!stop) return;
+        const cb = h('input', { type: 'checkbox' });
+        cb.checked = p.included.has(key);
+        cb.addEventListener('change', () => { if (cb.checked) p.included.add(key); else p.included.delete(key); });
+        stopListDiv.append(h('div', { class: 'row' },
+          h('label', { class: 'inline' }, cb, ` ${stop.label}`),
+          h('span', { class: 'spacer' }),
+          h('button', { class: 'icon', title: 'Move up', disabled: oi === 0, onclick: () => { [p.order[oi - 1], p.order[oi]] = [p.order[oi], p.order[oi - 1]]; renderStopList(); } }, '↑'),
+          h('button', { class: 'icon', title: 'Move down', disabled: oi === p.order.length - 1, onclick: () => { [p.order[oi + 1], p.order[oi]] = [p.order[oi], p.order[oi + 1]]; renderStopList(); } }, '↓')));
+      });
+    }
+    renderStopList();
+
+    return h('div', { class: 'subcard' },
+      h('div', { class: 'row between' },
+        h('h3', {}, `Profile ${pi + 1}`),
+        h('button', { class: 'icon danger', title: 'Remove profile', 'aria-label': 'Remove profile', onclick: () => { profiles.splice(pi, 1); renderProfiles(); } }, '✕')),
+      h('label', {}, 'Name'), nameInput2,
+      h('label', {}, 'Days'), h('div', { class: 'row' }, ...dayBoxes),
+      h('div', { class: 'row' },
+        h('div', {}, h('label', {}, 'Start'), startInput),
+        h('div', {}, h('label', {}, 'End'), endInput)),
+      h('label', {}, 'Stops shown, in order'), stopListDiv);
+  }
+
+  function renderProfiles() {
+    clear(profilesCard);
+    profilesCard.append(h('p', { class: 'small muted' }, 'While a profile is active the screen shows only its stops, in this order. All stops keep polling and logging.'));
+    profiles.forEach((p, pi) => profilesCard.append(profileCard(p, pi)));
+    profilesCard.append(h('button', {
+      disabled: profiles.length >= 4,
+      onclick: () => {
+        profiles.push({ name: '', days: [], start: '05:30', end: '10:00', order: cfg.stops.map((s) => s.key), included: new Set() });
+        renderProfiles();
+      },
+    }, '+ Add profile'));
+    if (profiles.length >= 4) profilesCard.append(h('p', { class: 'small muted' }, 'Maximum of 4 profiles reached.'));
+  }
+  renderProfiles();
+
+  // ---- Indego bikes (top-level bike) ----
+  const bikeCfg = cfg.bike || {};
+  const bikeEnabled = h('input', { type: 'checkbox', id: 'set-bike-enabled' });
+  bikeEnabled.checked = !!bikeCfg.enabled;
+  let bikeStations = (bikeCfg.stations || []).map((s) => ({ id: s.id, name: s.name }));
+  const bikeListDiv = h('div', {});
+  const bikeNearbyResults = h('div', {});
+  const bikeManualId = h('input', { type: 'number', id: 'bike-manual-id', min: 1, placeholder: 'e.g. 3468' });
+  const bikeManualAdd = h('button', {
+    onclick: () => {
+      const id = Math.trunc(Number(bikeManualId.value));
+      if (!id || id < 1) return;
+      if (bikeStations.some((s) => s.id === id) || bikeStations.length >= 3) return;
+      bikeStations.push({ id, name: `Station ${id}` });
+      bikeManualId.value = '';
+      renderBikeStations();
+    },
+  }, 'Add');
+
+  function renderBikeStations() {
+    clear(bikeListDiv);
+    if (!bikeStations.length) { bikeListDiv.append(h('p', { class: 'small muted' }, 'No stations chosen yet.')); }
+    for (const st of bikeStations) {
+      bikeListDiv.append(h('div', { class: 'row between' },
+        h('span', {}, `${st.name} (#${st.id})`),
+        h('button', { class: 'icon danger', title: 'Remove', 'aria-label': `Remove ${st.name}`, onclick: () => { bikeStations = bikeStations.filter((s) => s.id !== st.id); renderBikeStations(); } }, '✕')));
+    }
+    bikeManualAdd.disabled = bikeStations.length >= 3;
+    if (bikeStations.length >= 3) bikeListDiv.append(h('p', { class: 'small muted' }, 'Maximum of 3 stations.'));
+  }
+  renderBikeStations();
+
+  const bikeFindBtn = h('button', {
+    onclick: async (ev) => {
+      ev.target.disabled = true;
+      clear(bikeNearbyResults);
+      bikeNearbyResults.append(h('p', { class: 'muted small' }, 'Looking up nearby stations…'));
+      try {
+        const withCoords = (cfg.stops || []).filter((s) => Number(s.lat) && Number(s.lng));
+        if (!withCoords.length) {
+          clear(bikeNearbyResults);
+          bikeNearbyResults.append(h('p', { class: 'muted small' }, 'None of your configured stops have coordinates yet — add some from the Stops page first.'));
+          return;
+        }
+        const res = await fetch('http://bts-status.bicycletransit.workers.dev/phl');
+        if (!res.ok) throw new Error(`Indego feed returned HTTP ${res.status}`);
+        const geo = await res.json();
+        const scored = [];
+        for (const f of geo.features || []) {
+          const coords = f.geometry && f.geometry.coordinates;
+          if (!coords) continue;
+          const [lng, lat] = coords;
+          let best = Infinity;
+          for (const s of withCoords) best = Math.min(best, haversineMiles(Number(s.lat), Number(s.lng), lat, lng));
+          scored.push({ p: f.properties, dist: best });
+        }
+        scored.sort((a, b) => a.dist - b.dist);
+        const seen = new Set();
+        const top = [];
+        for (const item of scored) {
+          if (!item.p || seen.has(item.p.id)) continue;
+          seen.add(item.p.id);
+          top.push(item);
+          if (top.length >= 6) break;
+        }
+        clear(bikeNearbyResults);
+        if (!top.length) { bikeNearbyResults.append(h('p', { class: 'muted small' }, 'No stations found in the feed.')); return; }
+        for (const item of top) {
+          const p = item.p;
+          const already = bikeStations.some((s) => s.id === p.id);
+          bikeNearbyResults.append(h('div', { class: 'row between' },
+            h('span', {}, `${p.name} — ${item.dist.toFixed(1)} mi — ${p.bikesAvailable ?? '?'} bikes, ${p.docksAvailable ?? '?'} docks`),
+            h('button', {
+              disabled: already || bikeStations.length >= 3,
+              onclick: () => { bikeStations.push({ id: p.id, name: p.name }); renderBikeStations(); },
+            }, already ? 'Added' : 'Add')));
+        }
+      } catch (e) {
+        clear(bikeNearbyResults);
+        bikeNearbyResults.append(h('div', { class: 'banner warn' },
+          'Could not reach the Indego station feed from the browser. If this page was loaded over HTTPS, the browser blocks the plain-HTTP feed as mixed content — try loading the device UI over http:// instead. ' + (e && e.message ? `(${e.message})` : '')));
+      } finally {
+        ev.target.disabled = false;
+      }
+    },
+  }, 'Find stations near my stops');
+
   const form = h('div', { class: 'card settings-grid' },
     h('h2', {}, 'Device'),
     h('label', { for: 'set-name' }, 'Device name'), h('div', { class: 'row' }, nameInput, mdnsPreview),
@@ -1164,6 +1441,42 @@ async function renderSettings(root) {
     h('label', { for: 'set-ticker-lines' }, 'Height'), tickerLinesSelect,
     h('label', { for: 'set-ticker-speed' }, 'Scroll speed'), h('div', { class: 'row' }, tickerSpeedInput, tickerSpeedVal),
     h('p', { class: 'small muted' }, 'Service alerts and detours for your routes appear along the bottom of the main screen. A taller ticker wraps the text and scrolls it upward; lower speeds are easier to read.'),
+
+    h('h2', {}, 'Display extras'),
+    h('label', { class: 'inline' }, largeTextInput, ' Large text (two rows per stop, big numbers)'),
+    h('label', { class: 'inline' }, crowdingInput, ' Show crowding (SEPTA’s seat availability)'),
+
+    h('h2', {}, 'Quiet hours'),
+    h('label', { class: 'inline' }, quietEnabled, ' Enable quiet hours'),
+    h('label', { for: 'set-quiet-start' }, 'Start'), quietStart,
+    h('label', { for: 'set-quiet-end' }, 'End'), quietEnd,
+    h('label', { for: 'set-quiet-bright' }, 'Brightness during quiet hours'), h('div', { class: 'row' }, quietBrightness, quietBrightVal),
+    h('label', { for: 'set-quiet-wake' }, 'Wake for N seconds on touch'), quietWake,
+
+    h('h2', {}, 'Night clock'),
+    h('label', { class: 'inline' }, nightEnabled, ' Enable night clock'),
+    h('label', { for: 'set-night-after' }, 'Show the clock when nothing is due within N minutes'), nightAfter,
+
+    h('h2', {}, 'Time to leave'),
+    h('label', { class: 'inline' }, dueEnabled, ' Enable'),
+    h('label', { for: 'set-due-minutes' }, 'Minutes before arrival'), dueMinutes,
+    h('label', { class: 'inline' }, dueLed, ' Blink the LED'),
+    h('label', { class: 'inline' }, dueScreen, ' Blink the row on screen'),
+    h('label', { class: 'inline' }, dueChime, ' Two short beeps (board speaker)'),
+    h('p', { class: 'small muted' }, 'Beeps are silenced during quiet hours.'),
+
+    h('h2', {}, 'Profiles'),
+    profilesCard,
+
+    h('h2', {}, 'Indego bikes'),
+    h('label', { class: 'inline' }, bikeEnabled, ' Show Indego bike/dock counts'),
+    bikeListDiv,
+    h('div', { class: 'row', style: 'margin-top:.4rem' }, bikeFindBtn),
+    bikeNearbyResults,
+    h('label', { for: 'bike-manual-id', style: 'margin-top:.6rem' }, 'Or add by station id'),
+    h('div', { class: 'row' }, bikeManualId, bikeManualAdd),
+    h('p', { class: 'small muted' }, 'Station data from Bicycle Transit Systems (Indego).'),
+
     h('h2', {}, 'Header'),
     h('p', { class: 'small muted' }, 'The strip along the top of the main screen is narrow; pick what it shows.'),
     ...headerRows,
@@ -1188,9 +1501,28 @@ async function renderSettings(root) {
           ticker_lines: Number(tickerLinesSelect.value), ticker_speed: Number(tickerSpeedInput.value),
           use_https: httpsInput.checked, tls_verify: tlsInput.checked, logging: loggingInput.checked,
           header: Object.fromEntries(Object.entries(headerInputs).map(([k, cb]) => [k, cb.checked])),
+          large_text: largeTextInput.checked,
+          show_crowding: crowdingInput.checked,
+          quiet: {
+            enabled: quietEnabled.checked, start: quietStart.value, end: quietEnd.value,
+            brightness: Number(quietBrightness.value), wake_seconds: Number(quietWake.value),
+          },
+          night: { enabled: nightEnabled.checked, after_min: Number(nightAfter.value) },
         },
         alerts: alertsInput.checked,
         weather: { enabled: wxEnabled.checked, per_stop: wxPerStop.checked, units: wxUnits.value },
+        due: {
+          enabled: dueEnabled.checked, minutes: Number(dueMinutes.value),
+          led: dueLed.checked, screen: dueScreen.checked, chime: dueChime.checked,
+        },
+        profiles: profiles.map((p, pi) => ({
+          name: p.name.trim() || `Profile ${pi + 1}`,
+          days: [...p.days].sort((a, b) => a - b),
+          start: p.start,
+          end: p.end,
+          stops: p.order.filter((k) => p.included.has(k)),
+        })),
+        bike: { enabled: bikeEnabled.checked, stations: bikeStations.map((s) => ({ id: s.id, name: s.name })) },
       };
       clear(banner);
       try {

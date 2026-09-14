@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <ctime>
 
+LV_FONT_DECLARE(lv_font_montserrat_48_digits)
+
 namespace transit_app::ui {
 
 namespace {
@@ -104,8 +106,63 @@ void screenSize(int32_t &w, int32_t &h) {
   h = lv_display_get_vertical_resolution(disp);
 }
 
-int rowsPerStop(int32_t h) {
+int rowsPerStop(int32_t h, bool large_text) {
+  if (large_text) return 2;
   return h >= 320 ? 3 : 2;
+}
+
+const lv_font_t *fontHuge() {
+  return &lv_font_montserrat_48_digits;
+}
+
+std::string clockLabel(transit::Epoch when) {
+  if (when <= 0) return "--:--";
+  time_t t = (time_t)when;
+  struct tm lt;
+  localtime_r(&t, &lt);
+  int hour12 = lt.tm_hour % 12;
+  if (hour12 == 0) hour12 = 12;
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d:%02d%s", hour12, lt.tm_min, lt.tm_hour < 12 ? "a" : "p");
+  return buf;
+}
+
+std::string panelTitle(const transit::StopConfig &s) {
+  const char *bullet = "\xE2\x80\xA2";  // U+2022: the built-in font lacks the middle dot (U+00B7)
+  std::string label = s.label.empty() ? s.route : s.label;
+  std::string title;
+  if (s.title_style == "custom") {
+    title = s.title_text.empty() ? label : s.title_text;
+  } else if (s.title_style == "label") {
+    title = label;
+  } else if (s.title_style == "route_dest_stop") {
+    if (s.mode == transit::Mode::Rail) {
+      title = s.station + (s.direction.empty() ? "" : " (" + s.direction + ")");
+    } else {
+      title = s.route + " " LV_SYMBOL_RIGHT " " + s.headsign + " " + bullet + " " + s.stop_name;
+    }
+  } else {  // label_dest
+    if (s.mode == transit::Mode::Rail) {
+      const char *dir = s.direction == "N" ? "Northbound" : s.direction == "S" ? "Southbound" : "";
+      title = label + (dir[0] ? std::string(" (") + dir + ")" : "");
+    } else {
+      title = label + (s.headsign.empty() ? "" : " " LV_SYMBOL_RIGHT " " + s.headsign);
+    }
+  }
+  // DESIGN.md SS4.6/SS8: subway is schedule-only in v1; say so rather than showing "sched" on
+  // every row and letting the user wonder.
+  if (s.mode == transit::Mode::Subway) title += std::string(" ") + bullet + " schedule only";
+  return title;
+}
+
+std::string crowdingText(const std::string &seats) {
+  if (seats == "MANY_SEATS_AVAILABLE") return "seats";
+  if (seats == "FEW_SEATS_AVAILABLE") return "few seats";
+  if (seats == "STANDING_ROOM_ONLY") return "standing";
+  if (seats == "CRUSHED_STANDING_ROOM_ONLY") return "packed";
+  if (seats == "FULL") return "full";
+  if (seats == "EMPTY") return "empty";
+  return "";
 }
 
 const lv_font_t *fontBig(int32_t h) {

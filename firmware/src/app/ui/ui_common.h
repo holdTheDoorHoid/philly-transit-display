@@ -50,11 +50,23 @@ Badge badgeFor(const transit::Arrival &a);
 void screenSize(int32_t &w, int32_t &h);
 
 // DESIGN.md SS8: "320x240 gets 2 rows per stop and smaller fonts; 480x320
-// gets 3 rows."
-int rowsPerStop(int32_t h);
+// gets 3 rows." Large-text mode (device.large_text) is always 2.
+int rowsPerStop(int32_t h, bool large_text = false);
 const lv_font_t *fontBig(int32_t h);    // the big "minutes" number
+const lv_font_t *fontHuge();            // 48 px digits-only subset (src/fonts/): large text, night clock
 const lv_font_t *fontBody(int32_t h);   // destination / title text
 const lv_font_t *fontSmall(int32_t h);  // badges, footer, secondary text
+
+// DESIGN.md SS6 stops[].title_style: "17 Southbound → 20th-Johnston" (label_dest, default),
+// the label alone, "17 → 20th-Johnston • 19th St & Mifflin St", or title_text verbatim.
+std::string panelTitle(const transit::StopConfig &s);
+
+// SEPTA's estimated_seat_availability -> "seats", "few seats", "standing", "packed", "full",
+// "empty"; "" when unknown (DESIGN.md SS6 device.show_crowding).
+std::string crowdingText(const std::string &seats);
+
+// "11:42p" for the night clock and the "next bus" lines.
+std::string clockLabel(transit::Epoch when);
 
 // model.h's StopConfig has no per-route color field (DESIGN.md SS8 says
 // "route colour from config or default" but the schema/struct never grew

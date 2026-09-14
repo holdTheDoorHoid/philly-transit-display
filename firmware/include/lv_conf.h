@@ -72,7 +72,7 @@
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
     /*Size of the memory available for `lv_malloc()` in bytes (>= 2kB)*/
-    #define LV_MEM_SIZE (32 * 1024U)   /* static .bss; every KB here is a KB less heap for Wi-Fi/TLS */          /*[bytes]*/
+    #define LV_MEM_SIZE (40 * 1024U)   /* static .bss; every KB here is a KB less heap for Wi-Fi/TLS. 32 KB was 93 % used at boot once the night page, bike strip and crowding labels existed. */          /*[bytes]*/
 
     /*Size of the memory expand for `lv_malloc()` in bytes*/
     #define LV_MEM_POOL_EXPAND_SIZE 0
@@ -155,7 +155,10 @@
     
     /* 0: use a simple renderer capable of drawing only simple rectangles with gradient, images, texts, and straight lines only
      * 1: use a complex renderer capable of drawing rounded corners, shadow, skew lines, and arcs too */
-    #define LV_DRAW_SW_COMPLEX          1
+    /* 0: no shadows, transforms, or masks. NOTE: LVGL then SKIPS any rectangle with a radius
+     * (lv_draw_sw_fill.c logs "Can't draw complex rectangle" and draws nothing), so every
+     * style in this UI keeps radius 0. The routines cost ~12 KB of a full flash. */
+    #define LV_DRAW_SW_COMPLEX          0
 
     #if LV_DRAW_SW_COMPLEX == 1
         /*Allow buffering some shadow calculation.

@@ -94,7 +94,7 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
   lv_obj_set_style_border_width(reset_target, 1, 0);
   lv_obj_set_style_border_color(reset_target, colorSubtext(), 0);
   lv_obj_set_style_pad_all(reset_target, 8, 0);
-  lv_obj_set_style_radius(reset_target, 6, 0);
+  lv_obj_set_style_radius(reset_target, 0, 0);  // LV_DRAW_SW_COMPLEX is 0: rounded rects are not drawn
   lv_obj_remove_flag(reset_target, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(reset_target, LV_OBJ_FLAG_CLICKABLE);
   ctx->reset_label = addRow(reset_target, fontSmall(h));

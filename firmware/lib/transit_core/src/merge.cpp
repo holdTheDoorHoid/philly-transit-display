@@ -31,10 +31,26 @@ bool equalsIgnoreCase(const std::string& a, const std::string& b) {
 // for anything else ("On Time" is handled by the caller separately; "Delayed"/"Suspended"/etc.
 // fall through to false).
 bool parseSignedMinutes(const std::string& s, int* out) {
-  int n = 0;
-  char unit[16] = {0};
-  if (std::sscanf(s.c_str(), "%d %15s", &n, unit) != 2) return false;
-  std::string u(unit);
+  // Hand-rolled rather than sscanf() (see timeparse.cpp).
+  const char* p = s.c_str();
+  while (*p == ' ' || *p == '\t') ++p;
+  bool neg = false;
+  if (*p == '-' || *p == '+') {
+    neg = (*p == '-');
+    ++p;
+  }
+  int n = 0, digits = 0;
+  while (*p >= '0' && *p <= '9') {
+    n = n * 10 + (*p - '0');
+    ++p;
+    ++digits;
+  }
+  if (digits == 0 || (*p != ' ' && *p != '\t')) return false;
+  while (*p == ' ' || *p == '\t') ++p;
+  std::string u;
+  while (*p && *p != ' ' && *p != '\t' && u.size() < 15) u.push_back(*p++);
+  if (u.empty()) return false;
+  if (neg) n = -n;
   for (char& c : u) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   if (u == "min" || u == "mins" || u == "minute" || u == "minutes") {
     *out = n;

@@ -91,9 +91,26 @@ int64_t daysFromCivil(int y, int m, int d) {
 
 }  // namespace
 
+namespace {
+bool readFixed(const char*& p, int digits, int& out) {
+  int n = 0;
+  for (int i = 0; i < digits; ++i) {
+    if (*p < '0' || *p > '9') return false;
+    n = n * 10 + (*p++ - '0');
+  }
+  out = n;
+  return true;
+}
+}  // namespace
+
+// Hand-rolled rather than sscanf() (newlib's scanf family costs ~15 KB of flash on the ESP32).
 int64_t parseIsoLocal(const std::string& s, int32_t utc_offset_s) {
   int y = 0, mo = 0, d = 0, h = 0, mi = 0;
-  if (std::sscanf(s.c_str(), "%d-%d-%dT%d:%d", &y, &mo, &d, &h, &mi) != 5) return 0;
+  const char* p = s.c_str();
+  if (!(readFixed(p, 4, y) && *p++ == '-' && readFixed(p, 2, mo) && *p++ == '-' && readFixed(p, 2, d) && *p++ == 'T' &&
+        readFixed(p, 2, h) && *p++ == ':' && readFixed(p, 2, mi))) {
+    return 0;
+  }
   if (mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 || mi < 0 || mi > 59) return 0;
   int64_t naive = daysFromCivil(y, mo, d) * 86400 + static_cast<int64_t>(h) * 3600 + static_cast<int64_t>(mi) * 60;
   return naive - utc_offset_s;

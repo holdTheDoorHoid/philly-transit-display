@@ -76,14 +76,21 @@ function defaultConfig() {
       tls_verify: true,
       logging: true,
       header: { name: false, clock: true, weather: true, wifi: true, updated: true },
+      large_text: false,
+      show_crowding: true,
+      quiet: { enabled: false, start: '23:00', end: '06:00', brightness: 0, wake_seconds: 30 },
+      night: { enabled: true, after_min: 60 },
     },
     stops: [
-      { key: '17-21332', mode: 'bus', route: '17', stop_id: '21332', direction: '1', headsign: '20th-Johnston', label: '17 Southbound', stop_name: '19th St & Mifflin St', show: 3, lat: 39.927947, lng: -75.177147 },
-      { key: '17-21297', mode: 'bus', route: '17', stop_id: '21297', direction: '0', headsign: '2nd-Market', label: '17 Northbound', stop_name: '20th St & Mifflin St', show: 3 },
-      { key: 'rail-30th-N', mode: 'rail', station: '30th Street Station', direction: 'N', line: '', label: 'Regional Rail North', show: 2 },
+      { key: '17-21332', mode: 'bus', route: '17', stop_id: '21332', direction: '1', headsign: '20th-Johnston', label: '17 Southbound', stop_name: '19th St & Mifflin St', show: 3, lat: 39.927947, lng: -75.177147, title_style: 'label_dest', title_text: '', alt_of: '', alt_after_min: 15 },
+      { key: '17-21297', mode: 'bus', route: '17', stop_id: '21297', direction: '0', headsign: '2nd-Market', label: '17 Northbound', stop_name: '20th St & Mifflin St', show: 3, title_style: 'label_dest', title_text: '', alt_of: '', alt_after_min: 15 },
+      { key: 'rail-30th-N', mode: 'rail', station: '30th Street Station', direction: 'N', line: '', label: 'Regional Rail North', show: 2, title_style: 'label_dest', title_text: '', alt_of: '', alt_after_min: 15 },
     ],
     alerts: true,
     weather: { enabled: true, per_stop: true, units: 'f' },
+    due: { enabled: true, minutes: 3, led: true, screen: true, chime: false },
+    profiles: [],
+    bike: { enabled: false, stations: [] },
   };
 }
 
@@ -119,6 +126,30 @@ function validateConfig(cfg) {
   }
   if (typeof d.tls_verify !== 'boolean') return { error: 'tls_verify must be a boolean', path: 'device.tls_verify' };
   if (typeof d.logging !== 'boolean') return { error: 'logging must be a boolean', path: 'device.logging' };
+  if (d.large_text !== undefined && typeof d.large_text !== 'boolean') return { error: 'large_text must be a boolean', path: 'device.large_text' };
+  if (d.show_crowding !== undefined && typeof d.show_crowding !== 'boolean') return { error: 'show_crowding must be a boolean', path: 'device.show_crowding' };
+  const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+  if (d.quiet !== undefined) {
+    const q = d.quiet;
+    if (typeof q !== 'object' || q === null) return { error: 'quiet must be an object', path: 'device.quiet' };
+    if (q.enabled !== undefined && typeof q.enabled !== 'boolean') return { error: 'enabled must be a boolean', path: 'device.quiet.enabled' };
+    if (q.start !== undefined && (typeof q.start !== 'string' || !TIME_RE.test(q.start))) return { error: 'start must be "HH:MM"', path: 'device.quiet.start' };
+    if (q.end !== undefined && (typeof q.end !== 'string' || !TIME_RE.test(q.end))) return { error: 'end must be "HH:MM"', path: 'device.quiet.end' };
+    if (q.brightness !== undefined && (!Number.isInteger(q.brightness) || q.brightness < 0 || q.brightness > 50)) {
+      return { error: 'brightness must be an integer between 0 and 50', path: 'device.quiet.brightness' };
+    }
+    if (q.wake_seconds !== undefined && (!Number.isInteger(q.wake_seconds) || q.wake_seconds < 5 || q.wake_seconds > 300)) {
+      return { error: 'wake_seconds must be an integer between 5 and 300', path: 'device.quiet.wake_seconds' };
+    }
+  }
+  if (d.night !== undefined) {
+    const n = d.night;
+    if (typeof n !== 'object' || n === null) return { error: 'night must be an object', path: 'device.night' };
+    if (n.enabled !== undefined && typeof n.enabled !== 'boolean') return { error: 'enabled must be a boolean', path: 'device.night.enabled' };
+    if (n.after_min !== undefined && (!Number.isInteger(n.after_min) || n.after_min < 15 || n.after_min > 240)) {
+      return { error: 'after_min must be an integer between 15 and 240', path: 'device.night.after_min' };
+    }
+  }
   if (typeof cfg.alerts !== 'boolean') return { error: 'alerts must be a boolean', path: 'alerts' };
   if (d.header !== undefined) {
     if (typeof d.header !== 'object' || d.header === null) return { error: 'header must be an object', path: 'device.header' };
@@ -132,6 +163,33 @@ function validateConfig(cfg) {
     if (w.enabled !== undefined && typeof w.enabled !== 'boolean') return { error: 'enabled must be a boolean', path: 'weather.enabled' };
     if (w.per_stop !== undefined && typeof w.per_stop !== 'boolean') return { error: 'per_stop must be a boolean', path: 'weather.per_stop' };
     if (w.units !== undefined && !['f', 'c'].includes(w.units)) return { error: 'units must be "f" or "c"', path: 'weather.units' };
+  }
+  if (cfg.due !== undefined) {
+    const due = cfg.due;
+    if (typeof due !== 'object' || due === null) return { error: 'due must be an object', path: 'due' };
+    if (due.enabled !== undefined && typeof due.enabled !== 'boolean') return { error: 'enabled must be a boolean', path: 'due.enabled' };
+    if (due.minutes !== undefined && (!Number.isInteger(due.minutes) || due.minutes < 1 || due.minutes > 15)) {
+      return { error: 'minutes must be an integer between 1 and 15', path: 'due.minutes' };
+    }
+    for (const k of ['led', 'screen', 'chime']) {
+      if (due[k] !== undefined && typeof due[k] !== 'boolean') return { error: `${k} must be a boolean`, path: `due.${k}` };
+    }
+  }
+  if (cfg.bike !== undefined) {
+    const bike = cfg.bike;
+    if (typeof bike !== 'object' || bike === null) return { error: 'bike must be an object', path: 'bike' };
+    if (bike.enabled !== undefined && typeof bike.enabled !== 'boolean') return { error: 'enabled must be a boolean', path: 'bike.enabled' };
+    if (bike.stations !== undefined) {
+      if (!Array.isArray(bike.stations)) return { error: 'stations must be an array', path: 'bike.stations' };
+      if (bike.stations.length > 3) return { error: 'Maximum of 3 stations', path: 'bike.stations' };
+      for (let i = 0; i < bike.stations.length; i++) {
+        const s = bike.stations[i];
+        const p = `bike.stations[${i}]`;
+        if (typeof s !== 'object' || s === null) return { error: 'station must be an object', path: p };
+        if (!Number.isInteger(s.id) || s.id < 1) return { error: 'id must be an integer >= 1', path: `${p}.id` };
+        if (typeof s.name !== 'string' || !s.name.trim()) return { error: 'name must be a non-empty string', path: `${p}.name` };
+      }
+    }
   }
   if (!Array.isArray(cfg.stops)) return { error: 'stops must be an array', path: 'stops' };
   if (cfg.stops.length > 8) return { error: 'Maximum of 8 stops', path: 'stops' };
@@ -153,6 +211,52 @@ function validateConfig(cfg) {
       if (typeof s.route !== 'string' || !s.route.trim()) return { error: 'route must be a non-empty string', path: `${p}.route` };
       if (typeof s.stop_id !== 'string' || !s.stop_id.trim()) return { error: 'stop_id must be a non-empty string', path: `${p}.stop_id` };
       if (!['0', '1'].includes(s.direction)) return { error: 'direction must be "0" or "1"', path: `${p}.direction` };
+    }
+  }
+  // Second pass: fields added 2026-09-14 that reference other stops need the full key set above.
+  const TITLE_STYLES = ['label_dest', 'label', 'route_dest_stop', 'custom'];
+  for (let i = 0; i < cfg.stops.length; i++) {
+    const s = cfg.stops[i];
+    const p = `stops[${i}]`;
+    if (s.title_style !== undefined && !TITLE_STYLES.includes(s.title_style)) {
+      return { error: 'title_style must be one of label_dest, label, route_dest_stop, custom', path: `${p}.title_style` };
+    }
+    if (s.title_text !== undefined && (typeof s.title_text !== 'string' || s.title_text.length > 40)) {
+      return { error: 'title_text must be a string of at most 40 characters', path: `${p}.title_text` };
+    }
+    if (s.alt_of !== undefined && s.alt_of !== '') {
+      if (typeof s.alt_of !== 'string') return { error: 'alt_of must be a string', path: `${p}.alt_of` };
+      if (s.alt_of === s.key) return { error: 'alt_of cannot reference its own stop', path: `${p}.alt_of` };
+      if (!seenKeys.has(s.alt_of)) return { error: `alt_of references unknown stop "${s.alt_of}"`, path: `${p}.alt_of` };
+    }
+    if (s.alt_after_min !== undefined && (!Number.isInteger(s.alt_after_min) || s.alt_after_min < 5 || s.alt_after_min > 60)) {
+      return { error: 'alt_after_min must be an integer between 5 and 60', path: `${p}.alt_after_min` };
+    }
+  }
+  if (cfg.profiles !== undefined) {
+    if (!Array.isArray(cfg.profiles)) return { error: 'profiles must be an array', path: 'profiles' };
+    if (cfg.profiles.length > 4) return { error: 'Maximum of 4 profiles', path: 'profiles' };
+    const timeRe = /^([01]\d|2[0-3]):[0-5]\d$/;
+    for (let i = 0; i < cfg.profiles.length; i++) {
+      const pr = cfg.profiles[i];
+      const p = `profiles[${i}]`;
+      if (typeof pr !== 'object' || pr === null) return { error: 'profile must be an object', path: p };
+      if (typeof pr.name !== 'string' || !pr.name.trim() || pr.name.length > 24) {
+        return { error: 'name must be a non-empty string of at most 24 characters', path: `${p}.name` };
+      }
+      if (!Array.isArray(pr.days)) return { error: 'days must be an array', path: `${p}.days` };
+      const seenDays = new Set();
+      for (const dNum of pr.days) {
+        if (!Number.isInteger(dNum) || dNum < 0 || dNum > 6) return { error: 'days must be integers between 0 and 6', path: `${p}.days` };
+        if (seenDays.has(dNum)) return { error: 'days must not repeat', path: `${p}.days` };
+        seenDays.add(dNum);
+      }
+      if (typeof pr.start !== 'string' || !timeRe.test(pr.start)) return { error: 'start must be "HH:MM"', path: `${p}.start` };
+      if (typeof pr.end !== 'string' || !timeRe.test(pr.end)) return { error: 'end must be "HH:MM"', path: `${p}.end` };
+      if (!Array.isArray(pr.stops) || !pr.stops.length) return { error: 'stops must be a non-empty array of stop keys', path: `${p}.stops` };
+      for (const key of pr.stops) {
+        if (typeof key !== 'string' || !seenKeys.has(key)) return { error: `stops references unknown stop "${key}"`, path: `${p}.stops` };
+      }
     }
   }
   return null;
@@ -270,7 +374,46 @@ function buildState(query) {
     stops: stopsOut,
     alerts,
     weather: buildWeather(now),
+    active_profile: activeProfileName(now),
+    bike: buildBike(now),
   };
+}
+
+// Local "HH:MM" for a profile's days/start/end window check.
+function hhmmLocal(now) {
+  const d = new Date(now * 1000);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+// Window may cross midnight (matches how device.quiet is documented in DESIGN.md §6).
+function timeInWindow(cur, start, end) {
+  if (start === end) return true;
+  if (start < end) return cur >= start && cur < end;
+  return cur >= start || cur < end;
+}
+// Name of the first configured profile whose days/time window contains "now", else "".
+function activeProfileName(now) {
+  const dow = new Date(now * 1000).getDay();
+  const cur = hhmmLocal(now);
+  for (const p of config.profiles || []) {
+    if (!p.days || !p.days.includes(dow)) continue;
+    if (!timeInWindow(cur, p.start, p.end)) continue;
+    return p.name;
+  }
+  return '';
+}
+
+// Mock Indego bikes/docks for the configured stations (DESIGN.md §4.9's state.bike shape).
+function buildBike(now) {
+  const b = config.bike || {};
+  if (!b.enabled || !b.stations || !b.stations.length) return { enabled: !!b.enabled, age_s: 0, stations: [] };
+  const rand = seedFrom(`bike|${Math.floor(now / 300)}`);
+  const stations = b.stations.map((s) => {
+    const bikes = Math.floor(rand() * 12);
+    const ebikes = Math.min(bikes, Math.floor(rand() * 4));
+    const docks = 5 + Math.floor(rand() * 15);
+    return { id: s.id, name: s.name, bikes, ebikes, docks, active: true };
+  });
+  return { enabled: true, age_s: 30 + Math.round(now % 120), stations };
 }
 
 // Mirrors firmware/src/app/weather_service.cpp: main location conditions plus six hourly slots.

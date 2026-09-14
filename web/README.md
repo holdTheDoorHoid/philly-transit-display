@@ -78,12 +78,12 @@ DESIGN.md §10 caps the four assets at **60 KB gzipped total**. Current sizes
 | Asset | Raw | Gzip |
 |---|---:|---:|
 | `index.html` | 848 B | 433 B |
-| `app.js` | ~52 KB | ~13.6 KB |
+| `app.js` | ~77 KB | ~20.2 KB |
 | `app.css` | ~9.9 KB | ~2.8 KB |
 | `favicon.svg` | 410 B | 202 B |
-| **Total** | **~63 KB** | **~17.1 KB** |
+| **Total** | **~88 KB** | **~23.6 KB** |
 
-That leaves roughly 43 KB of headroom under the budget. `build.mjs` prints a warning
+That leaves roughly 36 KB of headroom under the budget. `build.mjs` prints a warning
 (without failing) if the total ever exceeds 60,000 bytes gzip.
 
 ## How the UI maps to the device API
@@ -106,6 +106,25 @@ unreachable) → direction (learned from `/api/proxy/schedule`) → label/rows �
 subway, or `rail-<station-slug>-<N|S|both>` for Regional Rail, and the whole config
 object is sent to `PUT /api/config` on save; a `400` response's `{ error, path }` is
 shown inline in the wizard.
+
+Each configured stop's edit form (§6 "Fields added 2026-09-14") also sets how its
+title is shown on screen (`title_style`: label → destination, label only, route →
+destination • stop, or custom text saved as `title_text`) and whether the stop is an
+*alternative* — hidden unless another configured stop's next arrival is more than
+`alt_after_min` minutes away (`alt_of`, the other stop's `key`). The stop list preview
+computes the on-screen title client-side the same way the firmware will, and shows an
+"alternative to …" hint when `alt_of` is set.
+
+The Settings view additionally covers, in order after the alert ticker section: large
+text / crowding display extras, quiet hours (backlight dims on a schedule, touch wakes
+it), the night clock, "time to leave" LED/screen/chime alerts, up to 4 schedule-based
+**profiles** (each with a name, days, a time window, and its own ordered stop list —
+checkboxes plus ↑/↓ reordering, built from the configured stops), and Indego bike
+stations (§4.9): a manual station-id add, and a "Find stations near my stops" lookup
+that fetches the Bicycle Transit status feed directly in the browser and ranks the six
+nearest stations by great-circle distance from stops that have `lat`/`lng`. That fetch
+is plain HTTP; if the web UI itself is loaded over HTTPS the browser blocks it as mixed
+content and the button shows a banner explaining that instead of failing silently.
 
 ## Assumptions made (DESIGN.md §7/§9.3 didn't fully pin these down)
 

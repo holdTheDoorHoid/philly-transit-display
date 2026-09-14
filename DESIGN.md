@@ -167,6 +167,18 @@ when that hour is *notable* next to the header: precipitation probability ≥ 40
 or a different kind of weather (fog vs clear); clear-vs-cloudy is not worth a line. Attribution:
 "Weather data by Open-Meteo.com" (CC BY 4.0) in the web UI and README.
 
+### 4.9 Indego bike share (Bicycle Transit status feed)
+`http://bts-status.bicycletransit.workers.dev/phl` (verified 2026-09-14: plain HTTP, no redirect,
+CORS `*`, `Cache-Control: max-age=60`, ~400 KB GeoJSON, 319 stations). The official GBFS feed at
+`gbfs.bcycle.com` is https-only and returns 403 over http, so it is not usable from the device.
+Each feature is `{ "geometry": {"coordinates": [lng, lat]}, "properties": { "id": 3468, "name":
+"Snyder & Dorrance", "totalDocks", "docksAvailable", "bikesAvailable", "classicBikesAvailable",
+"electricBikesAvailable", "kioskPublicStatus": "Active", ..., "bikes": [ per-dock entries ] } }`;
+a feature with its dock list can run to ~3 KB. The device never buffers the body: `lib/indego_core`
+scans the stream feature by feature (brace depth inside `"features"`), keeps at most one feature
+(cap 6 KB) and parses only those whose `"id"` is configured. The web UI fetches the same feed in
+the browser to offer the stations nearest each configured stop. Cadence 5 min.
+
 ## 5. Firmware architecture
 
 ```
@@ -233,7 +245,11 @@ ESP Web Tools `manifest.json` under `flasher/` for GitHub Pages (offsets 0x1000 
     "use_https": false,
     "tls_verify": true,
     "logging": true,
-    "header": { "name": false, "clock": true, "weather": true, "wifi": true, "updated": true }
+    "header": { "name": false, "clock": true, "weather": true, "wifi": true, "updated": true },
+    "large_text": false,
+    "show_crowding": true,
+    "quiet": { "enabled": false, "start": "23:00", "end": "06:00", "brightness": 0, "wake_seconds": 30 },
+    "night": { "enabled": true, "after_min": 60 }
   },
   "stops": [
     {
@@ -247,7 +263,11 @@ ESP Web Tools `manifest.json` under `flasher/` for GitHub Pages (offsets 0x1000 
       "stop_name": "19th St & Mifflin St",
       "show": 3,
       "lat": 39.927947,
-      "lng": -75.177147
+      "lng": -75.177147,
+      "title_style": "label_dest",
+      "title_text": "",
+      "alt_of": "",
+      "alt_after_min": 15
     },
     {
       "key": "17-21297",
@@ -271,9 +291,39 @@ ESP Web Tools `manifest.json` under `flasher/` for GitHub Pages (offsets 0x1000 
     }
   ],
   "alerts": true,
-  "weather": { "enabled": true, "per_stop": true, "units": "f" }
+  "weather": { "enabled": true, "per_stop": true, "units": "f" },
+  "due": { "enabled": true, "minutes": 3, "led": true, "screen": true, "chime": false },
+  "profiles": [
+    { "name": "Weekday morning", "days": [1, 2, 3, 4, 5], "start": "05:30", "end": "10:00",
+      "stops": ["17-21297", "17-21332"] }
+  ],
+  "bike": { "enabled": false, "stations": [ { "id": 3468, "name": "Snyder & Dorrance" } ] }
 }
 ```
+
+Fields added 2026-09-14 (all optional; absent means the default shown above):
+- `stops[].title_style`: how the panel is titled on screen. `label_dest` (default) = `17 Southbound → 20th-Johnston`
+  (label falls back to the route); `label` = the label alone; `route_dest_stop` = `17 → 20th-Johnston • 19th St & Mifflin St`;
+  `custom` = `title_text` verbatim. Rail: `label_dest` = `Label (Northbound)`.
+- `stops[].alt_of` + `alt_after_min`: this stop is an *alternative* shown only while the stop whose
+  key is `alt_of` has no arrival within `alt_after_min` minutes (or no data). Otherwise its panel is
+  hidden and the others take the space. Alternatives still poll and log normally.
+- `device.large_text`: two rows per stop with the minutes in a 48 px digits font (readable across a
+  room). `device.show_crowding`: SEPTA's estimated seat availability next to the destination
+  (`seats`, `few seats`, `standing`, `packed`, `full`, `empty`).
+- `device.quiet`: between `start` and `end` (local, may cross midnight) the backlight drops to
+  `brightness` percent (0 = off); a touch restores it for `wake_seconds` and does not change page.
+  Chimes are suppressed in quiet hours.
+- `device.night`: when no configured stop has an arrival within `after_min` minutes the main page
+  becomes a clock: big time, date, weather, and each stop's next departure ("17 Southbound 5:12a").
+- `due`: when an arrival first comes within `minutes`: the RGB LED blinks green (`led`), the row's
+  minutes blink (`screen`), and the speaker plays two short beeps once per trip (`chime`; GPIO 26 on
+  the Sunton boards). Off in quiet hours.
+- `profiles` (max 4): while a profile is active (`days` 0=Sunday..6, `start`/`end` local), the main
+  page shows only its `stops` in that order; otherwise all stops in config order. Every stop keeps
+  polling and logging.
+- `bike` (max 3 stations): Indego bikes/docks from Bicycle Transit's status feed (§4.9), one line
+  per station above the alert ticker.
 
 `rotation` is 0, 90, 180, or 270 degrees; 0 is the panel's native portrait orientation (the owner's preference), 90 is landscape. The UI rebuilds its layout when it changes.
 `theme` is `light` (default) or `dark`; both palettes keep every text colour at WCAG AA contrast or
@@ -325,13 +375,27 @@ is skipped), `unknown`.
 Main screen (portrait by default; every size derives from the runtime resolution so rotation just re-flows it):
 - Header (10 % height): device name (off by default), clock (12 h), current weather (`69° mostly
   clear`), Wi-Fi bars, "updated 12 s ago" - each switchable via `device.header`.
-- One panel per configured stop, stacked; each has a title row (`17 → 20th-Johnston • 19th & Mifflin`;
-  bullet, not middle dot - the built-in font lacks U+00B7), an optional weather note about the hour
-  of the next arrival (§4.8, only when notable), and `show` arrival rows: route badge (route colour from config or default), destination
+- One panel per stop the active profile shows (§6 `profiles`; all stops otherwise), stacked; each
+  has a title row per `title_style` (`17 Southbound → 20th-Johnston` by default; bullet, not middle
+  dot, in the route form - the built-in font lacks U+00B7), an optional weather note about the hour
+  of the next arrival (§4.8, only when notable), and `show` arrival rows (2 in large-text mode,
+  minutes in the 48 px digits font from `src/fonts/`): route badge (route colour from config or default), destination
   (ellipsized), big minutes right-aligned (`12`, `Due` when < 1 min, `Now` when 0, the clock time
   `1:14a` from 60 min out so an overnight or wrong-day schedule row never reads "958"), and a badge:
   green `on time` (−1..+5 min, SEPTA's own on-time definition), red `+13`, blue `−2`, grey `sched`,
-  orange `skip`.
+  orange `skip`. With `show_crowding`, SEPTA's seat estimate sits after the destination (`few
+  seats`, `standing`, `packed`). While a bus is within `due.minutes` its minutes blink red
+  (`due.screen`), the LED blinks green (`due.led`) and, once per live trip, the speaker beeps twice
+  (`due.chime`, silenced in quiet hours).
+- An alternative panel (`alt_of`) is hidden until its primary stop has nothing within
+  `alt_after_min`; then it takes the primary's place below it.
+- Indego strip above the ticker when `bike` is on: one line per station, `Indego Snyder &
+  Dorrance: 7 bikes (7 e), 4 docks` (§4.9), `offline` / `no data` when the feed says so.
+- Night page (`night`): when every shown stop has nothing within `after_min`, the arrivals page is
+  replaced by a big clock, the date, the header weather, and `17 Southbound: next 5:12a (sched)`
+  per stop. Tapping cycles pages exactly as from the arrivals page.
+- Quiet hours (`quiet`): the backlight drops to `brightness` (0 = off) inside the window; any touch
+  restores it for `wake_seconds` without changing page.
 - Footer ticker when alerts exist: `17: <alert>` and `17 detour: <detour>` for each distinct
   detour. Height is `device.ticker_lines` lines of the small font (default 3); one line scrolls
   sideways, more wrap and scroll upward credits-style, both at `device.ticker_speed` px/s via our

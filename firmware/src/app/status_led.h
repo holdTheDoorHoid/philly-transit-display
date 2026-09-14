@@ -25,4 +25,8 @@ void setStatusLed(LedState state);
 // net_poller's own task - never from the LVGL task/loop().
 void flashPollOk(uint32_t on_ms = 150);
 
+// Time-to-leave blink (due_alert.cpp): `on` lights the LED green, `false` puts the status colour
+// back. Non-blocking, unlike flashPollOk().
+void ledOverrideGreen(bool on);
+
 }  // namespace transit_app

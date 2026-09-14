@@ -14,6 +14,9 @@
 #include <string>
 #include <vector>
 
+#include "../bike_service.h"
+#include "../due_alert.h"
+#include "../profiles.h"
 #include "../weather_service.h"
 #include "ui_common.h"
 
@@ -29,6 +32,7 @@ namespace {
 struct RowWidgets {
   lv_obj_t *route_badge;
   lv_obj_t *destination;
+  lv_obj_t *crowding;  // "few seats" etc. (device.show_crowding), hidden when unknown
   lv_obj_t *minutes;
   lv_obj_t *status_badge;
 };
@@ -36,6 +40,9 @@ struct RowWidgets {
 struct PanelWidgets {
   std::string stop_key;
   std::string route;
+  std::string alt_of;       // DESIGN.md SS6: shown only while this stop's next arrival is far out
+  uint8_t alt_after_min = 15;
+  lv_obj_t *panel;
   lv_obj_t *title;
   lv_obj_t *weather_note;  // DESIGN.md SS8: shown only when the forecast at the next arrival is notable
   lv_obj_t *no_data_label;
@@ -58,28 +65,12 @@ struct MainScreenCtx {
   std::string ticker_text;
   int ticker_lines = 1;
   uint16_t ticker_speed = 30;
+  // Indego strip (DESIGN.md SS4.9): one label per configured station, above the ticker.
+  lv_obj_t *bike_box;
+  std::vector<lv_obj_t *> bike_labels;
+  bool blink_phase = false;  // due-row blink (due_alert.h)
   std::vector<PanelWidgets> panels;
 };
-
-std::string panelTitle(const StopConfig &s) {
-  char buf[96];
-  if (s.mode == transit::Mode::Rail) {
-    snprintf(buf, sizeof(buf), "%s%s%s", s.station.c_str(), s.direction.empty() ? "" : " ", s.direction.empty() ? "" : ("(" + s.direction + ")").c_str());
-  } else {
-    // U+2022 bullet, not U+00B7 middle dot: LVGL's built-in Montserrat fonts cover ASCII, the
-    // degree sign, the bullet and the FontAwesome symbols only, and the middle dot rendered as a
-    // blank box on the owner's board.
-    snprintf(buf, sizeof(buf), "%s %s %s %s %s", s.route.c_str(), LV_SYMBOL_RIGHT, s.headsign.c_str(), "\xE2\x80\xA2", s.stop_name.c_str());
-  }
-  std::string title(buf);
-  // DESIGN.md SS4.6/SS8: subway has no realtime source in v1 (mergeStop() falls back to
-  // BusSchedules-only, Status::Scheduled for every row) - the panel says so up front rather than
-  // making the user infer it from every row showing "sched".
-  if (s.mode == transit::Mode::Subway) {
-    title += " \xE2\x80\xA2 schedule only";
-  }
-  return title;
-}
 
 const StopSnapshot *findStopSnapshot(const Snapshot &snap, const std::string &key) {
   for (const StopSnapshot &s : snap.stops) {
@@ -183,7 +174,9 @@ void restartTicker(MainScreenCtx *ctx) {
 lv_obj_t *createMainScreen(const Config &cfg) {
   int32_t w, h;
   screenSize(w, h);
-  int rows = rowsPerStop(h);
+  bool large = cfg.device.large_text;
+  int rows = rowsPerStop(h, large);
+  const lv_font_t *minutes_font = large ? fontHuge() : fontBig(h);
 
   lv_obj_t *screen = lv_obj_create(nullptr);
   lv_obj_set_size(screen, w, h);
@@ -248,16 +241,21 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   lv_obj_set_style_pad_row(panels_area, 4, 0);
   lv_obj_set_flex_flow(panels_area, LV_FLEX_FLOW_COLUMN);
 
-  for (const StopConfig &s : cfg.stops) {
+  for (const StopConfig &s : visibleStops(cfg, time(nullptr))) {
     PanelWidgets pw;
     pw.stop_key = s.key;
     pw.route = s.route;
+    pw.alt_of = s.alt_of;
+    pw.alt_after_min = s.alt_after_min;
 
     lv_obj_t *panel = makeBox(panels_area);
+    pw.panel = panel;
+    if (!s.alt_of.empty()) lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);  // until the primary runs late
     lv_obj_set_size(panel, lv_pct(100), lv_pct(100));
     lv_obj_set_flex_grow(panel, 1);
     lv_obj_set_style_bg_color(panel, colorPanelBg(), 0);
-    lv_obj_set_style_radius(panel, 6, 0);
+    // Square corners: LV_DRAW_SW_COMPLEX is 0 (lv_conf.h, flash budget) and LVGL then skips a
+    // rounded rectangle entirely rather than drawing it square.
     lv_obj_set_style_pad_all(panel, 6, 0);
     lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
 
@@ -290,13 +288,16 @@ lv_obj_t *createMainScreen(const Config &cfg) {
       lv_obj_set_style_bg_color(rw.route_badge, routeBadgeColor(), 0);
       lv_obj_set_style_bg_opa(rw.route_badge, LV_OPA_COVER, 0);
       lv_obj_set_style_pad_hor(rw.route_badge, 4, 0);
-      lv_obj_set_style_radius(rw.route_badge, 4, 0);
 
       rw.destination = makeLabel(row, fontBody(h), colorText());
       lv_obj_set_flex_grow(rw.destination, 1);
       lv_label_set_long_mode(rw.destination, LV_LABEL_LONG_DOT);
 
-      rw.minutes = makeLabel(row, fontBig(h), colorText());
+      rw.crowding = makeLabel(row, fontSmall(h), colorSubtext());
+      lv_label_set_text(rw.crowding, "");
+      lv_obj_add_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
+
+      rw.minutes = makeLabel(row, minutes_font, colorText());
       lv_obj_set_style_text_align(rw.minutes, LV_TEXT_ALIGN_RIGHT, 0);
 
       rw.status_badge = makeLabel(row, fontSmall(h), colorSubtext());
@@ -305,6 +306,23 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     }
 
     ctx->panels.push_back(pw);
+  }
+
+  // ---- Indego strip (only shown when bike_service has stations) ----
+  ctx->bike_box = makeBox(screen);
+  lv_obj_set_size(ctx->bike_box, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_color(ctx->bike_box, colorPanelBg(), 0);
+  lv_obj_set_style_pad_all(ctx->bike_box, 4, 0);
+  lv_obj_set_style_pad_row(ctx->bike_box, 0, 0);
+  lv_obj_set_flex_flow(ctx->bike_box, LV_FLEX_FLOW_COLUMN);
+  lv_obj_add_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
+  for (size_t i = 0; i < kMaxBikeStations; ++i) {
+    lv_obj_t *l = makeLabel(ctx->bike_box, fontSmall(h), colorText());
+    lv_obj_set_width(l, lv_pct(100));
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    lv_label_set_text(l, "");
+    lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+    ctx->bike_labels.push_back(l);
   }
 
   // ---- Alert ticker (only shown when refreshMainScreen finds alerts) ----
@@ -393,9 +411,32 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
     lv_obj_set_style_text_color(ctx->updated_label, sub, 0);
   }
 
+  ctx->blink_phase = !ctx->blink_phase;
   for (PanelWidgets &pw : ctx->panels) {
     const StopSnapshot *stop = findStopSnapshot(snap, pw.stop_key);
     bool have_data = stop != nullptr && stop->ok && !stop->arrivals.empty();
+
+    // DESIGN.md SS6 alt_of: an alternative panel appears only while its primary stop has nothing
+    // within alt_after_min (or no data), and disappears again when a bus is close.
+    if (!pw.alt_of.empty()) {
+      const StopSnapshot *primary = findStopSnapshot(snap, pw.alt_of);
+      bool primary_far = true;
+      if (primary != nullptr && primary->ok) {
+        for (const Arrival &a : primary->arrivals) {
+          transit::Epoch eff = a.effective();
+          if (eff > 0 && eff - (transit::Epoch)now < (transit::Epoch)pw.alt_after_min * 60) {
+            primary_far = false;
+            break;
+          }
+        }
+      }
+      if (primary_far) {
+        lv_obj_remove_flag(pw.panel, LV_OBJ_FLAG_HIDDEN);
+      } else {
+        lv_obj_add_flag(pw.panel, LV_OBJ_FLAG_HIDDEN);
+        continue;
+      }
+    }
     if (have_data) {
       lv_obj_add_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
     } else {
@@ -435,13 +476,47 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
       lv_label_set_text(rw.route_badge, pw.route.c_str());
       lv_label_set_text(rw.destination, a.destination.c_str());
 
+      std::string crowd = cfg.device.show_crowding ? crowdingText(a.seats) : std::string();
+      if (crowd.empty()) {
+        lv_obj_add_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
+      } else {
+        lv_label_set_text(rw.crowding, crowd.c_str());
+        lv_obj_remove_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
+      }
+
       transit::Epoch eff = a.effective();
       transit::Epoch eta_s = eff > 0 ? (eff - (transit::Epoch)now) : 0;
       lv_label_set_text(rw.minutes, etaLabel(eta_s, eff).c_str());
+      // DESIGN.md SS6 due.screen: the minutes blink while this bus is within due.minutes.
+      bool blink = cfg.due.screen && arrivalIsDue(cfg, a, (transit::Epoch)now) && ctx->blink_phase;
+      lv_obj_set_style_text_color(rw.minutes, blink ? colorLate() : colorText(), 0);
 
       Badge badge = badgeFor(a);
       lv_label_set_text(rw.status_badge, badge.text.c_str());
       lv_obj_set_style_text_color(rw.status_badge, badge.color, 0);
+    }
+  }
+
+  BikeView bikes = getBikes();
+  if (!bikes.enabled || bikes.stations.empty()) {
+    lv_obj_add_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_remove_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
+    for (size_t i = 0; i < ctx->bike_labels.size(); ++i) {
+      if (i >= bikes.stations.size()) {
+        lv_obj_add_flag(ctx->bike_labels[i], LV_OBJ_FLAG_HIDDEN);
+        continue;
+      }
+      const indego::Station &st = bikes.stations[i];
+      if (st.bikes < 0) {
+        lv_label_set_text_fmt(ctx->bike_labels[i], "Indego %s: no data", st.name.c_str());
+      } else if (!st.active) {
+        lv_label_set_text_fmt(ctx->bike_labels[i], "Indego %s: offline", st.name.c_str());
+      } else {
+        lv_label_set_text_fmt(ctx->bike_labels[i], "Indego %s: %d bikes (%d e), %d docks", st.name.c_str(), st.bikes,
+                              st.ebikes < 0 ? 0 : st.ebikes, st.docks);
+      }
+      lv_obj_remove_flag(ctx->bike_labels[i], LV_OBJ_FLAG_HIDDEN);
     }
   }
 
