@@ -126,6 +126,7 @@ const api = {
   proxySchedule: (stopId) => fetchJSON(`/api/proxy/schedule?stop_id=${encodeURIComponent(stopId)}`),
   railStations: () => fetchJSON('/api/rail/stations'),
   stats: (stop, days) => fetchJSON(`/api/stats?stop=${encodeURIComponent(stop)}&days=${encodeURIComponent(days)}`),
+  statsOverview: (days) => fetchJSON(`/api/stats/overview?days=${encodeURIComponent(days)}`),
   logIndex: () => fetchJSON('/api/log/index'),
   reboot: () => fetchJSON('/api/reboot', { method: 'POST' }),
   wifiReset: () => fetchJSON('/api/wifi/reset', { method: 'POST' }),
@@ -319,10 +320,14 @@ function renderBikeCard(box, bike, style) {
   clear(box);
   if (!bike || !bike.enabled || !bike.stations || !bike.stations.length) return;
   const ageLabel = bikeAgeLabel(bike.age_s);
-  const header = h('div', { class: 'row between' },
-    h('h2', { class: 'bike-title' }, bikeIcon('bike'), 'Indego'),
+  // Same container/title-bar classes as a stop panel (.card.stop-panel / .title) so this
+  // card reads as one more panel in the stack, not a visually distinct widget; "title row
+  // between" reuses the existing .row.between flex utility to right-align the stale note
+  // inside that same bar instead of stacking it below.
+  const titleBar = h('div', { class: 'title row between' },
+    h('span', { class: 'bike-title' }, bikeIcon('bike'), 'Indego'),
     ageLabel && h('span', { class: 'small bike-age-warn' }, ageLabel));
-  const card = h('div', { class: 'card' }, header);
+  const card = h('div', { class: 'card stop-panel' }, titleBar);
   for (const st of bike.stations) card.append(renderStationRow(st, style === 'words' ? 'words' : 'icons'));
   box.append(card);
 }
@@ -1222,9 +1227,41 @@ async function renderStats(root) {
   const controls = h('div', { class: 'card row' },
     h('label', { for: 'stats-stop', class: 'inline' }, 'Stop'), stopSelect,
     h('label', { for: 'stats-days', class: 'inline' }, 'Window'), daysSelect);
+  const overview = h('div', { class: 'stack' }, h('div', { class: 'card muted' }, 'Loading overview…'));
   const body = h('div', { class: 'stack' }, h('p', { class: 'muted' }, 'Loading statistics…'));
   const csvCard = h('div', { class: 'card' }, h('h3', {}, 'Download logs'), h('div', { id: 'csv-list' }, 'Loading…'));
-  root.append(controls, body, csvCard);
+  root.append(controls, overview, body, csvCard);
+
+  // Row click in the overview table selects that stop in the detail picker below.
+  function selectStop(key) {
+    statsSelection.stop = key;
+    stopSelect.value = key;
+    load();
+    drawOverview();
+  }
+
+  async function loadOverview() {
+    clear(overview);
+    overview.append(h('div', { class: 'card muted' }, 'Loading overview…'));
+    try {
+      const data = await api.statsOverview(statsSelection.days);
+      if (!statsActive) return;
+      lastOverview = data;
+      drawOverview();
+    } catch (e) {
+      if (!statsActive) return;
+      clear(overview);
+      overview.append(h('div', { class: 'banner danger' }, e.message));
+    }
+  }
+  let lastOverview = null;
+  function drawOverview() {
+    if (!lastOverview) return;
+    clear(overview);
+    overview.append(buildOverviewTable(lastOverview, cfg.stops, statsSelection.stop, selectStop));
+    const bikeCards = buildBikeOverviewCards(lastOverview.bikes);
+    if (bikeCards) overview.append(bikeCards);
+  }
 
   async function load() {
     clear(body);
@@ -1240,9 +1277,10 @@ async function renderStats(root) {
       body.append(h('div', { class: 'banner danger' }, e.message));
     }
   }
-  stopSelect.addEventListener('change', () => { statsSelection.stop = stopSelect.value; load(); });
-  daysSelect.addEventListener('change', () => { statsSelection.days = Number(daysSelect.value); load(); });
+  stopSelect.addEventListener('change', () => { statsSelection.stop = stopSelect.value; load(); drawOverview(); });
+  daysSelect.addEventListener('change', () => { statsSelection.days = Number(daysSelect.value); load(); loadOverview(); });
   load();
+  loadOverview();
 
   api.logIndex().then((files) => {
     if (!statsActive) return;
@@ -1290,6 +1328,22 @@ function buildStatsBody(data) {
 
   wrap.append(h('div', { class: 'card' }, h('h3', {}, 'Prediction accuracy by horizon'), chartWrap(buildPredictionChart(data.prediction || [])),
     h('p', { class: 'small muted' }, 'Bar = mean absolute error in seconds. Dot above/below = bias (red = predictions ran late, blue = predictions ran early).')));
+
+  const crowding = data.crowding || {};
+  wrap.append(h('div', { class: 'card' }, h('h3', {}, 'Crowding by hour'),
+    chartWrap(buildCrowdChart(fillCrowdSlots(crowding.by_hour, 24, 'h'), (s, i) => (i % 3 === 0 ? s.h : ''))),
+    crowdLegend()));
+  wrap.append(h('div', { class: 'card' }, h('h3', {}, 'Crowding by weekday'),
+    chartWrap(buildCrowdChart(fillCrowdSlots(crowding.by_weekday, 7, 'wd'), (s) => ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][s.wd])),
+    crowdLegend()));
+
+  wrap.append(h('div', { class: 'card' }, h('h3', {}, 'Expected wait by hour'), chartWrap(buildWaitChart(fillWaitHours(data.wait_by_hour))),
+    h('p', { class: 'small muted' }, 'Bar = mean gap between buses, in minutes. Tick = worst gap seen. If you arrive at random, the typical wait is about half the mean gap; the marker is the worst gap seen.')));
+
+  wrap.append(h('div', { class: 'card' }, h('h3', {}, 'Reliability by hour'), chartWrap(buildReliabilityChart(fillWaitHours(data.wait_by_hour))),
+    h('div', { class: 'chart-legend' },
+      h('span', {}, h('span', { class: 'swatch', style: 'background:var(--chip-bunched)' }), 'Ghosts (vanished before arriving)'),
+      h('span', {}, h('span', { class: 'swatch', style: 'background:var(--chip-gapped)' }), 'No-shows (scheduled, never came)'))));
 
   return wrap;
 }
@@ -1409,6 +1463,240 @@ function buildPredictionChart(pred) {
   return svg;
 }
 
+/* ---- All-stops overview table (GET /api/stats/overview) ---- */
+
+// Relative time from a Unix timestamp, e.g. "2 h ago" — distinct from fmtAgo() above,
+// which formats an already-elapsed duration rather than a point in time.
+function fmtRelativeTs(ts) {
+  if (ts == null) return '--';
+  const sec = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (sec < 60) return `${Math.round(sec)} s ago`;
+  if (sec < 3600) return `${Math.round(sec / 60)} m ago`;
+  if (sec < 86400) return `${Math.round(sec / 3600)} h ago`;
+  return `${Math.round(sec / 86400)} d ago`;
+}
+// Same ≥80/60-80/<60 thresholds as the on-time badge tones elsewhere in the UI.
+function pctTone(pct) {
+  if (pct >= 80) return 'good';
+  if (pct >= 60) return 'warn';
+  return 'bad';
+}
+function stopLabelFor(stopsCfg, key) {
+  const s = stopsCfg.find((st) => st.key === key);
+  return (s && s.label) || key;
+}
+
+function buildOverviewTable(data, stopsCfg, selectedStop, onSelect) {
+  const stops = (data && data.stops) || [];
+  if (!stops.length) {
+    return h('div', { class: 'card' }, h('h3', {}, 'All stops'), h('p', { class: 'muted small' }, 'No arrivals logged yet.'));
+  }
+  const rows = stops.map((s) => {
+    const pct = s.on_time_pct ?? 0;
+    const selectThis = () => onSelect(s.stop);
+    return h('tr', {
+      class: `overview-row${s.stop === selectedStop ? ' selected' : ''}`,
+      tabindex: '0', role: 'button', 'aria-label': `Show details for ${stopLabelFor(stopsCfg, s.stop)}`,
+      onclick: selectThis,
+      onkeydown: (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectThis(); } },
+    },
+      h('td', {}, stopLabelFor(stopsCfg, s.stop)),
+      h('td', { class: 'num' }, String(s.samples ?? 0)),
+      h('td', { class: 'num' }, h('span', { class: `pct-chip ${pctTone(pct)}` }, `${pct?.toFixed?.(1) ?? pct}%`)),
+      h('td', { class: 'num' }, `${s.mean_late_min ?? 0} min`),
+      h('td', { class: 'num' }, String(s.ghost ?? 0)),
+      h('td', { class: 'num' }, String(s.noshow ?? 0)),
+      h('td', {}, fmtRelativeTs(s.last_seen_ts)));
+  });
+  const table = h('table', { class: 'overview-table' },
+    h('thead', {}, h('tr', {},
+      h('th', {}, 'Stop'), h('th', { class: 'num' }, 'Samples'), h('th', { class: 'num' }, 'On time %'),
+      h('th', { class: 'num' }, 'Mean late'), h('th', { class: 'num' }, 'Ghosts'), h('th', { class: 'num' }, 'No-shows'),
+      h('th', {}, 'Last seen'))),
+    h('tbody', {}, ...rows));
+  return h('div', { class: 'card' }, h('h3', {}, 'All stops'), h('div', { class: 'table-wrap' }, table),
+    h('p', { class: 'small muted' }, 'Click a row to see that stop’s detail charts below.'));
+}
+
+/* ---- Crowding charts (data.crowding.by_hour / by_weekday, 0-5 levels) ---- */
+
+const CROWD_LEVEL_NAMES = ['empty', 'open', 'few seats', 'standing', 'packed', 'full'];
+function crowdLevelColor(mean) {
+  if (mean <= 1) return 'var(--chip-normal)';
+  if (mean <= 3) return 'var(--chip-gapped)';
+  return 'var(--chip-bunched)';
+}
+function crowdDistTitle(s) {
+  const dist = s.dist || [];
+  const parts = CROWD_LEVEL_NAMES.map((name, i) => `${name} ${dist[i] || 0}`);
+  return `n=${s.n} · mean level ${s.mean.toFixed(1)} · ${parts.join(', ')}`;
+}
+// Fills 24 (h) or 7 (wd) fixed-size bins from a sparse array, same idea as
+// fillHours/fillWeekdays above but for the {n, mean, dist[6]} crowding shape.
+function fillCrowdSlots(arr, count, keyName) {
+  const slots = Array.from({ length: count }, (_, i) => ({ [keyName]: i, n: 0, mean: 0, dist: [0, 0, 0, 0, 0, 0] }));
+  for (const e of arr || []) {
+    const idx = e[keyName] ?? e.h ?? e.wd;
+    if (idx >= 0 && idx < count) {
+      slots[idx] = { [keyName]: idx, n: e.n || 0, mean: e.mean || 0, dist: Array.isArray(e.dist) && e.dist.length === 6 ? e.dist : [0, 0, 0, 0, 0, 0] };
+    }
+  }
+  return slots;
+}
+function buildCrowdChart(slots, labelFor) {
+  const w = Math.max(320, slots.length * (slots.length > 12 ? 26 : 40));
+  const hgt = 130, padB = 20, padT = 8;
+  const chartH = hgt - padT - padB;
+  const maxV = 5; // fixed 0-5 crowding scale
+  const barW = w / slots.length;
+  const svg = hs('svg', { viewBox: `0 0 ${w} ${hgt}`, width: w, height: hgt, role: 'img', 'aria-label': 'Crowding chart' });
+  slots.forEach((s, i) => {
+    const x = i * barW + 1;
+    const bw = Math.max(2, barW - 2);
+    if (s.n > 0) {
+      const barH = (s.mean / maxV) * chartH;
+      const y = padT + chartH - barH;
+      const rect = hs('rect', { x, y, width: bw, height: Math.max(1, barH), fill: crowdLevelColor(s.mean) });
+      rect.append(hs('title', {}, crowdDistTitle(s)));
+      svg.append(rect);
+    }
+    const lbl = labelFor(s, i);
+    if (lbl !== '') svg.append(hs('text', { x: x + bw / 2, y: hgt - 4, 'font-size': 9, fill: 'var(--text-muted)', 'text-anchor': 'middle' }, String(lbl)));
+  });
+  return svg;
+}
+function crowdLegend() {
+  return h('div', { class: 'chart-legend' },
+    h('span', {}, h('span', { class: 'swatch', style: 'background:var(--chip-normal)' }), '≤1 empty/open'),
+    h('span', {}, h('span', { class: 'swatch', style: 'background:var(--chip-gapped)' }), '2–3 few seats/standing'),
+    h('span', {}, h('span', { class: 'swatch', style: 'background:var(--chip-bunched)' }), '≥4 packed/full'),
+    h('span', {}, 'Levels: 0 empty, 1 open, 2 few seats, 3 standing, 4 packed, 5 full. Hover a bar for the full breakdown.'));
+}
+
+/* ---- Expected wait / reliability charts (data.wait_by_hour) ---- */
+
+function fillWaitHours(arr) {
+  const slots = Array.from({ length: 24 }, (_, hh) => ({ h: hh, n: 0, mean_gap_s: 0, max_gap_s: 0, ghost: 0, noshow: 0 }));
+  for (const e of arr || []) {
+    if (e.h >= 0 && e.h < 24) slots[e.h] = { h: e.h, n: e.n || 0, mean_gap_s: e.mean_gap_s || 0, max_gap_s: e.max_gap_s || 0, ghost: e.ghost || 0, noshow: e.noshow || 0 };
+  }
+  return slots;
+}
+function buildWaitChart(slots) {
+  const w = Math.max(320, slots.length * 26);
+  const hgt = 150, padL = 26, padB = 20, padT = 10;
+  const chartH = hgt - padT - padB;
+  const maxV = Math.max(1, ...slots.map((s) => Math.max(s.mean_gap_s, s.max_gap_s) / 60));
+  const barW = (w - padL) / slots.length;
+  const svg = hs('svg', { viewBox: `0 0 ${w} ${hgt}`, width: w, height: hgt, role: 'img', 'aria-label': 'Expected wait by hour' });
+  const step = Math.ceil(maxV / 4) || 1;
+  for (let gv = 0; gv <= maxV; gv += step) {
+    const y = padT + chartH - (gv / maxV) * chartH;
+    svg.append(hs('line', { x1: padL, x2: w, y1: y, y2: y, stroke: 'var(--border)', 'stroke-width': 1 }));
+    svg.append(hs('text', { x: 1, y: y + 3, 'font-size': 9, fill: 'var(--text-muted)' }, String(gv)));
+  }
+  slots.forEach((s, i) => {
+    const x = padL + i * barW + 1;
+    const bw = Math.max(2, barW - 2);
+    if (s.n > 0) {
+      const meanMin = s.mean_gap_s / 60;
+      const maxMin = s.max_gap_s / 60;
+      const barH = (meanMin / maxV) * chartH;
+      const y = padT + chartH - barH;
+      svg.append(hs('rect', { x, y, width: bw, height: Math.max(1, barH), fill: 'var(--accent)' }));
+      const cx = x + bw / 2;
+      const yMax = padT + chartH - (maxMin / maxV) * chartH;
+      svg.append(hs('line', { x1: cx, x2: cx, y1: y, y2: yMax, stroke: 'var(--text)', 'stroke-width': 1.5 }));
+      svg.append(hs('line', { x1: cx - 3, x2: cx + 3, y1: yMax, y2: yMax, stroke: 'var(--text)', 'stroke-width': 1.5 }));
+    }
+    if (i % 3 === 0) svg.append(hs('text', { x: x + bw / 2, y: hgt - 4, 'font-size': 9, fill: 'var(--text-muted)', 'text-anchor': 'middle' }, String(s.h)));
+  });
+  return svg;
+}
+function buildReliabilityChart(slots) {
+  const w = Math.max(320, slots.length * 26);
+  const hgt = 140, padL = 22, padB = 20, padT = 8;
+  const chartH = hgt - padT - padB;
+  const maxV = Math.max(1, ...slots.map((s) => (s.ghost || 0) + (s.noshow || 0)));
+  const barW = (w - padL) / slots.length;
+  const svg = hs('svg', { viewBox: `0 0 ${w} ${hgt}`, width: w, height: hgt, role: 'img', 'aria-label': 'Reliability by hour' });
+  const step = Math.ceil(maxV / 4) || 1;
+  for (let gv = 0; gv <= maxV; gv += step) {
+    const y = padT + chartH - (gv / maxV) * chartH;
+    svg.append(hs('line', { x1: padL, x2: w, y1: y, y2: y, stroke: 'var(--border)', 'stroke-width': 1 }));
+    svg.append(hs('text', { x: 1, y: y + 3, 'font-size': 9, fill: 'var(--text-muted)' }, String(gv)));
+  }
+  slots.forEach((s, i) => {
+    const x = padL + i * barW + 1;
+    const bw = Math.max(2, barW - 2);
+    const total = (s.ghost || 0) + (s.noshow || 0);
+    if (total > 0) {
+      const ghostH = ((s.ghost || 0) / maxV) * chartH;
+      const yGhost = padT + chartH - ghostH;
+      svg.append(hs('rect', { x, y: yGhost, width: bw, height: Math.max(0, ghostH), fill: 'var(--chip-bunched)' }));
+      const noshowH = ((s.noshow || 0) / maxV) * chartH;
+      const yNoshow = yGhost - noshowH;
+      svg.append(hs('rect', { x, y: yNoshow, width: bw, height: Math.max(0, noshowH), fill: 'var(--chip-gapped)' }));
+    }
+    if (i % 3 === 0) svg.append(hs('text', { x: x + bw / 2, y: hgt - 4, 'font-size': 9, fill: 'var(--text-muted)', 'text-anchor': 'middle' }, String(s.h)));
+  });
+  return svg;
+}
+
+/* ---- Indego availability by hour (overview.bikes, from GET /api/stats/overview) ---- */
+
+function buildBikeHourChart(byHour) {
+  const slots = Array.from({ length: 24 }, (_, hh) => ({ h: hh, n: 0, bikes: 0, ebikes: 0, docks: 0 }));
+  for (const e of byHour || []) {
+    if (e.h >= 0 && e.h < 24) slots[e.h] = { h: e.h, n: e.n || 0, bikes: e.bikes || 0, ebikes: e.ebikes || 0, docks: e.docks || 0 };
+  }
+  const w = Math.max(320, 24 * 22), hgt = 130, padL = 24, padB = 18, padT = 8;
+  const chartH = hgt - padT - padB;
+  const maxV = Math.max(1, ...slots.map((s) => Math.max(s.bikes, s.docks)));
+  const barW = (w - padL) / 24;
+  const svg = hs('svg', { viewBox: `0 0 ${w} ${hgt}`, width: w, height: hgt, role: 'img', 'aria-label': 'Indego availability by hour' });
+  const step = Math.ceil(maxV / 4) || 1;
+  for (let gv = 0; gv <= maxV; gv += step) {
+    const y = padT + chartH - (gv / maxV) * chartH;
+    svg.append(hs('line', { x1: padL, x2: w, y1: y, y2: y, stroke: 'var(--border)', 'stroke-width': 1 }));
+    svg.append(hs('text', { x: 1, y: y + 3, 'font-size': 8, fill: 'var(--text-muted)' }, String(gv)));
+  }
+  const dockPts = [];
+  slots.forEach((s, i) => {
+    const x = padL + i * barW + 1;
+    const bw = Math.max(1, barW - 2);
+    if (s.n > 0) {
+      const classic = Math.max(0, s.bikes - s.ebikes);
+      const ebikeH = (s.ebikes / maxV) * chartH;
+      const classicH = (classic / maxV) * chartH;
+      const yEbike = padT + chartH - ebikeH;
+      svg.append(hs('rect', { x, y: yEbike, width: bw, height: Math.max(0, ebikeH), fill: 'var(--chip-gapped)' }));
+      const yClassic = yEbike - classicH;
+      svg.append(hs('rect', { x, y: yClassic, width: bw, height: Math.max(0, classicH), fill: 'var(--accent)' }));
+      const yDock = padT + chartH - (s.docks / maxV) * chartH;
+      dockPts.push([x + bw / 2, yDock]);
+    }
+    if (i % 3 === 0) svg.append(hs('text', { x: x + bw / 2, y: hgt - 4, 'font-size': 8, fill: 'var(--text-muted)', 'text-anchor': 'middle' }, String(s.h)));
+  });
+  if (dockPts.length > 1) svg.append(hs('polyline', { points: dockPts.map(([px, py]) => `${px},${py}`).join(' '), fill: 'none', stroke: 'var(--text)', 'stroke-width': 1.5 }));
+  for (const [px, py] of dockPts) svg.append(hs('circle', { cx: px, cy: py, r: 2, fill: 'var(--text)' }));
+  return svg;
+}
+
+function buildBikeOverviewCards(bikes) {
+  if (!bikes || !bikes.length) return null;
+  const wrap = h('div', { class: 'stack' });
+  for (const st of bikes) {
+    wrap.append(h('div', { class: 'card' }, h('h3', {}, `Indego availability by hour — ${st.name || st.station}`),
+      chartWrap(buildBikeHourChart(st.by_hour || [])),
+      h('div', { class: 'chart-legend' },
+        h('span', {}, h('span', { class: 'swatch', style: 'background:var(--accent)' }), 'Classic bikes (mean)'),
+        h('span', {}, h('span', { class: 'swatch', style: 'background:var(--chip-gapped)' }), 'E-bikes (mean)'),
+        h('span', {}, h('span', { class: 'swatch', style: 'background:var(--text)' }), 'Docks (mean)'))));
+  }
+  return wrap;
+}
+
 /* ======================== Settings view ======================== */
 
 let settingsActive = false;
@@ -1470,10 +1758,6 @@ async function renderSettings(root) {
     tickerLinesSelect.disabled = off;
     tickerSpeedInput.disabled = off;
   });
-  const httpsInput = h('input', { type: 'checkbox', id: 'set-https' });
-  httpsInput.checked = !!d.use_https;
-  const tlsInput = h('input', { type: 'checkbox', id: 'set-tls' });
-  tlsInput.checked = d.tls_verify;
   const loggingInput = h('input', { type: 'checkbox', id: 'set-logging' });
   loggingInput.checked = d.logging;
   const alertsInput = h('input', { type: 'checkbox', id: 'set-alerts' });
@@ -1495,10 +1779,6 @@ async function renderSettings(root) {
   const wxUnits = h('select', { id: 'set-wx-units' },
     h('option', { value: 'f', selected: (wx.units || 'f') === 'f' || undefined }, '°F'),
     h('option', { value: 'c', selected: wx.units === 'c' || undefined }, '°C'));
-
-  const tlsWarn = h('div', { class: `banner warn${tlsInput.checked ? ' hidden' : ''}` },
-    'Disabling certificate verification lets a device on the network impersonate SEPTA and send fake arrival times. Only turn this off for troubleshooting.');
-  tlsInput.addEventListener('change', () => tlsWarn.classList.toggle('hidden', tlsInput.checked));
 
   // ---- Display extras ----
   const largeTextInput = h('input', { type: 'checkbox', id: 'set-large-text' });
@@ -1669,14 +1949,15 @@ async function renderSettings(root) {
     h('label', { class: 'inline' }, wxPerStop, ' Note the forecast at each stop\u2019s next arrival when it differs (rain, snow, fog)'),
     h('label', { for: 'set-wx-units' }, 'Units'), wxUnits,
     h('p', { class: 'small muted' }, 'Forecasts come from Open-Meteo.com (free, no account) for each stop\u2019s coordinates; stops within about a mile share one forecast. Stops added before this version may need coordinates - see the Stops page.'),
-    h('label', { class: 'inline', style: 'margin-top:1rem' }, httpsInput, ' Fetch SEPTA data over HTTPS'),
-    h('p', { class: 'small muted' }, 'Off by default: a TLS session needs about 40 KB of RAM the classic ESP32 does not have to spare. SEPTA serves the same data over plain HTTP.'),
-    h('label', { class: 'inline' }, tlsInput, ' Verify SEPTA’s TLS certificate (when HTTPS is on)'), tlsWarn,
-    h('label', { class: 'inline' }, loggingInput, ' Log arrivals to SD card'),
+    h('label', { class: 'inline', style: 'margin-top:1rem' }, loggingInput, ' Log arrivals to SD card'),
     h('label', { class: 'inline' }, alertsInput, ' Show service alerts'),
     h('div', { style: 'margin-top:1rem' }, h('button', { class: 'primary', onclick: async () => {
       const tz = tzSelect.value === '__custom__' ? tzCustom.value.trim() : tzSelect.value;
-      const { show_crowding: _legacyShowCrowding, ...dRest } = d;
+      // Drop legacy fields the current UI never sets: show_crowding (folded into
+      // crowding on load) and use_https/tls_verify (HTTPS mode removed from firmware —
+      // strip them here too so an old config fetched from the device doesn't cause them
+      // to be echoed back on save).
+      const { show_crowding: _legacyShowCrowding, use_https: _legacyUseHttps, tls_verify: _legacyTlsVerify, ...dRest } = d;
       const next = {
         ...cfg,
         device: {
@@ -1685,7 +1966,7 @@ async function renderSettings(root) {
           theme: themeSelect.value, invert_colors: invertInput.checked,
           ticker_lines: Number(tickerLinesSelect.value), ticker_speed: Number(tickerSpeedInput.value),
           ticker_show: tickerShowSelect.value,
-          use_https: httpsInput.checked, tls_verify: tlsInput.checked, logging: loggingInput.checked,
+          logging: loggingInput.checked,
           header: Object.fromEntries(Object.entries(headerInputs).map(([k, cb]) => [k, cb.checked])),
           large_text: largeTextInput.checked,
           crowding: crowdingSelect.value,

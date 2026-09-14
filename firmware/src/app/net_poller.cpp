@@ -10,6 +10,7 @@
 #include <freertos/task.h>
 
 #include <algorithm>
+#include <cmath>
 #include <ctime>
 #include <memory>
 #include <utility>
@@ -23,6 +24,7 @@
 #include "transit_core/septa_source.h"
 #include "transit_core/timeparse.h"
 #include "transit_stats/aggregate.h"
+#include "transit_stats/events.h"
 #include "transit_stats/log_window.h"
 #include "transit_stats/tracker.h"
 #include "weather_service.h"
@@ -189,7 +191,6 @@ AlertCacheEntry &findOrCreateAlertsEntry(const std::string &url) {
 
 // transit_core's HttpGet glue: http_fetch.cpp owns retry/backoff/TLS (DESIGN.md SS5), this just
 // adapts its `const char*` signature to transit::HttpGet's `std::string` one and threads
-// config.device.tls_verify through.
 // True for SEPTA's {"error": ...} bodies (transit_core/NOTES.md): BusSchedules answers a valid
 // stop_id with HTTP 400 + that body a few times in ten, then succeeds on retry.
 bool isSeptaErrorBody(const std::vector<uint8_t> &b) {
@@ -231,8 +232,8 @@ std::string stopIdFromUrl(const std::string &url) {
   return p == std::string::npos ? url : url.substr(p + 8);
 }
 
-transit::HttpGet makeHttpGet(bool tls_verify) {
-  return [tls_verify](const std::string &url, std::function<bool(const uint8_t *, size_t)> onData) -> int {
+transit::HttpGet makeHttpGet() {
+  return [](const std::string &url, std::function<bool(const uint8_t *, size_t)> onData) -> int {
     // BusSchedules is tiny (~1 KB) and flaky, so buffer it and retry on the error shape before
     // handing the consumer a single clean delivery; everything else streams straight through.
     if (url.find("BusSchedules") != std::string::npos) {
@@ -249,7 +250,7 @@ transit::HttpGet makeHttpGet(bool tls_verify) {
               body.insert(body.end(), d, d + n);
               return true;
             },
-            kFetchTimeoutMs, tls_verify, &reply);
+            kFetchTimeoutMs, &reply);
         if (overflow || (!body.empty() && !isSeptaErrorBody(body))) {
           // Judge the service day here as well as in transit_core (fetchPlausibleSchedule): only
           // this layer sees which backend answered, and only a fresh connection without the
@@ -278,7 +279,7 @@ transit::HttpGet makeHttpGet(bool tls_verify) {
       }
       return status;
     }
-    return transit_app::get(url.c_str(), std::move(onData), kFetchTimeoutMs, tls_verify);
+    return transit_app::get(url.c_str(), std::move(onData), kFetchTimeoutMs);
   };
 }
 
@@ -386,6 +387,58 @@ std::string currentLocalMonth() {
   return std::string(buf);
 }
 
+// DESIGN.md SS9.1 v2 columns the tracker cannot know: the weather at the event (arrive/ghost/
+// noshow rows, from the main forecast hour nearest ev.ts) and whether an alert (1) or a detour (2)
+// applied to the route at that moment (every stop event).
+void annotateEvents(std::vector<transit_stats::LogEvent> &events, const std::vector<transit::Alert> &alerts) {
+  WeatherView wx = getWeather();
+  for (auto &ev : events) {
+    using transit_stats::EventType;
+    if (ev.event == EventType::Bike || ev.event == EventType::Outage) continue;
+    uint8_t flag = 0;
+    for (const transit::Alert &al : alerts) {
+      if (!al.current || al.route != ev.route) continue;
+      flag = std::max<uint8_t>(flag, al.detours.empty() ? 1 : 2);
+    }
+    ev.alert = flag;
+    if (ev.event == EventType::Pred || !wx.enabled || !wx.main.valid()) continue;
+    const weather::Hour *h = wx.main.at(ev.ts);
+    if (h != nullptr && h->code >= 0) {
+      ev.temp = (int32_t)lround(h->temp);
+      ev.wx = h->code;
+    } else {
+      ev.temp = (int32_t)lround(wx.main.temp);
+      ev.wx = wx.main.code;
+    }
+  }
+}
+
+// DESIGN.md SS9.1 `bike` rows: one per configured Indego station per local clock hour, taken from
+// the last successful refresh (bike_service.cpp polls every 5 min, so the sample is that fresh).
+int g_bike_logged_hour = -1;  // tm_yday * 24 + tm_hour of the last rows written
+void logBikeSamples(const Config &cfg, time_t now, const std::string &month) {
+  if (!cfg.bike.enabled) return;
+  BikeView bikes = getBikes();
+  if (bikes.fetched_epoch == 0 || bikes.stations.empty()) return;
+  struct tm lt;
+  localtime_r(&now, &lt);
+  int hour_id = lt.tm_yday * 24 + lt.tm_hour;
+  if (hour_id == g_bike_logged_hour) return;
+  for (const indego::Station &st : bikes.stations) {
+    if (st.bikes < 0) continue;  // missing from the feed: nothing to sample
+    transit_stats::LogEvent ev;
+    ev.ts = (transit::Epoch)now;
+    ev.event = transit_stats::EventType::Bike;
+    ev.stop_key = "indego-" + std::to_string(st.id);
+    ev.note = st.name;
+    ev.bikes = st.bikes;
+    ev.ebikes = st.ebikes < 0 ? 0 : st.ebikes;
+    ev.docks = st.docks;
+    appendLine(month.c_str(), transit_stats::toCsv(ev).c_str());
+  }
+  g_bike_logged_hour = hour_id;
+}
+
 // One long-lived ArrivalTracker across the device's uptime (DESIGN.md SS9.1); registerStop() is
 // idempotent so it's safe to re-run on every config change. Heap-allocated on first use rather
 // than a plain global/static instance: ArrivalTracker's own header doc puts sizeof(ArrivalTracker)
@@ -434,7 +487,7 @@ void logHeapHeartbeat() {
 
 void pollOnce() {
   Config cfg = getActiveConfig();
-  transit::HttpGet http = makeHttpGet(cfg.device.tls_verify);
+  transit::HttpGet http = makeHttpGet();
   transit::Epoch now = (transit::Epoch)time(nullptr);
 
   if (g_invalidate_sched_cache) {
@@ -486,12 +539,16 @@ void pollOnce() {
       bool route_live = sc && routeIsLive(live_by_route, sc->route);
       if (tracker() != nullptr && now >= kSaneClockEpoch) tracker()->observe(stop, now, route_live, combined.last_poll_ok, events);
     }
-    if (!events.empty()) {
+    if (now >= kSaneClockEpoch) {
       std::string month = currentLocalMonth();
-      for (const auto &ev : events) {
-        std::string line = transit_stats::toCsv(ev);
-        appendLine(month.c_str(), line.c_str());
+      if (!events.empty()) {
+        annotateEvents(events, combined.alerts);
+        for (const auto &ev : events) {
+          std::string line = transit_stats::toCsv(ev);
+          appendLine(month.c_str(), line.c_str());
+        }
       }
+      logBikeSamples(cfg, (time_t)now, month);
     }
   }
 

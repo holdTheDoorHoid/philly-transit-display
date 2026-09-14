@@ -24,7 +24,8 @@ enum class TrackedKind : uint8_t { LiveTrip, ScheduledPending };
 // One tracked trip (live or scheduled-only) for one configured stop.
 // sizeof(TrackedTrip) is roughly 90-110 bytes (two std::string members, mostly short SEPTA ids
 // that fit in small-string-optimization and so cost no heap; a handful of int64/int32/bool
-// fields). With kMaxTrackedTripsPerStop = 16 that is under ~2 KB per stop.
+// fields, plus one int8_t for last_seats_level below). With kMaxTrackedTripsPerStop = 16 that is
+// under ~2 KB per stop.
 struct TrackedTrip {
   bool in_use = false;
   TrackedKind kind = TrackedKind::LiveTrip;
@@ -44,6 +45,10 @@ struct TrackedTrip {
   // since this trip started being tracked (see noshow-vs-outage rule below).
   bool route_had_live_through_window = true;
   uint32_t seq = 0;  // per-stop touch counter, used to evict the least-recently-touched trip
+  // Last seen seatsLevel() (0=empty..5=full, -1 unknown), LiveTrip only. Kept so the `arrive` row
+  // emitted after the trip vanishes (transit::Arrival is gone by then) can still carry a crowding
+  // token, converted back to its string form at emit time (see tracker.cpp).
+  int8_t last_seats_level = -1;
 };
 
 // Per-stop counters exposed for the on-device stats summary (DESIGN §8 "Stats page").

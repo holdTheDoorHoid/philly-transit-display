@@ -15,12 +15,14 @@
 #include "transit_stats/aggregate.h"
 #include "transit_stats/events.h"
 #include "transit_stats/log_window.h"
+#include "transit_stats/overview.h"
 #include "transit_stats/summary.h"
 #include "transit_stats/tracker.h"
 
 using transit_stats::ArrivalTracker;
 using transit_stats::EventType;
 using transit_stats::LogEvent;
+using transit_stats::OverviewAggregator;
 using transit_stats::StatsAggregator;
 using transit_stats::StopCounters;
 using transit_stats::StopSummary;
@@ -94,8 +96,8 @@ static void test_csv_round_trip_empty_optionals_are_empty_not_zero(void) {
 
   const std::string csv = transit_stats::toCsv(ev);
   // Column order: ts,event,stop_key,route,dir,trip,vehicle,scheduled_ts,predicted_ts,actual_ts,
-  //               late_min,horizon_s,headway_s,note
-  TEST_ASSERT_EQUAL_STRING("42,ghost,S,17,0,T1,,,,,,,,", csv.c_str());
+  //               late_min,horizon_s,headway_s,note,seats,temp,wx,alert,bikes,ebikes,docks
+  TEST_ASSERT_EQUAL_STRING("42,ghost,S,17,0,T1,,,,,,,,,,,,,,,", csv.c_str());
 
   LogEvent parsed;
   TEST_ASSERT_TRUE(transit_stats::fromCsv(csv.c_str(), csv.size(), parsed));
@@ -111,6 +113,128 @@ static void test_csv_header_line_is_rejected(void) {
   const char* header = transit_stats::csvHeader();
   LogEvent ev;
   TEST_ASSERT_FALSE(transit_stats::fromCsv(header, std::string(header).size(), ev));
+}
+
+// Log schema v2 (DESIGN.md §9.1): a full 21-column row, including every new column, round-trips.
+static void test_csv_round_trip_v2_full(void) {
+  LogEvent ev;
+  ev.ts = 1757900000;
+  ev.event = EventType::Arrive;
+  ev.stop_key = "17-21332";
+  ev.route = "17";
+  ev.dir = "0";
+  ev.trip = "3667";
+  ev.vehicle = "7477";
+  ev.actual_ts = 1757900010;
+  ev.late_min = 4;
+  ev.note = "";
+  ev.seats = "standing";
+  ev.temp = 71;
+  ev.wx = 3;
+  ev.alert = 2;
+  ev.bikes = 5;
+  ev.ebikes = 2;
+  ev.docks = 7;
+
+  const std::string csv = transit_stats::toCsv(ev);
+  LogEvent parsed;
+  TEST_ASSERT_TRUE(transit_stats::fromCsv(csv.c_str(), csv.size(), parsed));
+
+  TEST_ASSERT_EQUAL_STRING("standing", parsed.seats.c_str());
+  TEST_ASSERT_TRUE(parsed.temp.has_value());
+  TEST_ASSERT_EQUAL_INT32(71, *parsed.temp);
+  TEST_ASSERT_TRUE(parsed.wx.has_value());
+  TEST_ASSERT_EQUAL_INT32(3, *parsed.wx);
+  TEST_ASSERT_TRUE(parsed.alert.has_value());
+  TEST_ASSERT_EQUAL_UINT8(2, *parsed.alert);
+  TEST_ASSERT_TRUE(parsed.bikes.has_value());
+  TEST_ASSERT_EQUAL_INT32(5, *parsed.bikes);
+  TEST_ASSERT_TRUE(parsed.ebikes.has_value());
+  TEST_ASSERT_EQUAL_INT32(2, *parsed.ebikes);
+  TEST_ASSERT_TRUE(parsed.docks.has_value());
+  TEST_ASSERT_EQUAL_INT32(7, *parsed.docks);
+}
+
+// A `bike` row (EventType::Bike, log schema v2) round-trips: stop_key "indego-<id>", route/dir/
+// trip/vehicle empty, note = display name, bikes/ebikes/docks set.
+static void test_csv_round_trip_bike_event(void) {
+  LogEvent ev;
+  ev.ts = 1757900000;
+  ev.event = EventType::Bike;
+  ev.stop_key = "indego-3468";
+  ev.note = "Snyder & Dorrance";
+  ev.bikes = 4;
+  ev.ebikes = 2;
+  ev.docks = 9;
+
+  const std::string csv = transit_stats::toCsv(ev);
+  TEST_ASSERT_TRUE(csv.find(",bike,") != std::string::npos);
+
+  LogEvent parsed;
+  TEST_ASSERT_TRUE(transit_stats::fromCsv(csv.c_str(), csv.size(), parsed));
+  TEST_ASSERT_TRUE(parsed.event == EventType::Bike);
+  TEST_ASSERT_EQUAL_STRING("indego-3468", parsed.stop_key.c_str());
+  TEST_ASSERT_EQUAL_STRING("", parsed.route.c_str());
+  TEST_ASSERT_EQUAL_STRING("Snyder & Dorrance", parsed.note.c_str());
+  TEST_ASSERT_TRUE(parsed.bikes.has_value());
+  TEST_ASSERT_EQUAL_INT32(4, *parsed.bikes);
+  TEST_ASSERT_TRUE(parsed.ebikes.has_value());
+  TEST_ASSERT_EQUAL_INT32(2, *parsed.ebikes);
+  TEST_ASSERT_TRUE(parsed.docks.has_value());
+  TEST_ASSERT_EQUAL_INT32(9, *parsed.docks);
+}
+
+// A pre-2026-09-14 14-column row (log schema v1, no trailing "seats,temp,wx,alert,bikes,ebikes,
+// docks") still parses: the new fields all come back empty/unset, not an error.
+static void test_csv_round_trip_v1_14_columns_still_parses(void) {
+  const char* v1_line = "1757800000,arrive,17-21332,17,0,3667,7477,,1757800010,1757800012,3,,900,";
+  LogEvent ev;
+  TEST_ASSERT_TRUE(transit_stats::fromCsv(v1_line, std::string(v1_line).size(), ev));
+  TEST_ASSERT_TRUE(ev.event == EventType::Arrive);
+  TEST_ASSERT_EQUAL_STRING("17-21332", ev.stop_key.c_str());
+  TEST_ASSERT_TRUE(ev.late_min.has_value());
+  TEST_ASSERT_EQUAL_INT32(3, *ev.late_min);
+  TEST_ASSERT_EQUAL_STRING("", ev.seats.c_str());
+  TEST_ASSERT_FALSE(ev.temp.has_value());
+  TEST_ASSERT_FALSE(ev.wx.has_value());
+  TEST_ASSERT_FALSE(ev.alert.has_value());
+  TEST_ASSERT_FALSE(ev.bikes.has_value());
+  TEST_ASSERT_FALSE(ev.ebikes.has_value());
+  TEST_ASSERT_FALSE(ev.docks.has_value());
+}
+
+// A line with a column count that is neither 14 (v1) nor 21 (v2) is rejected, not silently
+// truncated/padded.
+static void test_csv_wrong_column_count_is_rejected(void) {
+  const char* bad = "1,arrive,S,17,0,T1,,,,,,,,,,,,,,";  // 20 fields, one short of v2
+  LogEvent ev;
+  TEST_ASSERT_FALSE(transit_stats::fromCsv(bad, std::string(bad).size(), ev));
+}
+
+// =============================================================================================
+// events.h/.cpp: seatsToken / seatsLevel (log schema v2 crowding column).
+// =============================================================================================
+
+static void test_seats_token_mapping(void) {
+  TEST_ASSERT_EQUAL_STRING("empty", transit_stats::seatsToken("EMPTY"));
+  TEST_ASSERT_EQUAL_STRING("open", transit_stats::seatsToken("MANY_SEATS_AVAILABLE"));
+  TEST_ASSERT_EQUAL_STRING("few", transit_stats::seatsToken("FEW_SEATS_AVAILABLE"));
+  TEST_ASSERT_EQUAL_STRING("standing", transit_stats::seatsToken("STANDING_ROOM_ONLY"));
+  TEST_ASSERT_EQUAL_STRING("packed", transit_stats::seatsToken("CRUSHED_STANDING_ROOM_ONLY"));
+  TEST_ASSERT_EQUAL_STRING("full", transit_stats::seatsToken("FULL"));
+  TEST_ASSERT_EQUAL_STRING("", transit_stats::seatsToken(""));
+  TEST_ASSERT_EQUAL_STRING("", transit_stats::seatsToken("SOMETHING_UNKNOWN"));
+}
+
+static void test_seats_level_mapping(void) {
+  TEST_ASSERT_EQUAL_INT(0, transit_stats::seatsLevel("empty"));
+  TEST_ASSERT_EQUAL_INT(1, transit_stats::seatsLevel("open"));
+  TEST_ASSERT_EQUAL_INT(2, transit_stats::seatsLevel("few"));
+  TEST_ASSERT_EQUAL_INT(3, transit_stats::seatsLevel("standing"));
+  TEST_ASSERT_EQUAL_INT(4, transit_stats::seatsLevel("packed"));
+  TEST_ASSERT_EQUAL_INT(5, transit_stats::seatsLevel("full"));
+  TEST_ASSERT_EQUAL_INT(-1, transit_stats::seatsLevel(""));
+  TEST_ASSERT_EQUAL_INT(-1, transit_stats::seatsLevel("nonsense"));
 }
 
 // =============================================================================================
@@ -413,6 +537,66 @@ static void test_tracker_memory_bound_eviction(void) {
     TEST_ASSERT_FALSE(tracker.getStopCounters("K1", ctr));  // least-recently-touched, evicted
     TEST_ASSERT_TRUE(tracker.getStopCounters("K9", ctr));   // most recent, retained
   }
+}
+
+// (f) Log schema v2: `pred` rows carry the crowding token current at that sighting, and the
+// `arrive` row (emitted after the trip has vanished, so there is no live Arrival left to read)
+// carries the *last seen* crowding token.
+static void test_tracker_seats_on_pred_and_arrive(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("S5", "17", "0");
+  std::vector<LogEvent> out;
+
+  const transit::Epoch t0 = 8000000000;
+  const transit::Epoch predicted = t0 + 1200;
+
+  {  // First sighting: horizon 1200s, seats "FEW_SEATS_AVAILABLE" -> "few".
+    transit::StopSnapshot snap;
+    snap.key = "S5";
+    transit::Arrival a;
+    a.trip = "SEAT1";
+    a.vehicle = "V1";
+    a.predicted = predicted;
+    a.scheduled = predicted - 60;
+    a.status = transit::Status::Live;
+    a.seats = "FEW_SEATS_AVAILABLE";
+    snap.arrivals.push_back(a);
+    tracker.observe(snap, t0, true, true, out);
+  }
+  {  // Horizon drops to 800s (crosses the 900s milestone) -> second pred row; seats now "standing".
+    transit::StopSnapshot snap;
+    snap.key = "S5";
+    transit::Arrival a;
+    a.trip = "SEAT1";
+    a.vehicle = "V1";
+    a.predicted = predicted;
+    a.scheduled = predicted - 60;
+    a.status = transit::Status::Live;
+    a.seats = "STANDING_ROOM_ONLY";
+    snap.arrivals.push_back(a);
+    tracker.observe(snap, t0 + 400, true, true, out);
+  }
+  {  // Vanishes right at its predicted time -> arrive, carrying the last-seen seats level.
+    transit::StopSnapshot snap;
+    snap.key = "S5";
+    tracker.observe(snap, predicted + 10, true, true, out);
+  }
+
+  std::vector<LogEvent> preds;
+  LogEvent arrive_ev;
+  bool found_arrive = false;
+  for (const auto& ev : out) {
+    if (ev.trip != "SEAT1") continue;
+    if (ev.event == EventType::Pred) preds.push_back(ev);
+    if (ev.event == EventType::Arrive) { arrive_ev = ev; found_arrive = true; }
+  }
+
+  TEST_ASSERT_TRUE(preds.size() >= 2);
+  TEST_ASSERT_EQUAL_STRING("few", preds[0].seats.c_str());
+  TEST_ASSERT_EQUAL_STRING("standing", preds[1].seats.c_str());
+
+  TEST_ASSERT_TRUE(found_arrive);
+  TEST_ASSERT_EQUAL_STRING("standing", arrive_ev.seats.c_str());
 }
 
 // =============================================================================================
@@ -761,14 +945,253 @@ static void test_summary_from_aggregator(void) {
 }
 
 // =============================================================================================
+// aggregate.h/.cpp: crowding and wait_by_hour (log schema v2), on a small synthetic log with a
+// trivial, deterministic (not America/New_York) hour/weekday function -- the point of this test
+// is the bucketing arithmetic, not timezone math (already covered by test_america_new_york_local_time).
+// =============================================================================================
+
+static void trivialHourWeekday(transit::Epoch utc, int& hour, int& weekday) {
+  hour = static_cast<int>((utc / 3600) % 24);
+  weekday = static_cast<int>((utc / 86400) % 7);
+}
+
+static void test_aggregator_crowding_and_wait_by_hour(void) {
+  const char* kStop2 = "CWSTOP";
+  StatsAggregator agg(kStop2, 0, 100000, &trivialHourWeekday);
+
+  auto feed = [&](const LogEvent& ev) {
+    const std::string line = transit_stats::toCsv(ev);
+    agg.feedLine(line.c_str(), line.size());
+  };
+  auto arrive = [&](transit::Epoch ts, const std::string& trip, const char* seats,
+                     std::optional<int32_t> headway_s) {
+    LogEvent ev;
+    ev.ts = ts;
+    ev.event = EventType::Arrive;
+    ev.stop_key = kStop2;
+    ev.trip = trip;
+    ev.actual_ts = ts;
+    ev.seats = seats;
+    ev.headway_s = headway_s;
+    feed(ev);
+  };
+
+  // Hour 8 (ts 28800/28801/28802): two known-seats arrivals (few=2, standing=3) and one
+  // unknown-seats arrival; two positive headways (300, 500) and one zero headway that must NOT
+  // count toward wait_by_hour's n/mean/max (DESIGN: "known headway_s (>0)").
+  arrive(28800, "C1", "few", 300);
+  arrive(28801, "C2", "standing", 500);
+  arrive(28802, "C3", "", 0);
+
+  // Hour 9 (ts 32400): one known-seats arrival (full=5), no headway.
+  arrive(32400, "C4", "full", std::nullopt);
+
+  LogEvent g;
+  g.ts = 28803;  // hour 8
+  g.event = EventType::Ghost;
+  g.stop_key = kStop2;
+  g.trip = "G1";
+  feed(g);
+
+  LogEvent n;
+  n.ts = 32401;  // hour 9
+  n.event = EventType::NoShow;
+  n.stop_key = kStop2;
+  n.trip = "N1";
+  feed(n);
+
+  ArduinoJson::JsonDocument doc;
+  agg.toJson(doc);
+
+  ArduinoJson::JsonArray crowd_hour = doc["crowding"]["by_hour"];
+  TEST_ASSERT_EQUAL_INT(24, static_cast<int>(crowd_hour.size()));
+  TEST_ASSERT_EQUAL_UINT16(2, crowd_hour[8]["n"].as<uint16_t>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 2.5f, crowd_hour[8]["mean"].as<float>());
+  ArduinoJson::JsonArray dist8 = crowd_hour[8]["dist"];
+  TEST_ASSERT_EQUAL_INT(6, static_cast<int>(dist8.size()));
+  TEST_ASSERT_EQUAL_UINT16(1, dist8[2].as<uint16_t>());  // few
+  TEST_ASSERT_EQUAL_UINT16(1, dist8[3].as<uint16_t>());  // standing
+  TEST_ASSERT_EQUAL_UINT16(1, crowd_hour[9]["n"].as<uint16_t>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 5.0f, crowd_hour[9]["mean"].as<float>());
+  TEST_ASSERT_EQUAL_UINT16(0, crowd_hour[10]["n"].as<uint16_t>());
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, crowd_hour[10]["mean"].as<float>());  // always present, even n==0
+
+  ArduinoJson::JsonArray crowd_wd = doc["crowding"]["by_weekday"];
+  TEST_ASSERT_EQUAL_INT(7, static_cast<int>(crowd_wd.size()));
+  // Every ts above is < 86400, so trivialHourWeekday puts them all on weekday 0.
+  TEST_ASSERT_EQUAL_UINT16(3, crowd_wd[0]["n"].as<uint16_t>());  // C1, C2, C4 (C3's seats unknown)
+
+  ArduinoJson::JsonArray wait_hour = doc["wait_by_hour"];
+  TEST_ASSERT_EQUAL_INT(24, static_cast<int>(wait_hour.size()));
+  TEST_ASSERT_EQUAL_UINT16(2, wait_hour[8]["n"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_INT32(400, wait_hour[8]["mean_gap_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_INT32(500, wait_hour[8]["max_gap_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_UINT16(1, wait_hour[8]["ghost"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_UINT16(0, wait_hour[8]["noshow"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_UINT16(0, wait_hour[9]["n"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_UINT16(1, wait_hour[9]["noshow"].as<uint16_t>());
+}
+
+// =============================================================================================
+// overview.h/.cpp: OverviewAggregator on a synthetic log with two stops and one Indego station.
+// =============================================================================================
+
+static void test_overview_aggregator_stops_and_bikes(void) {
+  OverviewAggregator agg(0, 200000, &trivialHourWeekday);
+
+  auto feed = [&](const LogEvent& ev) {
+    const std::string line = transit_stats::toCsv(ev);
+    agg.feedLine(line.c_str(), line.size());
+  };
+  auto arrive = [&](const char* stop, transit::Epoch ts, const std::string& trip, int32_t late_min) {
+    LogEvent ev;
+    ev.ts = ts;
+    ev.event = EventType::Arrive;
+    ev.stop_key = stop;
+    ev.trip = trip;
+    ev.actual_ts = ts;
+    ev.late_min = late_min;
+    feed(ev);
+  };
+
+  const char* kOA1 = "17-21332";
+  const char* kOA2 = "17-21297";
+
+  // OA1: 4 arrivals, late -1/2/6/3 -> 2 on-time (2, 3; SEPTA on-time is [0,5]), mean 2.5.
+  arrive(kOA1, 1000, "A1", -1);
+  arrive(kOA1, 2000, "A2", 2);
+  arrive(kOA1, 3000, "A3", 6);
+  arrive(kOA1, 4000, "A4", 3);
+
+  LogEvent oa1_ghost;
+  oa1_ghost.ts = 4500;
+  oa1_ghost.event = EventType::Ghost;
+  oa1_ghost.stop_key = kOA1;
+  oa1_ghost.trip = "GA1";
+  feed(oa1_ghost);
+
+  LogEvent oa1_noshow;
+  oa1_noshow.ts = 5000;  // OA1's last_seen_ts: max ts of ANY row for that stop
+  oa1_noshow.event = EventType::NoShow;
+  oa1_noshow.stop_key = kOA1;
+  oa1_noshow.trip = "NA1";
+  feed(oa1_noshow);
+
+  // OA2: 2 arrivals, late 0/1 -> both on-time, mean 0.5.
+  arrive(kOA2, 1500, "B1", 0);
+  arrive(kOA2, 2500, "B2", 1);
+
+  const char* kStation = "indego-3468";
+  auto bike = [&](transit::Epoch ts, int32_t bikes, int32_t ebikes, int32_t docks) {
+    LogEvent ev;
+    ev.ts = ts;
+    ev.event = EventType::Bike;
+    ev.stop_key = kStation;
+    ev.note = "Snyder & Dorrance";
+    ev.bikes = bikes;
+    ev.ebikes = ebikes;
+    ev.docks = docks;
+    feed(ev);
+  };
+  bike(28800, 4, 2, 8);  // hour 8
+  bike(28900, 6, 0, 6);  // hour 8
+  bike(32400, 3, 1, 9);  // hour 9
+
+  ArduinoJson::JsonDocument doc;
+  agg.toJson(doc);
+
+  TEST_ASSERT_EQUAL_INT32(2, doc["days"].as<int32_t>());  // (200000 - 0) / 86400, truncated
+
+  ArduinoJson::JsonArray stops = doc["stops"];
+  TEST_ASSERT_EQUAL_INT(2, static_cast<int>(stops.size()));
+
+  TEST_ASSERT_EQUAL_STRING(kOA1, stops[0]["stop"].as<const char*>());
+  TEST_ASSERT_EQUAL_UINT32(4, stops[0]["samples"].as<uint32_t>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 50.0f, stops[0]["on_time_pct"].as<float>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 2.5f, stops[0]["mean_late_min"].as<float>());
+  TEST_ASSERT_EQUAL_UINT32(1, stops[0]["ghost"].as<uint32_t>());
+  TEST_ASSERT_EQUAL_UINT32(1, stops[0]["noshow"].as<uint32_t>());
+  TEST_ASSERT_EQUAL_INT64(5000, stops[0]["last_seen_ts"].as<int64_t>());
+
+  TEST_ASSERT_EQUAL_STRING(kOA2, stops[1]["stop"].as<const char*>());
+  TEST_ASSERT_EQUAL_UINT32(2, stops[1]["samples"].as<uint32_t>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 100.0f, stops[1]["on_time_pct"].as<float>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 0.5f, stops[1]["mean_late_min"].as<float>());
+  TEST_ASSERT_EQUAL_UINT32(0, stops[1]["ghost"].as<uint32_t>());
+  TEST_ASSERT_EQUAL_UINT32(0, stops[1]["noshow"].as<uint32_t>());
+  TEST_ASSERT_EQUAL_INT64(2500, stops[1]["last_seen_ts"].as<int64_t>());
+
+  ArduinoJson::JsonArray bikes = doc["bikes"];
+  TEST_ASSERT_EQUAL_INT(1, static_cast<int>(bikes.size()));
+  TEST_ASSERT_EQUAL_STRING(kStation, bikes[0]["station"].as<const char*>());
+  TEST_ASSERT_EQUAL_STRING("Snyder & Dorrance", bikes[0]["name"].as<const char*>());
+
+  ArduinoJson::JsonArray by_hour = bikes[0]["by_hour"];
+  TEST_ASSERT_EQUAL_INT(24, static_cast<int>(by_hour.size()));
+  TEST_ASSERT_EQUAL_UINT16(2, by_hour[8]["n"].as<uint16_t>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 5.0f, by_hour[8]["bikes"].as<float>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 1.0f, by_hour[8]["ebikes"].as<float>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 7.0f, by_hour[8]["docks"].as<float>());
+  TEST_ASSERT_EQUAL_UINT16(1, by_hour[9]["n"].as<uint16_t>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 3.0f, by_hour[9]["bikes"].as<float>());
+  TEST_ASSERT_EQUAL_UINT16(0, by_hour[10]["n"].as<uint16_t>());  // always present, even n==0
+}
+
+// Fixed capacity (DESIGN §9.3): rows for a 9th distinct stop_key or 4th distinct Indego station
+// are ignored, not evicted -- the first kMaxOverviewStops/kMaxOverviewBikeStations keys seen win.
+static void test_overview_aggregator_capacity_ignores_overflow(void) {
+  OverviewAggregator agg(0, 200000, &trivialHourWeekday);
+  auto feed = [&](const LogEvent& ev) {
+    const std::string line = transit_stats::toCsv(ev);
+    agg.feedLine(line.c_str(), line.size());
+  };
+
+  for (int i = 1; i <= 9; i++) {  // one more than kMaxOverviewStops (8)
+    LogEvent ev;
+    ev.ts = 1000 + i;
+    ev.event = EventType::Arrive;
+    ev.stop_key = "STOP" + std::to_string(i);
+    ev.trip = "T" + std::to_string(i);
+    ev.actual_ts = ev.ts;
+    feed(ev);
+  }
+  for (int i = 1; i <= 4; i++) {  // one more than kMaxOverviewBikeStations (3)
+    LogEvent ev;
+    ev.ts = 2000 + i;
+    ev.event = EventType::Bike;
+    ev.stop_key = "indego-" + std::to_string(i);
+    ev.note = "Station " + std::to_string(i);
+    ev.bikes = i;
+    feed(ev);
+  }
+
+  ArduinoJson::JsonDocument doc;
+  agg.toJson(doc);
+
+  ArduinoJson::JsonArray stops = doc["stops"];
+  TEST_ASSERT_EQUAL_INT(8, static_cast<int>(stops.size()));
+  TEST_ASSERT_EQUAL_STRING("STOP1", stops[0]["stop"].as<const char*>());
+  TEST_ASSERT_EQUAL_STRING("STOP8", stops[7]["stop"].as<const char*>());
+
+  ArduinoJson::JsonArray bikes = doc["bikes"];
+  TEST_ASSERT_EQUAL_INT(3, static_cast<int>(bikes.size()));
+  TEST_ASSERT_EQUAL_STRING("indego-1", bikes[0]["station"].as<const char*>());
+  TEST_ASSERT_EQUAL_STRING("indego-3", bikes[2]["station"].as<const char*>());
+}
+
+// =============================================================================================
 // Memory budget (DESIGN.md §9.3: "all computed in one streaming pass with fixed-size
-// accumulators (< 8 KB)").
+// accumulators", < 9 KB for StatsAggregator, and OverviewAggregator's own "aim < 2 KB").
 // =============================================================================================
 
 static void test_stats_aggregator_size_budget(void) {
-  printf("sizeof(transit_stats::StatsAggregator) = %zu bytes\n", sizeof(StatsAggregator));
-  printf("sizeof(transit_stats::ArrivalTracker)   = %zu bytes\n", sizeof(ArrivalTracker));
-  TEST_ASSERT_TRUE(sizeof(StatsAggregator) < 8192);
+  printf("sizeof(transit_stats::StatsAggregator)    = %zu bytes\n", sizeof(StatsAggregator));
+  printf("sizeof(transit_stats::ArrivalTracker)      = %zu bytes\n", sizeof(ArrivalTracker));
+  printf("sizeof(transit_stats::OverviewAggregator)  = %zu bytes\n", sizeof(OverviewAggregator));
+  TEST_ASSERT_TRUE(sizeof(StatsAggregator) < 9216);
+  // DESIGN §9.3 aims for < 2 KB; asserted here with headroom rather than the exact target, since
+  // std::string SSO thresholds differ between the 64-bit host and the 32-bit ESP32 target.
+  TEST_ASSERT_TRUE(sizeof(OverviewAggregator) < 4096);
 }
 
 // =============================================================================================
@@ -845,6 +1268,12 @@ int main(int argc, char** argv) {
   RUN_TEST(test_csv_round_trip_full);
   RUN_TEST(test_csv_round_trip_empty_optionals_are_empty_not_zero);
   RUN_TEST(test_csv_header_line_is_rejected);
+  RUN_TEST(test_csv_round_trip_v2_full);
+  RUN_TEST(test_csv_round_trip_bike_event);
+  RUN_TEST(test_csv_round_trip_v1_14_columns_still_parses);
+  RUN_TEST(test_csv_wrong_column_count_is_rejected);
+  RUN_TEST(test_seats_token_mapping);
+  RUN_TEST(test_seats_level_mapping);
 
   RUN_TEST(test_america_new_york_local_time);
 
@@ -853,9 +1282,15 @@ int main(int argc, char** argv) {
   RUN_TEST(test_tracker_noshow_vs_outage);
   RUN_TEST(test_tracker_outage_start_end);
   RUN_TEST(test_tracker_memory_bound_eviction);
+  RUN_TEST(test_tracker_seats_on_pred_and_arrive);
 
   RUN_TEST(test_aggregator_synthetic_month);
+  RUN_TEST(test_aggregator_crowding_and_wait_by_hour);
   RUN_TEST(test_summary_from_aggregator);
+
+  RUN_TEST(test_overview_aggregator_stops_and_bikes);
+  RUN_TEST(test_overview_aggregator_capacity_ignores_overflow);
+
   RUN_TEST(test_stats_aggregator_size_budget);
 
   RUN_TEST(test_months_in_window_single_day_one_month);

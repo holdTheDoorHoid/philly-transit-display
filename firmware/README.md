@@ -36,7 +36,7 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
 
-Flash headroom is about 30 KB on the 3.5" boards (1,870,122 B used, 2026-09-14, after the crowding and Indego icon font). `platformio.ini`'s comment and `include/lv_conf.h` list the
+Flash headroom is about 175 KB on the 3.5" boards (2026-09-14, after dropping the HTTPS mode; it was 30 KB before that). `platformio.ini`'s comment and `include/lv_conf.h` list the
 knobs (fonts, LVGL features, debug level); do not grow the app slots without dropping OTA.
 Trims made 2026-09-14, first when the weather feature pushed the image to 99.9 % and again when
 the interview features did:
@@ -91,8 +91,9 @@ Rules that fell out of this, all learned the hard way (each one was a boot loop 
 - Anything large and long-lived (the tracker, task stacks) is allocated before Wi-Fi starts,
   while the heap is one contiguous block. Every `new` of a big object is `nothrow` and checked:
   with exceptions disabled a failed plain `new` calls `std::terminate()`.
-- No TLS by default (`device.use_https=false`). A TLS session needs ~40 KB with two 16 KB
-  contiguous buffers; SEPTA serves identical bytes over plain HTTP.
+- No TLS at all (v0.1.2 removed the opt-in HTTPS mode): a TLS session needs ~40 KB with two 16 KB
+  contiguous buffers this board cannot spare, every service the firmware uses serves plain http,
+  and dropping mbedTLS/x509/the CA bundle freed ~100 KB of flash.
 - No second worker task: the poller drains the web job queue between polls. The AsyncTCP task
   stack is capped at 8 KB (`CONFIG_ASYNC_TCP_STACK_SIZE`; the library default is 16 KB).
 - Proxied SEPTA bodies (stop lists up to ~18 KB) stream into a LittleFS temp file and are served

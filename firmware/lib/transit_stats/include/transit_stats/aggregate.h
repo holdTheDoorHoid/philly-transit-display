@@ -58,6 +58,27 @@ struct PredictionBucket {
   int32_t sum_err_s = 0;
 };
 
+// Crowding accumulator for one hour-of-day or weekday bin (log schema v2, DESIGN.md §9.3). Only
+// `arrive` rows with a known `seats` token contribute. dist[] follows seatsLevel()'s order:
+// empty, open, few, standing, packed, full.
+struct CrowdingBucket {
+  uint16_t n = 0;
+  uint32_t sum_level = 0;  // sum of seatsLevel() values, for the 1-decimal mean
+  uint16_t dist[6] = {};
+};
+
+// Wait/gap accumulator for one hour-of-day bin (DESIGN.md §9.3 "wait_by_hour"). n/mean_gap_s/
+// max_gap_s come from `arrive` rows with a known, positive headway_s; ghost/noshow are simple
+// per-hour counts of those event rows. Bucketed by the local hour of the row's own `ts` (not
+// actual_ts), per DESIGN.
+struct WaitBucket {
+  uint16_t n = 0;
+  uint32_t sum_gap_s = 0;
+  uint32_t max_gap_s = 0;
+  uint16_t ghost = 0;
+  uint16_t noshow = 0;
+};
+
 constexpr size_t kMaxPendingPredTrips = 64;
 
 // One `pred` row's state, waiting to be matched to a later `arrive` row for the same trip.
@@ -78,10 +99,12 @@ struct PendingPred {
 // required for the headway-ratio and prediction-matching features to see events in the order
 // they actually happened).
 //
-// Memory: every member is fixed-size; sizeof(StatsAggregator) is asserted < 8192 bytes in
+// Memory: every member is fixed-size; sizeof(StatsAggregator) is asserted < 9216 bytes in
 // test_stats/test_main.cpp per DESIGN §9.3. Approximate breakdown (64-bit host build):
-//   by_hour_[24] + by_weekday_[7]   : 31 * ~152 B                       ~4.7 KB
-//   pending_[kMaxPendingPredTrips]  : 64 * ~44 B                        ~2.8 KB
+//   by_hour_[24] + by_weekday_[7]        : 31 * ~152 B                  ~4.7 KB
+//   pending_[kMaxPendingPredTrips]       : 64 * ~44 B                   ~2.8 KB
+//   crowd_by_hour_[24] + crowd_by_weekday_[7] : 31 * ~20 B              ~0.6 KB
+//   wait_by_hour_[24]                    : 24 * ~16 B                  ~0.4 KB
 //   headway_, prediction_[4], scalar counters, stop_key_, window bounds ~0.3 KB
 // Intended lifecycle: construct one per /api/stats request, feed it the relevant log lines,
 // call toJson() once, then discard it.
@@ -102,6 +125,8 @@ class StatsAggregator {
   //   headway{n,bunched,gapped,ratio_hist[20]},
   //   ghost, noshow, outage_min,
   //   prediction[{horizon_s,n,mae_s,bias_s}] (4 entries, in kHorizonBuckets order, always present)
+  //   crowding{by_hour[{h,n,mean,dist[6]}] (24), by_weekday[{wd,n,mean,dist[6]}] (7)}
+  //   wait_by_hour[{h,n,mean_gap_s,max_gap_s,ghost,noshow}] (24 entries, always present)
   // `doc` is assumed empty/fresh and sized by the caller.
   void toJson(ArduinoJson::JsonDocument& doc) const;
 
@@ -141,6 +166,10 @@ class StatsAggregator {
   PendingPred pending_[kMaxPendingPredTrips];
   uint32_t pending_seq_ = 0;
   PredictionBucket prediction_[4];  // parallel to kHorizonBuckets
+
+  CrowdingBucket crowd_by_hour_[24];
+  CrowdingBucket crowd_by_weekday_[7];
+  WaitBucket wait_by_hour_[24];
 
   void handlePred(const LogEvent& ev);
   void handleArrive(const LogEvent& ev);

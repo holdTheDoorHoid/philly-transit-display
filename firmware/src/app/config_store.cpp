@@ -290,8 +290,6 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
   device["ticker_show"] = cfg.device.ticker_show;
   device["ticker_lines"] = cfg.device.ticker_lines;
   device["ticker_speed"] = cfg.device.ticker_speed;
-  device["tls_verify"] = cfg.device.tls_verify;
-  device["use_https"] = cfg.device.use_https;
   device["logging"] = cfg.device.logging;
   JsonObject header = device["header"].to<JsonObject>();
   header["name"] = cfg.device.header.name;
@@ -390,8 +388,7 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   result.device.ticker_show = std::string(device["ticker_show"] | "both");
   result.device.ticker_lines = device["ticker_lines"] | 3;
   result.device.ticker_speed = device["ticker_speed"] | 30;
-  result.device.tls_verify = device["tls_verify"] | true;
-  result.device.use_https = device["use_https"] | false;
+  // use_https / tls_verify (v0.1.0-0.1.1) are accepted and ignored: the TLS mode is gone (http_fetch.h).
   result.device.logging = device["logging"] | true;
   JsonVariantConst header = device["header"];
   result.device.header.name = header["name"] | false;

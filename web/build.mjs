@@ -46,6 +46,19 @@ function buildHeader() {
   const hashInput = compiled.map((a) => a.raw).reduce((acc, b) => Buffer.concat([acc, b]), Buffer.alloc(0));
   const etag = crypto.createHash('sha256').update(hashInput).digest('hex').slice(0, 16);
 
+  // Cache busting: index.html is served with Cache-Control: no-cache (revalidated on every
+  // navigation), but a browser's normal reload keeps fresh subresources, so a firmware update
+  // could show the old app.js/app.css for up to max-age (an hour). Referencing them with the
+  // content hash in the query string makes every new build fetch new files; the device ignores
+  // the query when matching /app.js and /app.css.
+  for (const a of compiled) {
+    if (a.file !== 'index.html') continue;
+    const html = a.raw.toString('utf8').replace('href="/app.css"', `href="/app.css?v=${etag}"`).replace('src="/app.js"', `src="/app.js?v=${etag}"`);
+    if (!html.includes(`app.js?v=${etag}`) || !html.includes(`app.css?v=${etag}`)) throw new Error('index.html: expected href="/app.css" and src="/app.js" to version');
+    a.raw = Buffer.from(html, 'utf8');
+    a.gz = gzipBytes(a.raw);
+  }
+
   const totalRaw = compiled.reduce((n, a) => n + a.raw.length, 0);
   const totalGz = compiled.reduce((n, a) => n + a.gz.length, 0);
 

@@ -110,6 +110,19 @@ for p in ('/', '/app.css', '/favicon.svg'):
     code, body = get(p); check('A asset ' + p, code == 200 and len(body) > 100, code)
 code, body = get('/nope'); check('A 404', code == 404, code)
 code, body = get('/api/stats?stop=nope&days=30'); check('A stats unknown stop no crash', code in (200, 400, 404), code)
+code, body = get_json('/api/stats/overview?days=7'); check('A stats overview', code == 200 and isinstance(body, dict) and 'stops' in body and 'bikes' in body and body.get('days') == 7, (code, str(body)[:120]))
+code, body = get_json('/api/stats?stop=' + base['stops'][0]['key'] + '&days=7'); check('A stats v2 fields', code == 200 and 'crowding' in body and len(body.get('wait_by_hour', [])) == 24 and len(body['crowding'].get('by_hour', [])) == 24, (code, list(body)[:8] if isinstance(body, dict) else body))
+code, raw = get('/api/log/index'); check('A log index', code == 200, code)
+try:
+    files = json.loads(raw) if raw else []
+    newest = sorted(f['file'] for f in files)[-1] if files else None
+except Exception:
+    newest = None
+if newest:
+    r = curl([B + '/api/log/' + newest], 120); lines = [l for l in r.stdout.decode(errors='replace').split('\n') if l.strip()]
+    v2 = [l for l in lines[-40:] if l.count(',') == 20]
+    check('A log rows are v2 (21 columns)', len(v2) > 0, (newest, len(lines), lines[-1][:80] if lines else ''))
+    check('A log has bike rows', any(',bike,indego-' in l for l in lines) or not base['bike'].get('enabled'), newest)
 
 # ---------- B. config round-trips ----------
 def roundtrip(name, mutate, expect=None, wait=2.5):

@@ -18,6 +18,7 @@
 #include "../due_alert.h"
 #include "../profiles.h"
 #include "../weather_service.h"
+#include "../../icons/weather_icons.h"
 #include "ui_common.h"
 
 using transit::Arrival;
@@ -54,7 +55,8 @@ struct MainScreenCtx {
   lv_obj_t *header;
   lv_obj_t *device_label;
   lv_obj_t *clock_label;
-  lv_obj_t *weather_label;
+  lv_obj_t *weather_icon;   // lv_image of the colour condition icon (src/icons), hidden with weather_label
+  lv_obj_t *weather_label;  // temperature ("69°"), or the words when no glyph fits
   lv_obj_t *wifi_label;
   lv_obj_t *updated_label;
   bool header_stale = false;
@@ -223,6 +225,8 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   ctx->clock_label = makeLabel(header, fontSmall(h), colorText());
   lv_label_set_text(ctx->clock_label, "--:--");
 
+  ctx->weather_icon = lv_image_create(header);
+  lv_obj_add_flag(ctx->weather_icon, LV_OBJ_FLAG_HIDDEN);  // shown once a forecast picks an icon
   ctx->weather_label = makeLabel(header, fontSmall(h), colorText());
   lv_label_set_text(ctx->weather_label, "");
 
@@ -245,7 +249,10 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   const HeaderConfig &hc = cfg.device.header;
   if (!hc.name) lv_obj_add_flag(ctx->device_label, LV_OBJ_FLAG_HIDDEN);
   if (!hc.clock) lv_obj_add_flag(ctx->clock_label, LV_OBJ_FLAG_HIDDEN);
-  if (!hc.weather || !cfg.weather.enabled) lv_obj_add_flag(ctx->weather_label, LV_OBJ_FLAG_HIDDEN);
+  if (!hc.weather || !cfg.weather.enabled) {
+    lv_obj_add_flag(ctx->weather_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ctx->weather_label, LV_OBJ_FLAG_HIDDEN);
+  }
   if (!hc.wifi) lv_obj_add_flag(ctx->wifi_label, LV_OBJ_FLAG_HIDDEN);
   if (!hc.updated) lv_obj_add_flag(ctx->updated_label, LV_OBJ_FLAG_HIDDEN);
 
@@ -476,7 +483,18 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
   lv_label_set_text(ctx->clock_label, clock_buf);
 
   if (!lv_obj_has_flag(ctx->weather_label, LV_OBJ_FLAG_HIDDEN)) {
-    lv_label_set_text(ctx->weather_label, headerWeatherText().c_str());
+    // Colour icon + temperature ("[sun] 69°"); the words only while there is no forecast.
+    static const lv_image_dsc_t *const kIcons[] = {nullptr, &wx_sun, &wx_moon, &wx_cloud_sun, &wx_cloud_moon, &wx_cloud,
+                                                   &wx_rain, &wx_showers, &wx_snow, &wx_fog, &wx_storm};
+    const lv_image_dsc_t *icon = kIcons[(int)headerWeatherIcon()];
+    if (icon == nullptr) {
+      lv_obj_add_flag(ctx->weather_icon, LV_OBJ_FLAG_HIDDEN);
+      lv_label_set_text(ctx->weather_label, headerWeatherText().c_str());
+    } else {
+      if (lv_image_get_src(ctx->weather_icon) != icon) lv_image_set_src(ctx->weather_icon, icon);
+      lv_obj_remove_flag(ctx->weather_icon, LV_OBJ_FLAG_HIDDEN);
+      lv_label_set_text(ctx->weather_label, headerWeatherTemp().c_str());
+    }
   }
 
   // Wi-Fi bars: fold RSSI into a rough 0-3 "bars" count next to the symbol.

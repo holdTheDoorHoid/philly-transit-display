@@ -37,7 +37,7 @@ proxy, mobile app, BLE provisioning, NJ Transit (needs an API key each user must
 | Config storage | LittleFS `/config.json`, mirrored by `GET/PUT /api/config` | Structured, easy to round-trip to the web UI. SD is for logs only so the device works without a card. |
 | Wi-Fi onboarding | Our own ~150-line captive portal (SoftAP + DNS hijack) on ESPAsyncWebServer; then always-on web UI + mDNS | WiFiManager was the first choice but cost ~120 KB of flash and spams `task_wdt` errors on core 3.x; replaced 2026-09-14. Captive portal is only for Wi-Fi; stop config lives in the permanent UI. |
 | Web server | ESP32Async/ESPAsyncWebServer (maintained fork) | Chunked/streamed responses for stats and proxied SEPTA calls without blocking LVGL. Keep concurrent handlers minimal. |
-| Transport | Plain HTTP by default (`device.use_https=false`); HTTPS with the Amazon Trust CA bundle available as an opt-in, `setInsecure()` behind a second flag | Measured 2026-09-14 on the 3.5" board: after LVGL, Wi-Fi, and the web server there is ~51 KB free with a 14 KB largest block, and a TLS session needs ~40 KB with two 16 KB contiguous buffers. SEPTA serves every endpoint over http:// without redirecting. Fake bus times via LAN MITM are low stakes; the setting exists for people who disagree. |
+| Transport | Plain HTTP only. The opt-in HTTPS mode (Amazon Trust CA bundle, `tls_verify`) shipped in v0.1.0-0.1.1 and was removed in v0.1.2 to free ~100 KB of flash; the board could not afford a TLS session's RAM anyway (section 2), and SEPTA, Open-Meteo and Bicycle Transit all serve plain http. |
 | Log format | Append-only CSV, one file per month on SD, one event per line | Human-readable, spreadsheet-friendly, streamable with tiny RAM. |
 | Stats computation | On device, streaming over CSV with fixed-size histograms | 320 KB RAM, no PSRAM; never load a month of log into memory. |
 | Repo/License | `holdTheDoorHoid/philly-transit-display`, MIT | Owner's choice. |
@@ -161,7 +161,8 @@ interpretation code; `hourly.*` are six arrays starting at the current hour. `li
 parses it and maps codes to words ("mostly clear", "light rain", "thunderstorm"). Stops carry
 `lat`/`lng` from the Stops API (§4.5); stops within 1.5 km share one request, at most four
 locations, refreshed every 10 minutes and on config change. The first configured stop's location
-is the "main" one the header shows (`69° mostly clear`). A stop panel gets a one-line note about
+is the "main" one the header shows as a colour condition icon plus the temperature (`[sun] 69°`;
+  the words only while there is no forecast). A stop panel gets a one-line note about
 the hour of its next arrival ("light rain at 10:15a, 62°", "rain likely (55%) at 10:15a") only
 when that hour is *notable* next to the header: precipitation probability ≥ 40 %, any wet weather,
 or a different kind of weather (fog vs clear); clear-vs-cloudy is not worth a line. Attribution:
@@ -188,7 +189,7 @@ firmware/
   src/main.cpp                   setup(): board init, LittleFS, config, WiFiManager, NTP, mDNS, web, tasks
   src/app/                       glue that is Arduino-specific:
     net_poller.{h,cpp}           FreeRTOS task on core 0: runs the §4.7 schedule, produces Snapshot
-    http_fetch.{h,cpp}           HTTPS GET with CA bundle, retry/backoff, streaming callback
+    http_fetch.{h,cpp}           plain-HTTP GET, retry/backoff, streaming callback, sticky BusSchedules cookie
     config_store.{h,cpp}         LittleFS <-> Config struct, validation, defaults, migration
     web_server.{h,cpp}           routes in §7, serves gzipped assets from src/generated/
     ui/                          LVGL screens: main, stats, device info; uses only Snapshot data
@@ -242,8 +243,6 @@ ESP Web Tools `manifest.json` under `flasher/` for GitHub Pages (offsets 0x1000 
     "invert_colors": true,
     "ticker_lines": 3,
     "ticker_speed": 30,
-    "use_https": false,
-    "tls_verify": true,
     "logging": true,
     "header": { "name": false, "clock": true, "weather": true, "wifi": true, "updated": true },
     "large_text": false,
@@ -368,6 +367,7 @@ gear). CORS not needed; the UI is same-origin. A later "settings PIN" is an opt-
 | `GET /api/proxy/schedule?stop_id=21332` | Proxies `BusSchedules` with retries; used to learn directions served at a stop |
 | `GET /api/rail/stations` | Static Regional Rail station list embedded in firmware |
 | `GET /api/stats?stop=<key>&days=30` | Aggregates (§9.3) computed by streaming the log |
+| `GET /api/stats/overview?days=7` | Every stop and Indego station in one pass (§9.3), for the Stats page's comparison table |
 | `GET /api/log/index` | `[ { "file": "2026-09.csv", "bytes": 123456 } ]` |
 | `GET /api/log/2026-09.csv` | Raw CSV download |
 | `POST /api/ota` | multipart `firmware` field; reboots on success |
@@ -387,7 +387,7 @@ is skipped), `unknown`.
 ## 8. Display UI (LVGL 9)
 
 Main screen (portrait by default; every size derives from the runtime resolution so rotation just re-flows it):
-- Header (10 % height): device name (off by default), clock (12 h), current weather (`69° mostly
+- Header (10 % height): device name (off by default), clock (12 h), current weather (a 24 px colour condition icon from `src/icons/` and `69°`, sun/moon by local hour; SS4.8; was `69° mostly
   clear`), Wi-Fi bars, "updated 12 s ago" - each switchable via `device.header`.
 - One panel per stop the active profile shows (§6 `profiles`; all stops otherwise), stacked; each
   has a title row per `title_style` (`17 Southbound → 20th-Johnston` by default; bullet, not middle
@@ -433,24 +433,44 @@ Main screen (portrait by default; every size derives from the runtime resolution
 ## 9. Logging and statistics
 
 ### 9.1 Event log (SD, `/transit-log/YYYY-MM.csv`)
-Header row on file creation. Columns:
+Header row on file creation. Columns (log schema v2, since 2026-09-14):
 ```
-ts,event,stop_key,route,dir,trip,vehicle,scheduled_ts,predicted_ts,actual_ts,late_min,horizon_s,headway_s,note
+ts,event,stop_key,route,dir,trip,vehicle,scheduled_ts,predicted_ts,actual_ts,late_min,horizon_s,headway_s,note,seats,temp,wx,alert,bikes,ebikes,docks
 ```
+Rows written before 2026-09-14 have only the first 14 columns, through `note`; the reader accepts
+both shapes (a 21-column row is v2, a 14-column row is v1 with `seats` and the six trailing
+columns unknown) and never rewrites old rows to add the new columns.
+
 Events emitted by `ArrivalTracker` from the stream of `StopSnapshot`s:
 - `pred` — a prediction snapshot for (stop, trip) at the first sighting and when the ETA first drops
-  under 900, 600, 300, 120 s. `horizon_s` = predicted − ts at that moment.
+  under 900, 600, 300, 120 s. `horizon_s` = predicted − ts at that moment. `seats` is the
+  crowding token current at that sighting (see below).
 - `arrive` — inferred actual arrival: the stop's `stop_time_update` for that trip disappears (bus
   passed: its sequence advanced beyond ours or the trip vanished while predicted within ±120 s of
   now). `actual_ts` = last predicted time if it is within 120 s of now, else now. Include
   `late_min` from TransitView at that moment and `scheduled_ts` = nearest BusSchedules entry to
   (`actual_ts` − late) within 10 min, if any. `headway_s` = gap since the previous `arrive` for the
-  same stop and direction.
+  same stop and direction. `seats` is the last crowding token seen for that trip before it vanished.
 - `ghost` — a tracked trip vanished while its prediction was still > 180 s in the future and it never
   arrived.
 - `noshow` — a scheduled departure passed by more than 10 min without any live trip matched to it,
   while the route had at least one live vehicle (otherwise it is an `outage`).
 - `outage` — polling failed for more than 5 min; one line at start and one at end (`note`).
+- `bike` — one row per configured Indego station per hour (`bike.stations`, §6), built by the app
+  layer, not `ArrivalTracker`. `stop_key` = `indego-<station id>` (e.g. `indego-3468`); route/dir/
+  trip/vehicle are empty; `note` = the station's display name; `bikes`/`ebikes`/`docks` carry that
+  hour's Bicycle Transit status feed counts (§4.9).
+
+New columns (all optional; empty means unknown, never coerced to 0):
+- `seats` — crowding token, one of `empty`, `open`, `few`, `standing`, `packed`, `full`; set on
+  `pred`/`arrive` rows only, from SEPTA's `estimated_seat_availability`
+  (EMPTY→`empty`, MANY_SEATS_AVAILABLE→`open`, FEW_SEATS_AVAILABLE→`few`,
+  STANDING_ROOM_ONLY→`standing`, CRUSHED_STANDING_ROOM_ONLY→`packed`, FULL→`full`).
+- `temp`, `wx` — device-unit temperature and WMO weather code at `ts` (§4.8), filled in by the app
+  layer on `pred`/`arrive`/`ghost`/`noshow` rows.
+- `alert` — 0 none, 1 a service alert was active for the route, 2 a detour was active; filled in by
+  the app layer on `pred`/`arrive`/`ghost`/`noshow` rows.
+- `bikes`, `ebikes`, `docks` — `bike` rows only (see above).
 Rotation: a new file each month; refuse to log when SD free space < 50 MB and show a warning.
 
 ### 9.2 Stats definitions
@@ -470,9 +490,37 @@ Rotation: a new file each month; refuse to log when SD free space < 50 MB and sh
   "by_weekday": [ ... ],
   "headway": { "n": 700, "bunched": 61, "gapped": 44, "ratio_hist": [ ... ] },
   "ghost": 9, "noshow": 4, "outage_min": 37,
-  "prediction": [ { "horizon_s": 300, "n": 500, "mae_s": 74, "bias_s": 21 } ] }
+  "prediction": [ { "horizon_s": 300, "n": 500, "mae_s": 74, "bias_s": 21 } ],
+  "crowding": { "by_hour": [ {"h":0,"n":12,"mean":1.4,"dist":[0,7,3,2,0,0]} ],
+                "by_weekday": [ {"wd":0,"n":0,"mean":0,"dist":[0,0,0,0,0,0]} ] },
+  "wait_by_hour": [ {"h":8,"n":14,"mean_gap_s":540,"max_gap_s":1320,"ghost":1,"noshow":0} ] }
 ```
-All computed in one streaming pass with fixed-size accumulators (< 8 KB).
+`by_hour`/`by_weekday` always carry 24/7 entries, in hour/weekday order, even for hours with no
+samples. `crowding` is built from `arrive` rows with a known `seats` (log schema v2, §9.1):
+`dist[6]` is a count per crowding level in the order empty/open/few/standing/packed/full, and
+`mean` is the mean level index (0 = empty .. 5 = full), one decimal, 0 when `n` is 0. `wait_by_hour`
+is a 24-entry, always-present per-local-hour breakdown of the actual headway: `n`/`mean_gap_s`/
+`max_gap_s` come from `arrive` rows with a known, positive `headway_s`; `ghost`/`noshow` are the
+counts of those event rows falling in that hour. All computed in one streaming pass with
+fixed-size accumulators (< 9 KB).
+
+`GET /api/stats/overview?days=N` streams every monthly log file in the window ONCE for every
+configured stop and Indego station (`OverviewAggregator`), rather than one pass per stop like
+`/api/stats` above — a cheap landing-page summary, not the detailed per-stop breakdown:
+```json
+{ "days": 7,
+  "stops": [ { "stop": "17-21332", "samples": 812, "on_time_pct": 71.4, "mean_late_min": 3.2,
+               "ghost": 9, "noshow": 4, "last_seen_ts": 1757900000 } ],
+  "bikes": [ { "station": "indego-3468", "name": "Snyder & Dorrance",
+               "by_hour": [ {"h":0,"n":7,"bikes":4.3,"ebikes":2.1,"docks":8.6} ] } ] }
+```
+`stops[]`/`bikes[]` carry one entry per distinct stop_key/Indego station actually seen in the
+window, in first-seen order, up to config's own caps (8 stops, 3 bike stations, §6) — a row for
+any key beyond that is ignored, not evicted. `on_time_pct`/`mean_late_min` use the same
+definitions as above; `last_seen_ts` is the max `ts` of any row (any event type) for that stop.
+Each bike station's `by_hour` is a 24-entry, always-present per-local-hour breakdown of that
+hour's `bike` rows; `name` is the display name from the most recently seen row. Fixed-size
+accumulators, aiming under 2 KB.
 
 ## 10. Web UI (`web/`)
 
@@ -485,7 +533,7 @@ Views: **Now** (live arrivals as the device sees them), **Stops** (list, reorder
 add flow: mode → route → stop list from `/api/proxy/stops` with a Leaflet map loaded from a CDN when
 online → direction learned from `/api/proxy/schedule` → label), **Stats** (per stop, charts in
 inline SVG: by-hour bars, weekday bars, headway ratio histogram, prediction MAE by horizon, ghost/
-noshow tiles; CSV download), **Settings** (device, brightness, poll, TLS, logging, OTA upload,
+noshow tiles; CSV download), **Settings** (device, brightness, poll, logging, OTA upload,
 Wi-Fi reset, firmware version). Total gzipped assets must stay under 60 KB.
 
 ## 11. Portability
@@ -498,8 +546,7 @@ should be a new `*_source.cpp` and a config `agency` field, nothing else.
 ## 12. Security posture
 
 Default is open on the LAN, like a printer. Firmware never contacts anything except SEPTA and NTP.
-SEPTA is fetched over plain HTTP by default for memory reasons (see section 2); HTTPS with certificate
-verification is a settings toggle. OTA accepts any image on the LAN in v1; a settings PIN is a documented
+SEPTA is fetched over plain HTTP (see section 2; the HTTPS toggle was removed in v0.1.2). OTA accepts any image on the LAN in v1; a settings PIN is a documented
 follow-up. No telemetry. Wi-Fi credentials live only in the ESP32 NVS.
 
 ### 12.1 Memory posture (2026-09-14)

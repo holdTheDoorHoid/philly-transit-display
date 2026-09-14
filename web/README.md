@@ -40,9 +40,17 @@ DESIGN.md §7 using Node built-ins only (`node:http`, `node:fs`, `node:path`,
   that file exists (it doesn't yet — that fixture belongs to another agent), else a
   ~55-station built-in list covering all Regional Rail lines.
 - `GET /api/stats?stop=&days=` returns deterministic synthetic aggregates in the
-  exact §9.3 shape (same `stop`+`days` always produces the same numbers). Add
-  `&empty=1` to get the zero-sample "no data yet" shape, useful for testing that UI
-  state.
+  §9.3 shape (same `stop`+`days` always produces the same numbers), plus two fields
+  not yet in §9.3: `crowding: { by_hour, by_weekday }` (0-5 mean crowding level and a
+  6-bucket level distribution per bin) and `wait_by_hour` (mean/max gap between buses
+  and ghost/no-show counts, per hour). Add `&empty=1` to get the zero-sample "no data
+  yet" shape, useful for testing that UI state.
+- `GET /api/stats/overview?days=` — new endpoint, not in §9.3: one summary row per
+  configured stop (`stop`, `samples`, `on_time_pct`, `mean_late_min`, `ghost`,
+  `noshow`, `last_seen_ts`) for the Stats page's all-stops table, plus `bikes`
+  (per-station `by_hour` Indego availability, empty when `bike.enabled` is off). A
+  stop's row reuses `buildStats`'s own PRNG sequence so its numbers match what you see
+  after selecting it in the per-stop detail below.
 - `GET /api/log/index` / `GET /api/log/<file>` — a synthetic two-file index and CSV
   content using the exact §9.1 header and column order.
 - `POST /api/ota` drains the multipart body and replies after a short simulated
@@ -78,12 +86,12 @@ DESIGN.md §10 caps the four assets at **60 KB gzipped total**. Current sizes
 | Asset | Raw | Gzip |
 |---|---:|---:|
 | `index.html` | 848 B | 433 B |
-| `app.js` | ~78 KB | ~20.5 KB |
-| `app.css` | ~10.0 KB | ~2.8 KB |
+| `app.js` | ~101 KB | ~26.0 KB |
+| `app.css` | ~12.6 KB | ~3.4 KB |
 | `favicon.svg` | 410 B | 202 B |
-| **Total** | **~89 KB** | **~24 KB** |
+| **Total** | **~115 KB** | **~30.0 KB** |
 
-That leaves roughly 35 KB of headroom under the budget. `build.mjs` prints a warning
+That leaves roughly 29 KB of headroom under the budget. `build.mjs` prints a warning
 (without failing) if the total ever exceeds 60,000 bytes gzip.
 
 ## How the UI maps to the device API
@@ -92,7 +100,7 @@ That leaves roughly 35 KB of headroom under the budget. `build.mjs` prints a war
 |---|---|---|
 | **Now** | `GET /api/state` every 15 s | — |
 | **Stops** | `GET /api/config`, `GET /api/proxy/stops`, `GET /api/proxy/schedule`, `GET /api/rail/stations` | `PUT /api/config` (reorder, edit, remove, add stops; enable/add/remove Indego stations — always sends the whole config) |
-| **Stats** | `GET /api/config` (stop picker), `GET /api/stats`, `GET /api/log/index` | — (CSV download links point at `GET /api/log/<file>`) |
+| **Stats** | `GET /api/config` (stop picker/labels), `GET /api/stats/overview` (all-stops table + Indego charts), `GET /api/stats` (per-stop detail), `GET /api/log/index` | — (CSV download links point at `GET /api/log/<file>`) |
 | **Settings** | `GET /api/config`, `GET /api/state` (firmware version) | `PUT /api/config`, `POST /api/ota`, `POST /api/reboot`, `POST /api/wifi/reset` |
 
 The Now view polls `/api/state` every 15 seconds while active and stops polling when
@@ -130,9 +138,12 @@ stop (whole config, `liveConfig` kept in sync, a "Saved." banner on success). Th
 card is hidden while the Add Stop wizard is open.
 
 On the Now page, the Indego card (`renderBikeCard` in `app.js`) shows only when
-`bike.enabled` and at least one station is configured: a header line (bicycle
-pictogram + "Indego", plus the data age in small amber text once `bike.age_s` exceeds
-600s) and one row per station. `bike.style` isn't echoed on `/api/state`, so the Now
+`bike.enabled` and at least one station is configured: it uses the same `.card
+.stop-panel` container and `.title` bar as a stop panel (bicycle pictogram + "Indego",
+with the stale-age note right-aligned inside that same bar via the existing `.row
+.between` utility, rather than stacked below it) so it reads as one more panel in the
+stack, and each station is a row styled like `.arrival-row` (same padding/border as the
+stop panels' arrival rows). `bike.style` isn't echoed on `/api/state`, so the Now
 view reads it once from `/api/config` alongside the crowding settings and falls back
 to `icons` if it's absent (old firmware) or unrecognized. In `icons` style each row
 shows three original inline-SVG pictograms with a count next to each — bicycle
@@ -146,6 +157,29 @@ color otherwise (`.tone-red` / `.tone-amber` in `app.css`). A station with `bike
 Dorrance, 15th & Spruce, Girard Station) are fixed via `BIKE_DEMO` in
 `mock-server.mjs` to cover all of the above in one screen: a 0/1-2/normal spread in
 one row, plus a "no data" row and an "offline" row.
+
+The Stats page opens with an **all-stops overview table** (`GET
+/api/stats/overview?days=`, same 7/30/90 selector as the per-stop detail below it):
+one row per configured stop with samples, on-time % (colored green/amber/red at the
+same ≥80/60-80/<60 thresholds as elsewhere), mean late, ghosts, no-shows, and a
+relative "last seen" time; clicking a row selects that stop in the detail picker
+below (`buildOverviewTable`'s `onSelect` callback). An empty `stops[]` (nothing
+logged yet) shows a muted "No arrivals logged yet." message instead of an empty
+table. When the response's `bikes[]` is non-empty, one small chart per Indego station
+follows the table (`buildBikeOverviewCards`): stacked bars of mean classic/e-bikes per
+hour with a line for mean docks, hidden entirely when `bikes[]` is empty (Indego
+disabled, or no stations configured).
+
+Per-stop detail (`GET /api/stats?stop=&days=`) adds four chart cards after the
+existing lateness/headway/prediction ones, all built with the same inline-SVG helpers
+(`buildCrowdChart`, `buildWaitChart`, `buildReliabilityChart` in `app.js`) rather than
+a charting library: **Crowding by hour** and **by weekday** (0-5 mean level per bin,
+green ≤1 / amber 2-3 / red ≥4, hover a bar for the full 6-level distribution);
+**Expected wait by hour** (bar = mean gap between buses in minutes, tick = worst gap
+seen — "if you arrive at random, the typical wait is about half the mean gap"); and
+**Reliability by hour** (stacked ghosts/no-shows per hour). All four skip drawing a
+bar for hours/weekdays with no samples (`n === 0`) rather than drawing a zero-height
+one.
 
 The alert ticker section of Settings has a **Show** select (`device.ticker_show`:
 `both` (default), `alerts`, `detours`, or `off`) that picks what the ticker displays.
@@ -184,6 +218,13 @@ if the actual device ends up shaped differently:
   but only writes `"by_weekday": [ ... ]` without naming the day field. The mock uses
   `d` (0=Sunday, matching `Date.getDay()`); the client reads `d ?? weekday ?? day ?? wd`
   defensively so it still renders if the real firmware names it differently.
+- **`GET /api/stats/overview`, `crowding`, and `wait_by_hour`**: none of these are in
+  DESIGN.md §9.3 yet — they're new per this round of work. Shapes used here: overview
+  rows are `{stop, samples, on_time_pct, mean_late_min, ghost, noshow, last_seen_ts}`
+  plus a top-level `bikes: [{station, name, by_hour}]`; `crowding` is `{by_hour,
+  by_weekday}` of `{h|wd, n, mean, dist[6]}` (mean and per-sample counts over the same
+  0-5 levels as `CROWD_WORDS` in `app.js`); `wait_by_hour` is `{h, n, mean_gap_s,
+  max_gap_s, ghost, noshow}`. Flag it if the firmware lands a different shape.
 - **`headway.ratio_hist` shape**: not specified beyond "a histogram of the ratio".
   The mock emits `[{ pct_lo, pct_hi, bucket, count }, ...]` over 5 bins (0-40,
   40-80, 80-120, 120-175, 175+, matching the bunched/gapped thresholds in §9.2). The

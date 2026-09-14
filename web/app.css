@@ -285,13 +285,15 @@ main#view {
 
 .bike-title { display: inline-flex; align-items: center; gap: .35rem; }
 .bike-age-warn { color: var(--warn); }
+/* Same padding/border as .arrival-row so the Indego card's rows line up visually with
+   the stop panels' arrival rows above it (see renderBikeCard in app.js). */
 .bike-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: .4rem .6rem;
-  padding: .35rem 0;
+  padding: .4rem 0;
   border-top: 1px solid var(--border);
 }
 .bike-row:first-of-type { border-top: none; }
@@ -371,6 +373,21 @@ main#view {
 .chart-wrap { overflow-x: auto; }
 .chart-wrap svg { display: block; }
 .chart-legend { display: flex; gap: 1rem; flex-wrap: wrap; font-size: .78rem; color: var(--text-muted); margin-top: .3rem; }
+
+/* All-stops overview table (GET /api/stats/overview) */
+.table-wrap { overflow-x: auto; }
+.overview-table { width: 100%; border-collapse: collapse; font-size: .85rem; white-space: nowrap; }
+.overview-table th, .overview-table td { padding: .45rem .6rem; text-align: left; border-top: 1px solid var(--border); }
+.overview-table thead th { border-top: none; font-size: .72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: .03em; }
+.overview-table th.num, .overview-table td.num { text-align: right; }
+.overview-row { cursor: pointer; }
+.overview-row:hover { background: var(--bg-sunken); }
+.overview-row.selected { background: var(--bg-sunken); font-weight: 600; }
+.overview-row:focus-visible { outline-offset: -2px; }
+.pct-chip { display: inline-block; padding: .15rem .5rem; border-radius: 999px; font-weight: 700; font-size: .82rem; }
+.pct-chip.good { background: var(--on-time-bg); color: var(--on-time-fg); }
+.pct-chip.warn { background: var(--warn-bg); color: var(--warn); }
+.pct-chip.bad { background: var(--late-bg); color: var(--late-fg); }
 .chart-legend .swatch { display: inline-block; width: .7em; height: .7em; border-radius: 2px; margin-right: .3em; vertical-align: -1px; }
 
 /* ---------- Settings view ---------- */

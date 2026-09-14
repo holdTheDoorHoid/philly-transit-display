@@ -535,6 +535,12 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
   g_server.on("/api/rail/stations", HTTP_GET, handleRailStations);
   startProxyWorker();
 
+  // Registered before /api/stats: ESPAsyncWebServer matches handler URIs by prefix, so the
+  // longer path has to come first or handleGetStats answers it with "stop is required".
+  g_server.on("/api/stats/overview", HTTP_GET, [](AsyncWebServerRequest *request) {
+    int days = request->hasParam("days") ? atoi(request->getParam("days")->value().c_str()) : 7;
+    queueOverviewRequest(request, days);
+  });
   g_server.on("/api/stats", HTTP_GET, handleGetStats);
   g_server.on("/api/log/index", HTTP_GET, handleLogIndex);
   // "/api/log/<file>.csv" - matched with a regex-free prefix check in onNotFound below instead of

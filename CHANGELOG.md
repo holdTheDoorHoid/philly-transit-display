@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- Logging: every arrival row now records SEPTA's crowding estimate, the weather at the event
+  (temperature and WMO code) and whether an alert or detour applied to the route; one `bike`
+  row per Indego station per hour records bikes, e-bikes and free docks. Old 14-column rows
+  still parse (DESIGN.md 9.1).
+- Stats: `/api/stats` gains crowding by hour and weekday and an expected-wait / reliability
+  by-hour table; new `/api/stats/overview` compares every stop (and charts Indego availability
+  by hour) in one pass. The web Stats page shows all of it, with an all-stops table on top.
+- Web: the Indego card on the Now page is styled like the stop panels.
+- Fixed a boot-time crash: Arduino's first hostname lookup clears lwIP's DNS cache from the
+  caller's task, and if SNTP's own lookup was in flight the SNTP callback asserted without the
+  core lock. The firmware now resolves the NTP host once before starting SNTP.
+- Header weather is a colour icon (sun, moon, cloud-sun, cloud-moon, cloud, rain, showers, snow,
+  fog, storm; `firmware/tools/gen_weather_icons.py`) plus the temperature; the words remain on the
+  night page. Web assets are referenced with their content hash so a browser never keeps an old
+  page after an update.
+- The optional HTTPS mode (`device.use_https`, `device.tls_verify`, the CA bundle) is gone: it
+  was off by default, the board cannot afford a TLS session's RAM, every service the firmware
+  uses serves plain http, and dropping it frees ~100 KB of flash. Old configs with those keys
+  still load.
+
 ## v0.1.1 - 2026-09-14
 
 - Crowding: the word for SEPTA's "many seats" level is now `open` (it used to be a bare `seats`,

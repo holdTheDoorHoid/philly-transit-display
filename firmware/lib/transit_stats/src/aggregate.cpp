@@ -135,6 +135,7 @@ void StatsAggregator::feedLine(const char* line, size_t len) {
     case EventType::Ghost: handleGhost(ev); break;
     case EventType::NoShow: handleNoShow(ev); break;
     case EventType::Outage: handleOutage(ev); break;
+    case EventType::Bike: break;  // per-stop only; OverviewAggregator handles Bike rows
   }
 }
 
@@ -180,6 +181,37 @@ void StatsAggregator::handlePred(const LogEvent& ev) {
 
 void StatsAggregator::handleArrive(const LogEvent& ev) {
   samples_++;
+
+  if (!ev.seats.empty()) {
+    const int level = seatsLevel(ev.seats);
+    if (level >= 0) {
+      // Same "actual_ts if known, else ts" bucketing convention as the lateness buckets just
+      // below -- this is a per-arrival-event time, so it follows the same rule.
+      const transit::Epoch bucket_time = ev.actual_ts.value_or(ev.ts);
+      int hour = 0, wd = 0;
+      tz_fn_(bucket_time, hour, wd);
+
+      CrowdingBucket& hb = crowd_by_hour_[hour];
+      hb.n++;
+      hb.sum_level += static_cast<uint32_t>(level);
+      hb.dist[level]++;
+
+      CrowdingBucket& wb = crowd_by_weekday_[wd];
+      wb.n++;
+      wb.sum_level += static_cast<uint32_t>(level);
+      wb.dist[level]++;
+    }
+  }
+
+  if (ev.headway_s.has_value() && *ev.headway_s > 0) {
+    int hour = 0, wd = 0;
+    tz_fn_(ev.ts, hour, wd);  // wait_by_hour buckets by the row's own ts, per DESIGN §9.3
+    WaitBucket& wb = wait_by_hour_[hour];
+    wb.n++;
+    const uint32_t gap = static_cast<uint32_t>(*ev.headway_s);
+    wb.sum_gap_s += gap;
+    if (gap > wb.max_gap_s) wb.max_gap_s = gap;
+  }
 
   const bool late_known = ev.late_min.has_value();
   if (late_known) {
@@ -242,8 +274,19 @@ void StatsAggregator::handleArrive(const LogEvent& ev) {
   }
 }
 
-void StatsAggregator::handleGhost(const LogEvent&) { ghost_++; }
-void StatsAggregator::handleNoShow(const LogEvent&) { noshow_++; }
+void StatsAggregator::handleGhost(const LogEvent& ev) {
+  ghost_++;
+  int hour = 0, wd = 0;
+  tz_fn_(ev.ts, hour, wd);
+  wait_by_hour_[hour].ghost++;
+}
+
+void StatsAggregator::handleNoShow(const LogEvent& ev) {
+  noshow_++;
+  int hour = 0, wd = 0;
+  tz_fn_(ev.ts, hour, wd);
+  wait_by_hour_[hour].noshow++;
+}
 
 void StatsAggregator::handleOutage(const LogEvent& ev) {
   if (ev.note == "end") {
@@ -332,6 +375,40 @@ void StatsAggregator::toJson(ArduinoJson::JsonDocument& doc) const {
     o["n"] = pb.n;
     o["mae_s"] = pb.n ? static_cast<int32_t>(std::lround(static_cast<double>(pb.sum_abs_err_s) / pb.n)) : 0;
     o["bias_s"] = pb.n ? static_cast<int32_t>(std::lround(static_cast<double>(pb.sum_err_s) / pb.n)) : 0;
+  }
+
+  ArduinoJson::JsonObject crowding = doc["crowding"].to<ArduinoJson::JsonObject>();
+  ArduinoJson::JsonArray crowd_by_hour = crowding["by_hour"].to<ArduinoJson::JsonArray>();
+  for (int h = 0; h < 24; h++) {
+    const CrowdingBucket& b = crowd_by_hour_[h];
+    ArduinoJson::JsonObject o = crowd_by_hour.add<ArduinoJson::JsonObject>();
+    o["h"] = h;
+    o["n"] = b.n;
+    o["mean"] = b.n ? round1(static_cast<double>(b.sum_level) / b.n) : 0.0;
+    ArduinoJson::JsonArray dist = o["dist"].to<ArduinoJson::JsonArray>();
+    for (uint16_t v : b.dist) dist.add(v);
+  }
+  ArduinoJson::JsonArray crowd_by_weekday = crowding["by_weekday"].to<ArduinoJson::JsonArray>();
+  for (int wd = 0; wd < 7; wd++) {
+    const CrowdingBucket& b = crowd_by_weekday_[wd];
+    ArduinoJson::JsonObject o = crowd_by_weekday.add<ArduinoJson::JsonObject>();
+    o["wd"] = wd;
+    o["n"] = b.n;
+    o["mean"] = b.n ? round1(static_cast<double>(b.sum_level) / b.n) : 0.0;
+    ArduinoJson::JsonArray dist = o["dist"].to<ArduinoJson::JsonArray>();
+    for (uint16_t v : b.dist) dist.add(v);
+  }
+
+  ArduinoJson::JsonArray wait_by_hour = doc["wait_by_hour"].to<ArduinoJson::JsonArray>();
+  for (int h = 0; h < 24; h++) {
+    const WaitBucket& b = wait_by_hour_[h];
+    ArduinoJson::JsonObject o = wait_by_hour.add<ArduinoJson::JsonObject>();
+    o["h"] = h;
+    o["n"] = b.n;
+    o["mean_gap_s"] = b.n ? static_cast<int32_t>(std::lround(static_cast<double>(b.sum_gap_s) / b.n)) : 0;
+    o["max_gap_s"] = static_cast<int32_t>(b.max_gap_s);
+    o["ghost"] = b.ghost;
+    o["noshow"] = b.noshow;
   }
 }
 

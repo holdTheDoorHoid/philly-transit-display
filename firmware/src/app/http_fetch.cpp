@@ -5,9 +5,7 @@
 #include <cstring>
 #include <string>
 #include <HTTPClient.h>
-#include <NetworkClientSecure.h>
 
-#include "ca_bundle.h"
 
 namespace transit_app {
 
@@ -61,16 +59,6 @@ class CallbackStream : public Stream {
 
 }  // namespace
 
-bool g_use_https = false;
-
-void setUseHttps(bool use_https) {
-  g_use_https = use_https;
-}
-
-bool useHttps() {
-  return g_use_https;
-}
-
 namespace {
 std::string g_sched_cookie;
 
@@ -93,24 +81,14 @@ const std::string &scheduleCookie() {
 }
 
 int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, uint32_t timeout_ms,
-        bool tls_verify, ReplyInfo *reply) {
+        ReplyInfo *reply) {
   int last_status = -1;
 
   std::string plain_url;
-  if (!g_use_https && strncmp(url, "https://", 8) == 0) {
+  if (strncmp(url, "https://", 8) == 0) {  // plain HTTP only, see http_fetch.h
     plain_url = std::string("http://") + (url + 8);
     url = plain_url.c_str();
   }
-  const bool https = strncmp(url, "https://", 8) == 0;
-
-  if (https && !tls_verify) {
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      log_w("http_fetch: tls_verify is OFF (config.device.tls_verify=false) - certificates are NOT checked");
-    }
-  }
-
   for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
     if (attempt > 0) {
       uint32_t backoff_ms = kBackoffBaseMs << (attempt - 1);
@@ -118,19 +96,8 @@ int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, ui
       delay(backoff_ms);
     }
 
-    // Only one of these is used per attempt; both live on this task's stack (small objects, the
-    // TLS context itself is heap-allocated by NetworkClientSecure on connect).
-    NetworkClientSecure secure_client;
     NetworkClient plain_client;
     NetworkClient *client = &plain_client;
-    if (https) {
-      if (tls_verify) {
-        secure_client.setCACertBundle(kSeptaCaBundle, kSeptaCaBundleLen);
-      } else {
-        secure_client.setInsecure();
-      }
-      client = &secure_client;
-    }
 
     HTTPClient http;
     http.setConnectTimeout((int32_t)timeout_ms);

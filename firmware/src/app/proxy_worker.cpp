@@ -22,6 +22,7 @@
 #include "transit_core/septa_source.h"
 #include "transit_stats/aggregate.h"
 #include "transit_stats/log_window.h"
+#include "transit_stats/overview.h"
 
 namespace transit_app {
 
@@ -36,7 +37,7 @@ constexpr UBaseType_t kQueueLen = 2;  // each paused request holds a TCP pcb and
 constexpr int kDefaultStatsDays = 30;
 constexpr int kMaxStatsDays = 365;
 
-enum class ProxyKind { Stops, Schedule, Stats };
+enum class ProxyKind { Stops, Schedule, Stats, Overview };
 
 // Shared between the web-server task (which creates this on a queued request) and this file's
 // worker task (which reads it after a possibly-long network fetch or SD scan): a request whose
@@ -44,8 +45,8 @@ enum class ProxyKind { Stops, Schedule, Stats };
 // freed), so onDisconnect() flips this instead of deleting anything out from under the worker.
 struct ProxyJob {
   ProxyKind kind;
-  std::string param;  // route (Stops), stop_id (Schedule), or stop key (Stats)
-  int days = kDefaultStatsDays;  // Stats only
+  std::string param;  // route (Stops), stop_id (Schedule), or stop key (Stats); unused for Overview
+  int days = kDefaultStatsDays;  // Stats and Overview
   // Weak pointer from AsyncWebServerRequest::pause(): the server keeps the request alive until we
   // send (or the client aborts, in which case lock() returns null and we drop the job).
   AsyncWebServerRequestPtr request;
@@ -95,7 +96,6 @@ uint8_t g_proxy_file_idx = 0;
 
 void runFetchJob(const ProxyJob &job) {
   std::string url = job.kind == ProxyKind::Stops ? septaStopsUrl(job.param) : transit::septaBusSchedulesUrl(job.param);
-  bool tls_verify = getActiveConfig().device.tls_verify;
 
   const char *path = kProxyFiles[g_proxy_file_idx];
   g_proxy_file_idx ^= 1;  // alternate so a response still being streamed is not overwritten
@@ -150,7 +150,7 @@ void runFetchJob(const ProxyJob &job) {
           }
           return true;
         },
-        kFetchTimeoutMs, tls_verify);
+        kFetchTimeoutMs);
     if (!write_failed && !flushBuf()) write_failed = true;
     out.close();
     Serial.printf("[proxy] %s -> HTTP %d, %u bytes in %u ms, heap %u\n", url.c_str(), status, (unsigned)written, (unsigned)(millis() - t0), (unsigned)ESP.getFreeHeap());
@@ -218,10 +218,39 @@ void runStatsJob(const ProxyJob &job) {
   req->send(200, "application/json", body);
 }
 
+// Same streaming pass for GET /api/stats/overview: every stop key and Indego station at once
+// (fixed-capacity OverviewAggregator, ~2 KB, heap-allocated for the same stack reason).
+void runOverviewJob(const ProxyJob &job) {
+  transit::Epoch now = (transit::Epoch)time(nullptr);
+  transit::Epoch window_end = now;
+  transit::Epoch window_start = now - (transit::Epoch)job.days * 86400;
+  std::unique_ptr<transit_stats::OverviewAggregator> agg(new (std::nothrow) transit_stats::OverviewAggregator(window_start, window_end));
+  if (!agg) {
+    if (auto r = lockRequest(job)) r->send(503, "application/json", "{\"error\":\"out of memory, try again\"}");
+    return;
+  }
+  for (const std::string &month : transit_stats::monthsInWindow(window_start, window_end)) {
+    std::string filename = month + ".csv";
+    streamLogLines(filename, [&](const char *line, size_t len) {
+      agg->feedLine(line, len);
+      return true;
+    });
+  }
+  auto req = lockRequest(job);
+  if (!req) return;
+  JsonDocument doc;
+  agg->toJson(doc);
+  String body;
+  serializeJson(doc, body);
+  req->send(200, "application/json", body);
+}
+
 void runJob(const ProxyJob &job) {
   if (!requestStillAlive(job)) return;  // client vanished before we even started
   if (job.kind == ProxyKind::Stats) {
     runStatsJob(job);
+  } else if (job.kind == ProxyKind::Overview) {
+    runOverviewJob(job);
   } else {
     runFetchJob(job);
   }
@@ -267,6 +296,12 @@ void queueStopsProxy(AsyncWebServerRequest *request, const std::string &route) {
 
 void queueScheduleProxy(AsyncWebServerRequest *request, const std::string &stop_id) {
   enqueue(request, ProxyKind::Schedule, stop_id);
+}
+
+void queueOverviewRequest(AsyncWebServerRequest *request, int days) {
+  if (days < 1) days = kDefaultStatsDays;
+  if (days > kMaxStatsDays) days = kMaxStatsDays;
+  enqueue(request, ProxyKind::Overview, std::string(), days);
 }
 
 void queueStatsRequest(AsyncWebServerRequest *request, const std::string &stop_key, int days) {

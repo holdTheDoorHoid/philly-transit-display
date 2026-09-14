@@ -30,6 +30,12 @@ WeatherView getWeather();  // thread-safe copy
 
 // "69° mostly clear" for the header; empty when disabled or nothing fetched yet.
 std::string headerWeatherText();
+// Header pieces for the icon form: which of the colour icons in src/icons/ fits the current WMO
+// code (None when there is no forecast) and the temperature alone ("69°"). Night (before 6 or
+// from 20 local) swaps sun for moon.
+enum class WeatherIcon : uint8_t { None, Sun, Moon, CloudSun, CloudMoon, Cloud, Rain, Showers, Snow, Fog, Storm };
+WeatherIcon headerWeatherIcon();
+std::string headerWeatherTemp();
 
 // One line for a stop panel about the forecast at `first_arrival_epoch` ("light rain at 10:15a,
 // 62°", "rain likely (55%) at 10:15a"), or empty when it would just repeat the header

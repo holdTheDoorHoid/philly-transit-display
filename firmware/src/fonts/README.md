@@ -1,9 +1,10 @@
 # Project fonts
 
 `lv_font_icons_16.c` — the 16 px icon font: `0123456789` and space from Montserrat Medium plus
-FontAwesome 5 Free `chair` (U+F6C0), `user` (U+F007), `bicycle` (U+F206), `bolt` (U+F0E7) and
-`parking` (U+F540), 4 bpp, ~4.5 KB. Used by `crowdingIcons()` and `bikeCounts()` in
-`ui_common.cpp` through LVGL's inline recolor (`#rrggbb text#`; the space after the colour is
+FontAwesome 5 Free `chair` (U+F6C0), `user` (U+F007), `bicycle` (U+F206), `bolt` (U+F0E7),
+`parking` (U+F540); 4 bpp, ~4.5 KB. Used by `crowdingIcons()` and `bikeCounts()` in
+`ui_common.cpp` through LVGL's inline recolor (the header weather icons are colour bitmaps in
+`src/icons/`, not glyphs) (`#rrggbb text#`; the space after the colour is
 mandatory and is not drawn). Generated 2026-09-14 with
 
 ```

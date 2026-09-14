@@ -96,8 +96,6 @@ struct DeviceConfig {
   std::string ticker_show = "both";  // both | alerts | detours | off (DESIGN.md SS6)
   uint8_t ticker_lines = 3;     // alert ticker height in text lines, 1..8 (1 = horizontal marquee)
   uint16_t ticker_speed = 30;   // alert ticker scroll speed in pixels per second, 5..200
-  bool tls_verify = true;
-  bool use_https = false;  // see http_fetch.h: TLS is a 40 KB luxury this board cannot afford by default
   bool logging = true;
   HeaderConfig header;
   bool large_text = false;     // two rows per stop, 48 px minutes (ui_common.cpp fontBig)

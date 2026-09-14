@@ -94,6 +94,7 @@ const char* toString(EventType t) {
     case EventType::Ghost: return "ghost";
     case EventType::NoShow: return "noshow";
     case EventType::Outage: return "outage";
+    case EventType::Bike: return "bike";
   }
   return "pred";  // unreachable for a valid enum value; keeps -Wall happy without RTTI/exceptions
 }
@@ -104,17 +105,38 @@ bool fromString(const std::string& s, EventType& out) {
   if (s == "ghost") { out = EventType::Ghost; return true; }
   if (s == "noshow") { out = EventType::NoShow; return true; }
   if (s == "outage") { out = EventType::Outage; return true; }
+  if (s == "bike") { out = EventType::Bike; return true; }
   return false;
+}
+
+const char* seatsToken(const std::string& septa_value) {
+  if (septa_value == "EMPTY") return "empty";
+  if (septa_value == "MANY_SEATS_AVAILABLE") return "open";
+  if (septa_value == "FEW_SEATS_AVAILABLE") return "few";
+  if (septa_value == "STANDING_ROOM_ONLY") return "standing";
+  if (septa_value == "CRUSHED_STANDING_ROOM_ONLY") return "packed";
+  if (septa_value == "FULL") return "full";
+  return "";
+}
+
+int seatsLevel(const std::string& token) {
+  if (token == "empty") return 0;
+  if (token == "open") return 1;
+  if (token == "few") return 2;
+  if (token == "standing") return 3;
+  if (token == "packed") return 4;
+  if (token == "full") return 5;
+  return -1;
 }
 
 const char* csvHeader() {
   return "ts,event,stop_key,route,dir,trip,vehicle,scheduled_ts,predicted_ts,actual_ts,late_min,"
-         "horizon_s,headway_s,note";
+         "horizon_s,headway_s,note,seats,temp,wx,alert,bikes,ebikes,docks";
 }
 
 std::string toCsv(const LogEvent& ev) {
   std::string out;
-  out.reserve(128);
+  out.reserve(160);
   appendCsvField(out, int64ToString(ev.ts), true);
   appendCsvField(out, toString(ev.event), false);
   appendCsvField(out, ev.stop_key, false);
@@ -129,14 +151,22 @@ std::string toCsv(const LogEvent& ev) {
   appendCsvField(out, ev.horizon_s ? int32ToString(*ev.horizon_s) : std::string(), false);
   appendCsvField(out, ev.headway_s ? int32ToString(*ev.headway_s) : std::string(), false);
   appendCsvField(out, ev.note, false);
+  appendCsvField(out, ev.seats, false);
+  appendCsvField(out, ev.temp ? int32ToString(*ev.temp) : std::string(), false);
+  appendCsvField(out, ev.wx ? int32ToString(*ev.wx) : std::string(), false);
+  appendCsvField(out, ev.alert ? std::to_string(static_cast<unsigned>(*ev.alert)) : std::string(), false);
+  appendCsvField(out, ev.bikes ? int32ToString(*ev.bikes) : std::string(), false);
+  appendCsvField(out, ev.ebikes ? int32ToString(*ev.ebikes) : std::string(), false);
+  appendCsvField(out, ev.docks ? int32ToString(*ev.docks) : std::string(), false);
   return out;
 }
 
 bool fromCsv(const char* line, size_t len, LogEvent& ev) {
   std::vector<std::string> f;
-  f.reserve(14);
+  f.reserve(21);
   splitCsvLine(line, len, f);
-  if (f.size() != 14) return false;
+  const bool is_v2 = f.size() == 21;
+  if (!is_v2 && f.size() != 14) return false;
 
   int64_t ts = 0;
   if (!parseInt64(f[0], ts)) return false;
@@ -166,6 +196,13 @@ bool fromCsv(const char* line, size_t len, LogEvent& ev) {
     dst = v;
     return true;
   };
+  auto parseOptU8 = [](const std::string& s, std::optional<uint8_t>& dst) {
+    if (s.empty()) { dst.reset(); return true; }
+    int32_t v = 0;
+    if (!parseInt32(s, v)) return false;
+    dst = static_cast<uint8_t>(v);
+    return true;
+  };
 
   if (!parseOptEpoch(f[7], out.scheduled_ts)) return false;
   if (!parseOptEpoch(f[8], out.predicted_ts)) return false;
@@ -174,6 +211,18 @@ bool fromCsv(const char* line, size_t len, LogEvent& ev) {
   if (!parseOptI32(f[11], out.horizon_s)) return false;
   if (!parseOptI32(f[12], out.headway_s)) return false;
   out.note = f[13];
+
+  if (is_v2) {
+    out.seats = f[14];
+    if (!parseOptI32(f[15], out.temp)) return false;
+    if (!parseOptI32(f[16], out.wx)) return false;
+    if (!parseOptU8(f[17], out.alert)) return false;
+    if (!parseOptI32(f[18], out.bikes)) return false;
+    if (!parseOptI32(f[19], out.ebikes)) return false;
+    if (!parseOptI32(f[20], out.docks)) return false;
+  }
+  // v1 (14-column) rows leave seats/temp/wx/alert/bikes/ebikes/docks at their default-constructed
+  // (empty/unset) values -- DESIGN.md §9.1's "rows before 2026-09-14 have 14 columns" contract.
 
   ev = std::move(out);
   return true;

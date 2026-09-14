@@ -33,5 +33,8 @@ void queueScheduleProxy(AsyncWebServerRequest *request, const std::string &stop_
 // monthsInWindow over the last `days` days) through a StatsAggregator for `stop_key` and responds
 // with the DESIGN.md SS9.3 JSON shape. Same request-ownership/disconnect-guard contract as above.
 void queueStatsRequest(AsyncWebServerRequest *request, const std::string &stop_key, int days);
+// Queues a GET /api/stats/overview job: one pass over the same files through an OverviewAggregator
+// (every stop and Indego station, DESIGN.md SS9.3).
+void queueOverviewRequest(AsyncWebServerRequest *request, int days);
 
 }  // namespace transit_app

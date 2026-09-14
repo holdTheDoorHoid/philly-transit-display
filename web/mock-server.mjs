@@ -73,8 +73,6 @@ function defaultConfig() {
       ticker_lines: 3,
       ticker_speed: 30,
       ticker_show: 'both',
-      use_https: false,
-      tls_verify: true,
       logging: true,
       header: { name: false, clock: true, weather: true, wifi: true, updated: true },
       large_text: false,
@@ -129,7 +127,6 @@ function validateConfig(cfg) {
   if (d.rotation !== undefined && ![0, 90, 180, 270].includes(d.rotation)) {
     return { error: 'rotation must be 0, 90, 180, or 270', path: 'device.rotation' };
   }
-  if (d.use_https !== undefined && typeof d.use_https !== 'boolean') return { error: 'use_https must be a boolean', path: 'device.use_https' };
   if (d.theme !== undefined && !['light', 'dark'].includes(d.theme)) return { error: 'theme must be "light" or "dark"', path: 'device.theme' };
   if (d.invert_colors !== undefined && typeof d.invert_colors !== 'boolean') return { error: 'invert_colors must be a boolean', path: 'device.invert_colors' };
   if (d.ticker_lines !== undefined && (!Number.isInteger(d.ticker_lines) || d.ticker_lines < 1 || d.ticker_lines > 8)) {
@@ -141,7 +138,6 @@ function validateConfig(cfg) {
   if (d.ticker_show !== undefined && !['both', 'alerts', 'detours', 'off'].includes(d.ticker_show)) {
     return { error: 'ticker_show must be both, alerts, detours, or off', path: 'device.ticker_show' };
   }
-  if (typeof d.tls_verify !== 'boolean') return { error: 'tls_verify must be a boolean', path: 'device.tls_verify' };
   if (typeof d.logging !== 'boolean') return { error: 'logging must be a boolean', path: 'device.logging' };
   if (d.large_text !== undefined && typeof d.large_text !== 'boolean') return { error: 'large_text must be a boolean', path: 'device.large_text' };
   if (d.crowding !== undefined && !['off', 'words', 'icons', 'both'].includes(d.crowding)) {
@@ -586,12 +582,65 @@ function proxySchedule(stopId) {
 
 /* ------------------------------ /api/stats ------------------------------ */
 
+// Crowding levels: 0 empty, 1 open, 2 few seats, 3 standing, 4 packed, 5 full (matches
+// the word/icon mapping the Now page already uses for SEPTA's seat estimate, see
+// CROWD_WORDS in app.js). Rush hours skew the per-sample level distribution higher.
+function crowdSample(rand, rush) {
+  const r = rand();
+  if (rush) return r < 0.05 ? 0 : r < 0.15 ? 1 : r < 0.35 ? 2 : r < 0.6 ? 3 : r < 0.85 ? 4 : 5;
+  return r < 0.25 ? 0 : r < 0.55 ? 1 : r < 0.8 ? 2 : r < 0.93 ? 3 : r < 0.98 ? 4 : 5;
+}
+function crowdBin(n, rush, rand) {
+  const dist = [0, 0, 0, 0, 0, 0];
+  for (let i = 0; i < n; i++) dist[crowdSample(rand, rush)]++;
+  const mean = +(dist.reduce((a, c, lvl) => a + c * lvl, 0) / n).toFixed(2);
+  return { n, mean, dist };
+}
+function buildCrowdingByHour(rand, scale) {
+  const out = [];
+  for (let hh = 5; hh <= 23; hh++) {
+    const rush = (hh >= 7 && hh <= 9) || (hh >= 16 && hh <= 18);
+    const n = Math.round((rush ? 16 : 5) * scale * (0.6 + rand()));
+    if (n <= 0) continue;
+    out.push({ h: hh, ...crowdBin(n, rush, rand) });
+  }
+  return out;
+}
+function buildCrowdingByWeekday(rand, scale) {
+  const out = [];
+  for (let wd = 0; wd < 7; wd++) {
+    const weekend = wd === 0 || wd === 6;
+    const n = Math.round((weekend ? 30 : 70) * scale * (0.6 + rand()));
+    if (n <= 0) continue;
+    out.push({ wd, ...crowdBin(n, !weekend, rand) });
+  }
+  return out;
+}
+// Gap between consecutive buses, by hour of day. mean_gap_s/max_gap_s pair with the
+// same n as by_hour above so "typical wait ~ half the mean gap" lines up with the
+// lateness chart's sample counts.
+function buildWaitByHour(rand, scale) {
+  const out = [];
+  for (let hh = 5; hh <= 23; hh++) {
+    const rush = (hh >= 7 && hh <= 9) || (hh >= 16 && hh <= 18);
+    const n = Math.round((rush ? 16 : 5) * scale * (0.6 + rand()));
+    if (n <= 0) continue;
+    const mean_gap_s = Math.round((rush ? 360 : 600) * (0.7 + rand() * 0.6));
+    const max_gap_s = Math.round(mean_gap_s * (1.5 + rand() * 1.5));
+    const ghost = Math.round(rand() * (rush ? 1.2 : 0.4));
+    const noshow = Math.round(rand() * (rush ? 0.6 : 0.3));
+    out.push({ h: hh, n, mean_gap_s, max_gap_s, ghost, noshow });
+  }
+  return out;
+}
+
 function buildStats(stop, days, empty) {
   if (empty) {
     return {
       stop, days, samples: 0, on_time_pct: 0, mean_late_min: 0,
       by_hour: [], by_weekday: [], headway: { n: 0, bunched: 0, gapped: 0, ratio_hist: [] },
       ghost: 0, noshow: 0, outage_min: 0, prediction: [],
+      crowding: { by_hour: [], by_weekday: [] }, wait_by_hour: [],
     };
   }
   const rand = seedFrom(`${stop}|${days}`);
@@ -649,7 +698,54 @@ function buildStats(stop, days, empty) {
     noshow: Math.round(2 * scale * rand()),
     outage_min: Math.round(20 * scale * rand()),
     prediction,
+    crowding: { by_hour: buildCrowdingByHour(rand, scale), by_weekday: buildCrowdingByWeekday(rand, scale) },
+    wait_by_hour: buildWaitByHour(rand, scale),
   };
+}
+
+/* ------------------------------ /api/stats/overview ------------------------------ */
+
+// Fraction of total dock capacity occupied by bikes, by hour of day: high overnight
+// (bikes come home), draining through the AM commute to a trough around 8-9a, then
+// slowly refilling through the day and evening as riders return them.
+const BIKE_HOURLY_FRACTION = [
+  0.86, 0.85, 0.83, 0.79, 0.70, 0.53, 0.36, 0.20, 0.12, 0.16, 0.25, 0.34,
+  0.40, 0.43, 0.46, 0.50, 0.55, 0.61, 0.69, 0.76, 0.81, 0.84, 0.86, 0.87,
+];
+function buildBikeByHour(stationId, days) {
+  const rand = seedFrom(`bikeoverview|${stationId}|${days}`);
+  const scale = days === 7 ? 0.25 : days === 90 ? 3 : 1;
+  const totalDocks = 12 + Math.floor(rand() * 8); // 12-19, fixed per station via the seed
+  const out = [];
+  for (let hh = 0; hh < 24; hh++) {
+    const n = Math.max(1, Math.round((6 + rand() * 6) * scale));
+    const bikes = Math.min(totalDocks - 1, Math.max(0, +(totalDocks * BIKE_HOURLY_FRACTION[hh] * (0.85 + rand() * 0.3)).toFixed(1)));
+    const ebikes = Math.min(bikes, +(bikes * (0.2 + rand() * 0.25)).toFixed(1));
+    const docks = +Math.max(0, totalDocks - bikes).toFixed(1);
+    out.push({ h: hh, n, bikes, ebikes, docks });
+  }
+  return out;
+}
+function buildBikesOverview(days) {
+  const b = config.bike || {};
+  if (!b.enabled || !b.stations || !b.stations.length) return [];
+  return b.stations.map((st) => ({ station: `indego-${st.id}`, name: st.name, by_hour: buildBikeByHour(st.id, days) }));
+}
+
+// Reuses buildStats' own PRNG sequence for the summary numbers so a stop's overview row
+// always matches the tiles shown when you select it below, then adds a last_seen_ts the
+// per-stop endpoint has no reason to carry.
+function buildStatsOverview(days) {
+  const now = Math.floor(Date.now() / 1000);
+  const stops = (config.stops || []).map((s) => {
+    const full = buildStats(s.key, days, false);
+    const seenRand = seedFrom(`overview-seen|${s.key}|${days}`);
+    return {
+      stop: s.key, samples: full.samples, on_time_pct: full.on_time_pct, mean_late_min: full.mean_late_min,
+      ghost: full.ghost, noshow: full.noshow, last_seen_ts: now - Math.round(seenRand() * 10800),
+    };
+  });
+  return { days, stops, bikes: buildBikesOverview(days) };
 }
 
 /* ------------------------------ /api/log/* ------------------------------ */
@@ -722,6 +818,12 @@ const server = http.createServer(async (req, res) => {
           pd.crowding = pd.show_crowding === false ? 'off' : 'words';
         }
         delete pd.show_crowding;
+        // HTTPS/TLS controls removed from the firmware and the Settings page (task C).
+        // An old client may still send use_https/tls_verify — accept the request rather
+        // than 400ing on them, but drop the keys so they don't get persisted or echoed
+        // back on the next GET /api/config.
+        delete pd.use_https;
+        delete pd.tls_verify;
       }
       const err = validateConfig(parsed);
       if (err) return sendJSON(res, 400, err);
@@ -739,6 +841,11 @@ const server = http.createServer(async (req, res) => {
       let days = Number(q.get('days') || 30);
       if (![7, 30, 90].includes(days)) days = [7, 30, 90].reduce((a, b) => (Math.abs(b - days) < Math.abs(a - days) ? b : a));
       return sendJSON(res, 200, buildStats(stop, days, q.get('empty') === '1'));
+    }
+    if (pathname === '/api/stats/overview' && req.method === 'GET') {
+      let days = Number(q.get('days') || 30);
+      if (![7, 30, 90].includes(days)) days = [7, 30, 90].reduce((a, b) => (Math.abs(b - days) < Math.abs(a - days) ? b : a));
+      return sendJSON(res, 200, buildStatsOverview(days));
     }
 
     if (pathname === '/api/log/index' && req.method === 'GET') return sendJSON(res, 200, logIndex());

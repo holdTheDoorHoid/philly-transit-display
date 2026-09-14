@@ -195,6 +195,37 @@ std::string headerWeatherText() {
   return buf;
 }
 
+static WeatherIcon iconForCode(int code, bool night) {
+  if (code < 0) return WeatherIcon::None;
+  if (code <= 1) return night ? WeatherIcon::Moon : WeatherIcon::Sun;
+  if (code == 2) return night ? WeatherIcon::CloudMoon : WeatherIcon::CloudSun;
+  if (code == 3) return WeatherIcon::Cloud;
+  if (code == 45 || code == 48) return WeatherIcon::Fog;
+  if (code >= 51 && code <= 67) return WeatherIcon::Rain;  // drizzle, rain, freezing rain
+  if ((code >= 71 && code <= 77) || code == 85 || code == 86) return WeatherIcon::Snow;
+  if (code >= 80 && code <= 82) return WeatherIcon::Showers;
+  if (code >= 95) return WeatherIcon::Storm;
+  return WeatherIcon::Cloud;
+}
+
+WeatherIcon headerWeatherIcon() {
+  Lock lock;
+  if (!lock.held || !g_enabled || g_locations.empty() || !g_locations[0].ok) return WeatherIcon::None;
+  time_t now = time(nullptr);
+  struct tm lt;
+  localtime_r(&now, &lt);
+  bool night = lt.tm_hour < 6 || lt.tm_hour >= 20;
+  return iconForCode(g_locations[0].forecast.code, night);
+}
+
+std::string headerWeatherTemp() {
+  Lock lock;
+  if (!lock.held || !g_enabled || g_locations.empty() || !g_locations[0].ok) return "";
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d\xC2\xB0", (int)lround(g_locations[0].forecast.temp));
+  return buf;
+}
+
 std::string stopWeatherNote(const std::string &stop_key, int64_t first_arrival_epoch) {
   Lock lock;
   if (!lock.held || !g_enabled || !g_per_stop || first_arrival_epoch <= 0) return "";

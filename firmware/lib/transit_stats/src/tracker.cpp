@@ -8,6 +8,15 @@ constexpr int64_t kArriveToleranceS = 120;         // "within ±120s of now" => 
 constexpr int64_t kNoShowLateS = 600;              // scheduled departure >10 min in the past
 constexpr int64_t kOutageThresholdS = 300;         // poll_ok false for >5 min => outage
 constexpr int64_t kHorizonThresholds[4] = {900, 600, 300, 120};
+
+// Ordered to match seatsLevel()'s 0..5 convention (events.h): empty, open, few, standing, packed,
+// full. Converts a stored TrackedTrip::last_seats_level back to its CSV token for an `arrive` row
+// (the live transit::Arrival, and so its raw SEPTA string, is gone by the time a trip vanishes).
+const char* seatsTokenFromLevel(int8_t level) {
+  static constexpr const char* kTokens[6] = {"empty", "open", "few", "standing", "packed", "full"};
+  if (level < 0 || level >= 6) return "";
+  return kTokens[level];
+}
 }  // namespace
 
 // ---- lookups / allocation ----------------------------------------------------------------
@@ -177,6 +186,8 @@ void ArrivalTracker::processLiveArrival(StopState& st, const transit::Arrival& a
   t.late_known = a.late_known;
   t.last_seen = now;
   t.seq = ++st.touch_seq;
+  const char* seats_tok = seatsToken(a.seats);
+  t.last_seats_level = static_cast<int8_t>(seatsLevel(seats_tok));
 
   const int64_t horizon = static_cast<int64_t>(a.predicted) - static_cast<int64_t>(now);
 
@@ -188,6 +199,7 @@ void ArrivalTracker::processLiveArrival(StopState& st, const transit::Arrival& a
     if (t.last_predicted != 0) ev.predicted_ts = t.last_predicted;
     if (t.late_known) ev.late_min = t.last_late_min;
     ev.horizon_s = static_cast<int32_t>(horizon);
+    ev.seats = seats_tok;
     out.push_back(std::move(ev));
   };
 
@@ -261,6 +273,7 @@ void ArrivalTracker::reapVanishedAndExpired(StopState& st, transit::Epoch now,
         if (t.last_scheduled != 0) ev.scheduled_ts = t.last_scheduled;
         ev.actual_ts = actual_ts;
         if (t.late_known) ev.late_min = t.last_late_min;
+        ev.seats = seatsTokenFromLevel(t.last_seats_level);
         if (st.has_last_arrive) {
           ev.headway_s = static_cast<int32_t>(actual_ts - st.last_arrive_actual);
         }

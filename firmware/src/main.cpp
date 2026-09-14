@@ -81,7 +81,6 @@ void setup() {
     transit_app::saveConfig(cfg);
   }
   transit_app::setActiveConfig(cfg);
-  transit_app::setUseHttps(cfg.device.use_https);
   transit_app::ui::applyRotation(cfg.device.rotation);  // panel-native is portrait; config picks the orientation
   transit_app::ui::applyInvert(cfg.device.invert_colors);
   transit_app::ui::setTheme(cfg.device.theme);
@@ -100,6 +99,15 @@ void setup() {
   transit_app::connectWifiOrPortal(wifiApName(), pumpLvgl);
   heapStage("wifi");
 
+  // Prime Arduino's DNS state before SNTP starts. NetworkManager::hostByName() calls
+  // dns_clear_cache() from the CALLER's task the first time it sees an IP; if SNTP's own lookup of
+  // pool.ntp.org is in flight at that moment, lwIP runs the SNTP callback without the core lock
+  // and asserts in sys_untimeout (seen 2026-09-14 as a panic on the first poll after a reboot).
+  // Resolving once here, with nothing pending, flips that state harmlessly and warms the cache.
+  {
+    IPAddress ntp_ip;
+    WiFi.hostByName("pool.ntp.org", ntp_ip);
+  }
   configTzTime(cfg.device.tz.c_str(), "pool.ntp.org");
 
   if (MDNS.begin(cfg.device.name.c_str())) {
@@ -110,7 +118,6 @@ void setup() {
   }
 
   transit_app::startWebServer([](bool data_changed) {
-    transit_app::setUseHttps(transit_app::getActiveConfig().device.use_https);
     transit_app::requestRepoll(data_changed);
     transit_app::ui::onConfigChanged(transit_app::getActiveConfig());  // applied on the LVGL task
   });
