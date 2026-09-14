@@ -1,6 +1,8 @@
 #include "ui.h"
 
 #include <esp32_smartdisplay.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include <algorithm>
 #include <ctime>
@@ -37,6 +39,49 @@ Config g_cfg;
 Page g_page = Page::Main;
 bool g_initialized = false;
 
+// Config handed over from another task (web server); applied on the LVGL task in tick().
+SemaphoreHandle_t g_pending_mutex = nullptr;
+Config g_pending_cfg;
+bool g_pending = false;
+
+void onScreenTapped(lv_event_t *e);
+
+lv_display_rotation_t rotationEnum(uint16_t degrees) {
+  switch (degrees) {
+    case 90: return LV_DISPLAY_ROTATION_90;
+    case 180: return LV_DISPLAY_ROTATION_180;
+    case 270: return LV_DISPLAY_ROTATION_270;
+    default: return LV_DISPLAY_ROTATION_0;
+  }
+}
+
+void buildScreens() {
+  g_main_screen = createMainScreen(g_cfg);
+  g_stats_screen = createStatsScreen(g_cfg);
+  g_device_info_screen = createDeviceInfoScreen(g_cfg);
+  lv_obj_add_event_cb(g_main_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(g_stats_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(g_device_info_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
+}
+
+// Tears down and recreates every screen (rotation or stop list changed). A blank screen is
+// loaded first because LVGL will not delete the active screen. Each screen's small context
+// struct (lv_obj user_data) is not freed here; config changes are rare enough that this
+// leak of a few hundred bytes per rebuild is acceptable until the screens grow destroy() helpers.
+void rebuildScreens() {
+  lv_obj_t *blank = lv_obj_create(nullptr);
+  lv_obj_set_style_bg_color(blank, colorBg(), 0);
+  lv_screen_load(blank);
+  if (g_main_screen) lv_obj_delete(g_main_screen);
+  if (g_stats_screen) lv_obj_delete(g_stats_screen);
+  if (g_device_info_screen) lv_obj_delete(g_device_info_screen);
+  buildScreens();
+  g_page = Page::Main;
+  refreshMainScreen(g_main_screen, g_cfg, currentSnapshot());
+  lv_screen_load(g_main_screen);
+  lv_obj_delete(blank);
+}
+
 void onScreenTapped(lv_event_t *e) {
   (void)e;
   switch (g_page) {
@@ -61,14 +106,9 @@ void onScreenTapped(lv_event_t *e) {
 
 void init(const Config &cfg) {
   g_cfg = cfg;
+  if (g_pending_mutex == nullptr) g_pending_mutex = xSemaphoreCreateMutex();
 
-  g_main_screen = createMainScreen(g_cfg);
-  g_stats_screen = createStatsScreen(g_cfg);
-  g_device_info_screen = createDeviceInfoScreen(g_cfg);
-
-  lv_obj_add_event_cb(g_main_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
-  lv_obj_add_event_cb(g_stats_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
-  lv_obj_add_event_cb(g_device_info_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
+  buildScreens();
 
   g_page = Page::Main;
   refreshMainScreen(g_main_screen, g_cfg, currentSnapshot());
@@ -120,6 +160,24 @@ void tick() {
   if (!g_initialized) {
     return;
   }
+  // Apply a configuration handed over by the web server task (rotation, brightness, stops).
+  bool apply = false;
+  Config next;
+  if (g_pending && g_pending_mutex && xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (g_pending) {
+      next = g_pending_cfg;
+      g_pending = false;
+      apply = true;
+    }
+    xSemaphoreGive(g_pending_mutex);
+  }
+  if (apply) {
+    bool rotate = next.device.rotation != g_cfg.device.rotation;
+    g_cfg = next;
+    if (rotate) applyRotation(g_cfg.device.rotation);
+    applyBrightness(g_cfg.device.brightness);
+    rebuildScreens();
+  }
   switch (g_page) {
     case Page::Main:
       refreshMainScreen(g_main_screen, g_cfg, currentSnapshot());
@@ -139,6 +197,21 @@ void tick() {
 void applyBrightness(uint8_t percent) {
   percent = std::min<uint8_t>(percent, 100);
   smartdisplay_lcd_set_backlight((float)percent / 100.0f);
+}
+
+void applyRotation(uint16_t degrees) {
+  lv_display_t *d = lv_display_get_default();
+  if (d == nullptr) return;
+  lv_display_set_rotation(d, rotationEnum(degrees));
+}
+
+void onConfigChanged(const Config &cfg) {
+  if (g_pending_mutex == nullptr) return;  // before init(): main.cpp applies the boot config itself
+  if (xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    g_pending_cfg = cfg;
+    g_pending = true;
+    xSemaphoreGive(g_pending_mutex);
+  }
 }
 
 }  // namespace transit_app::ui

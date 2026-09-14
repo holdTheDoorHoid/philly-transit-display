@@ -70,9 +70,9 @@ To refresh a board definition or add a new Sunton variant, see
 ## Local modification: LVGL draw buffer size
 
 All six JSONs have `LVGL_BUFFER_PIXELS` changed from `DISPLAY_WIDTH*DISPLAY_HEIGHT/4` to
-`/10`. With Arduino core 3.x the largest free heap block on these PSRAM-less boards is
+`/16`. With Arduino core 3.x the largest free heap block on these PSRAM-less boards is
 about 110 KB at boot; a quarter-screen RGB565 buffer on the 320x480 panels is 76.8 KB
 (and the upstream driver mistakenly sized it with the 3-byte `lv_color_t`, 115 KB, which
-failed outright). A tenth of the screen (30.7 KB on 3.5", 15.4 KB on 2.8") is LVGL's
+failed outright). A sixteenth of the screen (19.2 KB on 3.5", 9.6 KB on 2.8") is LVGL's
 recommended partial-render minimum and leaves room for Wi-Fi, TLS, and the web server.
 See `firmware/extra_scripts/patch_esp32_smartdisplay.py` for the `lv_color16_t` fix.

@@ -96,6 +96,10 @@ bool validateConfig(const Config &cfg, ConfigError &err) {
     err = {"brightness must be between 0 and 100", "device.brightness"};
     return false;
   }
+  if (cfg.device.rotation != 0 && cfg.device.rotation != 90 && cfg.device.rotation != 180 && cfg.device.rotation != 270) {
+    err = {"rotation must be 0, 90, 180, or 270", "device.rotation"};
+    return false;
+  }
   if (cfg.device.name.empty()) {
     err = {"device.name must not be empty (used as the mDNS hostname)", "device.name"};
     return false;
@@ -144,7 +148,9 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
   device["tz"] = cfg.device.tz;
   device["poll_seconds"] = cfg.device.poll_seconds;
   device["brightness"] = cfg.device.brightness;
+  device["rotation"] = cfg.device.rotation;
   device["tls_verify"] = cfg.device.tls_verify;
+  device["use_https"] = cfg.device.use_https;
   device["logging"] = cfg.device.logging;
 
   JsonArray stops = doc["stops"].to<JsonArray>();
@@ -179,7 +185,9 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   result.device.tz = std::string(device["tz"] | "EST5EDT,M3.2.0,M11.1.0");
   result.device.poll_seconds = device["poll_seconds"] | 30;
   result.device.brightness = device["brightness"] | 80;
+  result.device.rotation = device["rotation"] | 0;
   result.device.tls_verify = device["tls_verify"] | true;
+  result.device.use_https = device["use_https"] | false;
   result.device.logging = device["logging"] | true;
 
   JsonVariantConst stops = doc["stops"];

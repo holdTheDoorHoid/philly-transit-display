@@ -50,4 +50,12 @@ namespace transit_app {
 int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, uint32_t timeout_ms,
         bool tls_verify = true);
 
+// Selects the transport for every get(): with `use_https` false, an https:// URL is fetched over
+// plain http:// with a NetworkClient and no TLS at all. Default false: a TLS session needs ~40 KB
+// of heap with two 16 KB contiguous buffers, which the classic ESP32 (no PSRAM) running LVGL,
+// Wi-Fi, and a web server cannot spare (measured 2026-09-14: 51 KB free, 14 KB largest block at
+// poll time). SEPTA serves every endpoint over http:// without redirecting. config.device.use_https.
+void setUseHttps(bool use_https);
+bool useHttps();
+
 }  // namespace transit_app

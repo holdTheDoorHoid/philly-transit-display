@@ -37,6 +37,14 @@ struct PollStatus {
 // once, after Wi-Fi is connected.
 void startNetPoller(uint32_t poll_seconds);
 
+// Allocates the ~16 KB ArrivalTracker while the heap is still unfragmented. Call early in
+// setup(), before Wi-Fi. Returns false (and logging stays disabled) if the allocation failed.
+bool preallocateTracker();
+
+// Creates the poller task (12 KB stack) and its primitives without starting to poll. Call early
+// in setup(), before Wi-Fi, for the same heap-fragmentation reason as preallocateTracker().
+void initNetPoller();
+
 // Wakes the poller task immediately instead of waiting out its current interval. Wired to
 // web_server.cpp's onConfigChanged hook (DESIGN.md SS7: "PUT /api/config ... triggers immediate
 // re-poll") - also invalidates the BusSchedules cache, since a config change may have added a

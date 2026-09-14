@@ -15,8 +15,10 @@
 #include <ctime>
 
 #include "app/config_store.h"
+#include "app/http_fetch.h"
 #include "app/hw_probe.h"
 #include "app/net_poller.h"
+#include "app/proxy_worker.h"
 #include "app/sd_logger.h"
 #include "app/status_led.h"
 #include "app/ui/ui.h"
@@ -53,14 +55,19 @@ std::string wifiApName() {
 
 }  // namespace
 
+// Always-on heap trace at each setup stage (CORE_DEBUG_LEVEL=2 hides log_i), so a fragmented
+// heap is visible over serial before it turns into a failed allocation.
+void heapStage(const char *stage) {
+  Serial.printf("[heap] %-10s free=%u largest=%u\n", stage, (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
   transit_app::hwProbeEarly();
 
   smartdisplay_init();
-  lv_display_set_rotation(lv_display_get_default(), LV_DISPLAY_ROTATION_90);  // panels are wired portrait; DESIGN.md SS3/SS8 want landscape
-  transit_app::hwProbeDisplay();
+  heapStage("display");
 
   if (!LittleFS.begin(false)) {
     log_w("main: LittleFS mount failed, formatting");
@@ -74,8 +81,22 @@ void setup() {
     transit_app::saveConfig(cfg);
   }
   transit_app::setActiveConfig(cfg);
+  transit_app::setUseHttps(cfg.device.use_https);
+  transit_app::ui::applyRotation(cfg.device.rotation);  // panel-native is portrait; config picks the orientation
+  transit_app::hwProbeDisplay();
+  heapStage("config");
+
+  // Big long-lived objects first, while the heap is one contiguous block (a boot loop was traced
+  // to this allocation failing after Wi-Fi + web server had fragmented the heap).
+  if (!transit_app::preallocateTracker()) {
+    log_e("main: could not allocate the arrival tracker; SD logging disabled");
+  }
+  transit_app::initNetPoller();
+  transit_app::startProxyWorker();
+  heapStage("tasks");
 
   transit_app::connectWifiOrPortal(wifiApName(), pumpLvgl);
+  heapStage("wifi");
 
   configTzTime(cfg.device.tz.c_str(), "pool.ntp.org");
 
@@ -87,9 +108,11 @@ void setup() {
   }
 
   transit_app::startWebServer([]() {
+    transit_app::setUseHttps(transit_app::getActiveConfig().device.use_https);
     transit_app::requestRepoll();
-    transit_app::ui::applyBrightness(transit_app::getActiveConfig().device.brightness);
+    transit_app::ui::onConfigChanged(transit_app::getActiveConfig());  // applied on the LVGL task
   });
+  heapStage("web");
 
   transit_app::SdStatus sd = transit_app::mountSd();
   if (sd.mounted) {
@@ -102,9 +125,13 @@ void setup() {
   // flashes green on a good poll and holds red on a failed one from here on.
   transit_app::setStatusLed(LedState::Off);
 
+  heapStage("sd");
+
   transit_app::ui::init(cfg);
   transit_app::ui::applyBrightness(cfg.device.brightness);
+  heapStage("ui");
   transit_app::startNetPoller(cfg.device.poll_seconds);
+  heapStage("poller");
 
   log_i("main: setup complete, free heap %u bytes", (unsigned)ESP.getFreeHeap());
 }

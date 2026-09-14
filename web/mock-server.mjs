@@ -67,6 +67,8 @@ function defaultConfig() {
       tz: 'EST5EDT,M3.2.0,M11.1.0',
       poll_seconds: 30,
       brightness: 80,
+      rotation: 0,
+      use_https: false,
       tls_verify: true,
       logging: true,
     },
@@ -97,6 +99,10 @@ function validateConfig(cfg) {
   if (!Number.isInteger(d.brightness) || d.brightness < 10 || d.brightness > 100) {
     return { error: 'brightness must be an integer between 10 and 100', path: 'device.brightness' };
   }
+  if (d.rotation !== undefined && ![0, 90, 180, 270].includes(d.rotation)) {
+    return { error: 'rotation must be 0, 90, 180, or 270', path: 'device.rotation' };
+  }
+  if (d.use_https !== undefined && typeof d.use_https !== 'boolean') return { error: 'use_https must be a boolean', path: 'device.use_https' };
   if (typeof d.tls_verify !== 'boolean') return { error: 'tls_verify must be a boolean', path: 'device.tls_verify' };
   if (typeof d.logging !== 'boolean') return { error: 'logging must be a boolean', path: 'device.logging' };
   if (typeof cfg.alerts !== 'boolean') return { error: 'alerts must be a boolean', path: 'alerts' };

@@ -1045,9 +1045,14 @@ async function renderSettings(root) {
   tzSelect.addEventListener('change', () => tzCustom.classList.toggle('hidden', tzSelect.value !== '__custom__'));
 
   const pollInput = h('input', { type: 'number', id: 'set-poll', min: 15, max: 120, value: d.poll_seconds });
+  const ROTATIONS = [[0, 'Portrait (0°)'], [90, 'Landscape (90°)'], [180, 'Portrait, flipped (180°)'], [270, 'Landscape, flipped (270°)']];
+  const rotSelect = h('select', { id: 'set-rotation' },
+    ...ROTATIONS.map(([deg, label]) => h('option', { value: String(deg), selected: deg === (d.rotation ?? 0) || undefined }, label)));
   const brightInput = h('input', { type: 'range', id: 'set-bright', min: 10, max: 100, value: d.brightness });
   const brightVal = h('span', { class: 'small muted' }, `${d.brightness}%`);
   brightInput.addEventListener('input', () => { brightVal.textContent = `${brightInput.value}%`; });
+  const httpsInput = h('input', { type: 'checkbox', id: 'set-https' });
+  httpsInput.checked = !!d.use_https;
   const tlsInput = h('input', { type: 'checkbox', id: 'set-tls' });
   tlsInput.checked = d.tls_verify;
   const loggingInput = h('input', { type: 'checkbox', id: 'set-logging' });
@@ -1064,8 +1069,11 @@ async function renderSettings(root) {
     h('label', { for: 'set-name' }, 'Device name'), h('div', { class: 'row' }, nameInput, mdnsPreview),
     h('label', { for: 'set-tz' }, 'Timezone'), tzSelect, tzCustom,
     h('label', { for: 'set-poll' }, 'Poll interval (seconds)'), pollInput,
+    h('label', { for: 'set-rotation' }, 'Screen rotation'), rotSelect,
     h('label', { for: 'set-bright' }, 'Screen brightness'), h('div', { class: 'row' }, brightInput, brightVal),
-    h('label', { class: 'inline', style: 'margin-top:1rem' }, tlsInput, ' Verify SEPTA’s TLS certificate'), tlsWarn,
+    h('label', { class: 'inline', style: 'margin-top:1rem' }, httpsInput, ' Fetch SEPTA data over HTTPS'),
+    h('p', { class: 'small muted' }, 'Off by default: a TLS session needs about 40 KB of RAM the classic ESP32 does not have to spare. SEPTA serves the same data over plain HTTP.'),
+    h('label', { class: 'inline' }, tlsInput, ' Verify SEPTA’s TLS certificate (when HTTPS is on)'), tlsWarn,
     h('label', { class: 'inline' }, loggingInput, ' Log arrivals to SD card'),
     h('label', { class: 'inline' }, alertsInput, ' Show service alerts'),
     h('div', { style: 'margin-top:1rem' }, h('button', { class: 'primary', onclick: async () => {
@@ -1074,7 +1082,7 @@ async function renderSettings(root) {
         ...cfg,
         device: {
           ...d, name: nameInput.value.trim(), tz, poll_seconds: Number(pollInput.value),
-          brightness: Number(brightInput.value), tls_verify: tlsInput.checked, logging: loggingInput.checked,
+          brightness: Number(brightInput.value), rotation: Number(rotSelect.value), use_https: httpsInput.checked, tls_verify: tlsInput.checked, logging: loggingInput.checked,
         },
         alerts: alertsInput.checked,
       };

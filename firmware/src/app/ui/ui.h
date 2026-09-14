@@ -29,4 +29,12 @@ void tick();
 // again whenever PUT /api/config changes device.brightness (DESIGN.md task 8).
 void applyBrightness(uint8_t percent);
 
+// Rotates the display to `degrees` (0/90/180/270, config.device.rotation). Must be called from
+// the LVGL task; before init() it only rotates, after init() call onConfigChanged() instead.
+void applyRotation(uint16_t degrees);
+
+// Hands a new configuration to the UI from any task. The next tick() (LVGL task) applies
+// rotation and brightness and rebuilds the screens so new stops appear without a reboot.
+void onConfigChanged(const Config &cfg);
+
 }  // namespace transit_app::ui

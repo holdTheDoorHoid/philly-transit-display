@@ -1,6 +1,8 @@
 #include "net_poller.h"
 
 #include <Arduino.h>
+
+#include <new>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -34,7 +36,7 @@ namespace transit_app {
 namespace {
 
 constexpr uint32_t kFetchTimeoutMs = 15000;
-constexpr uint32_t kTaskStackBytes = 12288;
+constexpr uint32_t kTaskStackBytes = 10240;
 constexpr UBaseType_t kTaskPriority = 1;
 
 // DESIGN.md SS4.7.
@@ -113,7 +115,11 @@ transit_stats::StopSummary computeStopSummary(const std::string &stop_key) {
   // Heap-allocated: StatsAggregator's own header docs put sizeof() at just under 8KB, too large
   // to risk on an arbitrary caller's stack (this can be called from the LVGL task, not just
   // net_poller's own - see net_poller.h).
-  auto agg = std::make_unique<transit_stats::StatsAggregator>(stop_key, start, now);
+  std::unique_ptr<transit_stats::StatsAggregator> agg(new (std::nothrow) transit_stats::StatsAggregator(stop_key, start, now));
+  if (!agg) {
+    Serial.println("[net_poller] StatsAggregator allocation failed; summary unavailable");
+    return transit_stats::StopSummary{};
+  }
   for (const std::string &month : transit_stats::monthsInWindow(start, now)) {
     streamLogLines(month + ".csv", [&](const char *line, size_t len) {
       agg->feedLine(line, len);
@@ -264,17 +270,30 @@ std::string currentLocalMonth() {
 // fixed static .bss/.data budget if declared as a file-scope object - confirmed by hitting
 // "DRAM segment data does not fit" at link time with it declared that way.
 transit_stats::ArrivalTracker *g_tracker = nullptr;
+volatile bool g_enabled = false;
+bool g_task_created = false;
 
-transit_stats::ArrivalTracker &tracker() {
+// May return nullptr: with exceptions disabled a plain `new` that fails calls std::terminate()
+// (seen as a boot loop on the owner's board when the heap was too fragmented after Wi-Fi came
+// up), so allocate with nothrow and let callers degrade to "no logging" instead of crashing.
+// main.cpp calls preallocateTracker() before Wi-Fi starts so this normally never fails.
+transit_stats::ArrivalTracker *tracker() {
+  static bool warned = false;
   if (g_tracker == nullptr) {
-    g_tracker = new transit_stats::ArrivalTracker();
+    g_tracker = new (std::nothrow) transit_stats::ArrivalTracker();
+    if (g_tracker == nullptr && !warned) {
+      warned = true;
+      Serial.printf("[net_poller] ArrivalTracker allocation failed (%u bytes); arrival logging disabled\n", (unsigned)sizeof(transit_stats::ArrivalTracker));
+    }
   }
-  return *g_tracker;
+  return g_tracker;
 }
 
 void syncTrackerRegistrations(const std::vector<StopConfig> &stops) {
+  transit_stats::ArrivalTracker *t = tracker();
+  if (t == nullptr) return;
   for (const auto &s : stops) {
-    tracker().registerStop(s.key, s.route, s.direction);
+    t->registerStop(s.key, s.route, s.direction);
   }
 }
 
@@ -332,7 +351,7 @@ void pollOnce() {
         }
       }
       bool route_live = sc && routeIsLive(live_by_route, sc->route);
-      tracker().observe(stop, now, route_live, combined.last_poll_ok, events);
+      if (tracker() != nullptr) tracker()->observe(stop, now, route_live, combined.last_poll_ok, events);
     }
     if (!events.empty()) {
       std::string month = currentLocalMonth();
@@ -377,6 +396,11 @@ uint32_t nextIntervalS(const Config &cfg, bool ok, bool urgent, uint32_t &consec
 }
 
 void pollerTask(void * /*arg*/) {
+  // Created before Wi-Fi so the stack comes from an unfragmented heap; polling starts when
+  // startNetPoller() flips g_enabled.
+  while (!g_enabled) {
+    xSemaphoreTake(g_wake_sem, pdMS_TO_TICKS(500));
+  }
   uint32_t consecutive_failures = 0;
   for (;;) {
     pollOnce();
@@ -395,16 +419,28 @@ void pollerTask(void * /*arg*/) {
 
 }  // namespace
 
-void startNetPoller(uint32_t poll_seconds) {
-  g_poll_seconds = poll_seconds > 0 ? poll_seconds : 30;
+bool preallocateTracker() {
+  return tracker() != nullptr;
+}
+
+void initNetPoller() {
   if (g_mutex == nullptr) {
     g_mutex = xSemaphoreCreateMutex();
   }
   if (g_wake_sem == nullptr) {
     g_wake_sem = xSemaphoreCreateBinary();
   }
+  if (!g_task_created) {
+    g_task_created = xTaskCreatePinnedToCore(pollerTask, "net_poller", kTaskStackBytes, nullptr, kTaskPriority, nullptr, 0 /* core 0, DESIGN.md SS5 */) == pdPASS;
+  }
+}
+
+void startNetPoller(uint32_t poll_seconds) {
+  g_poll_seconds = poll_seconds > 0 ? poll_seconds : 30;
+  initNetPoller();
   syncTrackerRegistrations(getActiveConfig().stops);
-  xTaskCreatePinnedToCore(pollerTask, "net_poller", kTaskStackBytes, nullptr, kTaskPriority, nullptr, 0 /* core 0, DESIGN.md SS5 */);
+  g_enabled = true;
+  xSemaphoreGive(g_wake_sem);
 }
 
 void requestRepoll() {

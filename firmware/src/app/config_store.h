@@ -19,7 +19,9 @@ struct DeviceConfig {
   std::string tz = "EST5EDT,M3.2.0,M11.1.0";
   uint16_t poll_seconds = 30;
   uint8_t brightness = 80;
+  uint16_t rotation = 0;  // 0, 90, 180, 270 degrees; 0 = panel-native portrait (DESIGN.md SS6)
   bool tls_verify = true;
+  bool use_https = false;  // see http_fetch.h: TLS is a 40 KB luxury this board cannot afford by default
   bool logging = true;
 };
 

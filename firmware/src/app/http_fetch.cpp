@@ -1,6 +1,9 @@
 #include "http_fetch.h"
 
 #include <Arduino.h>
+
+#include <cstring>
+#include <string>
 #include <HTTPClient.h>
 #include <NetworkClientSecure.h>
 
@@ -70,11 +73,28 @@ void streamBody(HTTPClient &http, NetworkClient *stream, uint32_t timeout_ms, co
 
 }  // namespace
 
+bool g_use_https = false;
+
+void setUseHttps(bool use_https) {
+  g_use_https = use_https;
+}
+
+bool useHttps() {
+  return g_use_https;
+}
+
 int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, uint32_t timeout_ms,
         bool tls_verify) {
   int last_status = -1;
 
-  if (!tls_verify) {
+  std::string plain_url;
+  if (!g_use_https && strncmp(url, "https://", 8) == 0) {
+    plain_url = std::string("http://") + (url + 8);
+    url = plain_url.c_str();
+  }
+  const bool https = strncmp(url, "https://", 8) == 0;
+
+  if (https && !tls_verify) {
     static bool warned = false;
     if (!warned) {
       warned = true;
@@ -89,19 +109,26 @@ int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, ui
       delay(backoff_ms);
     }
 
-    NetworkClientSecure client;
-    if (tls_verify) {
-      client.setCACertBundle(kSeptaCaBundle, kSeptaCaBundleLen);
-    } else {
-      client.setInsecure();
+    // Only one of these is used per attempt; both live on this task's stack (small objects, the
+    // TLS context itself is heap-allocated by NetworkClientSecure on connect).
+    NetworkClientSecure secure_client;
+    NetworkClient plain_client;
+    NetworkClient *client = &plain_client;
+    if (https) {
+      if (tls_verify) {
+        secure_client.setCACertBundle(kSeptaCaBundle, kSeptaCaBundleLen);
+      } else {
+        secure_client.setInsecure();
+      }
+      client = &secure_client;
     }
 
     HTTPClient http;
     http.setConnectTimeout((int32_t)timeout_ms);
     http.setTimeout((uint16_t)timeout_ms);
-    http.setReuse(false);  // DESIGN.md SS4.7: never hold a TLS socket across the idle gap
+    http.setReuse(false);  // DESIGN.md SS4.7: never hold a socket across the idle gap
 
-    if (!http.begin(client, url)) {
+    if (!http.begin(*client, url)) {
       log_e("http_fetch: begin() failed for %s (bad URL?)", url);
       last_status = -1;
       continue;

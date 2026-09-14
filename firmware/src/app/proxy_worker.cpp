@@ -1,6 +1,8 @@
 #include "proxy_worker.h"
 
 #include <Arduino.h>
+
+#include <new>
 #include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -30,7 +32,7 @@ constexpr UBaseType_t kQueueLen = 4;
 // must comfortably clear that plus the rest of runStatsJob()'s frame (JsonDocument, String,
 // lambdas) even with it heap-allocated rather than a local - a smaller stack here silently
 // corrupts memory instead of failing loudly, so err generous.
-constexpr uint32_t kWorkerStackBytes = 16384;
+constexpr uint32_t kWorkerStackBytes = 8192;  // TLS handshake needs ~5 KB; JSON docs and the aggregator live on the heap
 constexpr int kDefaultStatsDays = 30;
 constexpr int kMaxStatsDays = 365;
 
@@ -121,7 +123,11 @@ void runStatsJob(const ProxyJob &job) {
   // under 8KB, too large to risk on this task's stack alongside everything else in this call
   // chain (see kWorkerStackBytes's comment) - same reasoning as net_poller.cpp's
   // computeStopSummary().
-  auto agg = std::make_unique<transit_stats::StatsAggregator>(job.param, window_start, window_end);
+  std::unique_ptr<transit_stats::StatsAggregator> agg(new (std::nothrow) transit_stats::StatsAggregator(job.param, window_start, window_end));
+  if (!agg) {
+    if (requestStillAlive(job)) job.request->send(503, "application/json", "{\"error\":\"out of memory, try again\"}");
+    return;
+  }
   for (const std::string &month : transit_stats::monthsInWindow(window_start, window_end)) {
     std::string filename = month + ".csv";
     streamLogLines(filename, [&](const char *line, size_t len) {
@@ -175,6 +181,9 @@ void startProxyWorker() {
   if (g_queue == nullptr) {
     g_queue = xQueueCreate(kQueueLen, sizeof(ProxyJob *));
   }
+  static bool started = false;
+  if (started) return;  // main.cpp starts it early (before Wi-Fi) so the stack is one contiguous block
+  started = true;
   xTaskCreate(workerTask, "proxy_worker", kWorkerStackBytes, nullptr, 1, nullptr);
 }
 
