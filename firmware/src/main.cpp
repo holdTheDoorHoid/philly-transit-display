@@ -86,7 +86,7 @@ void setup() {
     log_e("main: mDNS.begin() failed");
   }
 
-  transit_app::startWebServer();
+  transit_app::startWebServer(transit_app::requestRepoll);
 
   transit_app::SdStatus sd = transit_app::mountSd();
   if (sd.mounted) {

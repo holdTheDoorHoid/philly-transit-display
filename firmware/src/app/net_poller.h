@@ -1,12 +1,19 @@
 // FreeRTOS network-polling task, pinned to core 0. DESIGN.md SS5: "Network
 // polling runs on core 0. Shared state is a Snapshot guarded by a mutex,
 // swapped whole (never mutated in place)."
+//
+// DESIGN.md SS4.7's whole poll cycle lives here: transit_core's SeptaSource::pollBusStops()/
+// pollRailStops() do the fetch+merge orchestration; this file supplies the HttpGet glue
+// (http_fetch.cpp), the ScheduleCache, the alerts fetch (5 min, separate from pollBusStops -
+// see source.h), the poll-interval/backoff state machine, and feeds every StopSnapshot to
+// transit_stats::ArrivalTracker + sd_logger (DESIGN.md SS9.1).
 #pragma once
 #include <cstddef>
 #include <cstdint>
 #include <string>
 
 #include "transit_core/model.h"
+#include "transit_stats/summary.h"
 
 namespace transit_app {
 
@@ -22,24 +29,29 @@ struct PollStatus {
   std::string last_error;
 };
 
-// Starts the polling task. Fetches SEPTA's TransitView for route 17
-// (DESIGN.md SS1, SS4.3) every `poll_seconds` via http_fetch::get(), and
-// logs status, byte count, and free heap (DESIGN.md SS5's memory rules)
-// each time. Must be called once, after Wi-Fi is connected.
-//
-// Decoding the response and merging it into a real transit::Snapshot is
-// NOT implemented here - see the TODO in net_poller.cpp marking exactly
-// where transit_core::merge() plugs in once it exists. Until then,
-// getSnapshot() returns a Snapshot with only `generated`/`last_poll_ok`/
-// `last_error` populated (empty stops/alerts); demo_data.h supplies the
-// stop/arrival content shown on the UI and GET /api/state in this
-// skeleton.
+// Starts the polling task: reads the active config (config_store::getActiveConfig()) once per
+// cycle, so a PUT /api/config takes effect on the very next poll without a restart. `poll_seconds`
+// is only the *initial* cadence (also DeviceConfig::poll_seconds's default) - the task re-reads
+// the live config every cycle and re-derives the interval per DESIGN.md SS4.7 (15s when any
+// arrival is under 3 min out, exponential backoff on failure capped at 5 min). Must be called
+// once, after Wi-Fi is connected.
 void startNetPoller(uint32_t poll_seconds);
+
+// Wakes the poller task immediately instead of waiting out its current interval. Wired to
+// web_server.cpp's onConfigChanged hook (DESIGN.md SS7: "PUT /api/config ... triggers immediate
+// re-poll") - also invalidates the BusSchedules cache, since a config change may have added a
+// stop whose schedule was never fetched. Safe to call before startNetPoller() (a no-op then).
+void requestRepoll();
 
 // Returns a copy of the latest Snapshot, safe to call from any task.
 transit::Snapshot getSnapshot();
 
 // Returns a copy of the latest poll diagnostics, safe to call from any task.
 PollStatus getPollStatus();
+
+// Returns the current per-stop stats summary (DESIGN.md SS8 "Stats page") for `stop_key`, or
+// false if that stop has never been observed (never configured, or evicted - see
+// transit_stats::ArrivalTracker). Safe to call from any task (UI, web server).
+bool getStopSummary(const std::string &stop_key, transit_stats::StopSummary &out);
 
 }  // namespace transit_app
