@@ -13,3 +13,8 @@ web/dist/
 firmware/secrets.h
 # Claude Code local launch config
 .claude/
+
+# on-device test run artifacts (contain the owner's config)
+firmware/test/device/exhaustive_results.json
+firmware/test/device/test_backup_config.json
+firmware/test/device/__pycache__/
