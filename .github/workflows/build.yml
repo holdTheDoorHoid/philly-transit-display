@@ -1,0 +1,88 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Host unit tests (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+      - name: Run native tests
+        working-directory: firmware
+        run: pio test -e native
+
+  web-assets:
+    name: Web assets header is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - name: Check generated header
+        run: node web/build.mjs --check
+
+  firmware:
+    name: Firmware ${{ matrix.env }}
+    runs-on: ubuntu-latest
+    needs: [host-tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [cyd-3248S035R, cyd-3248S035C, cyd-2432S028R, cyd-2432S028Rv3, cyd-2432S024R, cyd-2432S024C]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+      - name: Build
+        working-directory: firmware
+        run: pio run -e ${{ matrix.env }}
+      - name: Collect binaries
+        run: |
+          set -e
+          out=dist/${{ matrix.env }}
+          mkdir -p "$out"
+          b=firmware/.pio/build/${{ matrix.env }}
+          cp "$b/firmware.bin" "$out/"
+          cp "$b/partitions.bin" "$out/"
+          cp "$b/bootloader.bin" "$out/"
+          ls -l "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.env }}
+          path: dist/${{ matrix.env }}
+
+  release:
+    name: Attach binaries to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [firmware, web-assets]
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: Zip per environment
+        run: |
+          cd dist
+          for d in firmware-*; do (cd "$d" && zip -r "../$d.zip" .); done
+          ls -l
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
