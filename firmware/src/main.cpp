@@ -9,7 +9,6 @@
 #include <ESPmDNS.h>
 #include <LittleFS.h>
 #include <WiFi.h>
-#include <WiFiManager.h>
 #include <esp32_smartdisplay.h>
 #include <esp_mac.h>
 
@@ -22,6 +21,7 @@
 #include "app/status_led.h"
 #include "app/ui/ui.h"
 #include "app/web_server.h"
+#include "app/wifi_portal.h"
 
 namespace {
 
@@ -51,39 +51,6 @@ std::string wifiApName() {
   return std::string(buf);
 }
 
-// DESIGN.md main.cpp task: "3 minute portal timeout then retry loop; show
-// the AP name and 'connect to set up Wi-Fi' on the LVGL screen while the
-// portal is open." Runs the portal non-blocking so pumpLvgl() can keep the
-// screen alive and responsive while WiFiManager's own captive-portal HTTP
-// server would otherwise block us in a plain autoConnect() call.
-void connectWifiOrOpenPortal(const std::string &ap_name) {
-  static WiFiManager wm;
-  static volatile bool s_portal_timed_out = false;
-
-  wm.setConfigPortalBlocking(false);
-  wm.setConfigPortalTimeout(180);  // 3 minutes
-  wm.setAPCallback([](WiFiManager *mgr) { transit_app::ui::showWifiSetupScreen(mgr->getConfigPortalSSID().c_str()); });
-  wm.setConfigPortalTimeoutCallback([]() { s_portal_timed_out = true; });
-
-  transit_app::setStatusLed(LedState::Connecting);
-  log_i("main: connecting to Wi-Fi (AP name if a portal opens: %s)", ap_name.c_str());
-
-  bool connected = wm.autoConnect(ap_name.c_str());
-  while (!connected) {
-    pumpLvgl();
-    connected = wm.process();
-    if (s_portal_timed_out) {
-      s_portal_timed_out = false;
-      log_w("main: Wi-Fi setup portal timed out with no network configured, reopening it");
-      connected = wm.autoConnect(ap_name.c_str());
-    }
-    delay(5);
-  }
-
-  log_i("main: Wi-Fi connected, IP %s", WiFi.localIP().toString().c_str());
-  transit_app::setStatusLed(LedState::Off);
-}
-
 }  // namespace
 
 void setup() {
@@ -108,7 +75,7 @@ void setup() {
   }
   transit_app::setActiveConfig(cfg);
 
-  connectWifiOrOpenPortal(wifiApName());
+  transit_app::connectWifiOrPortal(wifiApName(), pumpLvgl);
 
   configTzTime(cfg.device.tz.c_str(), "pool.ntp.org");
 
@@ -119,7 +86,10 @@ void setup() {
     log_e("main: mDNS.begin() failed");
   }
 
-  transit_app::startWebServer();
+  transit_app::startWebServer([]() {
+    transit_app::requestRepoll();
+    transit_app::ui::applyBrightness(transit_app::getActiveConfig().device.brightness);
+  });
 
   transit_app::SdStatus sd = transit_app::mountSd();
   if (sd.mounted) {
@@ -133,6 +103,7 @@ void setup() {
   transit_app::setStatusLed(LedState::Off);
 
   transit_app::ui::init(cfg);
+  transit_app::ui::applyBrightness(cfg.device.brightness);
   transit_app::startNetPoller(cfg.device.poll_seconds);
 
   log_i("main: setup complete, free heap %u bytes", (unsigned)ESP.getFreeHeap());

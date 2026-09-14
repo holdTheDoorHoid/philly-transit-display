@@ -11,8 +11,10 @@
 #include <vector>
 
 #include "transit_core/model.h"
+#include "transit_core/timeparse.h"
 #include "transit_stats/aggregate.h"
 #include "transit_stats/events.h"
+#include "transit_stats/log_window.h"
 #include "transit_stats/summary.h"
 #include "transit_stats/tracker.h"
 
@@ -769,6 +771,72 @@ static void test_stats_aggregator_size_budget(void) {
   TEST_ASSERT_TRUE(sizeof(StatsAggregator) < 8192);
 }
 
+// =============================================================================================
+// log_window.h/.cpp: which monthly CSV files a GET /api/stats?days=N window could touch.
+// =============================================================================================
+
+static transit::Epoch localEastern(int y, int mo, int d, int h, int mi, int s) {
+  return transit::localToEpoch(y, mo, d, h, mi, s, transit::kUsEastern);
+}
+
+static void test_months_in_window_single_day_one_month(void) {
+  // A one-day window entirely inside September 2026 should name just that month.
+  transit::Epoch start = localEastern(2026, 9, 13, 0, 0, 0);
+  transit::Epoch end = localEastern(2026, 9, 14, 0, 0, 0);
+  std::vector<std::string> months = transit_stats::monthsInWindow(start, end);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(months.size()));
+  TEST_ASSERT_EQUAL_STRING("2026-09", months[0].c_str());
+}
+
+static void test_months_in_window_spans_month_boundary(void) {
+  // days=30 ending partway through September should reach back into August.
+  transit::Epoch end = localEastern(2026, 9, 13, 12, 0, 0);
+  transit::Epoch start = end - 30 * 86400;
+  std::vector<std::string> months = transit_stats::monthsInWindow(start, end);
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(months.size()));
+  TEST_ASSERT_EQUAL_STRING("2026-08", months[0].c_str());
+  TEST_ASSERT_EQUAL_STRING("2026-09", months[1].c_str());
+}
+
+static void test_months_in_window_spans_year_boundary(void) {
+  transit::Epoch start = localEastern(2025, 12, 20, 0, 0, 0);
+  transit::Epoch end = localEastern(2026, 1, 10, 0, 0, 0);
+  std::vector<std::string> months = transit_stats::monthsInWindow(start, end);
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(months.size()));
+  TEST_ASSERT_EQUAL_STRING("2025-12", months[0].c_str());
+  TEST_ASSERT_EQUAL_STRING("2026-01", months[1].c_str());
+}
+
+static void test_months_in_window_many_months() {
+  // days=90 from DESIGN.md's example (§9.3 shows "days": 30, but the API accepts any N).
+  transit::Epoch end = localEastern(2026, 3, 1, 0, 0, 0);
+  transit::Epoch start = end - 90 * 86400;
+  std::vector<std::string> months = transit_stats::monthsInWindow(start, end);
+  // Dec, Jan, Feb, (Mar's first instant is excluded - window_end is exclusive at exactly
+  // midnight, so it never touches March at all).
+  TEST_ASSERT_EQUAL_UINT32(3, static_cast<uint32_t>(months.size()));
+  TEST_ASSERT_EQUAL_STRING("2025-12", months[0].c_str());
+  TEST_ASSERT_EQUAL_STRING("2026-01", months[1].c_str());
+  TEST_ASSERT_EQUAL_STRING("2026-02", months[2].c_str());
+}
+
+static void test_months_in_window_empty_when_end_not_after_start(void) {
+  transit::Epoch t = localEastern(2026, 9, 13, 0, 0, 0);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(transit_stats::monthsInWindow(t, t).size()));
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(transit_stats::monthsInWindow(t, t - 10).size()));
+}
+
+static void test_months_in_window_across_dst_spring_forward(void) {
+  // 2026's US "spring forward" is 2026-03-08 02:00 local. A window straddling it in UTC must
+  // not miscompute the local month on either side (this exercises the DST branch in
+  // localYearMonth(), not just the always-EST winter months every other test above uses).
+  transit::Epoch start = localEastern(2026, 3, 1, 0, 0, 0);
+  transit::Epoch end = localEastern(2026, 3, 31, 23, 59, 59);
+  std::vector<std::string> months = transit_stats::monthsInWindow(start, end);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(months.size()));
+  TEST_ASSERT_EQUAL_STRING("2026-03", months[0].c_str());
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -789,6 +857,13 @@ int main(int argc, char** argv) {
   RUN_TEST(test_aggregator_synthetic_month);
   RUN_TEST(test_summary_from_aggregator);
   RUN_TEST(test_stats_aggregator_size_budget);
+
+  RUN_TEST(test_months_in_window_single_day_one_month);
+  RUN_TEST(test_months_in_window_spans_month_boundary);
+  RUN_TEST(test_months_in_window_spans_year_boundary);
+  RUN_TEST(test_months_in_window_many_months);
+  RUN_TEST(test_months_in_window_empty_when_end_not_after_start);
+  RUN_TEST(test_months_in_window_across_dst_spring_forward);
 
   return UNITY_END();
 }

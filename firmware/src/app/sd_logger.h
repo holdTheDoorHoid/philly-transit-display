@@ -3,8 +3,13 @@
 // transit_stats::ArrivalTracker's job; this file only owns the filesystem
 // mechanics.
 #pragma once
+#include <FS.h>
+
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <string>
+#include <vector>
 
 namespace transit_app {
 
@@ -37,5 +42,31 @@ uint64_t logBytes();
 // SS9.1 header row first if the file doesn't already exist. Returns false
 // if the SD card isn't mounted or the write failed.
 bool appendLine(const char *month, const char *line);
+
+struct LogFileInfo {
+  std::string name;  // e.g. "2026-09.csv" - no directory prefix
+  uint64_t bytes = 0;
+};
+
+// Lists the monthly log files under /transit-log/, sorted by filename (which sorts
+// chronologically for "YYYY-MM.csv" names) - the shape GET /api/log/index (DESIGN.md SS7) wants.
+// Empty (not an error) if SD isn't mounted or no logs exist yet.
+std::vector<LogFileInfo> listLogFiles();
+
+// Streams "/transit-log/<filename>" one CSV line at a time (no trailing '\n'; a trailing '\r' is
+// left for the caller/parser to tolerate, matching transit_stats::fromCsv's own contract) to
+// `each`, stopping early if `each` returns false. Reads in a fixed-size chunk internally - never
+// loads the file into RAM (DESIGN.md SS5/SS9.3), regardless of how large the month's log has
+// grown. Returns false (having called `each` zero times) if SD isn't mounted or the file doesn't
+// exist - a month with no log yet is normal, not an error, so callers should not surface this as
+// one.
+bool streamLogLines(const std::string &filename, const std::function<bool(const char *, size_t)> &each);
+
+// Opens "/transit-log/<filename>" for reading and hands back the raw File, for
+// GET /api/log/<file>.csv's streamed download (AsyncWebServer's beginResponse(fs::FS&, path, ...)
+// reads it incrementally itself - this function does no buffering of its own). The returned File
+// evaluates false (operator bool()) if SD isn't mounted or the file doesn't exist; callers must
+// still call .close() on a valid one when done.
+File openLogFile(const std::string &filename);
 
 }  // namespace transit_app

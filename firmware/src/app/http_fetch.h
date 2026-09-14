@@ -37,10 +37,17 @@ namespace transit_app {
 // this version - the whole call either fully succeeds after 1-3 attempts, or
 // returns the final attempt's status/error).
 //
+// `tls_verify` selects whether the server certificate is checked against kSeptaCaBundle
+// (config.device.tls_verify, DESIGN.md SS2/SS12: "verified by default"). Passing false calls
+// NetworkClientSecure::setInsecure() instead and logs a one-time warning (net_poller.cpp is the
+// only caller that can turn this off, driven by the live config) - repeated per-request warnings
+// would be pointless log spam for something that's true for the device's whole uptime once set.
+//
 // Returns the HTTP status code (e.g. 200) from the response that was
 // ultimately kept (the first non-retried one, or the last attempt if all 3
 // were retried), or a negative HTTPClient error code if no attempt ever got
 // a response at all.
-int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, uint32_t timeout_ms);
+int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, uint32_t timeout_ms,
+        bool tls_verify = true);
 
 }  // namespace transit_app

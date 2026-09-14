@@ -102,6 +102,18 @@ For the 2.8"/2.4" boards, only what differs from the 3.5" table above:
 SD (CS 5 / MOSI 23 / MISO 19 / SCK 18), RGB LED (4/16/17), LDR (34), and speaker (26) are
 identical across every board in this project.
 
+## Backlight / brightness control
+
+`config.device.brightness` (0-100, DESIGN.md SS6) is applied via `esp32_smartdisplay`'s own
+`smartdisplay_lcd_set_backlight(float duty)` (`include/esp32_smartdisplay.h`; found by reading
+the vendored library source under `firmware/.pio/libdeps/<env>/esp32_smartdisplay/`, since
+neither the library's README nor DESIGN.md names the exact function) - `duty` is `[0, 1]`, so
+`firmware/src/app/ui/ui.cpp`'s `applyBrightness(uint8_t percent)` just divides by 100. The
+library already owns the LEDC channel it wires to each board's `DISPLAY_BCKL` pin (27 on the
+3.5" boards and the 2.4" `R`/`C` boards; 21 on the 2.8" boards - see the tables above), so
+nothing in `firmware/src/app/` touches LEDC or that GPIO directly; doing so independently would
+double-attach the pin's LEDC channel.
+
 ## Flashing
 
 `pio run -e <env> -t upload --upload-port /dev/ttyUSB0` is the normal path - PlatformIO
