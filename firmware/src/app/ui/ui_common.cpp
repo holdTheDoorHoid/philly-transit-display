@@ -4,7 +4,7 @@
 #include <ctime>
 
 LV_FONT_DECLARE(lv_font_montserrat_48_digits)
-LV_FONT_DECLARE(lv_font_fa_crowding_16)
+LV_FONT_DECLARE(lv_font_icons_16)
 
 namespace transit_app::ui {
 
@@ -112,8 +112,44 @@ int rowsPerStop(int32_t h, bool large_text) {
   return h >= 320 ? 3 : 2;
 }
 
+// Colour for a bike/dock count: red when none, amber when one or two, otherwise plain text.
+static uint32_t countHex(int n) {
+  if (n <= 0) return g_dark ? 0xF05654 : 0xC62828;  // == colorLate()
+  if (n <= 2) return g_dark ? 0xF5A030 : 0xB45309;  // == colorSkipped() (amber)
+  return g_dark ? 0xF0F0F0 : 0x14181C;              // == colorText()
+}
+static void appendColored(std::string &out, uint32_t hex, const std::string &body) {
+  char h[12];
+  snprintf(h, sizeof h, "#%06x ", (unsigned)hex);
+  out += h;
+  out += body;
+  out += '#';
+}
+
+std::string bikeCounts(int classic, int ebikes, int docks, bool icons) {
+  static const char kBike[] = "\xEF\x88\x86";  // U+F206 bicycle
+  static const char kBolt[] = "\xEF\x83\xA7";  // U+F0E7 bolt (e-bikes)
+  static const char kDock[] = "\xEF\x95\x80";  // U+F540 parking (free docks)
+  std::string out;
+  if (icons) {
+    appendColored(out, countHex(classic), std::string(kBike) + " " + std::to_string(classic));
+    out += "  ";
+    appendColored(out, countHex(ebikes), std::string(kBolt) + " " + std::to_string(ebikes));
+    out += "  ";
+    appendColored(out, countHex(docks), std::string(kDock) + " " + std::to_string(docks));
+  } else {
+    appendColored(out, countHex(classic), std::to_string(classic));
+    out += " bikes, ";
+    appendColored(out, countHex(ebikes), std::to_string(ebikes));
+    out += " e-bikes, ";
+    appendColored(out, countHex(docks), std::to_string(docks));
+    out += " docks";
+  }
+  return out;
+}
+
 const lv_font_t *fontIcons() {
-  return &lv_font_fa_crowding_16;
+  return &lv_font_icons_16;
 }
 
 const lv_font_t *fontHuge() {
@@ -183,7 +219,7 @@ std::string crowdingIcons(const std::string &seats, const std::string &style) {
   int level = crowdingLevel(seats);
   if (level < 0) return "";
   static const char kChair[] = "\xEF\x9B\x80";   // U+F6C0 chair
-  static const char kPerson[] = "\xEF\x86\x83";  // U+F183 standing person
+  static const char kPerson[] = "\xEF\x80\x87";  // U+F007 person silhouette (the U+F183 stick figure was 6 px wide)
   const char *glyph = kPerson;
   int lit = 3;
   uint32_t color;
@@ -205,7 +241,10 @@ std::string crowdingIcons(const std::string &seats, const std::string &style) {
     }
   }
   // LVGL recolor syntax: '#' + six hex digits + ' ' + text + '#'; commands may follow each other.
-  char hex[8];
+  // The buffer must hold all 8 characters plus the NUL: with char hex[8] snprintf dropped the
+  // trailing space, LVGL never saw the end of the colour parameter, and the meter laid out at
+  // zero width (found with /api/debug/ui rows on 2026-09-14).
+  char hex[12];
   std::string out;
   snprintf(hex, sizeof hex, "#%06x ", (unsigned)color);
   out += hex;

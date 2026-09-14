@@ -23,7 +23,9 @@ lv_obj_t *createMainScreen(const Config &cfg);
 // StopConfig::key <-> StopSnapshot::key; a configured stop with no matching
 // entry in `snap` shows "no data" instead of stale/wrong numbers.
 // Test hook (GET /api/debug/ui): which alternative panels are currently hidden, and the ticker text.
-void mainScreenDebug(lv_obj_t *screen, std::vector<std::string> &hidden_panels, std::string &ticker_text);
+// rows_debug: one line per visible arrival row, "key|dest|minutes|icons h=0 len=27 w=52|word h=1 'few seats'".
+void mainScreenDebug(lv_obj_t *screen, std::vector<std::string> &hidden_panels, std::string &ticker_text,
+                     std::string &rows_debug);
 
 void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const transit::Snapshot &snap);
 

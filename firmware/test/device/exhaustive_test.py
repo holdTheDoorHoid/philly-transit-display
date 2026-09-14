@@ -146,6 +146,14 @@ def _legacy_crowding(c):
     c['device'].pop('crowding', None); c['device']['show_crowding'] = False
 roundtrip('crowding legacy show_crowding=false -> off', _legacy_crowding, lambda g: g['device']['crowding'] == 'off' and 'show_crowding' not in g['device'])
 roundtrip('crowding words', lambda c: c['device'].update(crowding='words'), lambda g: g['device']['crowding'] == 'words')
+def _icons_drawn():
+    # every visible row with an icons string must lay out wider than 0 (the 2026-09-14 zero-width bug)
+    rows = [r for r in ui().get('rows', '').split('\n') if r and not r.startswith('bike|')]
+    with_icons = [r for r in rows if 'icons h=0' in r]
+    return all(' w=0 ' not in r.split('|')[3] + ' ' for r in with_icons), (len(rows), len(with_icons))
+roundtrip('crowding icons lay out (rows debug)', lambda c: c['device'].update(crowding='icons', crowding_icons='seats'), lambda g: g['device']['crowding'] == 'icons' and wait_for(lambda: _icons_drawn()[0], 10, 2))
+roundtrip('bike style words', lambda c: c['bike'].update(style='words'), lambda g: g['bike']['style'] == 'words')
+roundtrip('bike style icons', lambda c: c['bike'].update(style='icons'), lambda g: g['bike']['style'] == 'icons')
 roundtrip('night off', lambda c: c['device']['night'].update(enabled=False, after_min=240), lambda g: g['device']['night'] == {'enabled': False, 'after_min': 240})
 roundtrip('title styles', lambda c: (c['stops'][0].update(title_style='label'), c['stops'][1].update(title_style='custom', title_text='Uptown bus')), lambda g: g['stops'][0]['title_style'] == 'label' and g['stops'][1]['title_text'] == 'Uptown bus')
 roundtrip('title route_dest_stop', lambda c: c['stops'][0].update(title_style='route_dest_stop'), lambda g: g['stops'][0]['title_style'] == 'route_dest_stop')
@@ -182,6 +190,7 @@ invalid('rotation 45', lambda c: c['device'].update(rotation=45), 'device.rotati
 invalid('theme blue', lambda c: c['device'].update(theme='blue'), 'device.theme')
 invalid('crowding bad mode', lambda c: c['device'].update(crowding='sometimes'), 'device.crowding')
 invalid('crowding bad icons', lambda c: c['device'].update(crowding_icons='cats'), 'device.crowding_icons')
+invalid('bike style bad', lambda c: c['bike'].update(style='emoji'), 'bike.style')
 invalid('ticker_show sometimes', lambda c: c['device'].update(ticker_show='sometimes'), 'device.ticker_show')
 invalid('ticker_lines 9', lambda c: c['device'].update(ticker_lines=9), 'device.ticker_lines')
 invalid('ticker_speed 4', lambda c: c['device'].update(ticker_speed=4), 'device.ticker_speed')
@@ -296,6 +305,9 @@ check('F config intact after reboot', config() and config()['device']['name'] ==
 fw = '/home/hoid/Desktop/philly-transit-display/firmware/.pio/build/cyd-3248S035R/firmware.bin'
 if os.path.exists(fw):
     ver_before = state().get('firmware_version')
+    # The OTA handler refuses uploads below 60 KB free heap, and right after section F's reboot the
+    # first poll (Indego's 400 KB stream included) is still running: wait for it and for heap to settle.
+    wait_for(lambda: state().get('last_poll', {}).get('ok') and state().get('heap', 0) > 70000, 120, 5)
     r = curl(['-w', '\n%{http_code}', '-F', 'firmware=@' + fw, B + '/api/ota'], 180)
     body, _, code = r.stdout.rpartition(b'\n')
     check('G OTA upload accepted', code in (b'200', b'202'), (code, body[:120]))

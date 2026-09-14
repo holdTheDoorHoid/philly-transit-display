@@ -67,9 +67,15 @@ struct MainScreenCtx {
   std::string ticker_show = "both";  // config.device.ticker_show
   int ticker_lines = 1;
   uint16_t ticker_speed = 30;
-  // Indego strip (DESIGN.md SS4.9): one label per configured station, above the ticker.
+  // Indego section (DESIGN.md SS4.9/SS8): header row, then one row per configured station.
   lv_obj_t *bike_box;
-  std::vector<lv_obj_t *> bike_labels;
+  lv_obj_t *bike_age;  // "12 min old" in amber when the feed is stale, hidden otherwise
+  struct BikeRow {
+    lv_obj_t *row;
+    lv_obj_t *name;
+    lv_obj_t *counts;  // bikeCounts() with recolor; fontIcons() or fontSmall() per bike.style
+  };
+  std::vector<BikeRow> bike_rows;
   bool blink_phase = false;  // due-row blink (due_alert.h)
   std::vector<PanelWidgets> panels;
 };
@@ -325,21 +331,51 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     ctx->panels.push_back(pw);
   }
 
-  // ---- Indego strip (only shown when bike_service has stations) ----
+  // ---- Indego section (only shown when bike_service has stations) ----
+  // A panel like the stop panels: "[bicycle] Indego" header with a stale-age note on the right,
+  // then one row per station: name (ellipsized) and the counts meter right-aligned.
   ctx->bike_box = makeBox(screen);
   lv_obj_set_size(ctx->bike_box, lv_pct(100), LV_SIZE_CONTENT);
   lv_obj_set_style_bg_color(ctx->bike_box, colorPanelBg(), 0);
   lv_obj_set_style_pad_all(ctx->bike_box, 4, 0);
-  lv_obj_set_style_pad_row(ctx->bike_box, 0, 0);
+  lv_obj_set_style_pad_row(ctx->bike_box, 2, 0);
   lv_obj_set_flex_flow(ctx->bike_box, LV_FLEX_FLOW_COLUMN);
   lv_obj_add_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
+  auto makeBikeRow = [&](lv_obj_t *parent) {
+    lv_obj_t *row = makeBox(parent);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_pad_column(row, 6, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    return row;
+  };
+  {
+    lv_obj_t *head = makeBikeRow(ctx->bike_box);
+    lv_obj_t *icon = makeLabel(head, fontIcons(), colorText());
+    lv_label_set_text(icon, "\xEF\x88\x86");  // U+F206 bicycle
+    lv_obj_t *title = makeLabel(head, fontBody(h), colorText());
+    lv_label_set_text(title, "Indego");
+    ctx->bike_age = makeLabel(head, fontSmall(h), colorSkipped());
+    lv_obj_set_flex_grow(ctx->bike_age, 1);
+    lv_obj_set_style_text_align(ctx->bike_age, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_text(ctx->bike_age, "");
+    lv_obj_add_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN);
+  }
   for (size_t i = 0; i < kMaxBikeStations; ++i) {
-    lv_obj_t *l = makeLabel(ctx->bike_box, fontSmall(h), colorText());
-    lv_obj_set_width(l, lv_pct(100));
-    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-    lv_label_set_text(l, "");
-    lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
-    ctx->bike_labels.push_back(l);
+    MainScreenCtx::BikeRow br;
+    br.row = makeBikeRow(ctx->bike_box);
+    br.name = makeLabel(br.row, fontSmall(h), colorText());
+    lv_obj_set_flex_grow(br.name, 1);
+    lv_label_set_long_mode(br.name, LV_LABEL_LONG_DOT);
+    lv_label_set_text(br.name, "");
+    br.counts = makeLabel(br.row, fontIcons(), colorText());
+    lv_label_set_recolor(br.counts, true);
+    lv_obj_set_style_text_letter_space(br.counts, 1, 0);
+    lv_label_set_text(br.counts, "");
+    lv_obj_add_flag(br.row, LV_OBJ_FLAG_HIDDEN);
+    ctx->bike_rows.push_back(br);
   }
 
   // ---- Alert ticker (only shown when refreshMainScreen finds alerts) ----
@@ -379,13 +415,43 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   return screen;
 }
 
-void mainScreenDebug(lv_obj_t *screen, std::vector<std::string> &hidden_panels, std::string &ticker_text) {
+void mainScreenDebug(lv_obj_t *screen, std::vector<std::string> &hidden_panels, std::string &ticker_text,
+                     std::string &rows_debug) {
   auto *ctx = static_cast<MainScreenCtx *>(lv_obj_get_user_data(screen));
   hidden_panels.clear();
   ticker_text.clear();
+  rows_debug.clear();
   if (ctx == nullptr) return;
   for (const PanelWidgets &pw : ctx->panels) {
-    if (lv_obj_has_flag(pw.panel, LV_OBJ_FLAG_HIDDEN)) hidden_panels.push_back(pw.stop_key);
+    if (lv_obj_has_flag(pw.panel, LV_OBJ_FLAG_HIDDEN)) {
+      hidden_panels.push_back(pw.stop_key);
+      continue;
+    }
+    for (const RowWidgets &rw : pw.rows) {
+      lv_obj_t *row = lv_obj_get_parent(rw.minutes);
+      if (lv_obj_has_flag(row, LV_OBJ_FLAG_HIDDEN)) continue;
+      char buf[160];
+      snprintf(buf, sizeof buf, "%s|%s|%s|icons h=%d len=%u w=%d x=%d|word h=%d '%s'|row w=%d\n", pw.stop_key.c_str(),
+               lv_label_get_text(rw.destination), lv_label_get_text(rw.minutes),
+               lv_obj_has_flag(rw.crowd_icons, LV_OBJ_FLAG_HIDDEN) ? 1 : 0,
+               (unsigned)strlen(lv_label_get_text(rw.crowd_icons)), (int)lv_obj_get_width(rw.crowd_icons),
+               (int)lv_obj_get_x(rw.crowd_icons), lv_obj_has_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN) ? 1 : 0,
+               lv_label_get_text(rw.crowding), (int)lv_obj_get_width(row));
+      rows_debug += buf;
+    }
+  }
+  if (!lv_obj_has_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN)) {
+    char buf[120];
+    snprintf(buf, sizeof buf, "bike|age h=%d '%s'\n", lv_obj_has_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN) ? 1 : 0,
+             lv_label_get_text(ctx->bike_age));
+    rows_debug += buf;
+    for (const MainScreenCtx::BikeRow &br : ctx->bike_rows) {
+      if (lv_obj_has_flag(br.row, LV_OBJ_FLAG_HIDDEN)) continue;
+      snprintf(buf, sizeof buf, "bike|%s|counts len=%u w=%d h=%d|name w=%d\n", lv_label_get_text(br.name),
+               (unsigned)strlen(lv_label_get_text(br.counts)), (int)lv_obj_get_width(br.counts),
+               (int)lv_obj_get_height(br.counts), (int)lv_obj_get_width(br.name));
+      rows_debug += buf;
+    }
   }
   ticker_text = ctx->ticker_text;
 }
@@ -543,21 +609,38 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
     lv_obj_add_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
   } else {
     lv_obj_remove_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
-    for (size_t i = 0; i < ctx->bike_labels.size(); ++i) {
+    const bool icons = cfg.bike.style != "words";
+    if (bikes.fetched_epoch == 0) {
+      lv_label_set_text(ctx->bike_age, "no data yet");
+      lv_obj_remove_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN);
+    } else if ((uint32_t)now > bikes.fetched_epoch + 600) {
+      lv_label_set_text_fmt(ctx->bike_age, "%u min old", (unsigned)(((uint32_t)now - bikes.fetched_epoch) / 60));
+      lv_obj_remove_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (size_t i = 0; i < ctx->bike_rows.size(); ++i) {
+      MainScreenCtx::BikeRow &br = ctx->bike_rows[i];
       if (i >= bikes.stations.size()) {
-        lv_obj_add_flag(ctx->bike_labels[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(br.row, LV_OBJ_FLAG_HIDDEN);
         continue;
       }
       const indego::Station &st = bikes.stations[i];
-      if (st.bikes < 0) {
-        lv_label_set_text_fmt(ctx->bike_labels[i], "Indego %s: no data", st.name.c_str());
-      } else if (!st.active) {
-        lv_label_set_text_fmt(ctx->bike_labels[i], "Indego %s: offline", st.name.c_str());
+      lv_label_set_text(br.name, st.name.c_str());
+      if (st.bikes < 0 || !st.active) {
+        // The icon font has no letters: switch this row's meter to the text font for the note.
+        lv_obj_set_style_text_font(br.counts, fontSmall(0), 0);
+        lv_obj_set_style_text_color(br.counts, colorSubtext(), 0);
+        lv_label_set_text(br.counts, st.bikes < 0 ? "no data" : "offline");
       } else {
-        lv_label_set_text_fmt(ctx->bike_labels[i], "Indego %s: %d bikes (%d e), %d docks", st.name.c_str(), st.bikes,
-                              st.ebikes < 0 ? 0 : st.ebikes, st.docks);
+        int ebikes = st.ebikes < 0 ? 0 : st.ebikes;
+        int classic = st.classic >= 0 ? st.classic : st.bikes - ebikes;
+        lv_obj_set_style_text_font(br.counts, icons ? fontIcons() : fontSmall(0), 0);
+        lv_obj_set_style_text_color(br.counts, colorText(), 0);
+        std::string text = bikeCounts(classic, ebikes, st.docks, icons);
+        lv_label_set_text(br.counts, text.c_str());
       }
-      lv_obj_remove_flag(ctx->bike_labels[i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_remove_flag(br.row, LV_OBJ_FLAG_HIDDEN);
     }
   }
 

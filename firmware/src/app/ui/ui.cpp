@@ -296,7 +296,7 @@ void tick() {
   d.chimes = dueChimesPlayed();
   d.active_profile = g_active_profile >= 0 && (size_t)g_active_profile < g_cfg.profiles.size() ? g_cfg.profiles[(size_t)g_active_profile].name : "";
   d.shown_stops = g_shown_keys;
-  mainScreenDebug(g_main_screen, d.hidden_panels, d.ticker);
+  mainScreenDebug(g_main_screen, d.hidden_panels, d.ticker, d.rows);
   d.header_weather = g_cfg.weather.enabled ? headerWeatherText() : "";
   lv_mem_monitor_t m;
   lv_mem_monitor(&m);

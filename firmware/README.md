@@ -36,7 +36,7 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
 
-Flash headroom is about 36 KB on the 3.5" boards and 40 KB on the 2.4" capacitive board (2026-09-14, after the crowding icons). `platformio.ini`'s comment and `include/lv_conf.h` list the
+Flash headroom is about 30 KB on the 3.5" boards (1,870,122 B used, 2026-09-14, after the crowding and Indego icon font). `platformio.ini`'s comment and `include/lv_conf.h` list the
 knobs (fonts, LVGL features, debug level); do not grow the app slots without dropping OTA.
 Trims made 2026-09-14, first when the weather feature pushed the image to 99.9 % and again when
 the interview features did:

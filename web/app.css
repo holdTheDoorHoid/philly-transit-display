@@ -281,6 +281,28 @@ main#view {
 #alerts-list .alert-item:first-child { border-top: none; }
 .alert-route { font-weight: 700; margin-right: .4rem; }
 
+/* ---------- Indego card (Now view) ---------- */
+
+.bike-title { display: inline-flex; align-items: center; gap: .35rem; }
+.bike-age-warn { color: var(--warn); }
+.bike-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: .4rem .6rem;
+  padding: .35rem 0;
+  border-top: 1px solid var(--border);
+}
+.bike-row:first-of-type { border-top: none; }
+.bike-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 5rem; flex: 1 1 auto; }
+.bike-counts { display: flex; align-items: center; gap: .55rem; flex: 0 0 auto; white-space: nowrap; font-size: .85rem; }
+.bike-counts.words { flex-basis: 100%; white-space: normal; }
+.bike-count { display: inline-flex; align-items: center; gap: .2rem; }
+.bike-count svg, .bike-title svg { display: block; }
+.tone-red { color: var(--late-fg); }
+.tone-amber { color: var(--warn); }
+
 /* ---------- Stops view ---------- */
 
 .stop-list-item {

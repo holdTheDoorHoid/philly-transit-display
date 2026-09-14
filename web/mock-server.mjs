@@ -92,7 +92,19 @@ function defaultConfig() {
     weather: { enabled: true, per_stop: true, units: 'f' },
     due: { enabled: true, minutes: 3, led: true, screen: true, chime: false },
     profiles: [],
-    bike: { enabled: false, stations: [] },
+    // Three default stations exercise every case the Now-page card needs to show:
+    // Snyder & Dorrance mixes a 0 (classic), a 1-2 (ebikes) and a normal count (docks)
+    // in one row; the other two are "no data" (missing from feed) and "offline".
+    // See BIKE_DEMO below for the fixed counts.
+    bike: {
+      enabled: true,
+      style: 'icons',
+      stations: [
+        { id: 3468, name: 'Snyder & Dorrance' },
+        { id: 3005, name: '15th & Spruce' },
+        { id: 3010, name: 'Girard Station' },
+      ],
+    },
   };
 }
 
@@ -191,6 +203,9 @@ function validateConfig(cfg) {
     const bike = cfg.bike;
     if (typeof bike !== 'object' || bike === null) return { error: 'bike must be an object', path: 'bike' };
     if (bike.enabled !== undefined && typeof bike.enabled !== 'boolean') return { error: 'enabled must be a boolean', path: 'bike.enabled' };
+    if (bike.style !== undefined && !['icons', 'words'].includes(bike.style)) {
+      return { error: 'style must be "icons" or "words"', path: 'bike.style' };
+    }
     if (bike.stations !== undefined) {
       if (!Array.isArray(bike.stations)) return { error: 'stations must be an array', path: 'bike.stations' };
       if (bike.stations.length > 3) return { error: 'Maximum of 3 stations', path: 'bike.stations' };
@@ -414,16 +429,35 @@ function activeProfileName(now) {
   return '';
 }
 
+// Fixed counts for the three default stations (see defaultConfig above) so the web UI's
+// Indego card can be checked for every case — a 0, a 1-2, a normal count, a station
+// missing from the feed (-1s), and an offline one — without waiting on the real feed.
+// Stations a user adds beyond these still get randomized counts below.
+const BIKE_DEMO = {
+  3468: { classic: 0, ebikes: 2, docks: 11, total_docks: 15, active: true },
+  3005: { missing: true, active: true },
+  3010: { missing: true, active: false },
+};
+
 // Mock Indego bikes/docks for the configured stations (DESIGN.md §4.9's state.bike shape).
 function buildBike(now) {
   const b = config.bike || {};
   if (!b.enabled || !b.stations || !b.stations.length) return { enabled: !!b.enabled, age_s: 0, stations: [] };
   const rand = seedFrom(`bike|${Math.floor(now / 300)}`);
   const stations = b.stations.map((s) => {
-    const bikes = Math.floor(rand() * 12);
-    const ebikes = Math.min(bikes, Math.floor(rand() * 4));
+    const demo = BIKE_DEMO[s.id];
+    if (demo) {
+      if (demo.missing) {
+        return { id: s.id, name: s.name, bikes: -1, classic: -1, ebikes: -1, docks: -1, total_docks: -1, active: demo.active };
+      }
+      const bikes = demo.classic + demo.ebikes;
+      return { id: s.id, name: s.name, bikes, classic: demo.classic, ebikes: demo.ebikes, docks: demo.docks, total_docks: demo.total_docks, active: demo.active };
+    }
+    const classic = Math.floor(rand() * 10);
+    const ebikes = Math.floor(rand() * 4);
     const docks = 5 + Math.floor(rand() * 15);
-    return { id: s.id, name: s.name, bikes, ebikes, docks, active: true };
+    const total_docks = docks + classic + ebikes;
+    return { id: s.id, name: s.name, bikes: classic + ebikes, classic, ebikes, docks, total_docks, active: true };
   });
   return { enabled: true, age_s: 30 + Math.round(now % 120), stations };
 }

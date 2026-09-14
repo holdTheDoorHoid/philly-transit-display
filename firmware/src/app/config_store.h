@@ -73,6 +73,7 @@ struct BikeStation {
 };
 struct BikeConfig {
   bool enabled = false;
+  std::string style = "icons";       // icons | words: how the Indego section draws each station
   std::vector<BikeStation> stations;  // at most kMaxBikeStations
 };
 constexpr size_t kMaxBikeStations = 3;

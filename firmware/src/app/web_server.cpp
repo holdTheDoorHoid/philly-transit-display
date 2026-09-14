@@ -154,7 +154,9 @@ void serializeSnapshot(const Snapshot &snap, JsonObject out) {
     so["name"] = st.name;
     so["bikes"] = st.bikes;
     so["ebikes"] = st.ebikes;
+    so["classic"] = st.classic;
     so["docks"] = st.docks;
+    so["total_docks"] = st.total_docks;
     so["active"] = st.active;
   }
   JsonArray alerts = out["alerts"].to<JsonArray>();
@@ -511,6 +513,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     JsonArray hidden = doc["hidden_panels"].to<JsonArray>();
     for (const std::string &k : d.hidden_panels) hidden.add(k);
     doc["ticker"] = d.ticker;
+    doc["rows"] = d.rows;
     doc["header_weather"] = d.header_weather;
     doc["lv_used"] = d.lv_used;
     doc["lv_free"] = d.lv_free;

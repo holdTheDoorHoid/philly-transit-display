@@ -226,6 +226,10 @@ bool validateConfig(const Config &cfg, ConfigError &err) {
       }
     }
   }
+  if (cfg.bike.style != "icons" && cfg.bike.style != "words") {
+    err = {"style must be icons or words", "bike.style"};
+    return false;
+  }
   if (cfg.bike.stations.size() > kMaxBikeStations) {
     err = {"at most " + std::to_string(kMaxBikeStations) + " bike stations are allowed", "bike.stations"};
     return false;
@@ -362,6 +366,7 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
   }
   JsonObject bike = doc["bike"].to<JsonObject>();
   bike["enabled"] = cfg.bike.enabled;
+  bike["style"] = cfg.bike.style;
   JsonArray stations = bike["stations"].to<JsonArray>();
   for (const BikeStation &b : cfg.bike.stations) {
     JsonObject bo = stations.add<JsonObject>();
@@ -492,6 +497,7 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   }
   JsonVariantConst bike = doc["bike"];
   result.bike.enabled = bike["enabled"] | false;
+  result.bike.style = std::string(bike["style"] | "icons");
   JsonVariantConst stations = bike["stations"];
   if (stations.is<JsonArrayConst>()) {
     for (JsonVariantConst sv : stations.as<JsonArrayConst>()) {

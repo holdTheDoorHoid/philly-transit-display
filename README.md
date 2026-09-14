@@ -41,8 +41,9 @@ Alpha. As of 2026-09-14:
   alternative stop appears only when your usual one is running late; quiet hours dim the screen
   overnight; a night clock with the first departures replaces the empty panels when nothing is
   due; large-text mode for reading across a room; per-stop titles.
-- Indego bike share: bikes and docks at up to three stations near your stops, from Bicycle Transit
-  Systems' status feed.
+- Indego bike share: classic bikes, e-bikes and free docks at up to three stations near your
+  stops, from Bicycle Transit Systems' public status feed, drawn as an icon meter or in words;
+  a count turns amber at one or two and red at zero.
 - Log predictions and inferred arrivals to the SD card; view lateness by hour and weekday,
   headway bunching, ghost buses, and prediction accuracy in the web UI or on the screen.
 - Work on the 2.4", 2.8", and 3.5" CYD variants from one codebase.

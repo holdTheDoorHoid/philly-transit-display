@@ -64,6 +64,7 @@ struct UiDebug {
   std::vector<std::string> shown_stops;
   std::vector<std::string> hidden_panels;  // alternatives currently hidden
   std::string ticker;
+  std::string rows;            // main screen rows (main_screen.h mainScreenDebug)
   std::string header_weather;
   uint32_t lv_used = 0, lv_free = 0, lv_max_used = 0;
   int32_t hor_res = 0, ver_res = 0;

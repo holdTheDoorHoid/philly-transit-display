@@ -214,10 +214,14 @@ function renderNow(root) {
   // the first render. Falls back to words/seats on fetch failure or old firmware.
   let crowdMode = 'words';
   let crowdScheme = 'seats';
+  // bike.style is config-only (not echoed on /api/state); old firmware that doesn't
+  // know the field yet is treated as 'icons', its default.
+  let bikeStyle = 'icons';
   const configPromise = api.config().then((cfg) => {
     const cd = (cfg && cfg.device) || {};
     crowdMode = cd.crowding || (cd.show_crowding === false ? 'off' : 'words');
     crowdScheme = cd.crowding_icons || 'seats';
+    bikeStyle = (cfg && cfg.bike && cfg.bike.style === 'words') ? 'words' : 'icons';
   }).catch(() => {});
 
   async function tick() {
@@ -231,7 +235,7 @@ function renderNow(root) {
       renderStaleBanner(banner, state);
       renderProfileLine(profileLine, state);
       renderStopPanels(stops, state.stops || [], crowdMode, crowdScheme);
-      renderBikeCard(bike, state.bike);
+      renderBikeCard(bike, state.bike, bikeStyle);
       renderAlerts(alerts, state.alerts || []);
     } catch (e) {
       clear(banner);
@@ -248,15 +252,78 @@ function renderProfileLine(box, state) {
   if (state.active_profile) box.append(h('div', { class: 'muted small' }, `Profile: ${state.active_profile}`));
 }
 
-function renderBikeCard(box, bike) {
+// ---- Indego card (Now view): bike.style icons/words picks how each station's
+// counts are drawn; state.bike doesn't carry style itself (config-only), see bikeStyle
+// above. Original 14x14 pictograms below, drawn the same way as crowdIcon() — not
+// traced from any icon set.
+function bikeGlyph(kind) {
+  if (kind === 'bike') {
+    return [
+      hs('circle', { cx: 3.6, cy: 10.4, r: 2.5, fill: 'none', stroke: 'currentColor', 'stroke-width': 1.3 }),
+      hs('circle', { cx: 10.4, cy: 10.4, r: 2.5, fill: 'none', stroke: 'currentColor', 'stroke-width': 1.3 }),
+      hs('polyline', { points: '3.6,10.4 6.7,4.7 10.4,10.4', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.3, 'stroke-linejoin': 'round' }),
+      hs('line', { x1: 6.7, y1: 4.7, x2: 7, y2: 3.2, stroke: 'currentColor', 'stroke-width': 1.3 }),
+      hs('line', { x1: 6.7, y1: 4.7, x2: 5.4, y2: 10.4, stroke: 'currentColor', 'stroke-width': 1.3 }),
+    ];
+  }
+  if (kind === 'bolt') {
+    return [hs('polygon', { points: '7.6,1 2.6,8.4 5.8,8.4 5.1,13 11.1,6.1 7.8,6.1', fill: 'currentColor' })];
+  }
+  // dock: a simple "P"-in-a-rounded-square.
+  return [
+    hs('rect', { x: 1.2, y: 1.2, width: 11.6, height: 11.6, rx: 3, fill: 'none', stroke: 'currentColor', 'stroke-width': 1.3 }),
+    hs('text', { x: 7, y: 10.2, 'text-anchor': 'middle', 'font-size': 8.5, 'font-weight': 700, fill: 'currentColor', 'font-family': 'sans-serif' }, 'P'),
+  ];
+}
+function bikeIcon(kind) {
+  return hs('svg', { viewBox: '0 0 14 14', width: 13, height: 13, 'aria-hidden': 'true' }, ...bikeGlyph(kind));
+}
+// red at 0, amber at 1-2, normal text color otherwise (null -> no class).
+function bikeToneClass(n) {
+  if (n === 0) return 'tone-red';
+  if (n === 1 || n === 2) return 'tone-amber';
+  return null;
+}
+function bikeAgeLabel(age_s) {
+  if (age_s == null || age_s <= 600) return null;
+  return `${Math.round(age_s / 60)} min old`;
+}
+function bikeCountsIcons(st) {
+  const wrap = h('span', { class: 'bike-counts' });
+  for (const [kind, n] of [['bike', st.classic], ['bolt', st.ebikes], ['dock', st.docks]]) {
+    const tone = bikeToneClass(n);
+    wrap.append(h('span', { class: tone ? `bike-count ${tone}` : 'bike-count' }, bikeIcon(kind), String(n)));
+  }
+  return wrap;
+}
+function bikeCountsWords(st) {
+  const words = [
+    [st.classic, `bike${st.classic === 1 ? '' : 's'}`],
+    [st.ebikes, `e-bike${st.ebikes === 1 ? '' : 's'}`],
+    [st.docks, `dock${st.docks === 1 ? '' : 's'}`],
+  ];
+  const wrap = h('span', { class: 'bike-counts words small' });
+  words.forEach(([n, word], i) => {
+    if (i) wrap.append(', ');
+    wrap.append(h('span', { class: bikeToneClass(n) }, `${n} ${word}`));
+  });
+  return wrap;
+}
+function renderStationRow(st, style) {
+  const nameEl = h('span', { class: 'bike-name' }, st.name);
+  if (st.active === false) return h('div', { class: 'bike-row' }, nameEl, h('span', { class: 'muted small' }, 'offline'));
+  if (st.bikes === -1) return h('div', { class: 'bike-row' }, nameEl, h('span', { class: 'muted small' }, 'no data'));
+  return h('div', { class: 'bike-row' }, nameEl, style === 'words' ? bikeCountsWords(st) : bikeCountsIcons(st));
+}
+function renderBikeCard(box, bike, style) {
   clear(box);
   if (!bike || !bike.enabled || !bike.stations || !bike.stations.length) return;
-  const card = h('div', { class: 'card' }, h('h2', {}, 'Indego'));
-  for (const st of bike.stations) {
-    card.append(h('div', { class: 'row between' },
-      h('span', {}, `${st.name}: ${st.bikes} bikes (${st.ebikes} electric), ${st.docks} docks`),
-      st.active === false && h('span', { class: 'muted small' }, '(offline)')));
-  }
+  const ageLabel = bikeAgeLabel(bike.age_s);
+  const header = h('div', { class: 'row between' },
+    h('h2', { class: 'bike-title' }, bikeIcon('bike'), 'Indego'),
+    ageLabel && h('span', { class: 'small bike-age-warn' }, ageLabel));
+  const card = h('div', { class: 'card' }, header);
+  for (const st of bike.stations) card.append(renderStationRow(st, style === 'words' ? 'words' : 'icons'));
   box.append(card);
 }
 
@@ -682,6 +749,16 @@ function drawBikeCard() {
     persistConfig({ ...liveConfig, bike: { ...bike, enabled: enabledInput.checked } });
   });
   card.append(h('label', { class: 'inline' }, enabledInput, ' Show Indego bike/dock counts'));
+
+  // bike.style: icons | words (default icons for old firmware/config that predates the field).
+  const styleSelect = h('select', { id: 'bike-style' },
+    h('option', { value: 'icons', selected: (bike.style || 'icons') !== 'words' || undefined }, 'Icons + numbers'),
+    h('option', { value: 'words', selected: bike.style === 'words' || undefined }, 'Words'));
+  styleSelect.addEventListener('change', () => {
+    persistConfig({ ...liveConfig, bike: { ...bike, style: styleSelect.value } });
+  });
+  card.append(h('label', { for: 'bike-style' }, 'Indego style'));
+  card.append(styleSelect);
 
   const listDiv = h('div', {});
   if (!stations.length) { listDiv.append(h('p', { class: 'small muted' }, 'No stations chosen yet.')); }

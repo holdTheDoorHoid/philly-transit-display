@@ -330,8 +330,10 @@ Fields added 2026-09-14 (all optional; absent means the default shown above):
 - `profiles` (max 4): while a profile is active (`days` 0=Sunday..6, `start`/`end` local), the main
   page shows only its `stops` in that order; otherwise all stops in config order. Every stop keeps
   polling and logging.
-- `bike` (max 3 stations): Indego bikes/docks from Bicycle Transit's status feed (§4.9), one line
-  per station above the alert ticker.
+- `bike` (max 3 stations): Indego bikes/docks from Bicycle Transit's status feed (SS4.9). `style`
+  is `icons` (default: bicycle = classic bikes, bolt = e-bikes, P = free docks, each count red at 0
+  and amber at 1-2) or `words` (`5 bikes, 2 e-bikes, 7 docks`, same colour cue on the numbers).
+  `stations[]` carry the BTS station `id` and a display `name`.
 
 `rotation` is 0, 90, 180, or 270 degrees; 0 is the panel's native portrait orientation (the owner's preference), 90 is landscape. The UI rebuilds its layout when it changes.
 `theme` is `light` (default) or `dark`; both palettes keep every text colour at WCAG AA contrast or
@@ -402,8 +404,12 @@ Main screen (portrait by default; every size derives from the runtime resolution
   (`due.chime`, silenced in quiet hours).
 - An alternative panel (`alt_of`) is hidden until its primary stop has nothing within
   `alt_after_min`; then it takes the primary's place below it.
-- Indego strip above the ticker when `bike` is on: one line per station, `Indego Snyder &
-  Dorrance: 7 bikes (7 e), 4 docks` (§4.9), `offline` / `no data` when the feed says so.
+- Indego section above the ticker when `bike` is on: a panel headed `[bicycle] Indego` (with
+  `12 min old` in amber on the right once the feed is older than 10 minutes, or `no data yet`),
+  then one row per station: the configured name, ellipsized, and the counts right-aligned per
+  `bike.style` (SS6). A station missing from the feed reads `no data`; an inactive one `offline`.
+  The glyphs come from the 16 px icon font in `src/fonts/` and are coloured with LVGL's inline
+  recolor, one label per station.
 - Night page (`night`): when every shown stop has nothing within `after_min`, the arrivals page is
   replaced by a big clock, the date, the header weather, and `17 Southbound: next 5:12a (sched)`
   per stop. Tapping cycles pages exactly as from the arrivals page.

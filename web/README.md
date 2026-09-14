@@ -116,16 +116,36 @@ computes the on-screen title client-side the same way the firmware will, and sho
 "alternative to …" hint when `alt_of` is set.
 
 Below the stop list, the Stops page also has an **Indego bikes** card (`bike`, §6,
-max 3 stations): an enabled checkbox, the chosen stations with remove buttons, a
-"Find stations near my stops" lookup that fetches the Bicycle Transit status feed
-directly in the browser and ranks the six nearest stations by great-circle distance
-from stops that have `lat`/`lng` (plain HTTP; if the web UI itself is loaded over
-HTTPS the browser blocks it as mixed content and the button shows a banner explaining
-that instead of failing silently), and a manual station-id add. It's on the Stops page
-rather than Settings because the owner manages bike stations alongside the stops they
-sit near; every change there saves immediately through the same `PUT /api/config`
-pattern as reordering or removing a stop (whole config, `liveConfig` kept in sync, a
-"Saved." banner on success). This card is hidden while the Add Stop wizard is open.
+max 3 stations): an enabled checkbox, an **Indego style** select (`bike.style`:
+`icons` (default) or `words` — picks how counts are drawn on the Now page, see below),
+the chosen stations with remove buttons, a "Find stations near my stops" lookup that
+fetches the Bicycle Transit status feed directly in the browser and ranks the six
+nearest stations by great-circle distance from stops that have `lat`/`lng` (plain
+HTTP; if the web UI itself is loaded over HTTPS the browser blocks it as mixed content
+and the button shows a banner explaining that instead of failing silently), and a
+manual station-id add. It's on the Stops page rather than Settings because the owner
+manages bike stations alongside the stops they sit near; every change there saves
+immediately through the same `PUT /api/config` pattern as reordering or removing a
+stop (whole config, `liveConfig` kept in sync, a "Saved." banner on success). This
+card is hidden while the Add Stop wizard is open.
+
+On the Now page, the Indego card (`renderBikeCard` in `app.js`) shows only when
+`bike.enabled` and at least one station is configured: a header line (bicycle
+pictogram + "Indego", plus the data age in small amber text once `bike.age_s` exceeds
+600s) and one row per station. `bike.style` isn't echoed on `/api/state`, so the Now
+view reads it once from `/api/config` alongside the crowding settings and falls back
+to `icons` if it's absent (old firmware) or unrecognized. In `icons` style each row
+shows three original inline-SVG pictograms with a count next to each — bicycle
+(classic bikes), bolt (e-bikes), dock ("P" in a rounded square, free docks) — drawn
+the same way as the crowding glyphs (`crowdIcon`), not traced from any icon set; in
+`words` style the same three counts are spelled out ("5 bikes, 2 e-bikes, 7 docks")
+instead. Either way each count is colored red at 0, amber at 1-2, and the normal text
+color otherwise (`.tone-red` / `.tone-amber` in `app.css`). A station with `bikes ===
+-1` (missing from the feed) shows "no data"; one with `active: false` shows "offline"
+(muted) — both hide the counts entirely. The mock's three default stations (Snyder &
+Dorrance, 15th & Spruce, Girard Station) are fixed via `BIKE_DEMO` in
+`mock-server.mjs` to cover all of the above in one screen: a 0/1-2/normal spread in
+one row, plus a "no data" row and an "offline" row.
 
 The alert ticker section of Settings has a **Show** select (`device.ticker_show`:
 `both` (default), `alerts`, `detours`, or `off`) that picks what the ticker displays.

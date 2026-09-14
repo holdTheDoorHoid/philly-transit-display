@@ -54,7 +54,9 @@ void screenSize(int32_t &w, int32_t &h);
 int rowsPerStop(int32_t h, bool large_text = false);
 const lv_font_t *fontBig(int32_t h);    // the big "minutes" number
 const lv_font_t *fontHuge();            // 48 px digits-only subset (src/fonts/): large text, night clock
-const lv_font_t *fontIcons();           // 16 px chair + person glyphs (src/fonts/): crowding meter
+// 16 px icon font (src/fonts/lv_font_icons_16.c): digits and space from Montserrat plus FontAwesome
+// chair, person, bicycle, bolt and parking glyphs; crowding meter and the Indego section.
+const lv_font_t *fontIcons();
 const lv_font_t *fontBody(int32_t h);   // destination / title text
 const lv_font_t *fontSmall(int32_t h);  // badges, footer, secondary text
 
@@ -70,6 +72,10 @@ std::string crowdingText(const std::string &seats);
 // amber), people fill once you stand (1/2/3, amber then red). style "crowd": people only,
 // 1 green / 2 amber / 3 red. Unused slots are drawn dim so the meter keeps its width.
 std::string crowdingIcons(const std::string &seats, const std::string &style);
+// One Indego station's counts for a recolor-enabled label. icons=true: "[bicycle] 5  [bolt] 2
+// [P] 7" for fontIcons(); false: "5 bikes, 2 e-bikes, 7 docks" for fontSmall(). Each count is
+// red at 0 and amber at 1-2 (DESIGN.md SS8), the low-station cue the owner asked for.
+std::string bikeCounts(int classic, int ebikes, int docks, bool icons);
 
 // "11:42p" for the night clock and the "next bus" lines.
 std::string clockLabel(transit::Epoch when);
