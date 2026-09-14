@@ -76,7 +76,11 @@ const lv_font_t *fontBig(int32_t h) {
   return h >= 320 ? &lv_font_montserrat_28 : &lv_font_montserrat_20;
 }
 const lv_font_t *fontBody(int32_t h) {
-  return h >= 320 ? &lv_font_montserrat_16 : &lv_font_montserrat_14;
+  // Flash diet: only Montserrat 14/20/28 are enabled (lv_conf.h) - this used to be 16 on the
+  // taller panels, but that was the only caller of size 16 in the whole UI, so sharing 14 here
+  // drops a whole embedded bitmap font from flash for one row of body text being 2px smaller.
+  (void)h;
+  return &lv_font_montserrat_14;
 }
 const lv_font_t *fontSmall(int32_t /*h*/) {
   return &lv_font_montserrat_14;

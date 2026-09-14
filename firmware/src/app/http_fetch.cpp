@@ -70,8 +70,17 @@ void streamBody(HTTPClient &http, NetworkClient *stream, uint32_t timeout_ms, co
 
 }  // namespace
 
-int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, uint32_t timeout_ms) {
+int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, uint32_t timeout_ms,
+        bool tls_verify) {
   int last_status = -1;
+
+  if (!tls_verify) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      log_w("http_fetch: tls_verify is OFF (config.device.tls_verify=false) - certificates are NOT checked");
+    }
+  }
 
   for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
     if (attempt > 0) {
@@ -81,7 +90,11 @@ int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, ui
     }
 
     NetworkClientSecure client;
-    client.setCACertBundle(kSeptaCaBundle, kSeptaCaBundleLen);
+    if (tls_verify) {
+      client.setCACertBundle(kSeptaCaBundle, kSeptaCaBundleLen);
+    } else {
+      client.setInsecure();
+    }
 
     HTTPClient http;
     http.setConnectTimeout((int32_t)timeout_ms);

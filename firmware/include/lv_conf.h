@@ -416,7 +416,7 @@
 #define LV_FONT_MONTSERRAT_10 0
 #define LV_FONT_MONTSERRAT_12 0
 #define LV_FONT_MONTSERRAT_14 1
-#define LV_FONT_MONTSERRAT_16 1
+#define LV_FONT_MONTSERRAT_16 0
 #define LV_FONT_MONTSERRAT_18 0
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_22 0
@@ -604,7 +604,13 @@
  *==================*/
 
 /*A simple, impressive and very complete theme*/
-#define LV_USE_THEME_DEFAULT 1
+/* Flash diet: every screen in firmware/src/app/ui/ builds plain lv_obj/lv_label widgets and sets
+ * every color/font itself (ui_common.cpp) rather than using lv_button/lv_slider/etc. or relying
+ * on theme defaults, so the default theme's style tables (lv_theme_default.c) cost flash for
+ * nothing this UI reads. lv_display.c only calls lv_theme_default_init() inside
+ * `#if LV_USE_THEME_DEFAULT`, so disabling it leaves disp->theme unset (NULL), which is fine -
+ * nothing in this codebase calls lv_theme_get_*() or creates a themed widget. */
+#define LV_USE_THEME_DEFAULT 0
 #if LV_USE_THEME_DEFAULT
 
     /*0: Light mode; 1: Dark mode*/

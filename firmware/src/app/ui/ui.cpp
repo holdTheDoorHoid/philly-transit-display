@@ -92,7 +92,7 @@ void showWifiSetupScreen(const std::string &ap_name) {
     lv_obj_set_width(hint, lv_pct(90));
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(hint, "Connect a phone or laptop to this Wi-Fi network to set up your home Wi-Fi.");
+    lv_label_set_text(hint, "Connect a phone or laptop to this Wi-Fi network, then open http://192.168.4.1 to set up your home Wi-Fi.");
 
     g_wifi_setup_screen = screen;
   }
