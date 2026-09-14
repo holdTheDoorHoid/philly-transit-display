@@ -5,23 +5,75 @@ A desk display for Philadelphia transit riders, running on the ESP32 "Cheap Yell
 stops you care about, with live lateness, and logs every arrival to the SD card so it can
 tell you how the route actually performs over time.
 
-Status: **pre-alpha, under active development.** Nothing is flashable yet.
-
 - Design and decisions: [DESIGN.md](DESIGN.md)
-- Data source research: [docs/research/septa-data-sources.md](docs/research/septa-data-sources.md)
-- Hardware research: [docs/research/cyd-hardware.md](docs/research/cyd-hardware.md)
+- Hardware, pin maps, flashing: [docs/hardware.md](docs/hardware.md)
+- Firmware build notes and flash budget: [firmware/README.md](firmware/README.md)
+- Web UI and mock server: [web/README.md](web/README.md)
+- Research that the design rests on: [docs/research/](docs/research/)
 
-## What it will do
+## Status
 
-- Pick any SEPTA bus/trolley route and stop (or Regional Rail station) from a web page served by
-  the device itself. No app, no cloud account.
+Alpha. As of 2026-09-14:
+
+| Piece | State |
+|---|---|
+| Boots, display, touch probe, Wi-Fi setup hotspot | Verified on an ESP32-3248S035R (3.5" resistive) |
+| Live SEPTA arrivals, lateness, alerts on screen | Implemented, awaiting on-device verification |
+| Web UI: stops wizard with map, stats charts, settings, OTA | Implemented; verified against the mock server |
+| SD logging and on-device statistics | Implemented; 64 host tests pass; awaiting a card and a day of data |
+| Other CYD variants (2.8", 2.4", capacitive) | Build in CI; not yet tested on hardware |
+| Browser flasher on GitHub Pages | Wired to publish on the first tagged release |
+
+## What it does
+
+- Pick any SEPTA bus/trolley route and stop, subway station (schedule only), or Regional Rail
+  station from a web page served by the device itself. No app, no cloud account, no API key.
 - Show the next 2-3 arrivals per stop and direction with minutes-until and a late/early badge.
 - Show SEPTA service alerts and detours for your routes.
 - Log predictions and inferred arrivals to the SD card; view lateness by hour and weekday,
   headway bunching, ghost buses, and prediction accuracy in the web UI or on the screen.
 - Work on the 2.4", 2.8", and 3.5" CYD variants from one codebase.
-- Be portable: the real-time decoder speaks standard GTFS-Realtime, so other agencies can be
+- Stay portable: the real-time decoder speaks standard GTFS-Realtime, so other agencies can be
   added without touching the display or stats code.
+
+## Quick start
+
+1. **Flash.** Either use the browser flasher (published with each release) or build it yourself:
+   ```sh
+   pip install platformio
+   cd firmware
+   pio pkg install -e cyd-3248S035R      # pick your board's env, see platformio.ini
+   pio run -e cyd-3248S035R -t upload --upload-port /dev/ttyUSB0
+   ```
+   On Linux your user needs to be in the `dialout` group.
+2. **Join Wi-Fi.** The screen shows a hotspot name like `TransitDisplay-29BC`. Join it from a
+   phone or laptop; the setup page opens (or browse to `http://192.168.4.1`). Pick your network.
+3. **Pick stops.** Open `http://transit-display.local`, go to Stops, and use Add stop: choose a
+   route, pick the stop on the map or list, choose the direction. Save. The screen updates on the
+   next poll.
+4. **Stats.** Insert a FAT32 microSD card. After a day or so, the Stats page shows how the route
+   really behaves at your stop; the raw CSV is downloadable from the same page.
+
+The default configuration shows Route 17 at 19th & Mifflin in both directions.
+
+## Development
+
+```sh
+cd firmware && pio test -e native          # transit_core + transit_stats host tests
+node web/mock-server.mjs 8080              # web UI against captured SEPTA responses
+node web/build.mjs                         # regenerate firmware/src/generated/web_assets.h
+python3 tools/gtfsrt_decode.py             # inspect a captured GTFS-RT feed
+```
+
+Layout: `firmware/` (PlatformIO project; `lib/transit_core` parses SEPTA and GTFS-RT,
+`lib/transit_stats` tracks arrivals and aggregates statistics, `src/app` is the Arduino glue),
+`web/` (the device's web UI), `flasher/` (ESP Web Tools page), `docs/`.
+
+## Data sources
+
+SEPTA's public API and GTFS-Realtime feeds, no key required. See DESIGN.md section 4 for the
+endpoints, the trip-id join that makes per-stop lateness possible, and the quirks discovered
+along the way (letter route ids, intermittent 400/501 responses, subway route ids B1/L1).
 
 ## License
 
