@@ -76,3 +76,11 @@ about 110 KB at boot; a quarter-screen RGB565 buffer on the 320x480 panels is 76
 failed outright). A sixteenth of the screen (19.2 KB on 3.5", 9.6 KB on 2.8") is LVGL's
 recommended partial-render minimum and leaves room for Wi-Fi, TLS, and the web server.
 See `firmware/extra_scripts/patch_esp32_smartdisplay.py` for the `lv_color16_t` fix.
+
+## `DISPLAY_INVERT_DEFAULT`
+
+Project-specific flag (not from upstream): the boot default for `device.invert_colors`, the
+panel colour-inversion setting. `esp32-3248S035R.json` and `esp32-3248S035C.json` set it to 1
+because the 3.5" IPS panel renders inverted without it (verified on the owner's board,
+`docs/hardware.md` "Colour inversion"). Absent means 0. Users can override it at runtime from
+Settings, so getting this wrong for a variant is a one-click fix rather than a rebuild.

@@ -71,8 +71,29 @@ bool useHttps() {
   return g_use_https;
 }
 
+namespace {
+std::string g_sched_cookie;
+
+std::string cookieNameValue(const String &set_cookie) {
+  int semi = set_cookie.indexOf(';');
+  String nv = semi >= 0 ? set_cookie.substring(0, semi) : set_cookie;
+  nv.trim();
+  return std::string(nv.c_str());
+}
+}  // namespace
+
+void pinScheduleBackend(const std::string &cookie) {
+  if (!cookie.empty()) g_sched_cookie = cookie;
+}
+void unpinScheduleBackend() {
+  g_sched_cookie.clear();
+}
+const std::string &scheduleCookie() {
+  return g_sched_cookie;
+}
+
 int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, uint32_t timeout_ms,
-        bool tls_verify) {
+        bool tls_verify, ReplyInfo *reply) {
   int last_status = -1;
 
   std::string plain_url;
@@ -121,8 +142,17 @@ int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, ui
       last_status = -1;
       continue;
     }
+    static const char *kCollect[] = {"Set-Cookie", "X-B-Srvr"};
+    http.collectHeaders(kCollect, 2);
+    if (!g_sched_cookie.empty() && strstr(url, "BusSchedules") != nullptr) {
+      http.addHeader("Cookie", g_sched_cookie.c_str());
+    }
 
     int status = http.GET();
+    if (reply != nullptr) {
+      reply->set_cookie = cookieNameValue(http.header("Set-Cookie"));
+      reply->backend = std::string(http.header("X-B-Srvr").c_str());
+    }
     size_t delivered = 0;
     if (status > 0) {
       CallbackStream sink(onData);

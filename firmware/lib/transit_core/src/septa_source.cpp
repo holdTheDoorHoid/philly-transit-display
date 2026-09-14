@@ -157,6 +157,41 @@ int SeptaSource::fetchRailArrivals(const std::string& station, std::vector<RailA
   return status;
 }
 
+namespace {
+
+// Earliest entry that is still upcoming (or at most a minute past), 0 if none.
+Epoch earliestUpcoming(const std::vector<SchedEntry>& entries, Epoch now) {
+  Epoch best = 0;
+  for (const auto& e : entries) {
+    if (e.scheduled < now - 60) continue;
+    if (best == 0 || e.scheduled < best) best = e.scheduled;
+  }
+  return best;
+}
+
+}  // namespace
+
+bool fetchPlausibleSchedule(SeptaSource& src, const std::string& stop_id, Epoch now, HttpGet http,
+                            std::vector<SchedEntry>* out) {
+  std::vector<SchedEntry> best;
+  Epoch best_first = 0;
+  for (int attempt = 0; attempt < kScheduleFetchAttempts; ++attempt) {
+    std::vector<SchedEntry> fetched;
+    src.fetchSchedule(stop_id, &fetched, http);
+    Epoch first = earliestUpcoming(fetched, now);
+    if (first == 0) continue;  // transport/parse failure, or nothing upcoming: try again
+    if (best_first == 0 || first < best_first) {
+      best = std::move(fetched);
+      best_first = first;
+    }
+    if (best_first - now <= kSchedulePlausibleS) break;
+  }
+  if (best.empty()) return false;
+  bool plausible = best_first - now <= kSchedulePlausibleS;
+  *out = std::move(best);
+  return plausible;
+}
+
 Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet http,
                       ScheduleCache& cache) {
   Snapshot snap;
@@ -209,9 +244,13 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
     std::vector<SchedEntry> entries;
     if (!cache.get(stop_id, &entries)) {
       std::vector<SchedEntry> fetched;
-      src.fetchSchedule(stop_id, &fetched, http);
+      bool plausible = fetchPlausibleSchedule(src, stop_id, now, http, &fetched);
       if (!fetched.empty()) {
-        cache.put(stop_id, fetched);
+        if (plausible) {
+          cache.put(stop_id, fetched);
+        } else {
+          cache.putSuspect(stop_id, fetched);
+        }
         entries = std::move(fetched);
       }
     }

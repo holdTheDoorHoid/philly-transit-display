@@ -141,6 +141,18 @@ StopSnapshot mergeStop(const StopConfig& cfg, const std::vector<StopTimeUpdate>&
     if (!stringMatches(cfg.direction, sched[i].direction)) continue;
     if (sched[i].scheduled <= now - 60) continue;
 
+    // One row per static trip id. SEPTA's wrong-service-day answers (septa_source.h,
+    // fetchPlausibleSchedule) have been seen listing the same trip on three consecutive days;
+    // keep whichever copy comes first.
+    bool duplicate = false;
+    for (auto& existing : snap.arrivals) {
+      if (existing.status != Status::Scheduled || existing.trip != sched[i].trip_id) continue;
+      if (sched[i].scheduled < existing.scheduled) existing.scheduled = sched[i].scheduled;
+      duplicate = true;
+      break;
+    }
+    if (duplicate) continue;
+
     Arrival a;
     a.trip = sched[i].trip_id;
     a.destination = !sched[i].direction_desc.empty() ? sched[i].direction_desc : cfg.headsign;

@@ -1,39 +1,61 @@
 #include "ui_common.h"
 
+#include <cstdio>
+#include <ctime>
+
 namespace transit_app::ui {
 
+namespace {
+bool g_dark = false;
+}  // namespace
+
+void setTheme(const std::string &name) {
+  g_dark = (name == "dark");
+}
+
+bool isDarkTheme() {
+  return g_dark;
+}
+
+// Light palette: every text colour clears WCAG AA (4.5:1) against the white panel background.
+// The first build shipped only the dark palette, which on a panel that needs colour inversion
+// (docs/hardware.md) came out as pale cyan and pink badges on white. Dark palette: the original,
+// with the secondary text lifted a little for contrast.
 lv_color_t colorBg() {
-  return lv_color_hex(0x101418);
+  return lv_color_hex(g_dark ? 0x101418 : 0xE9ECF0);
 }
 lv_color_t colorPanelBg() {
-  return lv_color_hex(0x1c2126);
+  return lv_color_hex(g_dark ? 0x1C2126 : 0xFFFFFF);
 }
 lv_color_t colorText() {
-  return lv_color_hex(0xf0f0f0);
+  return lv_color_hex(g_dark ? 0xF0F0F0 : 0x14181C);
 }
 lv_color_t colorSubtext() {
-  return lv_color_hex(0x9aa4ad);
+  return lv_color_hex(g_dark ? 0xA9B4BE : 0x4A5560);
 }
 lv_color_t colorOnTime() {
-  return lv_color_hex(0x2fb344);
+  return lv_color_hex(g_dark ? 0x3DCB55 : 0x1B7F3B);
 }
 lv_color_t colorLate() {
-  return lv_color_hex(0xe0403f);
+  return lv_color_hex(g_dark ? 0xF05654 : 0xC62828);
 }
 lv_color_t colorEarly() {
-  return lv_color_hex(0x3b82f6);
+  return lv_color_hex(g_dark ? 0x5B9BFF : 0x1D4ED8);
 }
 lv_color_t colorScheduled() {
-  return lv_color_hex(0x8a8f96);
+  return lv_color_hex(g_dark ? 0x9AA0A8 : 0x5B6673);
 }
 lv_color_t colorSkipped() {
-  return lv_color_hex(0xf08c1a);
+  return lv_color_hex(g_dark ? 0xF5A030 : 0xB45309);
 }
 lv_color_t colorStale() {
-  return lv_color_hex(0xf0a500);
+  return lv_color_hex(0xF5B301);  // amber header in either theme...
+}
+lv_color_t colorOnStale() {
+  return lv_color_hex(0x14181C);  // ...always with dark text on it
 }
 lv_color_t routeBadgeColor() {
-  return lv_color_hex(0x274b8f);  // SEPTA-ish blue
+  return lv_color_hex(g_dark ? 0x274B8F : 0x1E4A9C);  // SEPTA-ish blue, white text
 }
 
 std::string minutesLabel(transit::Epoch eta_s) {
@@ -44,6 +66,20 @@ std::string minutesLabel(transit::Epoch eta_s) {
     return "Due";
   }
   return std::to_string((eta_s + 30) / 60);
+}
+
+std::string etaLabel(transit::Epoch eta_s, transit::Epoch when) {
+  if (eta_s >= 60 * 60 && when > 0) {
+    time_t t = (time_t)when;
+    struct tm local_tm;
+    localtime_r(&t, &local_tm);
+    int hour12 = local_tm.tm_hour % 12;
+    if (hour12 == 0) hour12 = 12;
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%d:%02d%s", hour12, local_tm.tm_min, local_tm.tm_hour < 12 ? "a" : "p");
+    return buf;
+  }
+  return minutesLabel(eta_s);
 }
 
 Badge badgeFor(const transit::Arrival &a) {

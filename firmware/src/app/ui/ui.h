@@ -33,6 +33,15 @@ void applyBrightness(uint8_t percent);
 // the LVGL task; before init() it only rotates, after init() call onConfigChanged() instead.
 void applyRotation(uint16_t degrees);
 
+// Turns the panel controller's colour inversion on or off (config.device.invert_colors). IPS
+// variants of the Sunton boards need it on to show colours as drawn; without it a near-black
+// background renders as white (docs/hardware.md). Same task rules as applyRotation().
+void applyInvert(bool invert);
+
+// Selects the light or dark palette (config.device.theme); see ui_common.h setTheme(). Before
+// init() only; afterwards onConfigChanged() applies it with the screen rebuild.
+void setTheme(const std::string &name);
+
 // Hands a new configuration to the UI from any task. The next tick() (LVGL task) applies
 // rotation and brightness and rebuilds the screens so new stops appear without a reboot.
 void onConfigChanged(const Config &cfg);

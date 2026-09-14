@@ -218,3 +218,38 @@ void test_merge_rail_no_direction_filter_returns_both() {
   StopSnapshot snap = mergeRail(cfg, r.items, 1789352000);
   TEST_ASSERT_EQUAL_UINT32(10, static_cast<uint32_t>(snap.arrivals.size()));
 }
+
+// SEPTA's wrong-service-day BusSchedules answers have listed the same static trip id on three
+// consecutive days (seen live 2026-09-14 for stop 21297: trip 280824 at +887, +2327, +3767 min).
+// One row per trip id, earliest copy wins.
+void test_merge_stop_dedupes_scheduled_rows_by_trip_id() {
+  StopConfig cfg;
+  cfg.key = "17-21297";
+  cfg.mode = Mode::Bus;
+  cfg.route = "17";
+  cfg.stop_id = "21297";
+  cfg.direction = "0";
+  Epoch now = 1789351200;
+  std::vector<SchedEntry> sched;
+  for (int day = 2; day >= 0; --day) {  // deliberately out of order: latest copy first
+    SchedEntry e;
+    e.route = "17";
+    e.trip_id = "280824";
+    e.direction = "0";
+    e.direction_desc = "2nd-Market";
+    e.scheduled = now + 600 + day * 86400;
+    sched.push_back(e);
+  }
+  SchedEntry other;
+  other.route = "17";
+  other.trip_id = "280909";
+  other.direction = "0";
+  other.scheduled = now + 1800;
+  sched.push_back(other);
+
+  StopSnapshot snap = mergeStop(cfg, {}, {}, sched, now);
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_EQUAL_STRING("280824", snap.arrivals[0].trip.c_str());
+  TEST_ASSERT_EQUAL_INT64(now + 600, snap.arrivals[0].scheduled);
+  TEST_ASSERT_EQUAL_STRING("280909", snap.arrivals[1].trip.c_str());
+}

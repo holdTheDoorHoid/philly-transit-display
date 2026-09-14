@@ -16,8 +16,19 @@ build one of this project's `cyd-*` PlatformIO environments.
 
 ## 3.5" boards: `cyd-3248S035R` and `cyd-3248S035C`
 
-Both are 320x480 ST7796 panels (rendered landscape at runtime via
-`lv_display_set_rotation()` in `main.cpp`); they differ only in the touch controller.
+Both are 320x480 ST7796 panels (portrait by default, `device.rotation` picks the orientation
+via `lv_display_set_rotation()` in `main.cpp`); they differ only in the touch controller.
+
+### Colour inversion
+
+`esp32_smartdisplay` sends the ST7796's colour-inversion command only when a board file defines
+`DISPLAY_IPS`, and none of the vendored Sunton files do. The owner's `ESP32-3248S035R` has an IPS
+panel: without inversion its near-black UI background rendered as white, and the panel flashed
+white (not black) while the firmware was crash-looping (2026-09-14). So the 3.5" board files carry
+`-D DISPLAY_INVERT_DEFAULT=1`, which seeds the runtime setting `device.invert_colors`
+(`ui::applyInvert()`, Settings > "Invert panel colors"). If a unit shows the light theme as dark,
+an orange route badge instead of blue, or a white flash at boot, flip that setting - no rebuild
+needed. The 2.4"/2.8" board files leave the default off, matching upstream.
 
 ### TFT panel (ST7796, SPI2_HOST) - same on both variants
 

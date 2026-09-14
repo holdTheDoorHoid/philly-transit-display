@@ -52,10 +52,21 @@ function fmtAgo(sec) {
   if (sec < 3600) return `${Math.round(sec / 60)}m ago`;
   return `${Math.round(sec / 3600)}h ago`;
 }
-function fmtEtaMinutes(etaS) {
+function fmtClock(epoch) {
+  const d = new Date(epoch * 1000);
+  const h = d.getHours() % 12 || 12;
+  return `${h}:${String(d.getMinutes()).padStart(2, '0')}${d.getHours() < 12 ? 'a' : 'p'}`;
+}
+// Minutes until the arrival; from an hour out, the clock time instead (a scheduled trip hours
+// away - overnight service, or SEPTA answering with the wrong service day - reads as "1:14a",
+// not "958"). Mirrors ui_common.cpp etaLabel() on the device.
+function fmtEta(a) {
+  const etaS = a.eta_s;
   if (etaS == null) return '--';
   if (etaS <= 0) return 'Now';
   if (etaS < 60) return 'Due';
+  const when = a.predicted || a.scheduled;
+  if (etaS >= 3600 && when) return fmtClock(when);
   return String(Math.round(etaS / 60));
 }
 function humanBytes(n) {
@@ -268,7 +279,7 @@ function renderStopPanels(container, stopSnaps) {
         panel.append(h('div', { class: 'arrival-row' },
           h('span', { class: 'route-badge' }, s.route || (s.mode === 'rail' ? 'RR' : '?')),
           h('span', { class: 'arrival-dest' }, a.destination || s.headsign || ''),
-          h('span', { class: 'arrival-minutes' }, fmtEtaMinutes(a.eta_s)),
+          h('span', { class: 'arrival-minutes' }, fmtEta(a)),
           h('span', { class: `status-badge ${badge.cls}`, title: badge.aria, 'aria-label': badge.aria }, badge.text),
         ));
       }
@@ -1051,6 +1062,19 @@ async function renderSettings(root) {
   const brightInput = h('input', { type: 'range', id: 'set-bright', min: 10, max: 100, value: d.brightness });
   const brightVal = h('span', { class: 'small muted' }, `${d.brightness}%`);
   brightInput.addEventListener('input', () => { brightVal.textContent = `${brightInput.value}%`; });
+  const THEMES = [['light', 'Light'], ['dark', 'Dark']];
+  const themeSelect = h('select', { id: 'set-theme' },
+    ...THEMES.map(([v, label]) => h('option', { value: v, selected: v === (d.theme || 'light') || undefined }, label)));
+  const invertInput = h('input', { type: 'checkbox', id: 'set-invert' });
+  invertInput.checked = !!d.invert_colors;
+  const tickerLines = d.ticker_lines ?? 3;
+  const tickerLinesSelect = h('select', { id: 'set-ticker-lines' },
+    ...[1, 2, 3, 4, 5, 6, 7, 8].map((n) => h('option', { value: String(n), selected: n === tickerLines || undefined },
+      n === 1 ? '1 line (scrolls sideways)' : `${n} lines (scrolls upward)`)));
+  const tickerSpeed = d.ticker_speed ?? 30;
+  const tickerSpeedInput = h('input', { type: 'range', id: 'set-ticker-speed', min: 5, max: 120, value: tickerSpeed });
+  const tickerSpeedVal = h('span', { class: 'small muted' }, `${tickerSpeed} px/s`);
+  tickerSpeedInput.addEventListener('input', () => { tickerSpeedVal.textContent = `${tickerSpeedInput.value} px/s`; });
   const httpsInput = h('input', { type: 'checkbox', id: 'set-https' });
   httpsInput.checked = !!d.use_https;
   const tlsInput = h('input', { type: 'checkbox', id: 'set-tls' });
@@ -1071,6 +1095,13 @@ async function renderSettings(root) {
     h('label', { for: 'set-poll' }, 'Poll interval (seconds)'), pollInput,
     h('label', { for: 'set-rotation' }, 'Screen rotation'), rotSelect,
     h('label', { for: 'set-bright' }, 'Screen brightness'), h('div', { class: 'row' }, brightInput, brightVal),
+    h('label', { for: 'set-theme' }, 'Screen theme'), themeSelect,
+    h('label', { class: 'inline' }, invertInput, ' Invert panel colors'),
+    h('p', { class: 'small muted' }, 'Some panels need this on to show colors correctly. If the light theme looks dark, the route badge looks orange instead of blue, or the screen flashes white at boot, flip it.'),
+    h('h2', {}, 'Alert ticker'),
+    h('label', { for: 'set-ticker-lines' }, 'Height'), tickerLinesSelect,
+    h('label', { for: 'set-ticker-speed' }, 'Scroll speed'), h('div', { class: 'row' }, tickerSpeedInput, tickerSpeedVal),
+    h('p', { class: 'small muted' }, 'Service alerts and detours for your routes appear along the bottom of the main screen. A taller ticker wraps the text and scrolls it upward; lower speeds are easier to read.'),
     h('label', { class: 'inline', style: 'margin-top:1rem' }, httpsInput, ' Fetch SEPTA data over HTTPS'),
     h('p', { class: 'small muted' }, 'Off by default: a TLS session needs about 40 KB of RAM the classic ESP32 does not have to spare. SEPTA serves the same data over plain HTTP.'),
     h('label', { class: 'inline' }, tlsInput, ' Verify SEPTA’s TLS certificate (when HTTPS is on)'), tlsWarn,
@@ -1082,7 +1113,10 @@ async function renderSettings(root) {
         ...cfg,
         device: {
           ...d, name: nameInput.value.trim(), tz, poll_seconds: Number(pollInput.value),
-          brightness: Number(brightInput.value), rotation: Number(rotSelect.value), use_https: httpsInput.checked, tls_verify: tlsInput.checked, logging: loggingInput.checked,
+          brightness: Number(brightInput.value), rotation: Number(rotSelect.value),
+          theme: themeSelect.value, invert_colors: invertInput.checked,
+          ticker_lines: Number(tickerLinesSelect.value), ticker_speed: Number(tickerSpeedInput.value),
+          use_https: httpsInput.checked, tls_verify: tlsInput.checked, logging: loggingInput.checked,
         },
         alerts: alertsInput.checked,
       };

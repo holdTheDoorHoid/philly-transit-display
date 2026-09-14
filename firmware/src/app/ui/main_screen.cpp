@@ -8,8 +8,10 @@
 
 #include <WiFi.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <ctime>
+#include <string>
 #include <vector>
 
 #include "ui_common.h"
@@ -44,7 +46,15 @@ struct MainScreenCtx {
   lv_obj_t *clock_label;
   lv_obj_t *wifi_label;
   lv_obj_t *updated_label;
-  lv_obj_t *ticker;
+  bool header_stale = false;
+  // Alert ticker (DESIGN.md SS8): a clipping box with one label inside, moved by an lv_anim at
+  // a fixed pixel speed. LVGL's built-in label scroll caps one full pass at 10 s regardless of
+  // length, which for a paragraph of SEPTA detour text was unreadably fast.
+  lv_obj_t *ticker_box;
+  lv_obj_t *ticker_label;
+  std::string ticker_text;
+  int ticker_lines = 1;
+  uint16_t ticker_speed = 30;
   std::vector<PanelWidgets> panels;
 };
 
@@ -53,14 +63,17 @@ std::string panelTitle(const StopConfig &s) {
   if (s.mode == transit::Mode::Rail) {
     snprintf(buf, sizeof(buf), "%s%s%s", s.station.c_str(), s.direction.empty() ? "" : " ", s.direction.empty() ? "" : ("(" + s.direction + ")").c_str());
   } else {
-    snprintf(buf, sizeof(buf), "%s %s %s %s %s", s.route.c_str(), LV_SYMBOL_RIGHT, s.headsign.c_str(), "\xC2\xB7" /* middle dot */, s.stop_name.c_str());
+    // U+2022 bullet, not U+00B7 middle dot: LVGL's built-in Montserrat fonts cover ASCII, the
+    // degree sign, the bullet and the FontAwesome symbols only, and the middle dot rendered as a
+    // blank box on the owner's board.
+    snprintf(buf, sizeof(buf), "%s %s %s %s %s", s.route.c_str(), LV_SYMBOL_RIGHT, s.headsign.c_str(), "\xE2\x80\xA2", s.stop_name.c_str());
   }
   std::string title(buf);
   // DESIGN.md SS4.6/SS8: subway has no realtime source in v1 (mergeStop() falls back to
   // BusSchedules-only, Status::Scheduled for every row) - the panel says so up front rather than
   // making the user infer it from every row showing "sched".
   if (s.mode == transit::Mode::Subway) {
-    title += " \xC2\xB7 schedule only";
+    title += " \xE2\x80\xA2 schedule only";
   }
   return title;
 }
@@ -79,6 +92,87 @@ lv_obj_t *makeLabel(lv_obj_t *parent, const lv_font_t *font, lv_color_t color) {
   lv_obj_set_style_text_font(l, font, 0);
   lv_obj_set_style_text_color(l, color, 0);
   return l;
+}
+
+// Plain container: no theme chrome, and not clickable so a tap on it reaches the screen's
+// tap-to-cycle handler (DESIGN.md SS8 "tap anywhere") instead of stopping at the child.
+lv_obj_t *makeBox(lv_obj_t *parent) {
+  lv_obj_t *o = lv_obj_create(parent);
+  lv_obj_set_style_border_width(o, 0, 0);
+  lv_obj_set_style_radius(o, 0, 0);
+  lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+  return o;
+}
+
+void animSetX(void *obj, int32_t v) {
+  lv_obj_set_x(static_cast<lv_obj_t *>(obj), v);
+}
+void animSetY(void *obj, int32_t v) {
+  lv_obj_set_y(static_cast<lv_obj_t *>(obj), v);
+}
+
+// Ticker copy: "17: <alert>" then "17 detour: <detour>" for each distinct detour (SEPTA lists
+// the same one twice), one item per line when the ticker is taller than a line, otherwise joined
+// with " • " for the single-line marquee.
+std::string tickerText(const std::vector<transit::Alert> &alerts, bool multiline) {
+  const char *sep = multiline ? "\n" : "   \xE2\x80\xA2   ";
+  std::string text;
+  std::vector<std::string> seen;
+  auto add = [&](const std::string &item) {
+    if (item.empty()) return;
+    for (const std::string &s : seen) {
+      if (s == item) return;
+    }
+    seen.push_back(item);
+    if (!text.empty()) text += sep;
+    text += item;
+  };
+  for (const transit::Alert &al : alerts) {
+    add(al.route + ": " + al.text);
+    for (const std::string &d : al.detours) add(al.route + " detour: " + d);
+  }
+  return text;
+}
+
+// (Re)starts the ticker animation for the current text: a horizontal marquee for a one-line
+// ticker, a credits-style upward scroll for a taller one; static when the text already fits.
+// The whole pass runs at config.device.ticker_speed pixels per second.
+void restartTicker(MainScreenCtx *ctx) {
+  lv_obj_t *box = ctx->ticker_box;
+  lv_obj_t *label = ctx->ticker_label;
+  lv_anim_delete(label, nullptr);
+  lv_obj_update_layout(box);
+  int32_t box_w = lv_obj_get_content_width(box);
+  int32_t box_h = lv_obj_get_content_height(box);
+  int32_t label_w = lv_obj_get_width(label);
+  int32_t label_h = lv_obj_get_height(label);
+  uint32_t speed = std::max<uint32_t>(5, std::min<uint32_t>(ctx->ticker_speed, 200));
+
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, label);
+  lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+  if (ctx->ticker_lines <= 1) {
+    lv_obj_set_y(label, 0);
+    if (label_w <= box_w) {
+      lv_obj_set_x(label, 0);
+      return;
+    }
+    lv_anim_set_exec_cb(&a, animSetX);
+    lv_anim_set_values(&a, box_w, -label_w);
+    lv_anim_set_duration(&a, (uint32_t)(box_w + label_w) * 1000u / speed);
+  } else {
+    lv_obj_set_x(label, 0);
+    if (label_h <= box_h) {
+      lv_obj_set_y(label, 0);
+      return;
+    }
+    lv_anim_set_exec_cb(&a, animSetY);
+    lv_anim_set_values(&a, box_h, -label_h);
+    lv_anim_set_duration(&a, (uint32_t)(box_h + label_h) * 1000u / speed);
+  }
+  lv_anim_start(&a);
 }
 
 }  // namespace
@@ -101,16 +195,13 @@ lv_obj_t *createMainScreen(const Config &cfg) {
 
   // ---- Header (10% height) ----
   int32_t header_h = h / 10 > 20 ? h / 10 : 20;
-  lv_obj_t *header = lv_obj_create(screen);
+  lv_obj_t *header = makeBox(screen);
   lv_obj_set_size(header, lv_pct(100), header_h);
   lv_obj_set_style_bg_color(header, colorPanelBg(), 0);
   lv_obj_set_style_pad_hor(header, 8, 0);
   lv_obj_set_style_pad_ver(header, 2, 0);
-  lv_obj_set_style_border_width(header, 0, 0);
-  lv_obj_set_style_radius(header, 0, 0);
   lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
   ctx->header = header;
 
   ctx->device_label = makeLabel(header, fontSmall(h), colorText());
@@ -119,10 +210,8 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   ctx->clock_label = makeLabel(header, fontSmall(h), colorText());
   lv_label_set_text(ctx->clock_label, "--:--");
 
-  lv_obj_t *right_group = lv_obj_create(header);
-  lv_obj_remove_flag(right_group, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *right_group = makeBox(header);
   lv_obj_set_style_bg_opa(right_group, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(right_group, 0, 0);
   lv_obj_set_style_pad_all(right_group, 0, 0);
   lv_obj_set_size(right_group, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
   lv_obj_set_flex_flow(right_group, LV_FLEX_FLOW_ROW);
@@ -136,30 +225,26 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   lv_label_set_text(ctx->updated_label, "updated -- ago");
 
   // ---- Stop panels ----
-  lv_obj_t *panels_area = lv_obj_create(screen);
+  lv_obj_t *panels_area = makeBox(screen);
   lv_obj_set_size(panels_area, lv_pct(100), lv_pct(100));
   lv_obj_set_flex_grow(panels_area, 1);
   lv_obj_set_style_bg_opa(panels_area, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(panels_area, 0, 0);
   lv_obj_set_style_pad_all(panels_area, 4, 0);
   lv_obj_set_style_pad_row(panels_area, 4, 0);
   lv_obj_set_flex_flow(panels_area, LV_FLEX_FLOW_COLUMN);
-  lv_obj_remove_flag(panels_area, LV_OBJ_FLAG_SCROLLABLE);
 
   for (const StopConfig &s : cfg.stops) {
     PanelWidgets pw;
     pw.stop_key = s.key;
     pw.route = s.route;
 
-    lv_obj_t *panel = lv_obj_create(panels_area);
+    lv_obj_t *panel = makeBox(panels_area);
     lv_obj_set_size(panel, lv_pct(100), lv_pct(100));
     lv_obj_set_flex_grow(panel, 1);
     lv_obj_set_style_bg_color(panel, colorPanelBg(), 0);
-    lv_obj_set_style_border_width(panel, 0, 0);
     lv_obj_set_style_radius(panel, 6, 0);
     lv_obj_set_style_pad_all(panel, 6, 0);
     lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
-    lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
 
     pw.title = makeLabel(panel, fontBody(h), colorText());
     lv_label_set_text(pw.title, panelTitle(s).c_str());
@@ -171,15 +256,13 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_obj_add_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
 
     for (int r = 0; r < rows; ++r) {
-      lv_obj_t *row = lv_obj_create(panel);
+      lv_obj_t *row = makeBox(panel);
       lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
       lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-      lv_obj_set_style_border_width(row, 0, 0);
       lv_obj_set_style_pad_all(row, 2, 0);
       lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
       lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
       lv_obj_set_style_pad_column(row, 6, 0);
-      lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
       RowWidgets rw;
       rw.route_badge = makeLabel(row, fontSmall(h), lv_color_white());
@@ -203,19 +286,39 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     ctx->panels.push_back(pw);
   }
 
-  // ---- Footer ticker (only shown when refreshMainScreen finds alerts) ----
-  ctx->ticker = lv_label_create(screen);
-  lv_obj_set_width(ctx->ticker, lv_pct(100));
-  lv_obj_set_style_text_font(ctx->ticker, fontSmall(h), 0);
-  lv_obj_set_style_text_color(ctx->ticker, colorText(), 0);
-  lv_obj_set_style_bg_color(ctx->ticker, colorPanelBg(), 0);
-  lv_obj_set_style_bg_opa(ctx->ticker, LV_OPA_COVER, 0);
-  lv_obj_set_style_pad_all(ctx->ticker, 4, 0);
-  lv_label_set_long_mode(ctx->ticker, LV_LABEL_LONG_SCROLL_CIRCULAR);
-  lv_label_set_text(ctx->ticker, "");
-  lv_obj_add_flag(ctx->ticker, LV_OBJ_FLAG_HIDDEN);
+  // ---- Alert ticker (only shown when refreshMainScreen finds alerts) ----
+  ctx->ticker_lines = std::max<int>(1, std::min<int>(cfg.device.ticker_lines, 8));
+  ctx->ticker_speed = cfg.device.ticker_speed;
+  const lv_font_t *ticker_font = fontSmall(h);
+  const int32_t ticker_pad = 4;
+  const int32_t line_space = 2;
+  int32_t ticker_h = ctx->ticker_lines * lv_font_get_line_height(ticker_font) + (ctx->ticker_lines - 1) * line_space + 2 * ticker_pad;
+
+  ctx->ticker_box = makeBox(screen);
+  lv_obj_set_size(ctx->ticker_box, lv_pct(100), ticker_h);
+  lv_obj_set_style_bg_color(ctx->ticker_box, colorPanelBg(), 0);
+  lv_obj_set_style_pad_all(ctx->ticker_box, ticker_pad, 0);
+  lv_obj_add_flag(ctx->ticker_box, LV_OBJ_FLAG_HIDDEN);
+
+  ctx->ticker_label = makeLabel(ctx->ticker_box, ticker_font, colorText());
+  lv_obj_set_style_text_line_space(ctx->ticker_label, line_space, 0);
+  if (ctx->ticker_lines <= 1) {
+    lv_label_set_long_mode(ctx->ticker_label, LV_LABEL_LONG_CLIP);  // one line, as wide as its text
+    lv_obj_set_width(ctx->ticker_label, LV_SIZE_CONTENT);
+  } else {
+    lv_label_set_long_mode(ctx->ticker_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->ticker_label, lv_pct(100));
+  }
+  lv_label_set_text(ctx->ticker_label, "");
 
   lv_obj_set_user_data(screen, ctx);
+  // Freed with the screen (ui.cpp rebuildScreens() deletes and recreates screens on a config
+  // change; without this each rebuild leaked the context - measured ~2 KB of heap per change).
+  lv_obj_add_event_cb(screen, [](lv_event_t *e) {
+    lv_obj_t *scr = static_cast<lv_obj_t *>(lv_event_get_target(e));
+    delete static_cast<MainScreenCtx *>(lv_obj_get_user_data(scr));
+    lv_obj_set_user_data(scr, nullptr);
+  }, LV_EVENT_DELETE, nullptr);
   return screen;
 }
 
@@ -253,7 +356,16 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
   } else {
     lv_label_set_text_fmt(ctx->updated_label, "updated %ld s ago", (long)age_s);
   }
-  lv_obj_set_style_bg_color(ctx->header, stale ? colorStale() : colorPanelBg(), 0);
+  if (stale != ctx->header_stale) {
+    ctx->header_stale = stale;
+    lv_obj_set_style_bg_color(ctx->header, stale ? colorStale() : colorPanelBg(), 0);
+    lv_color_t fg = stale ? colorOnStale() : colorText();
+    lv_color_t sub = stale ? colorOnStale() : colorSubtext();
+    lv_obj_set_style_text_color(ctx->device_label, fg, 0);
+    lv_obj_set_style_text_color(ctx->clock_label, fg, 0);
+    lv_obj_set_style_text_color(ctx->wifi_label, sub, 0);
+    lv_obj_set_style_text_color(ctx->updated_label, sub, 0);
+  }
 
   for (PanelWidgets &pw : ctx->panels) {
     const StopSnapshot *stop = findStopSnapshot(snap, pw.stop_key);
@@ -291,7 +403,7 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
 
       transit::Epoch eff = a.effective();
       transit::Epoch eta_s = eff > 0 ? (eff - (transit::Epoch)now) : 0;
-      lv_label_set_text(rw.minutes, minutesLabel(eta_s).c_str());
+      lv_label_set_text(rw.minutes, etaLabel(eta_s, eff).c_str());
 
       Badge badge = badgeFor(a);
       lv_label_set_text(rw.status_badge, badge.text.c_str());
@@ -299,18 +411,21 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
     }
   }
 
-  if (snap.alerts.empty()) {
-    lv_obj_add_flag(ctx->ticker, LV_OBJ_FLAG_HIDDEN);
-  } else {
-    std::string text;
-    for (const transit::Alert &al : snap.alerts) {
-      if (!text.empty()) {
-        text += "   \xE2\x80\xA2   ";  // " • "
-      }
-      text += al.route + ": " + al.text;
+  std::string ticker = tickerText(snap.alerts, ctx->ticker_lines > 1);
+  if (ticker.empty()) {
+    if (!ctx->ticker_text.empty()) {
+      lv_anim_delete(ctx->ticker_label, nullptr);
+      lv_label_set_text(ctx->ticker_label, "");
+      ctx->ticker_text.clear();
     }
-    lv_label_set_text(ctx->ticker, text.c_str());
-    lv_obj_remove_flag(ctx->ticker, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ctx->ticker_box, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_remove_flag(ctx->ticker_box, LV_OBJ_FLAG_HIDDEN);
+    if (ticker != ctx->ticker_text) {
+      ctx->ticker_text = ticker;
+      lv_label_set_text(ctx->ticker_label, ticker.c_str());
+      restartTicker(ctx);
+    }
   }
 }
 

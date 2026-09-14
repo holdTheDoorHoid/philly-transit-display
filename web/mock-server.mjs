@@ -68,6 +68,10 @@ function defaultConfig() {
       poll_seconds: 30,
       brightness: 80,
       rotation: 0,
+      theme: 'light',
+      invert_colors: false,
+      ticker_lines: 3,
+      ticker_speed: 30,
       use_https: false,
       tls_verify: true,
       logging: true,
@@ -103,6 +107,14 @@ function validateConfig(cfg) {
     return { error: 'rotation must be 0, 90, 180, or 270', path: 'device.rotation' };
   }
   if (d.use_https !== undefined && typeof d.use_https !== 'boolean') return { error: 'use_https must be a boolean', path: 'device.use_https' };
+  if (d.theme !== undefined && !['light', 'dark'].includes(d.theme)) return { error: 'theme must be "light" or "dark"', path: 'device.theme' };
+  if (d.invert_colors !== undefined && typeof d.invert_colors !== 'boolean') return { error: 'invert_colors must be a boolean', path: 'device.invert_colors' };
+  if (d.ticker_lines !== undefined && (!Number.isInteger(d.ticker_lines) || d.ticker_lines < 1 || d.ticker_lines > 8)) {
+    return { error: 'ticker_lines must be an integer between 1 and 8', path: 'device.ticker_lines' };
+  }
+  if (d.ticker_speed !== undefined && (!Number.isInteger(d.ticker_speed) || d.ticker_speed < 5 || d.ticker_speed > 200)) {
+    return { error: 'ticker_speed must be an integer between 5 and 200', path: 'device.ticker_speed' };
+  }
   if (typeof d.tls_verify !== 'boolean') return { error: 'tls_verify must be a boolean', path: 'device.tls_verify' };
   if (typeof d.logging !== 'boolean') return { error: 'logging must be a boolean', path: 'device.logging' };
   if (typeof cfg.alerts !== 'boolean') return { error: 'alerts must be a boolean', path: 'alerts' };

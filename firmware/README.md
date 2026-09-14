@@ -32,9 +32,9 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 
 | Build | Flash | Static RAM |
 |---|---:|---:|
-| Full feature set (current) | 1,866,782 B (98.2 %) | 89,940 B (27.4 %) |
+| Full feature set (current) | 1,875,130 B (98.7 %) | 90,060 B (27.5 %) |
 
-Flash headroom is about 34 KB. `platformio.ini`'s comment and `include/lv_conf.h` list the
+Flash headroom is about 25 KB. `platformio.ini`'s comment and `include/lv_conf.h` list the
 knobs (fonts, LVGL features, debug level); do not grow the app slots without dropping OTA.
 
 ### Heap, stage by stage (`[heap]` lines on the serial console at boot)

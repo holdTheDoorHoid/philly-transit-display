@@ -7,8 +7,26 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace transit_app {
+
+// Response headers a caller may want back from get(). SEPTA's BusSchedules is served by an AWS
+// load balancer whose backends disagree about the current service day (transit_core/NOTES.md 9);
+// the balancer names the backend in `X-B-Srvr` and offers a sticky-session cookie in
+// `Set-Cookie: AWSELB=...` (10 minute max-age, refreshed on every request that presents it).
+struct ReplyInfo {
+  std::string set_cookie;  // "AWSELB=<value>" with the attributes stripped, or empty
+  std::string backend;     // X-B-Srvr, e.g. "api_main3", or empty
+};
+
+// Sticky BusSchedules backend: once pinned, get() sends the cookie with every URL containing
+// "BusSchedules" so the balancer keeps routing to the backend that last answered for today.
+// net_poller.cpp pins after a plausible answer and unpins after a wrong-day one, so a bad
+// backend is abandoned on the next connection instead of being sticky for ten minutes.
+void pinScheduleBackend(const std::string &cookie);
+void unpinScheduleBackend();
+const std::string &scheduleCookie();
 
 // Performs one HTTPS GET of `url`, verifying the server certificate against
 // kSeptaCaBundle (ca_bundle.h). Retries up to 3 times total, with backoff of
@@ -43,8 +61,11 @@ namespace transit_app {
 // ultimately kept (the first non-retried one, or the last attempt if all 3
 // were retried), or a negative HTTPClient error code if no attempt ever got
 // a response at all.
+//
+// `reply`, if non-null, receives the Set-Cookie and X-B-Srvr headers of the response that was
+// kept (see ReplyInfo).
 int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, uint32_t timeout_ms,
-        bool tls_verify = true);
+        bool tls_verify = true, ReplyInfo *reply = nullptr);
 
 // Selects the transport for every get(): with `use_https` false, an https:// URL is fetched over
 // plain http:// with a NetworkClient and no TLS at all. Default false: a TLS session needs ~40 KB

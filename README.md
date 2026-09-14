@@ -18,9 +18,10 @@ Alpha. As of 2026-09-14:
 | Piece | State |
 |---|---|
 | Boots, display, touch probe, Wi-Fi setup hotspot | Verified on an ESP32-3248S035R (3.5" resistive) |
-| Live SEPTA arrivals, lateness, alerts on screen | Implemented, awaiting on-device verification |
-| Web UI: stops wizard with map, stats charts, settings, OTA | Implemented; verified against the mock server |
-| SD logging and on-device statistics | Implemented; 64 host tests pass; awaiting a card and a day of data |
+| Live SEPTA arrivals, lateness, alerts on screen | Verified on the same board against live SEPTA data |
+| Light/dark theme, panel colour inversion, alert ticker height and speed, rotation | Settings in the web UI; apply without a reboot |
+| Web UI: stops wizard with map, stats charts, settings, OTA | Verified on the device (OTA upload not yet exercised) |
+| SD logging and on-device statistics | Logging and `/api/stats` verified on the device; 70 host tests pass; statistics need a few days of data to mean much |
 | Other CYD variants (2.8", 2.4", capacitive) | Build in CI; not yet tested on hardware |
 | Browser flasher on GitHub Pages | Wired to publish on the first tagged release |
 

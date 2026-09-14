@@ -21,6 +21,7 @@
 #include "proxy_worker.h"
 #include "status_led.h"
 #include "transit_core/septa_source.h"
+#include "transit_core/timeparse.h"
 #include "transit_stats/aggregate.h"
 #include "transit_stats/log_window.h"
 #include "transit_stats/tracker.h"
@@ -43,6 +44,11 @@ constexpr UBaseType_t kTaskPriority = 1;
 
 // DESIGN.md SS4.7.
 constexpr uint32_t kBusSchedulesRefreshMs = 10 * 60 * 1000;
+// A schedule that still looked like the wrong service day after every fetch attempt
+// (transit_core septa_source.h fetchPlausibleSchedule) is kept only this long, so the next
+// polls get another try at SEPTA's good backend instead of showing tomorrow's owl trips for
+// ten minutes.
+constexpr uint32_t kBusSchedulesSuspectRefreshMs = 2 * 60 * 1000;
 constexpr uint32_t kAlertsRefreshMs = 5 * 60 * 1000;
 constexpr int64_t kUrgentEtaS = 180;    // "any arrival is under 3 min" -> poll every 15s
 constexpr uint32_t kUrgentIntervalS = 15;
@@ -51,6 +57,22 @@ constexpr uint32_t kMaxBackoffS = 300;  // "cap 5 min"
 
 SemaphoreHandle_t g_mutex = nullptr;
 SemaphoreHandle_t g_wake_sem = nullptr;  // given to wake the poller task early (config change)
+
+// NTP has synced once the clock reads later than 2023-11; before that every "minutes until"
+// figure is measured from 1970 (first seen as "first trip in 29823220 min" on a boot where the
+// first poll beat the NTP reply).
+constexpr time_t kSaneClockEpoch = 1700000000;
+bool clockIsSane() { return time(nullptr) >= kSaneClockEpoch; }
+volatile bool g_last_poll_unsynced = false;
+
+// Stand-in ScheduleCache for a poll that runs before the clock is sane: nothing is cached (a
+// judgement made against 1970 would be wrong for ten minutes), so the next poll refetches.
+class NoStoreScheduleCache : public transit::ScheduleCache {
+ public:
+  bool get(const std::string &, std::vector<SchedEntry> *) override { return false; }
+  void put(const std::string &, const std::vector<SchedEntry> &) override {}
+  void putSuspect(const std::string &, const std::vector<SchedEntry> &) override {}
+};
 transit::Snapshot g_snapshot;
 PollStatus g_status;
 uint32_t g_poll_seconds = 30;
@@ -64,7 +86,7 @@ class AppScheduleCache : public transit::ScheduleCache {
   bool get(const std::string &stop_id, std::vector<SchedEntry> *out) override {
     for (auto &e : entries_) {
       if (e.stop_id == stop_id) {
-        if (millis() - e.fetched_ms > kBusSchedulesRefreshMs) return false;
+        if (millis() - e.fetched_ms > e.ttl_ms) return false;
         *out = e.entries;
         return true;
       }
@@ -72,14 +94,14 @@ class AppScheduleCache : public transit::ScheduleCache {
     return false;
   }
   void put(const std::string &stop_id, const std::vector<SchedEntry> &entries) override {
-    for (auto &e : entries_) {
-      if (e.stop_id == stop_id) {
-        e.entries = entries;
-        e.fetched_ms = millis();
-        return;
-      }
-    }
-    entries_.push_back({stop_id, entries, millis()});
+    store(stop_id, entries, kBusSchedulesRefreshMs);
+  }
+  void putSuspect(const std::string &stop_id, const std::vector<SchedEntry> &entries) override {
+    Serial.printf("[net_poller] BusSchedules for stop %s looks like the wrong service day (%u entries, first trip %ld min away); retrying in %u s\n",
+                  stop_id.c_str(), (unsigned)entries.size(),
+                  entries.empty() ? 0L : (long)((entries.front().scheduled - (transit::Epoch)time(nullptr)) / 60),
+                  (unsigned)(kBusSchedulesSuspectRefreshMs / 1000));
+    store(stop_id, entries, kBusSchedulesSuspectRefreshMs);
   }
   // DESIGN.md SS4.7: refresh "also on config change" - force every stop to be refetched on the
   // next poll rather than waiting out the 10 minute window.
@@ -90,7 +112,19 @@ class AppScheduleCache : public transit::ScheduleCache {
     std::string stop_id;
     std::vector<SchedEntry> entries;
     uint32_t fetched_ms = 0;
+    uint32_t ttl_ms = kBusSchedulesRefreshMs;
   };
+  void store(const std::string &stop_id, const std::vector<SchedEntry> &entries, uint32_t ttl_ms) {
+    for (auto &e : entries_) {
+      if (e.stop_id == stop_id) {
+        e.entries = entries;
+        e.fetched_ms = millis();
+        e.ttl_ms = ttl_ms;
+        return;
+      }
+    }
+    entries_.push_back({stop_id, entries, millis(), ttl_ms});
+  }
   std::vector<Entry> entries_;
 };
 
@@ -160,15 +194,52 @@ bool isSeptaErrorBody(const std::vector<uint8_t> &b) {
   return b.size() >= 8 && memcmp(b.data(), "{\"error\"", 8) == 0;
 }
 
+// Minutes until the earliest upcoming "DateCalender" in a BusSchedules body, or -1 if none
+// parsed. A cheap scan over the raw JSON (the entries are ~90 bytes each and there are at most a
+// dozen) so the fetch layer can judge SEPTA's service day per backend and steer the sticky
+// cookie before transit_core ever parses the body. Mirrors fetchPlausibleSchedule()'s test.
+long firstUpcomingMinutes(const std::vector<uint8_t> &body) {
+  static const char kKey[] = "\"DateCalender\":\"";
+  const size_t klen = sizeof(kKey) - 1;
+  transit::Epoch now = (transit::Epoch)time(nullptr);
+  transit::Epoch best = 0;
+  std::string text(body.begin(), body.end());
+  size_t pos = 0;
+  while ((pos = text.find(kKey, pos)) != std::string::npos) {
+    pos += klen;
+    size_t end = text.find('"', pos);
+    if (end == std::string::npos) break;
+    std::string raw = text.substr(pos, end - pos);
+    std::string unescaped;
+    for (size_t i = 0; i < raw.size(); ++i) {
+      if (raw[i] == '\\' && i + 1 < raw.size() && raw[i + 1] == '/') continue;  // "09\/15\/26"
+      unescaped.push_back(raw[i]);
+    }
+    bool ok = false;
+    transit::Epoch t = transit::parseBusScheduleTime(unescaped, &ok);
+    if (ok && t >= now - 60 && (best == 0 || t < best)) best = t;
+    pos = end;
+  }
+  if (best == 0) return -1;
+  return (long)((best - now) / 60);
+}
+
+std::string stopIdFromUrl(const std::string &url) {
+  size_t p = url.find("stop_id=");
+  return p == std::string::npos ? url : url.substr(p + 8);
+}
+
 transit::HttpGet makeHttpGet(bool tls_verify) {
   return [tls_verify](const std::string &url, std::function<bool(const uint8_t *, size_t)> onData) -> int {
     // BusSchedules is tiny (~1 KB) and flaky, so buffer it and retry on the error shape before
     // handing the consumer a single clean delivery; everything else streams straight through.
     if (url.find("BusSchedules") != std::string::npos) {
       int status = -1;
-      for (int attempt = 0; attempt < 4; ++attempt) {
+      constexpr int kAttempts = 4;
+      for (int attempt = 0; attempt < kAttempts; ++attempt) {
         std::vector<uint8_t> body;
         bool overflow = false;
+        ReplyInfo reply;
         status = transit_app::get(
             url.c_str(),
             [&](const uint8_t *d, size_t n) {
@@ -176,8 +247,27 @@ transit::HttpGet makeHttpGet(bool tls_verify) {
               body.insert(body.end(), d, d + n);
               return true;
             },
-            kFetchTimeoutMs, tls_verify);
+            kFetchTimeoutMs, tls_verify, &reply);
         if (overflow || (!body.empty() && !isSeptaErrorBody(body))) {
+          // Judge the service day here as well as in transit_core (fetchPlausibleSchedule): only
+          // this layer sees which backend answered, and only a fresh connection without the
+          // sticky cookie can land on a different one (transit_core/NOTES.md 9).
+          long first_min = clockIsSane() ? firstUpcomingMinutes(body) : -1;
+          bool wrong_day = clockIsSane() && first_min > (long)(transit::kSchedulePlausibleS / 60);
+          Serial.printf("[net_poller] BusSchedules stop %s: backend %s, first trip in %ld min%s\n",
+                        stopIdFromUrl(url).c_str(), reply.backend.empty() ? "?" : reply.backend.c_str(), first_min,
+                        wrong_day ? " (wrong service day)" : (clockIsSane() ? "" : " (clock not synced, not judged)"));
+          if (!clockIsSane()) {
+            // Can't tell a good backend from a bad one yet: deliver as-is, leave the cookie alone.
+          } else if (wrong_day) {
+            unpinScheduleBackend();
+            if (attempt + 1 < kAttempts) {
+              vTaskDelay(pdMS_TO_TICKS(200));
+              continue;
+            }
+          } else {
+            pinScheduleBackend(reply.set_cookie);
+          }
           if (!body.empty()) onData(body.data(), body.size());
           return status;
         }
@@ -354,7 +444,13 @@ void pollOnce() {
     (s.mode == Mode::Rail ? rail_like : bus_like).push_back(s);
   }
 
-  Snapshot bus_snap = transit::pollBusStops(bus_like, now, http, g_sched_cache);
+  // Before NTP: use a cache that stores nothing, so schedules judged against 1970 are refetched
+  // on the next poll (which comes sooner - see pollerTask) instead of sticking for ten minutes.
+  NoStoreScheduleCache nostore;
+  g_last_poll_unsynced = !clockIsSane();
+  transit::ScheduleCache &sched_cache = g_last_poll_unsynced ? static_cast<transit::ScheduleCache &>(nostore)
+                                                             : static_cast<transit::ScheduleCache &>(g_sched_cache);
+  Snapshot bus_snap = transit::pollBusStops(bus_like, now, http, sched_cache);
   Snapshot rail_snap = transit::pollRailStops(rail_like, now, http);
 
   Snapshot combined;
@@ -383,7 +479,7 @@ void pollOnce() {
         }
       }
       bool route_live = sc && routeIsLive(live_by_route, sc->route);
-      if (tracker() != nullptr && now >= 1700000000) tracker()->observe(stop, now, route_live, combined.last_poll_ok, events);
+      if (tracker() != nullptr && now >= kSaneClockEpoch) tracker()->observe(stop, now, route_live, combined.last_poll_ok, events);
     }
     if (!events.empty()) {
       std::string month = currentLocalMonth();
@@ -433,13 +529,14 @@ void pollerTask(void * /*arg*/) {
   while (!g_enabled) {
     xSemaphoreTake(g_wake_sem, pdMS_TO_TICKS(500));
   }
-  // Wait for NTP before the first poll (up to 20 s): the tracker and the SD log key everything
-  // by wall-clock time, and a poll at "3 seconds since 1970" produced garbage pred rows.
-  for (int i = 0; i < 40 && time(nullptr) < 1700000000; ++i) {
+  // Wait for NTP before the first poll (up to 45 s): the tracker and the SD log key everything
+  // by wall-clock time, a poll at "3 seconds since 1970" produced garbage pred rows, and the
+  // BusSchedules service-day check needs today's date. 20 s was not always enough.
+  for (int i = 0; i < 90 && !clockIsSane(); ++i) {
     vTaskDelay(pdMS_TO_TICKS(500));
   }
-  if (time(nullptr) < 1700000000) {
-    Serial.println("[net_poller] clock not synced after 20 s; polling anyway, logging waits for a sane clock");
+  if (!clockIsSane()) {
+    Serial.println("[net_poller] clock not synced after 45 s; polling anyway, schedules are not cached and logging waits for a sane clock");
   }
   uint32_t consecutive_failures = 0;
   for (;;) {
@@ -450,6 +547,7 @@ void pollerTask(void * /*arg*/) {
     bool ok = snap.last_poll_ok;
     bool urgent = anyArrivalUrgent(snap, (transit::Epoch)time(nullptr));
     uint32_t interval_s = nextIntervalS(cfg, ok, urgent, consecutive_failures);
+    if (g_last_poll_unsynced) interval_s = std::min<uint32_t>(interval_s, 10);  // re-poll soon once NTP lands
 
     // Blocks for up to interval_s, but wakes immediately if requestRepoll() gives the semaphore
     // (DESIGN.md SS7: PUT /api/config "triggers immediate re-poll").

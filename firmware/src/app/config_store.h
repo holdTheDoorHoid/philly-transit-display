@@ -14,12 +14,23 @@ namespace transit_app {
 constexpr const char *kConfigPath = "/config.json";
 constexpr size_t kMaxStops = 8;  // DESIGN.md SS6: "Maximum 8 stops."
 
+// Board build flag (firmware/boards/*.json): whether this board's panel shows correct colours
+// only with the controller's inversion command on (IPS variants do). Runtime-overridable via
+// device.invert_colors; see docs/hardware.md "Colour inversion".
+#ifndef DISPLAY_INVERT_DEFAULT
+#define DISPLAY_INVERT_DEFAULT 0
+#endif
+
 struct DeviceConfig {
   std::string name = "transit-display";
   std::string tz = "EST5EDT,M3.2.0,M11.1.0";
   uint16_t poll_seconds = 30;
   uint8_t brightness = 80;
   uint16_t rotation = 0;  // 0, 90, 180, 270 degrees; 0 = panel-native portrait (DESIGN.md SS6)
+  std::string theme = "light";  // "light" | "dark" (ui_common.h setTheme)
+  bool invert_colors = DISPLAY_INVERT_DEFAULT != 0;  // panel colour inversion (ui.h applyInvert)
+  uint8_t ticker_lines = 3;     // alert ticker height in text lines, 1..8 (1 = horizontal marquee)
+  uint16_t ticker_speed = 30;   // alert ticker scroll speed in pixels per second, 5..200
   bool tls_verify = true;
   bool use_https = false;  // see http_fetch.h: TLS is a 40 KB luxury this board cannot afford by default
   bool logging = true;

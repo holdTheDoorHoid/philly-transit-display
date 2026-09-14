@@ -225,3 +225,102 @@ void test_poll_rail_stops_merges_by_direction() {
   TEST_ASSERT_EQUAL_UINT32(5, static_cast<uint32_t>(n->arrivals.size()));
   TEST_ASSERT_EQUAL_UINT32(5, static_cast<uint32_t>(s->arrivals.size()));
 }
+
+// --- BusSchedules wrong-service-day retry (septa_source.h fetchPlausibleSchedule, NOTES.md 9) ----
+
+namespace {
+
+// Serves a scripted sequence of fixture bodies to successive requests for any URL (the n-th
+// request gets bodies[min(n, size-1)]), and counts the requests it saw.
+HttpGet makeSequenceHttp(std::vector<std::string> bodies, int* calls) {
+  return [bodies, calls](const std::string&, std::function<bool(const uint8_t*, size_t)> onData) -> int {
+    size_t i = static_cast<size_t>(*calls) < bodies.size() ? static_cast<size_t>(*calls) : bodies.size() - 1;
+    ++*calls;
+    std::vector<uint8_t> body = transit_test::readFixture(bodies[i]);
+    onData(body.data(), body.size());
+    return 200;
+  };
+}
+
+}  // namespace
+
+// Captured 2026-09-14 09:24 EDT: busschedules_21297_wrong_day.json is SEPTA's answer from a stale
+// backend (first trip 09/15/26 12:32 am, old "Front-Market" headsign); busschedules_21297.json is
+// the good answer (first trip 09/13/26 10:32 pm). With `now` = 2026-09-13 22:00 EDT the good
+// body's first trip is 32 minutes out and the bad one's is over a day out.
+void test_fetch_plausible_schedule_retries_past_wrong_service_day() {
+  int calls = 0;
+  HttpGet http = makeSequenceHttp({"busschedules_21297_wrong_day.json", "busschedules_21297.json"}, &calls);
+  SeptaSource src;
+  std::vector<SchedEntry> out;
+  Epoch now = 1789351200;  // 2026-09-13 22:00:00 EDT
+  bool plausible = fetchPlausibleSchedule(src, "21297", now, http, &out);
+  TEST_ASSERT_TRUE(plausible);
+  TEST_ASSERT_EQUAL_INT(2, calls);  // stopped as soon as a plausible answer arrived
+  TEST_ASSERT_TRUE(out.size() > 0);
+  TEST_ASSERT_EQUAL_STRING("281678", out[0].trip_id.c_str());
+  TEST_ASSERT_EQUAL_STRING("2nd-Market", out[0].direction_desc.c_str());
+}
+
+void test_fetch_plausible_schedule_accepts_first_good_answer_without_retrying() {
+  int calls = 0;
+  HttpGet http = makeSequenceHttp({"busschedules_21297.json"}, &calls);
+  SeptaSource src;
+  std::vector<SchedEntry> out;
+  TEST_ASSERT_TRUE(fetchPlausibleSchedule(src, "21297", 1789351200, http, &out));
+  TEST_ASSERT_EQUAL_INT(1, calls);
+}
+
+void test_fetch_plausible_schedule_keeps_best_effort_when_every_answer_is_wrong() {
+  int calls = 0;
+  HttpGet http = makeSequenceHttp({"busschedules_21297_wrong_day.json"}, &calls);
+  SeptaSource src;
+  std::vector<SchedEntry> out;
+  bool plausible = fetchPlausibleSchedule(src, "21297", 1789351200, http, &out);
+  TEST_ASSERT_FALSE(plausible);
+  TEST_ASSERT_EQUAL_INT(kScheduleFetchAttempts, calls);
+  TEST_ASSERT_EQUAL_UINT32(4, static_cast<uint32_t>(out.size()));  // still returned, cached briefly
+  TEST_ASSERT_EQUAL_STRING("280909", out[0].trip_id.c_str());
+}
+
+void test_fetch_plausible_schedule_leaves_out_untouched_on_total_failure() {
+  int calls = 0;
+  HttpGet http = makeSequenceHttp({"busschedules_error_400.json"}, &calls);
+  SeptaSource src;
+  std::vector<SchedEntry> out;
+  TEST_ASSERT_FALSE(fetchPlausibleSchedule(src, "21297", 1789351200, http, &out));
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(out.size()));
+}
+
+// pollBusStops() routes an implausible schedule through ScheduleCache::putSuspect rather than
+// put(), so the glue layer can expire it quickly.
+void test_poll_bus_stops_marks_wrong_day_schedule_as_suspect() {
+  class RecordingCache : public FakeScheduleCache {
+   public:
+    void putSuspect(const std::string& stop_id, const std::vector<SchedEntry>& entries) override {
+      suspect[stop_id] = entries;
+    }
+    std::map<std::string, std::vector<SchedEntry>> suspect;
+  };
+  HttpGet http = [](const std::string& url, std::function<bool(const uint8_t*, size_t)> onData) -> int {
+    std::string fixture = url.find("BusSchedules") != std::string::npos ? "busschedules_21297_wrong_day.json"
+                          : url.find("TransitView") != std::string::npos ? "transitview_BSL.json"
+                                                                          : "septa_bus_tripupdates.pb";
+    std::vector<uint8_t> body = transit_test::readFixture(fixture);
+    onData(body.data(), body.size());
+    return 200;
+  };
+  StopConfig nb;
+  nb.key = "17-21297";
+  nb.mode = Mode::Bus;
+  nb.route = "17";
+  nb.stop_id = "21297";
+  nb.direction = "0";
+  RecordingCache cache;
+  Snapshot snap = pollBusStops({nb}, 1789351200, http, cache);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(cache.stored.count("21297")));
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(cache.suspect.count("21297")));
+  const StopSnapshot* st = findStop(snap, "17-21297");
+  TEST_ASSERT_NOT_NULL(st);
+  TEST_ASSERT_TRUE(st->arrivals.size() > 0);  // best effort still displayed
+}

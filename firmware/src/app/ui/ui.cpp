@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include <esp32_smartdisplay.h>
+#include <esp_lcd_panel_ops.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -64,10 +65,9 @@ void buildScreens() {
   lv_obj_add_event_cb(g_device_info_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
 }
 
-// Tears down and recreates every screen (rotation or stop list changed). A blank screen is
-// loaded first because LVGL will not delete the active screen. Each screen's small context
-// struct (lv_obj user_data) is not freed here; config changes are rare enough that this
-// leak of a few hundred bytes per rebuild is acceptable until the screens grow destroy() helpers.
+// Tears down and recreates every screen (rotation, theme, ticker or stop list changed). A blank
+// screen is loaded first because LVGL will not delete the active screen. Each screen frees its
+// own context struct from an LV_EVENT_DELETE handler.
 void rebuildScreens() {
   lv_obj_t *blank = lv_obj_create(nullptr);
   lv_obj_set_style_bg_color(blank, colorBg(), 0);
@@ -106,6 +106,7 @@ void onScreenTapped(lv_event_t *e) {
 
 void init(const Config &cfg) {
   g_cfg = cfg;
+  setTheme(g_cfg.device.theme);
   if (g_pending_mutex == nullptr) g_pending_mutex = xSemaphoreCreateMutex();
 
   buildScreens();
@@ -173,8 +174,11 @@ void tick() {
   }
   if (apply) {
     bool rotate = next.device.rotation != g_cfg.device.rotation;
+    bool invert = next.device.invert_colors != g_cfg.device.invert_colors;
     g_cfg = next;
+    setTheme(g_cfg.device.theme);  // rebuildScreens() below re-reads every colour
     if (rotate) applyRotation(g_cfg.device.rotation);
+    if (invert) applyInvert(g_cfg.device.invert_colors);
     applyBrightness(g_cfg.device.brightness);
     rebuildScreens();
   }
@@ -203,6 +207,18 @@ void applyRotation(uint16_t degrees) {
   lv_display_t *d = lv_display_get_default();
   if (d == nullptr) return;
   lv_display_set_rotation(d, rotationEnum(degrees));
+}
+
+void applyInvert(bool invert) {
+  lv_display_t *d = lv_display_get_default();
+  if (d == nullptr) return;
+  // esp32_smartdisplay stores the esp_lcd panel handle in the display's user_data
+  // (lvgl_panel_st7796_spi.c / lvgl_panel_ili9341_spi.c). The library itself only sends the
+  // inversion command when a board file defines DISPLAY_IPS, which none of the vendored Sunton
+  // files do; the owner's 3.5" panel needs it (docs/hardware.md).
+  auto panel = static_cast<esp_lcd_panel_handle_t>(lv_display_get_user_data(d));
+  if (panel == nullptr) return;
+  esp_lcd_panel_invert_color(panel, invert);
 }
 
 void onConfigChanged(const Config &cfg) {

@@ -52,6 +52,14 @@ class ScheduleCache {
 
   // Replaces the cached schedule for stop_id with `entries` and resets its freshness clock.
   virtual void put(const std::string& stop_id, const std::vector<SchedEntry>& entries) = 0;
+
+  // Like put(), for a schedule that still looked implausible after every fetch attempt (see
+  // fetchPlausibleSchedule() in septa_source.h: SEPTA sometimes answers with the wrong service
+  // day). Implementations should keep such entries for a much shorter time so the next poll gets
+  // another chance at a good answer. Default: same as put().
+  virtual void putSuspect(const std::string& stop_id, const std::vector<SchedEntry>& entries) {
+    put(stop_id, entries);
+  }
 };
 
 // Agency-agnostic real-time source interface (DESIGN.md 11). SeptaSource (septa_source.h) is

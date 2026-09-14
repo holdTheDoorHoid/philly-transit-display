@@ -64,6 +64,24 @@ class SeptaSource : public TransitSource {
   int fetchRailArrivals(const std::string& station, std::vector<RailArrival>* out, HttpGet http);
 };
 
+// SEPTA's BusSchedules backend is not consistent across requests: some of the servers behind it
+// hold a stale schedule with no service for the current day and answer with the first trips of
+// the *next* day. Observed 2026-09-14 at 09:15 for stop 21297: two of five identical requests
+// returned trips at 12:32 am the following day (under the old "Front-Market" headsign), the other
+// three returned 9:30 am today (NOTES.md 9). Shown naively, that is "887 minutes" on the display.
+//
+// fetchPlausibleSchedule() calls SeptaSource::fetchSchedule up to kScheduleFetchAttempts times
+// while the earliest upcoming entry is more than kSchedulePlausibleS away, and keeps the response
+// whose first upcoming trip is soonest. Returns true if the kept response looked plausible (first
+// upcoming trip within kSchedulePlausibleS); false if every attempt looked wrong (the best one is
+// still written to *out so a genuinely sparse overnight schedule is displayed) or nothing usable
+// came back at all (*out untouched). Callers cache a false result only briefly (ScheduleCache::
+// putSuspect).
+constexpr int kScheduleFetchAttempts = 3;
+constexpr Epoch kSchedulePlausibleS = 2 * 3600;
+bool fetchPlausibleSchedule(SeptaSource& src, const std::string& stop_id, Epoch now, HttpGet http,
+                            std::vector<SchedEntry>* out);
+
 // Orchestrates one full poll cycle for every Mode::Bus/Mode::Trolley/Mode::Subway entry in
 // `configs` (DESIGN.md 4.7, 11):
 //   1. One GTFS-RT TripUpdates fetch, streamed through a single GtfsRtStream filtered to the

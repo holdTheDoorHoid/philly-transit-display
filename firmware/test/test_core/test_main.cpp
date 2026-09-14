@@ -48,6 +48,7 @@ void test_merge_rail_on_time_status();
 void test_merge_rail_line_filter();
 void test_merge_rail_unrecognized_line_code_matches_nothing();
 void test_merge_rail_no_direction_filter_returns_both();
+void test_merge_stop_dedupes_scheduled_rows_by_trip_id();
 
 // test_septa_source.cpp
 void test_septa_url_builders();
@@ -59,6 +60,11 @@ void test_poll_bus_stops_merges_both_configured_stops();
 void test_poll_bus_stops_subway_is_schedule_only();
 void test_poll_bus_stops_transport_failure_marks_snapshot();
 void test_poll_rail_stops_merges_by_direction();
+void test_fetch_plausible_schedule_retries_past_wrong_service_day();
+void test_fetch_plausible_schedule_accepts_first_good_answer_without_retrying();
+void test_fetch_plausible_schedule_keeps_best_effort_when_every_answer_is_wrong();
+void test_fetch_plausible_schedule_leaves_out_untouched_on_total_failure();
+void test_poll_bus_stops_marks_wrong_day_schedule_as_suspect();
 
 int main(int argc, char** argv) {
   (void)argc;
@@ -103,6 +109,7 @@ int main(int argc, char** argv) {
   RUN_TEST(test_merge_rail_line_filter);
   RUN_TEST(test_merge_rail_unrecognized_line_code_matches_nothing);
   RUN_TEST(test_merge_rail_no_direction_filter_returns_both);
+  RUN_TEST(test_merge_stop_dedupes_scheduled_rows_by_trip_id);
 
   RUN_TEST(test_septa_url_builders);
   RUN_TEST(test_alert_route_id_for_bus_and_trolley);
@@ -113,6 +120,11 @@ int main(int argc, char** argv) {
   RUN_TEST(test_poll_bus_stops_subway_is_schedule_only);
   RUN_TEST(test_poll_bus_stops_transport_failure_marks_snapshot);
   RUN_TEST(test_poll_rail_stops_merges_by_direction);
+  RUN_TEST(test_fetch_plausible_schedule_retries_past_wrong_service_day);
+  RUN_TEST(test_fetch_plausible_schedule_accepts_first_good_answer_without_retrying);
+  RUN_TEST(test_fetch_plausible_schedule_keeps_best_effort_when_every_answer_is_wrong);
+  RUN_TEST(test_fetch_plausible_schedule_leaves_out_untouched_on_total_failure);
+  RUN_TEST(test_poll_bus_stops_marks_wrong_day_schedule_as_suspect);
 
   return UNITY_END();
 }

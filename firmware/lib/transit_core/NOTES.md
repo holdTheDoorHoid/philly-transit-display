@@ -220,6 +220,38 @@ follows DESIGN.md's own stated convention (`Mode::Trolley -> trolley_route_<rout
 Alerts feed; whether it also holds for `T1`-`T5` should be re-checked once one of them has a
 live alert to test against.
 
+## 9. BusSchedules sometimes answers for the wrong service day
+
+Seen 2026-09-14 between 09:15 and 09:24 EDT, on the owner's board and then reproduced with curl.
+Five identical requests:
+
+```
+curl -s 'http://www3.septa.org/api/BusSchedules/index.php?stop_id=21297'
+```
+
+returned, in order: `09/15/26 12:32 am` (Front-Market), `09/15/26 12:32 am` (Front-Market),
+`09/14/26 09:30 am` (2nd-Market), `09/14/26 09:30 am`, `09/14/26 09:30 am`. The first two are the
+first trips of the *next* day from a backend that still holds the old (pre-"New Bus Network")
+schedule and evidently has no service for the current date; the last three are correct. Stop 21332
+showed the same split (`09/15/26 01:14 am` vs the current day). One bad answer also listed the same
+static trip id on three consecutive days.
+
+Consequences in the code: `fetchPlausibleSchedule()` (septa_source.h) retries up to 3 times while
+the earliest upcoming entry is more than 2 h out and keeps the soonest answer; `ScheduleCache` grew
+`putSuspect()` so the firmware caches a still-implausible answer for 2 minutes instead of 10;
+`mergeStop()` de-duplicates scheduled rows by trip id. Fixture: `busschedules_21297_wrong_day.json`
+(the bad body, captured 09:24). The UI separately renders any arrival an hour or more away as a
+clock time.
+
+Follow-up the same morning with `curl -D -`: the endpoint is an AWS ELB over at least six
+backends, named in an `X-B-Srvr` header. Six fresh connections gave `api_main5` -> 09/16 01:14 am,
+`api_main3` -> 09/14 09:41 am (correct), `api_main2` -> `{"error"}`, `api_main3` -> correct,
+`api_main6` -> 09/15 12:16 am, `api_main3` -> correct. Four requests over one keep-alive connection
+all hit the same backend. The balancer sets `AWSELB=<opaque>; MAX-AGE=600` and honours it on
+later requests, which is what the firmware's `pinScheduleBackend()` (http_fetch.h) relies on to
+stay on a backend that answers for today. transit_core stays cookie-agnostic: the retry-and-pick-
+soonest logic here is the portable part, the cookie is glue-layer.
+
 ## Summary of decisions this drove in the code
 
 - `parseBusSchedules`/`parseTransitView`/`parseRailArrivals` all check for `{"error": ...}`

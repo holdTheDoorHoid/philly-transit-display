@@ -104,6 +104,18 @@ bool validateConfig(const Config &cfg, ConfigError &err) {
     err = {"device.name must not be empty (used as the mDNS hostname)", "device.name"};
     return false;
   }
+  if (cfg.device.theme != "light" && cfg.device.theme != "dark") {
+    err = {"theme must be \"light\" or \"dark\"", "device.theme"};
+    return false;
+  }
+  if (cfg.device.ticker_lines < 1 || cfg.device.ticker_lines > 8) {
+    err = {"ticker_lines must be between 1 and 8", "device.ticker_lines"};
+    return false;
+  }
+  if (cfg.device.ticker_speed < 5 || cfg.device.ticker_speed > 200) {
+    err = {"ticker_speed must be between 5 and 200 pixels per second", "device.ticker_speed"};
+    return false;
+  }
 
   std::set<std::string> seen_keys;
   for (size_t i = 0; i < cfg.stops.size(); ++i) {
@@ -149,6 +161,10 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
   device["poll_seconds"] = cfg.device.poll_seconds;
   device["brightness"] = cfg.device.brightness;
   device["rotation"] = cfg.device.rotation;
+  device["theme"] = cfg.device.theme;
+  device["invert_colors"] = cfg.device.invert_colors;
+  device["ticker_lines"] = cfg.device.ticker_lines;
+  device["ticker_speed"] = cfg.device.ticker_speed;
   device["tls_verify"] = cfg.device.tls_verify;
   device["use_https"] = cfg.device.use_https;
   device["logging"] = cfg.device.logging;
@@ -186,6 +202,10 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   result.device.poll_seconds = device["poll_seconds"] | 30;
   result.device.brightness = device["brightness"] | 80;
   result.device.rotation = device["rotation"] | 0;
+  result.device.theme = std::string(device["theme"] | "light");
+  result.device.invert_colors = device["invert_colors"] | (DISPLAY_INVERT_DEFAULT != 0);
+  result.device.ticker_lines = device["ticker_lines"] | 3;
+  result.device.ticker_speed = device["ticker_speed"] | 30;
   result.device.tls_verify = device["tls_verify"] | true;
   result.device.use_https = device["use_https"] | false;
   result.device.logging = device["logging"] | true;

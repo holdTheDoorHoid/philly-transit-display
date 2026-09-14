@@ -10,6 +10,12 @@
 
 namespace transit_app::ui {
 
+// Selects the palette every colour*() below returns: "dark", or anything else for the light
+// default (config.device.theme, DESIGN.md SS6). Screens pick colours up when they are built, so
+// ui.cpp calls this before buildScreens()/rebuildScreens().
+void setTheme(const std::string &name);
+bool isDarkTheme();
+
 lv_color_t colorBg();
 lv_color_t colorPanelBg();
 lv_color_t colorText();
@@ -20,9 +26,16 @@ lv_color_t colorEarly();    // blue
 lv_color_t colorScheduled();  // grey
 lv_color_t colorSkipped();  // orange
 lv_color_t colorStale();    // amber, for the header when data is stale
+lv_color_t colorOnStale();  // text colour to use on that amber
 
 // "12", "Due" (< 1 min out), "Now" (<= 0) - DESIGN.md SS8.
 std::string minutesLabel(transit::Epoch eta_s);
+
+// minutesLabel(), except that an arrival an hour or more away shows as its local clock time
+// ("1:14a") instead of a minute count: a scheduled trip hours out (overnight service, or SEPTA
+// answering with the wrong service day - septa_source.h) reads as a time, not as "958".
+// `when` is the arrival's effective() epoch.
+std::string etaLabel(transit::Epoch eta_s, transit::Epoch when);
 
 struct Badge {
   std::string text;

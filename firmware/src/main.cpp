@@ -83,6 +83,8 @@ void setup() {
   transit_app::setActiveConfig(cfg);
   transit_app::setUseHttps(cfg.device.use_https);
   transit_app::ui::applyRotation(cfg.device.rotation);  // panel-native is portrait; config picks the orientation
+  transit_app::ui::applyInvert(cfg.device.invert_colors);
+  transit_app::ui::setTheme(cfg.device.theme);
   transit_app::hwProbeDisplay();
   heapStage("config");
 

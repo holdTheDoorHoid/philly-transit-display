@@ -105,6 +105,11 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
   lv_obj_add_event_cb(reset_target, resetTargetEventCb, LV_EVENT_PRESS_LOST, ctx);
 
   lv_obj_set_user_data(screen, ctx);
+  lv_obj_add_event_cb(screen, [](lv_event_t *e) {  // see main_screen.cpp: freed with the screen
+    lv_obj_t *scr = static_cast<lv_obj_t *>(lv_event_get_target(e));
+    delete static_cast<DeviceInfoCtx *>(lv_obj_get_user_data(scr));
+    lv_obj_set_user_data(scr, nullptr);
+  }, LV_EVENT_DELETE, nullptr);
   return screen;
 }
 
