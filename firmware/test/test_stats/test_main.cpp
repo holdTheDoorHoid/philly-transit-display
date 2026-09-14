@@ -385,7 +385,7 @@ static void test_tracker_memory_bound_eviction(void) {
 
     transit::StopSnapshot snap;
     snap.key = "S4";
-    for (int i = 1; i <= 17; i++) {  // one more than kMaxTrackedTripsPerStop (16)
+    for (int i = 1; i <= (int)kMaxTrackedTripsPerStop + 1; i++) {  // one more than the per-stop cap
       transit::Arrival a;
       a.trip = "T" + std::to_string(i);
       a.predicted = 6000000000 + i;
