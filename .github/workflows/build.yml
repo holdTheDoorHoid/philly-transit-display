@@ -51,6 +51,11 @@ jobs:
           key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
       - name: Install PlatformIO
         run: pip install --upgrade platformio
+      - name: Install platform and libraries first
+        # The pre: patch script in platformio.ini must find esp32_smartdisplay on disk,
+        # so resolve lib_deps before the first build instead of building twice.
+        working-directory: firmware
+        run: pio pkg install -e ${{ matrix.env }}
       - name: Build
         working-directory: firmware
         run: pio run -e ${{ matrix.env }}
