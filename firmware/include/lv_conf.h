@@ -133,6 +133,14 @@
 #define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (24 * 1024)   /*[bytes]*/
 
 #define LV_USE_DRAW_SW 1
+/* Blend targets this project never draws into (no images, no layers in these formats): each
+ * disabled format drops a 3-7 KB lv_draw_sw_blend_image_to_* routine from a full flash. RGB565
+ * (the draw buffer) and ARGB8888 (transparent layers) stay on. */
+#define LV_DRAW_SW_SUPPORT_RGB888   0
+#define LV_DRAW_SW_SUPPORT_XRGB8888 0
+#define LV_DRAW_SW_SUPPORT_L8       0
+#define LV_DRAW_SW_SUPPORT_AL88     0
+#define LV_DRAW_SW_SUPPORT_I1       0
 #if LV_USE_DRAW_SW == 1
     /* Set the number of draw unit.
      * > 1 requires an operating system enabled in `LV_USE_OS`
@@ -418,7 +426,11 @@
 #define LV_FONT_MONTSERRAT_14 1
 #define LV_FONT_MONTSERRAT_16 0
 #define LV_FONT_MONTSERRAT_18 0
-#define LV_FONT_MONTSERRAT_20 1
+/* Only the 240-tall boards use size 20 (ui_common.cpp fontBig()); their board files pass
+ * -D LV_FONT_MONTSERRAT_20=1. Leaving it out of the 3.5" build saves ~13 KB of a full flash. */
+#ifndef LV_FONT_MONTSERRAT_20
+#define LV_FONT_MONTSERRAT_20 0
+#endif
 #define LV_FONT_MONTSERRAT_22 0
 #define LV_FONT_MONTSERRAT_24 0
 #define LV_FONT_MONTSERRAT_26 0

@@ -84,3 +84,10 @@ panel colour-inversion setting. `esp32-3248S035R.json` and `esp32-3248S035C.json
 because the 3.5" IPS panel renders inverted without it (verified on the owner's board,
 `docs/hardware.md` "Colour inversion"). Absent means 0. Users can override it at runtime from
 Settings, so getting this wrong for a variant is a one-click fix rather than a rebuild.
+
+## `LV_FONT_MONTSERRAT_20`
+
+The 240-tall boards (`esp32-2432S028R`, `esp32-2432S028Rv3`, `esp32-2432S024R`,
+`esp32-2432S024C`) pass `-D LV_FONT_MONTSERRAT_20=1` because `ui_common.cpp`'s `fontBig()` uses
+size 20 for the big minutes on panels under 320 px tall. `lv_conf.h` defaults it to 0, which
+keeps ~22 KB of glyph bitmaps out of the 3.5" build (firmware/README.md "Memory and flash budget").

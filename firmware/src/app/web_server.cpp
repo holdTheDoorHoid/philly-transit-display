@@ -14,6 +14,7 @@
 #include "config_store.h"
 #include "demo_data.h"
 #include "net_poller.h"
+#include "weather_service.h"
 #include "proxy_worker.h"
 #include "sd_logger.h"
 #include "transit_core/rail_stations.h"
@@ -94,9 +95,33 @@ void serializeSnapshot(const Snapshot &snap, JsonObject out) {
     }
     so["ok"] = s.ok;
     so["error"] = s.error;
+    so["weather_note"] = stopWeatherNote(s.key, s.arrivals.empty() ? 0 : s.arrivals.front().effective());
     JsonArray arrivals = so["arrivals"].to<JsonArray>();
     for (const Arrival &a : s.arrivals) {
       serializeArrival(a, arrivals.add<JsonObject>(), now);
+    }
+  }
+  // DESIGN.md SS4.8/SS7: the main location's conditions plus the hourly slots the notes use.
+  WeatherView wv = getWeather();
+  JsonObject weather = out["weather"].to<JsonObject>();
+  weather["enabled"] = wv.enabled;
+  weather["units"] = wv.fahrenheit ? "f" : "c";
+  weather["age_s"] = wv.fetched_epoch > 0 ? (int64_t)now - (int64_t)wv.fetched_epoch : -1;
+  if (wv.main.valid()) {
+    JsonObject m = weather["main"].to<JsonObject>();
+    m["temp"] = wv.main.temp;
+    m["feels_like"] = wv.main.feels_like;
+    m["code"] = wv.main.code;
+    m["text"] = weather::codeText(wv.main.code);
+    m["wind"] = wv.main.wind;
+    JsonArray hours = m["hours"].to<JsonArray>();
+    for (const weather::Hour &h : wv.main.hours) {
+      JsonObject ho = hours.add<JsonObject>();
+      ho["t"] = h.epoch;
+      ho["code"] = h.code;
+      ho["text"] = weather::codeText(h.code);
+      ho["prob"] = h.precip_prob;
+      ho["temp"] = h.temp;
     }
   }
   JsonArray alerts = out["alerts"].to<JsonArray>();

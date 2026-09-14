@@ -31,6 +31,9 @@ Alpha. As of 2026-09-14:
   station from a web page served by the device itself. No app, no cloud account, no API key.
 - Show the next 2-3 arrivals per stop and direction with minutes-until and a late/early badge.
 - Show SEPTA service alerts and detours for your routes.
+- Show the current weather in the header and, when the forecast at a stop's next arrival calls for
+  an umbrella, say so on that stop's panel. Weather data by [Open-Meteo.com](https://open-meteo.com/)
+  (CC BY 4.0), no account needed.
 - Log predictions and inferred arrivals to the SD card; view lateness by hour and weekday,
   headway bunching, ghost buses, and prediction accuracy in the web UI or on the screen.
 - Work on the 2.4", 2.8", and 3.5" CYD variants from one codebase.

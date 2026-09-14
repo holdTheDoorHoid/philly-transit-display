@@ -33,6 +33,8 @@ struct StopConfig {
   std::string label;      // user label, e.g. "17 Southbound"
   std::string stop_name;  // e.g. "19th St & Mifflin St"
   uint8_t show = 3;       // arrival rows to display, 1..4
+  double lat = 0;         // stop coordinates from SEPTA's Stops API, for weather (DESIGN.md 4.8);
+  double lng = 0;         // 0/0 = unknown (older configs, Regional Rail)
 };
 
 // One upcoming vehicle at one configured stop.

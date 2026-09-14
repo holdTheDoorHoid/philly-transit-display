@@ -67,6 +67,8 @@ Config defaultConfig() {
   southbound.label = "17 Southbound";
   southbound.stop_name = "19th St & Mifflin St";
   southbound.show = 3;
+  southbound.lat = 39.927947;  // SEPTA Stops API, route 17
+  southbound.lng = -75.177147;
 
   StopConfig northbound;
   northbound.key = "17-21297";
@@ -78,6 +80,8 @@ Config defaultConfig() {
   northbound.label = "17 Northbound";
   northbound.stop_name = "20th St & Mifflin St";
   northbound.show = 3;
+  northbound.lat = 39.927942;
+  northbound.lng = -75.178646;
 
   cfg.stops = {southbound, northbound};
   return cfg;
@@ -115,6 +119,13 @@ bool validateConfig(const Config &cfg, ConfigError &err) {
   if (cfg.device.ticker_speed < 5 || cfg.device.ticker_speed > 200) {
     err = {"ticker_speed must be between 5 and 200 pixels per second", "device.ticker_speed"};
     return false;
+  }
+  for (size_t i = 0; i < cfg.stops.size(); ++i) {
+    const StopConfig &s = cfg.stops[i];
+    if (s.lat < -90 || s.lat > 90 || s.lng < -180 || s.lng > 180) {
+      err = {"lat/lng out of range", field("stops", i, "lat")};
+      return false;
+    }
   }
 
   std::set<std::string> seen_keys;
@@ -168,6 +179,12 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
   device["tls_verify"] = cfg.device.tls_verify;
   device["use_https"] = cfg.device.use_https;
   device["logging"] = cfg.device.logging;
+  JsonObject header = device["header"].to<JsonObject>();
+  header["name"] = cfg.device.header.name;
+  header["clock"] = cfg.device.header.clock;
+  header["weather"] = cfg.device.header.weather;
+  header["wifi"] = cfg.device.header.wifi;
+  header["updated"] = cfg.device.header.updated;
 
   JsonArray stops = doc["stops"].to<JsonArray>();
   for (const StopConfig &s : cfg.stops) {
@@ -187,9 +204,17 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
     o["label"] = s.label;
     o["stop_name"] = s.stop_name;
     o["show"] = s.show;
+    if (s.lat != 0 || s.lng != 0) {
+      o["lat"] = s.lat;
+      o["lng"] = s.lng;
+    }
   }
 
   doc["alerts"] = cfg.alerts;
+  JsonObject weather = doc["weather"].to<JsonObject>();
+  weather["enabled"] = cfg.weather.enabled;
+  weather["per_stop"] = cfg.weather.per_stop;
+  weather["units"] = cfg.weather.fahrenheit ? "f" : "c";
 }
 
 bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
@@ -209,6 +234,12 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   result.device.tls_verify = device["tls_verify"] | true;
   result.device.use_https = device["use_https"] | false;
   result.device.logging = device["logging"] | true;
+  JsonVariantConst header = device["header"];
+  result.device.header.name = header["name"] | false;
+  result.device.header.clock = header["clock"] | true;
+  result.device.header.weather = header["weather"] | true;
+  result.device.header.wifi = header["wifi"] | true;
+  result.device.header.updated = header["updated"] | true;
 
   JsonVariantConst stops = doc["stops"];
   if (!stops.isNull()) {
@@ -231,6 +262,8 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
       s.label = std::string(v["label"] | "");
       s.stop_name = std::string(v["stop_name"] | "");
       s.show = v["show"] | 3;
+      s.lat = v["lat"] | 0.0;
+      s.lng = v["lng"] | 0.0;
       if (s.mode == Mode::Rail) {
         // DESIGN.md SS6's rail example uses "line", not "route"; model.h's
         // StopConfig folds both into `route` (see its doc comment).
@@ -246,6 +279,30 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   }
 
   result.alerts = doc["alerts"] | true;
+  JsonVariantConst weather = doc["weather"];
+  result.weather.enabled = weather["enabled"] | true;
+  result.weather.per_stop = weather["per_stop"] | true;
+  std::string units = std::string(weather["units"] | "f");
+  if (units != "f" && units != "c") {
+    err = {"weather.units must be \"f\" or \"c\"", "weather.units"};
+    return false;
+  }
+  result.weather.fahrenheit = (units == "f");
+
+  // Configs saved before stops carried coordinates: the two default stops get theirs back so
+  // weather works without re-adding them (the web UI offers a lookup for any other stop).
+  {
+    Config defaults = defaultConfig();
+    for (StopConfig &s : result.stops) {
+      if (s.lat != 0 || s.lng != 0) continue;
+      for (const StopConfig &d : defaults.stops) {
+        if (d.key == s.key && d.stop_id == s.stop_id) {
+          s.lat = d.lat;
+          s.lng = d.lng;
+        }
+      }
+    }
+  }
 
   if (!validateConfig(result, err)) {
     return false;

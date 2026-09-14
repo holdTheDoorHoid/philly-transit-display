@@ -109,7 +109,12 @@ int rowsPerStop(int32_t h) {
 }
 
 const lv_font_t *fontBig(int32_t h) {
-  return h >= 320 ? &lv_font_montserrat_28 : &lv_font_montserrat_20;
+#if LV_FONT_MONTSERRAT_20
+  if (h < 320) return &lv_font_montserrat_20;  // 240-tall panels (2.4"/2.8" boards)
+#else
+  (void)h;
+#endif
+  return &lv_font_montserrat_28;
 }
 const lv_font_t *fontBody(int32_t h) {
   // Flash diet: only Montserrat 14/20/28 are enabled (lv_conf.h) - this used to be 16 on the

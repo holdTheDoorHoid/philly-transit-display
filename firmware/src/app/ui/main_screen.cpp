@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "../weather_service.h"
 #include "ui_common.h"
 
 using transit::Arrival;
@@ -36,6 +37,7 @@ struct PanelWidgets {
   std::string stop_key;
   std::string route;
   lv_obj_t *title;
+  lv_obj_t *weather_note;  // DESIGN.md SS8: shown only when the forecast at the next arrival is notable
   lv_obj_t *no_data_label;
   std::vector<RowWidgets> rows;
 };
@@ -44,6 +46,7 @@ struct MainScreenCtx {
   lv_obj_t *header;
   lv_obj_t *device_label;
   lv_obj_t *clock_label;
+  lv_obj_t *weather_label;
   lv_obj_t *wifi_label;
   lv_obj_t *updated_label;
   bool header_stale = false;
@@ -210,6 +213,9 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   ctx->clock_label = makeLabel(header, fontSmall(h), colorText());
   lv_label_set_text(ctx->clock_label, "--:--");
 
+  ctx->weather_label = makeLabel(header, fontSmall(h), colorText());
+  lv_label_set_text(ctx->weather_label, "");
+
   lv_obj_t *right_group = makeBox(header);
   lv_obj_set_style_bg_opa(right_group, LV_OPA_TRANSP, 0);
   lv_obj_set_style_pad_all(right_group, 0, 0);
@@ -223,6 +229,15 @@ lv_obj_t *createMainScreen(const Config &cfg) {
 
   ctx->updated_label = makeLabel(right_group, fontSmall(h), colorSubtext());
   lv_label_set_text(ctx->updated_label, "updated -- ago");
+
+  // DESIGN.md SS8: config.device.header picks what the (narrow) header shows; hidden flex items
+  // take no space, so the remaining ones spread out.
+  const HeaderConfig &hc = cfg.device.header;
+  if (!hc.name) lv_obj_add_flag(ctx->device_label, LV_OBJ_FLAG_HIDDEN);
+  if (!hc.clock) lv_obj_add_flag(ctx->clock_label, LV_OBJ_FLAG_HIDDEN);
+  if (!hc.weather || !cfg.weather.enabled) lv_obj_add_flag(ctx->weather_label, LV_OBJ_FLAG_HIDDEN);
+  if (!hc.wifi) lv_obj_add_flag(ctx->wifi_label, LV_OBJ_FLAG_HIDDEN);
+  if (!hc.updated) lv_obj_add_flag(ctx->updated_label, LV_OBJ_FLAG_HIDDEN);
 
   // ---- Stop panels ----
   lv_obj_t *panels_area = makeBox(screen);
@@ -250,6 +265,12 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_label_set_text(pw.title, panelTitle(s).c_str());
     lv_obj_set_width(pw.title, lv_pct(100));
     lv_label_set_long_mode(pw.title, LV_LABEL_LONG_DOT);
+
+    pw.weather_note = makeLabel(panel, fontSmall(h), colorEarly());
+    lv_obj_set_width(pw.weather_note, lv_pct(100));
+    lv_label_set_long_mode(pw.weather_note, LV_LABEL_LONG_DOT);
+    lv_label_set_text(pw.weather_note, "");
+    lv_obj_add_flag(pw.weather_note, LV_OBJ_FLAG_HIDDEN);
 
     pw.no_data_label = makeLabel(panel, fontSmall(h), colorSubtext());
     lv_label_set_text(pw.no_data_label, "no data yet");
@@ -341,6 +362,10 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
   snprintf(clock_buf, sizeof(clock_buf), "%d:%02d %s", hour12, local_tm.tm_min, local_tm.tm_hour < 12 ? "AM" : "PM");
   lv_label_set_text(ctx->clock_label, clock_buf);
 
+  if (!lv_obj_has_flag(ctx->weather_label, LV_OBJ_FLAG_HIDDEN)) {
+    lv_label_set_text(ctx->weather_label, headerWeatherText().c_str());
+  }
+
   // Wi-Fi bars: fold RSSI into a rough 0-3 "bars" count next to the symbol.
   int32_t rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -100;
   const char *bars = rssi > -60 ? "3" : rssi > -75 ? "2" : rssi > -90 ? "1" : "0";
@@ -363,6 +388,7 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
     lv_color_t sub = stale ? colorOnStale() : colorSubtext();
     lv_obj_set_style_text_color(ctx->device_label, fg, 0);
     lv_obj_set_style_text_color(ctx->clock_label, fg, 0);
+    lv_obj_set_style_text_color(ctx->weather_label, fg, 0);
     lv_obj_set_style_text_color(ctx->wifi_label, sub, 0);
     lv_obj_set_style_text_color(ctx->updated_label, sub, 0);
   }
@@ -385,6 +411,14 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
         lv_label_set_text(pw.no_data_label, "no arrivals");
       }
       lv_obj_remove_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    std::string note = have_data ? stopWeatherNote(pw.stop_key, stop->arrivals.front().effective()) : std::string();
+    if (note.empty()) {
+      lv_obj_add_flag(pw.weather_note, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_label_set_text(pw.weather_note, note.c_str());
+      lv_obj_remove_flag(pw.weather_note, LV_OBJ_FLAG_HIDDEN);
     }
 
     for (size_t i = 0; i < pw.rows.size(); ++i) {

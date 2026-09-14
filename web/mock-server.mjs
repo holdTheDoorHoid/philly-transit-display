@@ -75,13 +75,15 @@ function defaultConfig() {
       use_https: false,
       tls_verify: true,
       logging: true,
+      header: { name: false, clock: true, weather: true, wifi: true, updated: true },
     },
     stops: [
-      { key: '17-21332', mode: 'bus', route: '17', stop_id: '21332', direction: '1', headsign: '20th-Johnston', label: '17 Southbound', stop_name: '19th St & Mifflin St', show: 3 },
+      { key: '17-21332', mode: 'bus', route: '17', stop_id: '21332', direction: '1', headsign: '20th-Johnston', label: '17 Southbound', stop_name: '19th St & Mifflin St', show: 3, lat: 39.927947, lng: -75.177147 },
       { key: '17-21297', mode: 'bus', route: '17', stop_id: '21297', direction: '0', headsign: '2nd-Market', label: '17 Northbound', stop_name: '20th St & Mifflin St', show: 3 },
       { key: 'rail-30th-N', mode: 'rail', station: '30th Street Station', direction: 'N', line: '', label: 'Regional Rail North', show: 2 },
     ],
     alerts: true,
+    weather: { enabled: true, per_stop: true, units: 'f' },
   };
 }
 
@@ -118,6 +120,19 @@ function validateConfig(cfg) {
   if (typeof d.tls_verify !== 'boolean') return { error: 'tls_verify must be a boolean', path: 'device.tls_verify' };
   if (typeof d.logging !== 'boolean') return { error: 'logging must be a boolean', path: 'device.logging' };
   if (typeof cfg.alerts !== 'boolean') return { error: 'alerts must be a boolean', path: 'alerts' };
+  if (d.header !== undefined) {
+    if (typeof d.header !== 'object' || d.header === null) return { error: 'header must be an object', path: 'device.header' };
+    for (const k of ['name', 'clock', 'weather', 'wifi', 'updated']) {
+      if (d.header[k] !== undefined && typeof d.header[k] !== 'boolean') return { error: `${k} must be a boolean`, path: `device.header.${k}` };
+    }
+  }
+  if (cfg.weather !== undefined) {
+    const w = cfg.weather;
+    if (typeof w !== 'object' || w === null) return { error: 'weather must be an object', path: 'weather' };
+    if (w.enabled !== undefined && typeof w.enabled !== 'boolean') return { error: 'enabled must be a boolean', path: 'weather.enabled' };
+    if (w.per_stop !== undefined && typeof w.per_stop !== 'boolean') return { error: 'per_stop must be a boolean', path: 'weather.per_stop' };
+    if (w.units !== undefined && !['f', 'c'].includes(w.units)) return { error: 'units must be "f" or "c"', path: 'weather.units' };
+  }
   if (!Array.isArray(cfg.stops)) return { error: 'stops must be an array', path: 'stops' };
   if (cfg.stops.length > 8) return { error: 'Maximum of 8 stops', path: 'stops' };
   const seenKeys = new Set();
@@ -254,7 +269,31 @@ function buildState(query) {
     firmware_version: '0.1.0-mock',
     stops: stopsOut,
     alerts,
+    weather: buildWeather(now),
   };
+}
+
+// Mirrors firmware/src/app/weather_service.cpp: main location conditions plus six hourly slots.
+function buildWeather(now) {
+  const w = config.weather || {};
+  if (w.enabled === false) return { enabled: false, units: w.units || 'f', age_s: -1 };
+  const hourStart = now - (now % 3600);
+  const codes = [1, 2, 3, 61, 63, 80];
+  const text = { 1: 'mostly clear', 2: 'partly cloudy', 3: 'overcast', 61: 'light rain', 63: 'rain', 80: 'light showers' };
+  const f = (w.units || 'f') === 'f';
+  return {
+    enabled: true, units: f ? 'f' : 'c', age_s: 60 + (now % 300),
+    main: {
+      temp: f ? 69.4 : 20.8, feels_like: f ? 68.7 : 20.4, code: 1, text: 'mostly clear', wind: 9.3,
+      hours: codes.map((code, i) => ({ t: hourStart + i * 3600, code, text: text[code], prob: [0, 5, 20, 60, 80, 55][i], temp: (f ? 69 : 20.5) + i })),
+    },
+  };
+}
+
+function weatherNoteFor(cfgStop) {
+  const w = config.weather || {};
+  if (w.enabled === false || w.per_stop === false) return '';
+  return cfgStop.direction === '0' ? 'rain likely (60%) at 10:15a' : '';
 }
 
 function buildBusSnapshot(cfgStop, now) {
@@ -289,7 +328,7 @@ function buildBusSnapshot(cfgStop, now) {
   return {
     key: cfgStop.key, mode: cfgStop.mode, route: cfgStop.route, stop_id: cfgStop.stop_id,
     direction: cfgStop.direction, headsign: cfgStop.headsign, label: cfgStop.label,
-    stop_name: cfgStop.stop_name, show: cfgStop.show, ok: true, error: '', fetched: now, arrivals,
+    stop_name: cfgStop.stop_name, show: cfgStop.show, ok: true, error: '', weather_note: weatherNoteFor(cfgStop), fetched: now, arrivals,
   };
 }
 
@@ -319,7 +358,7 @@ function buildRailSnapshot(cfgStop, now) {
   return {
     key: cfgStop.key, mode: 'rail', station: cfgStop.station, direction: cfgStop.direction,
     headsign: '', label: cfgStop.label, stop_name: cfgStop.station, show: cfgStop.show,
-    ok: true, error: '', fetched: now, arrivals,
+    ok: true, error: '', weather_note: '', fetched: now, arrivals,
   };
 }
 

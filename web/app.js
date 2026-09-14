@@ -245,6 +245,10 @@ function renderStatusStrip(strip, state) {
     ['Last poll', lp.ok === false ? 'Failed' : fmtAgo(lp.age_s)],
     ['Uptime', fmtAgo(state.uptime)],
   ];
+  const wx = state.weather || {};
+  if (wx.enabled && wx.main) {
+    tiles.splice(0, 0, ['Weather', `${Math.round(wx.main.temp)}°${(wx.units || 'f').toUpperCase()} ${wx.main.text || ''}`.trim()]);
+  }
   for (const [k, v] of tiles) {
     strip.append(h('div', { class: 'status-tile' }, h('div', { class: 'k' }, k), h('div', { class: 'v' }, v)));
   }
@@ -269,6 +273,7 @@ function renderStopPanels(container, stopSnaps) {
     const title = `${s.route || (s.mode === 'rail' ? 'Rail' : '')}${s.headsign ? ' → ' + s.headsign : ''}${s.stop_name ? ' · ' + s.stop_name : ''}`.trim()
       || s.label || s.key;
     const panel = h('div', { class: 'card stop-panel' }, h('div', { class: 'title' }, s.label ? `${s.label} — ${title}` : title));
+    if (s.weather_note) panel.append(h('div', { class: 'small', style: 'color:var(--early-fg)' }, s.weather_note));
     if (!s.ok) {
       panel.append(h('div', { class: 'banner danger' }, s.error || 'No data for this stop.'));
     } else if (!s.arrivals || !s.arrivals.length) {
@@ -353,10 +358,49 @@ async function renderStops(root) {
   drawStops();
 }
 
+// Stops saved before this version carry no coordinates, so they get no weather. The Stops API
+// the wizard already proxies has them; one click fills them in and saves.
+function coordinatesBanner() {
+  const missing = (liveConfig.stops || []).filter((s) => s.mode !== 'rail' && !(Number(s.lat) && Number(s.lng)));
+  if (!missing.length) return null;
+  const btn = h('button', { onclick: async (ev) => {
+    ev.target.disabled = true;
+    try {
+      const routes = [...new Set(missing.map((s) => s.route))];
+      const byId = new Map();
+      for (const r of routes) {
+        const list = await api.proxyStops(r).catch(() => []);
+        for (const e of list || []) byId.set(String(e.stopid), e);
+      }
+      let filled = 0;
+      const next = { ...liveConfig, stops: liveConfig.stops.map((s) => {
+        const e = byId.get(String(s.stop_id));
+        if (!e || s.mode === 'rail' || (Number(s.lat) && Number(s.lng))) return s;
+        filled++;
+        return { ...s, lat: Number(e.lat) || 0, lng: Number(e.lng) || 0 };
+      }) };
+      if (!filled) { stopsBanner('SEPTA did not list those stops on their routes; coordinates not found.', 'warn'); return; }
+      liveConfig = await api.saveConfig(next) || next;
+      drawStops();
+      stopsBanner(`Added coordinates for ${filled} stop${filled === 1 ? '' : 's'}; weather will follow on the next poll.`, 'ok');
+    } catch (e) {
+      stopsBanner(e.message);
+    } finally {
+      ev.target.disabled = false;
+    }
+  } }, 'Look up coordinates');
+  return h('div', { class: 'banner warn' },
+    `${missing.length} stop${missing.length === 1 ? ' has' : 's have'} no coordinates, so ${missing.length === 1 ? 'it gets' : 'they get'} no weather. `, btn);
+}
+
 function drawStops() {
   clear(stopsRoot);
   const wrap = h('div', { class: 'stack' });
   wrap.append(h('div', { id: 'stops-banner' }));
+  if (!wizard) {
+    const cb = coordinatesBanner();
+    if (cb) wrap.append(cb);
+  }
   if (wizard) {
     wrap.append(drawWizard());
   } else {
@@ -687,6 +731,7 @@ function drawWizard() {
             key, mode: wizard.mode, route: wizard.route, stop_id: String(wizard.stopId),
             direction: wizard.direction, headsign: wizard.directionDesc || '',
             label: labelInput.value.trim() || key, stop_name: nameInput.value.trim(),
+            lat: Number(wizard.lat) || 0, lng: Number(wizard.lng) || 0,
             show: Number(showInput.value),
           };
           const next = { ...liveConfig, stops: [...liveConfig.stops, stop] };
@@ -1083,6 +1128,23 @@ async function renderSettings(root) {
   loggingInput.checked = d.logging;
   const alertsInput = h('input', { type: 'checkbox', id: 'set-alerts' });
   alertsInput.checked = cfg.alerts;
+  const hdr = d.header || {};
+  const HEADER_ITEMS = [['name', 'Device name', false], ['clock', 'Clock', true], ['weather', 'Current weather', true], ['wifi', 'Wi-Fi signal', true], ['updated', '"updated N s ago"', true]];
+  const headerInputs = {};
+  const headerRows = HEADER_ITEMS.map(([k, label, dflt]) => {
+    const cb = h('input', { type: 'checkbox', id: `set-hdr-${k}` });
+    cb.checked = hdr[k] ?? dflt;
+    headerInputs[k] = cb;
+    return h('label', { class: 'inline' }, cb, ` ${label}`);
+  });
+  const wx = cfg.weather || {};
+  const wxEnabled = h('input', { type: 'checkbox', id: 'set-wx' });
+  wxEnabled.checked = wx.enabled ?? true;
+  const wxPerStop = h('input', { type: 'checkbox', id: 'set-wx-stop' });
+  wxPerStop.checked = wx.per_stop ?? true;
+  const wxUnits = h('select', { id: 'set-wx-units' },
+    h('option', { value: 'f', selected: (wx.units || 'f') === 'f' || undefined }, '°F'),
+    h('option', { value: 'c', selected: wx.units === 'c' || undefined }, '°C'));
 
   const tlsWarn = h('div', { class: `banner warn${tlsInput.checked ? ' hidden' : ''}` },
     'Disabling certificate verification lets a device on the network impersonate SEPTA and send fake arrival times. Only turn this off for troubleshooting.');
@@ -1102,6 +1164,14 @@ async function renderSettings(root) {
     h('label', { for: 'set-ticker-lines' }, 'Height'), tickerLinesSelect,
     h('label', { for: 'set-ticker-speed' }, 'Scroll speed'), h('div', { class: 'row' }, tickerSpeedInput, tickerSpeedVal),
     h('p', { class: 'small muted' }, 'Service alerts and detours for your routes appear along the bottom of the main screen. A taller ticker wraps the text and scrolls it upward; lower speeds are easier to read.'),
+    h('h2', {}, 'Header'),
+    h('p', { class: 'small muted' }, 'The strip along the top of the main screen is narrow; pick what it shows.'),
+    ...headerRows,
+    h('h2', {}, 'Weather'),
+    h('label', { class: 'inline' }, wxEnabled, ' Show weather'),
+    h('label', { class: 'inline' }, wxPerStop, ' Note the forecast at each stop\u2019s next arrival when it differs (rain, snow, fog)'),
+    h('label', { for: 'set-wx-units' }, 'Units'), wxUnits,
+    h('p', { class: 'small muted' }, 'Forecasts come from Open-Meteo.com (free, no account) for each stop\u2019s coordinates; stops within about a mile share one forecast. Stops added before this version may need coordinates - see the Stops page.'),
     h('label', { class: 'inline', style: 'margin-top:1rem' }, httpsInput, ' Fetch SEPTA data over HTTPS'),
     h('p', { class: 'small muted' }, 'Off by default: a TLS session needs about 40 KB of RAM the classic ESP32 does not have to spare. SEPTA serves the same data over plain HTTP.'),
     h('label', { class: 'inline' }, tlsInput, ' Verify SEPTA’s TLS certificate (when HTTPS is on)'), tlsWarn,
@@ -1117,8 +1187,10 @@ async function renderSettings(root) {
           theme: themeSelect.value, invert_colors: invertInput.checked,
           ticker_lines: Number(tickerLinesSelect.value), ticker_speed: Number(tickerSpeedInput.value),
           use_https: httpsInput.checked, tls_verify: tlsInput.checked, logging: loggingInput.checked,
+          header: Object.fromEntries(Object.entries(headerInputs).map(([k, cb]) => [k, cb.checked])),
         },
         alerts: alertsInput.checked,
+        weather: { enabled: wxEnabled.checked, per_stop: wxPerStop.checked, units: wxUnits.value },
       };
       clear(banner);
       try {

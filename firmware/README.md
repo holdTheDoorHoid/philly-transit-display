@@ -32,10 +32,20 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 
 | Build | Flash | Static RAM |
 |---|---:|---:|
-| Full feature set (current) | 1,875,130 B (98.7 %) | 90,060 B (27.5 %) |
+| Full feature set incl. weather (current) | 1,841,758 B (96.9 %) | 90,108 B (27.5 %) |
+| Same, before the two trims below | 1,897,974 B (99.9 %) | |
 
-Flash headroom is about 25 KB. `platformio.ini`'s comment and `include/lv_conf.h` list the
+Flash headroom is about 58 KB. `platformio.ini`'s comment and `include/lv_conf.h` list the
 knobs (fonts, LVGL features, debug level); do not grow the app slots without dropping OTA.
+Two trims made 2026-09-14 when the weather feature pushed the image to 99.9 %:
+- Montserrat 20 is only compiled for the 240-tall boards (their board files pass
+  `-D LV_FONT_MONTSERRAT_20=1`; `lv_conf.h` defaults it to 0): 22 KB on the 3.5" build.
+- `LV_DRAW_SW_SUPPORT_{RGB888,XRGB8888,L8,AL88,I1}` are 0: this UI never draws images, and each
+  blend routine was 3-7 KB. 33 KB.
+
+Gotcha: PlatformIO does not recompile the LVGL library when only `include/lv_conf.h` changes,
+so a config edit can look like it had no effect. Run `pio run -t clean` (or delete
+`.pio/build/<env>/lib*/lvgl`) before measuring. CI always builds clean.
 
 ### Heap, stage by stage (`[heap]` lines on the serial console at boot)
 

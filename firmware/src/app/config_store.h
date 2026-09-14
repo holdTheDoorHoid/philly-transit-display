@@ -21,6 +21,23 @@ constexpr size_t kMaxStops = 8;  // DESIGN.md SS6: "Maximum 8 stops."
 #define DISPLAY_INVERT_DEFAULT 0
 #endif
 
+// Which items the main screen's header shows (DESIGN.md SS8). The device name is off by default:
+// it is useful on the web page, not on the device that carries it, and the header is narrow.
+struct HeaderConfig {
+  bool name = false;
+  bool clock = true;
+  bool weather = true;
+  bool wifi = true;
+  bool updated = true;
+};
+
+// DESIGN.md SS4.8: Open-Meteo forecasts for the configured stops' locations.
+struct WeatherConfig {
+  bool enabled = true;
+  bool per_stop = true;     // one-line note on a stop panel when its next arrival's hour differs
+  bool fahrenheit = true;   // JSON "units": "f" | "c"
+};
+
 struct DeviceConfig {
   std::string name = "transit-display";
   std::string tz = "EST5EDT,M3.2.0,M11.1.0";
@@ -34,6 +51,7 @@ struct DeviceConfig {
   bool tls_verify = true;
   bool use_https = false;  // see http_fetch.h: TLS is a 40 KB luxury this board cannot afford by default
   bool logging = true;
+  HeaderConfig header;
 };
 
 struct Config {
@@ -41,6 +59,7 @@ struct Config {
   DeviceConfig device;
   std::vector<transit::StopConfig> stops;
   bool alerts = true;
+  WeatherConfig weather;
 };
 
 // { "error": "...", "path": "stops[1].stop_id" } - DESIGN.md SS6's shape for
