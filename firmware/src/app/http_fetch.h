@@ -28,14 +28,10 @@ namespace transit_app {
 // false from `onData` to abort the transfer early (the connection is still
 // closed cleanly before get() returns).
 //
-// Caveat: if a later attempt is needed after `onData` has already been
-// called one or more times for an earlier, failed attempt, those earlier
-// calls are NOT retracted - get() has no way to tell a streaming consumer
-// "discard what you just saw." Callers that need all-or-nothing semantics
-// should buffer nothing durable until get() returns, or reset their partial
-// state whenever a new attempt starts (there is no per-attempt callback in
-// this version - the whole call either fully succeeds after 1-3 attempts, or
-// returns the final attempt's status/error).
+// Retries happen only while no body bytes have reached `onData`; once any byte was
+// delivered the call returns that attempt's status and the caller judges the body
+// (SEPTA sometimes labels a valid body HTTP 501). Chunked and Content-Length bodies
+// are both handled.
 //
 // `tls_verify` selects whether the server certificate is checked against kSeptaCaBundle
 // (config.device.tls_verify, DESIGN.md SS2/SS12: "verified by default"). Passing false calls

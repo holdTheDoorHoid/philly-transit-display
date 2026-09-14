@@ -45,7 +45,10 @@ std::string logFilePath(const std::string &filename) {
 SdStatus mountSd() {
 #ifdef BOARD_HAS_TF
   g_sd_spi.begin(TF_SPI_SCLK, TF_SPI_MISO, TF_SPI_MOSI, TF_CS);
-  if (!SD.begin(TF_CS, g_sd_spi)) {
+  Serial.printf("[heap] sd-pre    free=%u largest=%u\n", (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  bool began = SD.begin(TF_CS, g_sd_spi, 4000000, "/sd", 2 /* max open files */);
+  Serial.printf("[heap] sd-begin  free=%u largest=%u\n", (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  if (!began) {
     log_w("sd_logger: SD.begin() failed (no card, or not readable)");
     g_status = SdStatus{};
     return g_status;

@@ -15,7 +15,6 @@ namespace {
 
 constexpr int kMaxAttempts = 3;
 constexpr uint32_t kBackoffBaseMs = 500;  // 500, 1000, 2000
-constexpr size_t kChunkSize = 512;
 
 bool isRetryableStatus(int status) {
   if (status < 0) {
@@ -32,44 +31,33 @@ bool isRetryableStatus(int status) {
   }
 }
 
-// Reads the response body in kChunkSize pieces, handing each to `onData`.
-// Relies on Content-Length (http.getSize()); SEPTA's endpoints (DESIGN.md
-// SS4) are all small JSON/protobuf responses served with an explicit
-// Content-Length, so this does not implement chunked transfer-decoding.
-void streamBody(HTTPClient &http, NetworkClient *stream, uint32_t timeout_ms, const std::function<bool(const uint8_t *, size_t)> &onData) {
-  int remaining = http.getSize();  // -1 if unknown (would need chunked decoding)
-  uint8_t buf[kChunkSize];
-  uint32_t deadline = millis() + timeout_ms;
-
-  while (http.connected() && (remaining > 0 || remaining == -1)) {
-    if ((int32_t)(millis() - deadline) > 0) {
-      log_w("http_fetch: body read timed out with %d byte(s) still expected", remaining);
-      break;
+// Adapts HTTPClient::writeToStream() (which understands both Content-Length and chunked
+// transfer-encoding) to the onData callback. Never buffers the body.
+class CallbackStream : public Stream {
+ public:
+  explicit CallbackStream(const std::function<bool(const uint8_t *, size_t)> &onData) : onData_(onData) {}
+  size_t write(uint8_t b) override { return write(&b, 1); }
+  size_t write(const uint8_t *buffer, size_t size) override {
+    delivered_ += size;
+    if (aborted_) return 0;
+    if (onData_ && !onData_(buffer, size)) {
+      aborted_ = true;
+      return 0;  // HTTPClient treats a short write as an error and stops
     }
-    size_t avail = stream->available();
-    if (avail == 0) {
-      if (!stream->connected()) {
-        break;
-      }
-      delay(1);
-      continue;
-    }
-    size_t want = avail < sizeof(buf) ? avail : sizeof(buf);
-    if (remaining > 0 && (size_t)remaining < want) {
-      want = (size_t)remaining;
-    }
-    int n = stream->readBytes(buf, want);
-    if (n <= 0) {
-      break;
-    }
-    if (remaining > 0) {
-      remaining -= n;
-    }
-    if (onData && !onData(buf, (size_t)n)) {
-      break;  // consumer asked to stop early
-    }
+    return size;
   }
-}
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+  size_t delivered() const { return delivered_; }
+  bool aborted() const { return aborted_; }
+
+ private:
+  const std::function<bool(const uint8_t *, size_t)> &onData_;
+  size_t delivered_ = 0;
+  bool aborted_ = false;
+};
 
 }  // namespace
 
@@ -135,13 +123,19 @@ int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, ui
     }
 
     int status = http.GET();
+    size_t delivered = 0;
     if (status > 0) {
-      streamBody(http, http.getStreamPtr(), timeout_ms, onData);
+      CallbackStream sink(onData);
+      http.writeToStream(&sink);
+      delivered = sink.delivered();
     }
     http.end();
     last_status = status;
 
-    if (!isRetryableStatus(status)) {
+    // Retry only when the consumer has not seen any body bytes: a streaming consumer cannot
+    // un-see a partial or mislabeled response (SEPTA returns HTTP 501 with a perfectly valid
+    // body, see transit_core/NOTES.md), so once bytes flowed the caller judges the body.
+    if (!isRetryableStatus(status) || delivered > 0) {
       return status;
     }
   }

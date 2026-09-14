@@ -13,8 +13,12 @@
 
 namespace transit_app {
 
-// Starts the worker task. Call once from startWebServer().
+// Creates the job queue. Call once, early (main.cpp).
 void startProxyWorker();
+
+// Runs at most one queued job on the calling task (net_poller calls this between polls).
+// Returns false when the queue was empty.
+bool runQueuedProxyJob();
 
 // Queues a Stops proxy job for `route` and takes ownership of `request` (the caller must not
 // touch it again). Responds 200 with SEPTA's JSON verbatim, or 502 {"error"} on any failure

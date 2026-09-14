@@ -214,4 +214,10 @@ void onConfigChanged(const Config &cfg) {
   }
 }
 
+void logMemory() {
+  lv_mem_monitor_t m;
+  lv_mem_monitor(&m);
+  Serial.printf("[lvmem] total=%u free=%u used_pct=%u frag_pct=%u max_used=%u\n", (unsigned)m.total_size, (unsigned)m.free_size, (unsigned)m.used_pct, (unsigned)m.frag_pct, (unsigned)m.max_used);
+}
+
 }  // namespace transit_app::ui

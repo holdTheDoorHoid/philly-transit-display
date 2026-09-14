@@ -17,6 +17,7 @@
 #include "config_store.h"
 #include "http_fetch.h"
 #include "sd_logger.h"
+#include "proxy_worker.h"
 #include "status_led.h"
 #include "transit_core/septa_source.h"
 #include "transit_stats/aggregate.h"
@@ -351,7 +352,7 @@ void pollOnce() {
         }
       }
       bool route_live = sc && routeIsLive(live_by_route, sc->route);
-      if (tracker() != nullptr) tracker()->observe(stop, now, route_live, combined.last_poll_ok, events);
+      if (tracker() != nullptr && now >= 1700000000) tracker()->observe(stop, now, route_live, combined.last_poll_ok, events);
     }
     if (!events.empty()) {
       std::string month = currentLocalMonth();
@@ -401,6 +402,14 @@ void pollerTask(void * /*arg*/) {
   while (!g_enabled) {
     xSemaphoreTake(g_wake_sem, pdMS_TO_TICKS(500));
   }
+  // Wait for NTP before the first poll (up to 20 s): the tracker and the SD log key everything
+  // by wall-clock time, and a poll at "3 seconds since 1970" produced garbage pred rows.
+  for (int i = 0; i < 40 && time(nullptr) < 1700000000; ++i) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+  if (time(nullptr) < 1700000000) {
+    Serial.println("[net_poller] clock not synced after 20 s; polling anyway, logging waits for a sane clock");
+  }
   uint32_t consecutive_failures = 0;
   for (;;) {
     pollOnce();
@@ -413,7 +422,14 @@ void pollerTask(void * /*arg*/) {
 
     // Blocks for up to interval_s, but wakes immediately if requestRepoll() gives the semaphore
     // (DESIGN.md SS7: PUT /api/config "triggers immediate re-poll").
-    xSemaphoreTake(g_wake_sem, pdMS_TO_TICKS(interval_s * 1000UL));
+    // Sleep in slices so queued web jobs (setup-wizard proxies, /api/stats) run on this task
+    // instead of needing a stack of their own; a config change (requestRepoll) ends the wait.
+    uint32_t deadline = millis() + interval_s * 1000UL;
+    while ((int32_t)(millis() - deadline) < 0) {
+      if (xSemaphoreTake(g_wake_sem, pdMS_TO_TICKS(250)) == pdTRUE) break;
+      while (runQueuedProxyJob()) {
+      }
+    }
   }
 }
 

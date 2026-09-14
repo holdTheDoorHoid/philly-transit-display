@@ -130,6 +130,7 @@ void setup() {
   transit_app::ui::init(cfg);
   transit_app::ui::applyBrightness(cfg.device.brightness);
   heapStage("ui");
+  transit_app::ui::logMemory();
   transit_app::startNetPoller(cfg.device.poll_seconds);
   heapStage("poller");
 

@@ -73,10 +73,25 @@ void serializeArrival(const Arrival &a, JsonObject o, transit::Epoch now) {
 
 void serializeSnapshot(const Snapshot &snap, JsonObject out) {
   transit::Epoch now = (transit::Epoch)time(nullptr);
+  // The web UI titles each panel from these config fields, so echo them next to the live data.
+  Config cfg = getActiveConfig();
   JsonArray stops = out["stops"].to<JsonArray>();
   for (const StopSnapshot &s : snap.stops) {
     JsonObject so = stops.add<JsonObject>();
     so["key"] = s.key;
+    for (const transit::StopConfig &sc : cfg.stops) {
+      if (sc.key != s.key) continue;
+      so["mode"] = sc.mode == transit::Mode::Rail ? "rail" : sc.mode == transit::Mode::Subway ? "subway" : sc.mode == transit::Mode::Trolley ? "trolley" : "bus";
+      so["route"] = sc.route;
+      so["stop_id"] = sc.stop_id;
+      so["station"] = sc.station;
+      so["direction"] = sc.direction;
+      so["headsign"] = sc.headsign;
+      so["label"] = sc.label;
+      so["stop_name"] = sc.stop_name;
+      so["show"] = sc.show;
+      break;
+    }
     so["ok"] = s.ok;
     so["error"] = s.error;
     JsonArray arrivals = so["arrivals"].to<JsonArray>();

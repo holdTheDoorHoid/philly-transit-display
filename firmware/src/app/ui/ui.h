@@ -37,4 +37,7 @@ void applyRotation(uint16_t degrees);
 // rotation and brightness and rebuilds the screens so new stops appear without a reboot.
 void onConfigChanged(const Config &cfg);
 
+// Prints LVGL pool usage over serial (sizing LV_MEM_SIZE).
+void logMemory();
+
 }  // namespace transit_app::ui
