@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Philly Transit Display flasher</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 42rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  select, esp-web-install-button { font-size: 1rem; }
+  .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }
+  code { background: rgba(127,127,127,.15); padding: .1em .3em; border-radius: 4px; }
+  .note { font-size: .9rem; opacity: .8; }
+</style>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+</head>
+<body>
+<h1>Philly Transit Display</h1>
+<p>Flash the firmware to an ESP32 "Cheap Yellow Display" straight from this page. Needs Chrome or
+Edge on a computer (Web Serial). Plug the board in over USB, pick its variant, click Install.</p>
+<div class="row">
+  <label for="variant">Board variant</label>
+  <select id="variant">
+    <option value="cyd-3248S035R">3.5" resistive touch (ESP32-3248S035R)</option>
+    <option value="cyd-3248S035C">3.5" capacitive touch (ESP32-3248S035C)</option>
+    <option value="cyd-2432S028R">2.8" one micro-USB (ESP32-2432S028R)</option>
+    <option value="cyd-2432S028Rv3">2.8" two USB ports (ST7789)</option>
+    <option value="cyd-2432S024R">2.4" resistive (ESP32-2432S024R)</option>
+    <option value="cyd-2432S024C">2.4" capacitive (ESP32-2432S024C)</option>
+  </select>
+  <esp-web-install-button id="btn" manifest="manifests/cyd-3248S035R.json">
+    <span slot="unsupported">Your browser does not support Web Serial. Use Chrome or Edge on a desktop.</span>
+    <span slot="not-allowed">Web Serial needs HTTPS or localhost.</span>
+  </esp-web-install-button>
+</div>
+<p class="note">Not sure which board you have? The 3.5" boards say <code>ESP32-3248S035</code> on the back; the
+2.8" ones say <code>ESP32-2432S028</code>. Two USB connectors on a 2.8" board means the ST7789 variant. If touch
+does not respond after flashing, try the other touch variant of the same size.</p>
+<h2>After flashing</h2>
+<ol>
+  <li>The screen shows a hotspot name like <code>TransitDisplay-29BC</code>. Join it from your phone or laptop.</li>
+  <li>A setup page opens (or browse to <code>http://192.168.4.1</code>). Pick your Wi-Fi and enter its password.</li>
+  <li>Once connected, open <code>http://transit-display.local</code> to choose your routes and stops.</li>
+</ol>
+<p class="note">Source, issues, and the design notes: <a href="https://github.com/holdTheDoorHoid/philly-transit-display">github.com/holdTheDoorHoid/philly-transit-display</a>.
+The firmware only ever talks to SEPTA and an NTP time server; there is no account and no cloud.</p>
+<script>
+  const sel = document.getElementById('variant'), btn = document.getElementById('btn');
+  sel.addEventListener('change', () => btn.setAttribute('manifest', `manifests/${sel.value}.json`));
+</script>
+</body>
+</html>

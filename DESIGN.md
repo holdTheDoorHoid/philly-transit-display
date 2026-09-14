@@ -34,7 +34,7 @@ proxy, mobile app, BLE provisioning, NJ Transit (needs an API key each user must
 | Regional Rail | Arrivals API per station | Already includes `sched_time`, `depart_time`, and `status`; tiny payload. |
 | Alerts | Alerts API with `routes=bus_route_17` style param | 1-3 KB per route. `req1=` silently returns `[]`; never use it. |
 | Config storage | LittleFS `/config.json`, mirrored by `GET/PUT /api/config` | Structured, easy to round-trip to the web UI. SD is for logs only so the device works without a card. |
-| Wi-Fi onboarding | tzapu WiFiManager captive portal on first boot; then always-on web UI + mDNS | Turnkey and familiar. Captive portal is only for Wi-Fi; stop config lives in the permanent UI. |
+| Wi-Fi onboarding | Our own ~150-line captive portal (SoftAP + DNS hijack) on ESPAsyncWebServer; then always-on web UI + mDNS | WiFiManager was the first choice but cost ~120 KB of flash and spams `task_wdt` errors on core 3.x; replaced 2026-09-14. Captive portal is only for Wi-Fi; stop config lives in the permanent UI. |
 | Web server | ESP32Async/ESPAsyncWebServer (maintained fork) | Chunked/streamed responses for stats and proxied SEPTA calls without blocking LVGL. Keep concurrent handlers minimal. |
 | TLS | Validate SEPTA's certificate with the Arduino-ESP32 CA bundle. `setInsecure()` only behind an explicit config flag | Fake bus times are low-stakes but not zero; default to verified. |
 | Log format | Append-only CSV, one file per month on SD, one event per line | Human-readable, spreadsheet-friendly, streamable with tiny RAM. |
@@ -55,7 +55,7 @@ Supported PlatformIO environments (board JSONs from `rzeldent/platformio-espress
 | `cyd-3248S035C` | ESP32-3248S035C | 3.5" ST7796 480x320 | GT911 capacitive (I2C 21/22) | Probe decides R vs C. |
 | `cyd-2432S028R` | ESP32-2432S028R | 2.8" ILI9341 320x240 | XPT2046 | Single micro-USB. |
 | `cyd-2432S028Rv3` | 2-USB 2.8" | ST7789 320x240 | XPT2046 (X mirrored) | Different inversion/RGB order. |
-| `cyd-2432S024R` / `C` | ESP32-2432S024 | 2.4" 320x240 | XPT2046 / CST820 | Pins differ; lower priority. |
+| `cyd-2432S024R` / `C` | ESP32-2432S024 | 2.4" 320x240 | XPT2046 / CST816S | Pins differ; lower priority. |
 | `native` | host | - | - | Unit tests for `transit_core` and `transit_stats`. |
 
 SD card: SPI (CS 5, MOSI 23, MISO 19, SCK 18 on the 2.8"; confirm for 3.5"). RGB LED pins 4/16/17
@@ -169,9 +169,11 @@ swapped whole (never mutated in place). SD writes happen from a low-priority log
 FreeRTOS queue. Web handlers only read the Snapshot and the config; stats requests stream the CSV
 through the aggregator inside the handler in chunks small enough to keep the heap flat.
 
-Memory rules: no full framebuffer; LVGL partial buffers sized by esp32-smartdisplay defaults; one
+Memory rules: no full framebuffer; LVGL partial buffer is 1/10 of the screen in RGB565 (the library default of 1/4 with 3-byte pixels does not fit, see `firmware/boards/README.md`); large long-lived objects (ArrivalTracker ~16 KB, StatsAggregator ~8 KB) are heap-allocated, never file-scope globals, because the ESP32's static .bss budget is separate from and much smaller than the heap; one
 TLS connection at a time; ArduinoJson documents sized from measured payloads (§4) with 25 %
 headroom; log free heap once per poll at `INFO`; refuse to start OTA if free heap < 60 KB.
+
+Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-14 the full feature set uses 97.8 % (41 KB headroom); `firmware/README.md` ranks what to cut if more is needed. Do not grow the app slots without dropping OTA.
 
 Build/flash: `pio run -e cyd-3248S035R`, `pio run -e cyd-3248S035R -t upload --upload-port
 /dev/ttyUSB0`. Releases publish `bootloader.bin`, `partitions.bin`, `firmware.bin` per env plus an
@@ -218,7 +220,7 @@ ESP Web Tools `manifest.json` under `flasher/` for GitHub Pages (offsets 0x1000 
       "mode": "rail",
       "station": "30th Street Station",
       "direction": "N",
-      "line": "",
+      "line": "",   // maps to StopConfig::route for rail stops (optional line filter)
       "label": "Regional Rail North",
       "show": 2
     }

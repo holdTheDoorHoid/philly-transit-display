@@ -1,0 +1,16 @@
+{
+  "name": "Philly Transit Display (cyd-2432S024R)",
+  "version": "latest",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "../firmware/cyd-2432S024R/bootloader.bin", "offset": 4096 },
+        { "path": "../firmware/cyd-2432S024R/partitions.bin", "offset": 32768 },
+        { "path": "../firmware/cyd-2432S024R/boot_app0.bin", "offset": 57344 },
+        { "path": "../firmware/cyd-2432S024R/firmware.bin", "offset": 65536 }
+      ]
+    }
+  ]
+}
