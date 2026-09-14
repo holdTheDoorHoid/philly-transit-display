@@ -97,7 +97,9 @@ Never use `TransitViewAll` (129 KB).
 `.../api/BusSchedules/index.php?stop_id=21332` (~700 B). Returns `{ "<route>": [ {trip_id,
 DateCalender "09/13/26 10:25 pm", Direction "0"/"1", DirectionDesc} ] }`. Scheduled only. Its
 `trip_id` is the static-GTFS id and does NOT match real-time trip ids. Cache 10 minutes.
-Retry up to 3 times with backoff on any non-200 (observed 400 and 501 for valid stops).
+Retry up to 3 times with backoff on any non-200 (observed 400 and 501 for valid stops). **Note:** a
+501 can carry a perfectly valid JSON body, so parse whatever body arrives and treat only the
+`{"error": ...}` shape as a real failure (verified 2026-09-13, see `firmware/lib/transit_core/NOTES.md`).
 
 ### 4.5 Stops per route (setup only)
 `.../api/Stops/index.php?req1=17` (12 KB, 133 stops, in route order but both directions in one
@@ -105,12 +107,20 @@ list). Proxied to the browser during setup; streamed, never buffered whole.
 
 ### 4.6 Regional Rail and Subway
 Rail: `.../api/Arrivals/index.php?station=<name>&results=5&direction=N|S`. "Northbound/Southbound"
-are legacy division names, not compass. Line/destination filtering is client side.
+are legacy division names, not compass. Line/destination filtering is client side. Station names
+accepted by the API differ from GTFS `stops.txt` for 13 stations; `rail_stations.cpp` carries the
+corrected list (149 verified names). Six stations could not be resolved and are excluded for now:
+Fern Rock, Holmesburg Junction, Norristown Transit Center, Richard Allen Ln, Airport Terminals C&D,
+Delaware Valley University.
 Subway (B and L lines): `TransitView?route=BSL` and `Stops?req1=BSL` return `[]`, and the bus
-GTFS-RT feed carries no subway trips (verified). v1 shows subway stops schedule-only via
-BusSchedules **if** the stop_id resolves there (unverified; the `transit_core` agent verifies with a
-BSL station stop_id from GTFS static). If it does not resolve, the UI must say "not supported yet"
-rather than fail silently.
+GTFS-RT feed carries no subway trips (verified). **Verified 2026-09-13:** BusSchedules does serve
+subway station stop_ids, keyed by the GTFS route ids `B1` (Broad Street) and `L1` (Market-Frankford),
+not `BSL`/`MFL` (fixture `busschedules_bsl_1286.json`). So v1 shows subway stops schedule-only;
+`mergeStop` does not require the schedule's route id to equal the configured one. The UI labels
+such rows `sched` and the stop panel says "schedule only" for subway.
+Alerts for subway and Regional Rail use the `rr_route_` prefix (`rr_route_bsl`, `rr_route_mfl`,
+`rr_route_trent`); Regional Rail line codes need a lookup table, not a formula. Bus and trolley
+alerts use `bus_route_<id>` including the T, G, D, and K letter routes.
 
 ### 4.7 Poll schedule (defaults, configurable)
 | What | Interval | Notes |
