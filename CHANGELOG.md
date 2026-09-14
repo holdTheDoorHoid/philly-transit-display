@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.1 - 2026-09-14
 
 - Crowding: the word for SEPTA's "many seats" level is now `open` (it used to be a bare `seats`,
   which read as a truncated label). `device.show_crowding` becomes `device.crowding` (off / words /
