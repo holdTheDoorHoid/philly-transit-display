@@ -41,9 +41,10 @@ milestone of the SS13 feature work (all figures against the current, full featur
 | 5. Logging, stats, log downloads | 1,855,438 | 97.6% | 118,268 | 36.1% |
 | 6. OTA (`POST /api/ota`) | 1,862,054 | 98.0% | 118,508 | 36.2% |
 | 7. Real Snapshot on screen (main/stats UI) | 1,859,018 | 97.8% | 118,508 | 36.2% |
-| 8. Brightness control (**final**) | **1,859,126** | **97.8%** | **118,508** | **36.2%** |
+| 8. Brightness control | 1,859,126 | 97.8% | 118,508 | 36.2% |
+| Fix: heap-allocate `/api/stats`' StatsAggregator (**final**) | **1,858,902** | **97.8%** | **118,508** | **36.2%** |
 
-**Final headroom: 41,418 bytes (≈40.4 KB, 2.2%) — under the 64 KB target by about 24.1 KB.**
+**Final headroom: 41,642 bytes (≈40.7 KB, 2.2%) — under the 64 KB target by about 23.9 KB.**
 RAM is not a concern (36.2%, no changes needed there beyond heap-allocating the two objects
 noted below).
 
