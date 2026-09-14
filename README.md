@@ -23,7 +23,7 @@ Alpha. As of 2026-09-14:
 | Web UI: stops wizard with map, stats charts, settings, OTA | Verified on the device (OTA upload not yet exercised) |
 | SD logging and on-device statistics | Logging and `/api/stats` verified on the device; 70 host tests pass; statistics need a few days of data to mean much |
 | Other CYD variants (2.8", 2.4", capacitive) | Build in CI; not yet tested on hardware |
-| Browser flasher on GitHub Pages | Wired to publish on the first tagged release |
+| Browser flasher on GitHub Pages | Published with each release at https://holdthedoorhoid.github.io/philly-transit-display/ |
 
 ## What it does
 
@@ -50,7 +50,9 @@ Alpha. As of 2026-09-14:
 
 ## Quick start
 
-1. **Flash.** Either use the browser flasher (published with each release) or build it yourself:
+1. **Flash.** Either use the browser flasher at
+   https://holdthedoorhoid.github.io/philly-transit-display/ (Chrome or Edge, board plugged in over
+   USB, pick your board variant) or build it yourself:
    ```sh
    pip install platformio
    cd firmware
