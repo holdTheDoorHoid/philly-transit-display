@@ -15,6 +15,8 @@
 #include "demo_data.h"
 #include "net_poller.h"
 #include "weather_service.h"
+#include "ui/ui.h"
+#include <esp_heap_caps.h>
 #include "bike_service.h"
 #include "profiles.h"
 #include "proxy_worker.h"
@@ -106,10 +108,10 @@ void serializeSnapshot(const Snapshot &snap, JsonObject out) {
   // DESIGN.md SS4.8/SS7: the main location's conditions plus the hourly slots the notes use.
   WeatherView wv = getWeather();
   JsonObject weather = out["weather"].to<JsonObject>();
-  weather["enabled"] = wv.enabled;
+  weather["enabled"] = cfg.weather.enabled;  // the config, not the last poll: a save applies at once
   weather["units"] = wv.fahrenheit ? "f" : "c";
   weather["age_s"] = wv.fetched_epoch > 0 ? (int64_t)now - (int64_t)wv.fetched_epoch : -1;
-  if (wv.main.valid()) {
+  if (cfg.weather.enabled && wv.main.valid()) {
     JsonObject m = weather["main"].to<JsonObject>();
     m["temp"] = wv.main.temp;
     m["feels_like"] = wv.main.feels_like;
@@ -130,10 +132,23 @@ void serializeSnapshot(const Snapshot &snap, JsonObject out) {
   out["active_profile"] = prof >= 0 ? cfg.profiles[(size_t)prof].name : "";
   BikeView bv = getBikes();
   JsonObject bike = out["bike"].to<JsonObject>();
-  bike["enabled"] = bv.enabled;
+  bike["enabled"] = cfg.bike.enabled;
   bike["age_s"] = bv.fetched_epoch > 0 ? (int64_t)now - (int64_t)bv.fetched_epoch : -1;
   JsonArray bstations = bike["stations"].to<JsonArray>();
-  for (const indego::Station &st : bv.stations) {
+  // In config order, with counts from the last fetch when that station was part of it; a station
+  // added a moment ago shows -1 until the poller catches up rather than being missing.
+  for (const BikeStation &cs : cfg.bike.stations) {
+    if (!cfg.bike.enabled) break;
+    indego::Station st;
+    st.id = cs.id;
+    st.name = cs.name;
+    for (const indego::Station &f : bv.stations) {
+      if (f.id == cs.id) {
+        st = f;
+        if (st.name.empty()) st.name = cs.name;
+        break;
+      }
+    }
     JsonObject so = bstations.add<JsonObject>();
     so["id"] = st.id;
     so["name"] = st.name;
@@ -241,7 +256,26 @@ void handleGetConfig(AsyncWebServerRequest *request) {
   sendJson(request, 200, doc);
 }
 
-void handlePutConfig(AsyncWebServerRequest *request, JsonVariant &json, const std::function<void()> &onConfigChanged) {
+// True when the parts of the config that decide what is fetched differ (stops, weather, bike).
+bool dataSettingsChanged(const Config &a, const Config &b) {
+  if (a.stops.size() != b.stops.size()) return true;
+  for (size_t i = 0; i < a.stops.size(); ++i) {
+    const transit::StopConfig &x = a.stops[i], &y = b.stops[i];
+    if (x.key != y.key || x.stop_id != y.stop_id || x.route != y.route || x.station != y.station || x.direction != y.direction ||
+        x.lat != y.lat || x.lng != y.lng || x.mode != y.mode) {
+      return true;
+    }
+  }
+  if (a.weather.enabled != b.weather.enabled || a.weather.per_stop != b.weather.per_stop || a.weather.fahrenheit != b.weather.fahrenheit) return true;
+  if (a.bike.enabled != b.bike.enabled || a.bike.stations.size() != b.bike.stations.size()) return true;
+  for (size_t i = 0; i < a.bike.stations.size(); ++i) {
+    if (a.bike.stations[i].id != b.bike.stations[i].id) return true;
+  }
+  if (a.alerts != b.alerts || a.device.poll_seconds != b.device.poll_seconds || a.device.tz != b.device.tz) return true;
+  return false;
+}
+
+void handlePutConfig(AsyncWebServerRequest *request, JsonVariant &json, const std::function<void(bool)> &onConfigChanged) {
   Config cfg;
   ConfigError err;
   if (!jsonToConfig(json, cfg, err)) {
@@ -252,9 +286,10 @@ void handlePutConfig(AsyncWebServerRequest *request, JsonVariant &json, const st
     sendError(request, 500, "failed to write config to LittleFS");
     return;
   }
+  bool data_changed = dataSettingsChanged(getActiveConfig(), cfg);
   setActiveConfig(cfg);
   if (onConfigChanged) {
-    onConfigChanged();
+    onConfigChanged(data_changed);
   }
   JsonDocument doc;
   configToJson(cfg, doc);
@@ -455,11 +490,40 @@ void registerWebAssets() {
 
 }  // namespace
 
-void startWebServer(std::function<void()> onConfigChanged) {
+void startWebServer(std::function<void(bool)> onConfigChanged) {
   g_server.on("/api/state", HTTP_GET, handleGetState);
   g_server.on("/api/config", HTTP_GET, handleGetConfig);
   g_server.on("/api/config", HTTP_PUT, [onConfigChanged](AsyncWebServerRequest *request, JsonVariant &json) { handlePutConfig(request, json, onConfigChanged); });
   g_server.on("/api/reboot", HTTP_POST, handlePostReboot);
+  // Test hooks (DESIGN.md SS7): what the screen is doing, and a simulated touch.
+  g_server.on("/api/debug/ui", HTTP_GET, [](AsyncWebServerRequest *request) {
+    ui::UiDebug d = ui::debugSnapshot();
+    JsonDocument doc;
+    doc["page"] = d.page;
+    doc["dimmed"] = d.dimmed;
+    doc["brightness"] = d.brightness;
+    doc["due_active"] = d.due_active;
+    doc["chimes"] = d.chimes;
+    doc["active_profile"] = d.active_profile;
+    JsonArray shown = doc["shown_stops"].to<JsonArray>();
+    for (const std::string &k : d.shown_stops) shown.add(k);
+    JsonArray hidden = doc["hidden_panels"].to<JsonArray>();
+    for (const std::string &k : d.hidden_panels) hidden.add(k);
+    doc["ticker"] = d.ticker;
+    doc["header_weather"] = d.header_weather;
+    doc["lv_used"] = d.lv_used;
+    doc["lv_free"] = d.lv_free;
+    doc["lv_max_used"] = d.lv_max_used;
+    doc["hor_res"] = d.hor_res;
+    doc["ver_res"] = d.ver_res;
+    doc["heap"] = ESP.getFreeHeap();
+    doc["largest_block"] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    sendJson(request, 200, doc);
+  });
+  g_server.on("/api/debug/tap", HTTP_POST, [](AsyncWebServerRequest *request) {
+    ui::requestTap();
+    request->send(200, "application/json", "{\"ok\":true}");
+  });
   g_server.on("/api/wifi/reset", HTTP_POST, handlePostWifiReset);
 
   g_server.on("/api/proxy/stops", HTTP_GET, handleProxyStops);

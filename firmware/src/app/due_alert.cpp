@@ -15,6 +15,7 @@ std::string g_chimed[kChimedRing];
 size_t g_chimed_next = 0;
 bool g_led_phase = false;
 bool g_led_overriding = false;
+uint32_t g_chimes = 0;
 
 bool alreadyChimed(const std::string &trip) {
   for (const std::string &t : g_chimed) {
@@ -29,6 +30,7 @@ void rememberChimed(const std::string &trip) {
 }
 
 void chime() {
+  ++g_chimes;
 #if defined(BOARD_HAS_SPEAK) && defined(SPEAK)
   // Two short beeps through the board's amp (GPIO 26 on the Sunton boards). tone() is
   // non-blocking on the ESP32 core; the 160 ms wait between them runs on the LVGL task once per
@@ -40,6 +42,10 @@ void chime() {
 }
 
 }  // namespace
+
+uint32_t dueChimesPlayed() {
+  return g_chimes;
+}
 
 bool arrivalIsDue(const Config &cfg, const transit::Arrival &a, transit::Epoch now) {
   if (!cfg.due.enabled || a.status == transit::Status::Skipped) return false;

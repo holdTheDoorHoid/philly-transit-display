@@ -49,7 +49,10 @@ void initNetPoller();
 // web_server.cpp's onConfigChanged hook (DESIGN.md SS7: "PUT /api/config ... triggers immediate
 // re-poll") - also invalidates the BusSchedules cache, since a config change may have added a
 // stop whose schedule was never fetched. Safe to call before startNetPoller() (a no-op then).
-void requestRepoll();
+// Wakes the poller now. `data_changed` (stops, weather or bike settings differ) also drops the
+// schedule, weather and bike caches; a brightness or theme change must not re-download 400 KB of
+// bike feed.
+void requestRepoll(bool data_changed = true);
 
 // Returns a copy of the latest Snapshot, safe to call from any task.
 transit::Snapshot getSnapshot();

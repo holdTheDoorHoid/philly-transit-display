@@ -12,6 +12,7 @@
 #include "../due_alert.h"
 #include "../net_poller.h"
 #include "../profiles.h"
+#include "../weather_service.h"
 #include "daypart_core/daypart.h"
 #include "device_info_screen.h"
 #include "main_screen.h"
@@ -51,6 +52,9 @@ uint32_t g_wake_until_ms = 0;     // touch during quiet hours: normal brightness
 bool g_swallow_click = false;     // the press that woke the screen must not change page
 int g_applied_brightness = -1;
 std::vector<std::string> g_shown_keys;  // stops the arrivals page shows (profiles.h), per build
+bool g_due_active = false;
+volatile bool g_tap_requested = false;
+UiDebug g_debug;  // written at the end of tick() under g_pending_mutex, read by the web task
 
 // Config handed over from another task (web server); applied on the LVGL task in tick().
 SemaphoreHandle_t g_pending_mutex = nullptr;
@@ -123,6 +127,7 @@ bool applyQuietHours() {
 void rebuildScreens() {
   lv_obj_t *blank = lv_obj_create(nullptr);
   lv_obj_set_style_bg_color(blank, colorBg(), 0);
+  lv_obj_set_style_bg_opa(blank, LV_OPA_COVER, 0);
   lv_screen_load(blank);
   if (g_main_screen) lv_obj_delete(g_main_screen);
   if (g_night_screen) lv_obj_delete(g_night_screen);
@@ -196,6 +201,7 @@ void showWifiSetupScreen(const std::string &ap_name) {
     lv_obj_t *screen = lv_obj_create(nullptr);
     lv_obj_set_size(screen, w, h);
     lv_obj_set_style_bg_color(screen, colorBg(), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(screen, 16, 0);
     lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(screen, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -257,9 +263,15 @@ void tick() {
     rebuildScreens();
   }
 
+  if (g_tap_requested) {  // POST /api/debug/tap: the same two events a finger produces
+    g_tap_requested = false;
+    onScreenPressed(nullptr);
+    onScreenTapped(nullptr);
+  }
+
   bool dimmed = applyQuietHours();
   transit::Snapshot snap = currentSnapshot();
-  dueAlertTick(g_cfg, snap, g_shown_keys, dimmed, (transit::Epoch)time(nullptr));
+  g_due_active = dueAlertTick(g_cfg, snap, g_shown_keys, dimmed, (transit::Epoch)time(nullptr));
 
   switch (g_page) {
     case Page::Main:
@@ -275,6 +287,42 @@ void tick() {
       refreshStatsScreen(g_stats_screen);
       break;
   }
+
+  UiDebug d;
+  d.page = g_page == Page::Stats ? "stats" : g_page == Page::DeviceInfo ? "device" : (g_night ? "night" : "main");
+  d.dimmed = dimmed;
+  d.brightness = g_applied_brightness;
+  d.due_active = g_due_active;
+  d.chimes = dueChimesPlayed();
+  d.active_profile = g_active_profile >= 0 && (size_t)g_active_profile < g_cfg.profiles.size() ? g_cfg.profiles[(size_t)g_active_profile].name : "";
+  d.shown_stops = g_shown_keys;
+  mainScreenDebug(g_main_screen, d.hidden_panels, d.ticker);
+  d.header_weather = g_cfg.weather.enabled ? headerWeatherText() : "";
+  lv_mem_monitor_t m;
+  lv_mem_monitor(&m);
+  d.lv_used = m.total_size - m.free_size;
+  d.lv_free = m.free_size;
+  d.lv_max_used = m.max_used;
+  lv_display_t *disp = lv_display_get_default();
+  d.hor_res = lv_display_get_horizontal_resolution(disp);
+  d.ver_res = lv_display_get_vertical_resolution(disp);
+  if (g_pending_mutex && xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    g_debug = d;
+    xSemaphoreGive(g_pending_mutex);
+  }
+}
+
+UiDebug debugSnapshot() {
+  UiDebug d;
+  if (g_pending_mutex && xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    d = g_debug;
+    xSemaphoreGive(g_pending_mutex);
+  }
+  return d;
+}
+
+void requestTap() {
+  g_tap_requested = true;
 }
 
 void applyBrightness(uint8_t percent) {

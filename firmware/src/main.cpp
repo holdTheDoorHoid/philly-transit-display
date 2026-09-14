@@ -109,9 +109,9 @@ void setup() {
     log_e("main: mDNS.begin() failed");
   }
 
-  transit_app::startWebServer([]() {
+  transit_app::startWebServer([](bool data_changed) {
     transit_app::setUseHttps(transit_app::getActiveConfig().device.use_https);
-    transit_app::requestRepoll();
+    transit_app::requestRepoll(data_changed);
     transit_app::ui::onConfigChanged(transit_app::getActiveConfig());  // applied on the LVGL task
   });
   heapStage("web");

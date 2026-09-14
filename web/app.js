@@ -434,6 +434,7 @@ function drawStops() {
     wrap.append(drawWizard());
   } else {
     wrap.append(drawStopList());
+    wrap.append(drawBikeCard());
   }
   stopsRoot.append(wrap);
 }
@@ -600,6 +601,120 @@ function removeStop(i) {
   const next = liveConfig.stops.slice();
   next.splice(i, 1);
   persistConfig({ ...liveConfig, stops: next });
+}
+
+/* ---- Indego bikes (top-level bike, DESIGN.md §6) ---- */
+// Lives on the Stops page (managed alongside the stops it's placed near, not in Settings).
+// Every action here saves immediately through persistConfig, same as moveStop/removeStop above.
+
+function drawBikeCard() {
+  const bike = liveConfig.bike || { enabled: false, stations: [] };
+  const stations = bike.stations || [];
+  const card = h('div', { class: 'card' });
+  card.append(h('h2', {}, 'Indego bikes'));
+
+  const enabledInput = h('input', { type: 'checkbox', id: 'bike-enabled' });
+  enabledInput.checked = !!bike.enabled;
+  enabledInput.addEventListener('change', () => {
+    persistConfig({ ...liveConfig, bike: { ...bike, enabled: enabledInput.checked } });
+  });
+  card.append(h('label', { class: 'inline' }, enabledInput, ' Show Indego bike/dock counts'));
+
+  const listDiv = h('div', {});
+  if (!stations.length) { listDiv.append(h('p', { class: 'small muted' }, 'No stations chosen yet.')); }
+  for (const st of stations) {
+    listDiv.append(h('div', { class: 'row between' },
+      h('span', {}, `${st.name} (#${st.id})`),
+      h('button', {
+        class: 'icon danger', title: 'Remove', 'aria-label': `Remove ${st.name}`,
+        onclick: () => {
+          const next = stations.filter((s) => s.id !== st.id);
+          persistConfig({ ...liveConfig, bike: { ...bike, stations: next } });
+        },
+      }, '✕')));
+  }
+  if (stations.length >= 3) listDiv.append(h('p', { class: 'small muted' }, 'Maximum of 3 stations.'));
+  card.append(listDiv);
+
+  const nearbyResults = h('div', {});
+  const findBtn = h('button', {
+    onclick: async (ev) => {
+      ev.target.disabled = true;
+      clear(nearbyResults);
+      nearbyResults.append(h('p', { class: 'muted small' }, 'Looking up nearby stations…'));
+      try {
+        const withCoords = (liveConfig.stops || []).filter((s) => Number(s.lat) && Number(s.lng));
+        if (!withCoords.length) {
+          clear(nearbyResults);
+          nearbyResults.append(h('p', { class: 'muted small' }, 'None of your configured stops have coordinates yet — add some above first.'));
+          return;
+        }
+        const res = await fetch('http://bts-status.bicycletransit.workers.dev/phl');
+        if (!res.ok) throw new Error(`Indego feed returned HTTP ${res.status}`);
+        const geo = await res.json();
+        const scored = [];
+        for (const f of geo.features || []) {
+          const coords = f.geometry && f.geometry.coordinates;
+          if (!coords) continue;
+          const [lng, lat] = coords;
+          let best = Infinity;
+          for (const s of withCoords) best = Math.min(best, haversineMiles(Number(s.lat), Number(s.lng), lat, lng));
+          scored.push({ p: f.properties, dist: best });
+        }
+        scored.sort((a, b) => a.dist - b.dist);
+        const seen = new Set();
+        const top = [];
+        for (const item of scored) {
+          if (!item.p || seen.has(item.p.id)) continue;
+          seen.add(item.p.id);
+          top.push(item);
+          if (top.length >= 6) break;
+        }
+        clear(nearbyResults);
+        if (!top.length) { nearbyResults.append(h('p', { class: 'muted small' }, 'No stations found in the feed.')); return; }
+        const current = (liveConfig.bike && liveConfig.bike.stations) || [];
+        for (const item of top) {
+          const p = item.p;
+          const already = current.some((s) => s.id === p.id);
+          nearbyResults.append(h('div', { class: 'row between' },
+            h('span', {}, `${p.name} — ${item.dist.toFixed(1)} mi — ${p.bikesAvailable ?? '?'} bikes, ${p.docksAvailable ?? '?'} docks`),
+            h('button', {
+              disabled: already || current.length >= 3,
+              onclick: () => {
+                const now = liveConfig.bike || { enabled: false, stations: [] };
+                const next = [...(now.stations || []), { id: p.id, name: p.name }];
+                persistConfig({ ...liveConfig, bike: { ...now, stations: next } });
+              },
+            }, already ? 'Added' : 'Add')));
+        }
+      } catch (e) {
+        clear(nearbyResults);
+        nearbyResults.append(h('div', { class: 'banner warn' },
+          'Could not reach the Indego station feed from the browser. If this page was loaded over HTTPS, the browser blocks the plain-HTTP feed as mixed content — try loading the device UI over http:// instead. ' + (e && e.message ? `(${e.message})` : '')));
+      } finally {
+        ev.target.disabled = false;
+      }
+    },
+  }, 'Find stations near my stops');
+  card.append(h('div', { class: 'row', style: 'margin-top:.4rem' }, findBtn));
+  card.append(nearbyResults);
+
+  const manualId = h('input', { type: 'number', id: 'bike-manual-id', min: 1, placeholder: 'e.g. 3468' });
+  const manualAdd = h('button', {
+    disabled: stations.length >= 3,
+    onclick: () => {
+      const id = Math.trunc(Number(manualId.value));
+      if (!id || id < 1) return;
+      if (stations.some((s) => s.id === id) || stations.length >= 3) return;
+      const next = [...stations, { id, name: `Station ${id}` }];
+      persistConfig({ ...liveConfig, bike: { ...bike, stations: next } });
+    },
+  }, 'Add');
+  card.append(h('label', { for: 'bike-manual-id', style: 'margin-top:.6rem' }, 'Or add by station id'));
+  card.append(h('div', { class: 'row' }, manualId, manualAdd));
+  card.append(h('p', { class: 'small muted' }, 'Station data from Bicycle Transit Systems (Indego).'));
+
+  return card;
 }
 
 /* ---- Add-stop wizard ---- */
@@ -1204,6 +1319,17 @@ async function renderSettings(root) {
   const tickerSpeedInput = h('input', { type: 'range', id: 'set-ticker-speed', min: 5, max: 120, value: tickerSpeed });
   const tickerSpeedVal = h('span', { class: 'small muted' }, `${tickerSpeed} px/s`);
   tickerSpeedInput.addEventListener('input', () => { tickerSpeedVal.textContent = `${tickerSpeedInput.value} px/s`; });
+  const TICKER_SHOW = [['both', 'Alerts and detours'], ['alerts', 'Alerts only'], ['detours', 'Detours only'], ['off', 'Nothing (ticker off)']];
+  const tickerShow = d.ticker_show || 'both';
+  const tickerShowSelect = h('select', { id: 'set-ticker-show' },
+    ...TICKER_SHOW.map(([v, label]) => h('option', { value: v, selected: v === tickerShow || undefined }, label)));
+  tickerLinesSelect.disabled = tickerShow === 'off';
+  tickerSpeedInput.disabled = tickerShow === 'off';
+  tickerShowSelect.addEventListener('change', () => {
+    const off = tickerShowSelect.value === 'off';
+    tickerLinesSelect.disabled = off;
+    tickerSpeedInput.disabled = off;
+  });
   const httpsInput = h('input', { type: 'checkbox', id: 'set-https' });
   httpsInput.checked = !!d.use_https;
   const tlsInput = h('input', { type: 'checkbox', id: 'set-tls' });
@@ -1340,93 +1466,6 @@ async function renderSettings(root) {
   }
   renderProfiles();
 
-  // ---- Indego bikes (top-level bike) ----
-  const bikeCfg = cfg.bike || {};
-  const bikeEnabled = h('input', { type: 'checkbox', id: 'set-bike-enabled' });
-  bikeEnabled.checked = !!bikeCfg.enabled;
-  let bikeStations = (bikeCfg.stations || []).map((s) => ({ id: s.id, name: s.name }));
-  const bikeListDiv = h('div', {});
-  const bikeNearbyResults = h('div', {});
-  const bikeManualId = h('input', { type: 'number', id: 'bike-manual-id', min: 1, placeholder: 'e.g. 3468' });
-  const bikeManualAdd = h('button', {
-    onclick: () => {
-      const id = Math.trunc(Number(bikeManualId.value));
-      if (!id || id < 1) return;
-      if (bikeStations.some((s) => s.id === id) || bikeStations.length >= 3) return;
-      bikeStations.push({ id, name: `Station ${id}` });
-      bikeManualId.value = '';
-      renderBikeStations();
-    },
-  }, 'Add');
-
-  function renderBikeStations() {
-    clear(bikeListDiv);
-    if (!bikeStations.length) { bikeListDiv.append(h('p', { class: 'small muted' }, 'No stations chosen yet.')); }
-    for (const st of bikeStations) {
-      bikeListDiv.append(h('div', { class: 'row between' },
-        h('span', {}, `${st.name} (#${st.id})`),
-        h('button', { class: 'icon danger', title: 'Remove', 'aria-label': `Remove ${st.name}`, onclick: () => { bikeStations = bikeStations.filter((s) => s.id !== st.id); renderBikeStations(); } }, '✕')));
-    }
-    bikeManualAdd.disabled = bikeStations.length >= 3;
-    if (bikeStations.length >= 3) bikeListDiv.append(h('p', { class: 'small muted' }, 'Maximum of 3 stations.'));
-  }
-  renderBikeStations();
-
-  const bikeFindBtn = h('button', {
-    onclick: async (ev) => {
-      ev.target.disabled = true;
-      clear(bikeNearbyResults);
-      bikeNearbyResults.append(h('p', { class: 'muted small' }, 'Looking up nearby stations…'));
-      try {
-        const withCoords = (cfg.stops || []).filter((s) => Number(s.lat) && Number(s.lng));
-        if (!withCoords.length) {
-          clear(bikeNearbyResults);
-          bikeNearbyResults.append(h('p', { class: 'muted small' }, 'None of your configured stops have coordinates yet — add some from the Stops page first.'));
-          return;
-        }
-        const res = await fetch('http://bts-status.bicycletransit.workers.dev/phl');
-        if (!res.ok) throw new Error(`Indego feed returned HTTP ${res.status}`);
-        const geo = await res.json();
-        const scored = [];
-        for (const f of geo.features || []) {
-          const coords = f.geometry && f.geometry.coordinates;
-          if (!coords) continue;
-          const [lng, lat] = coords;
-          let best = Infinity;
-          for (const s of withCoords) best = Math.min(best, haversineMiles(Number(s.lat), Number(s.lng), lat, lng));
-          scored.push({ p: f.properties, dist: best });
-        }
-        scored.sort((a, b) => a.dist - b.dist);
-        const seen = new Set();
-        const top = [];
-        for (const item of scored) {
-          if (!item.p || seen.has(item.p.id)) continue;
-          seen.add(item.p.id);
-          top.push(item);
-          if (top.length >= 6) break;
-        }
-        clear(bikeNearbyResults);
-        if (!top.length) { bikeNearbyResults.append(h('p', { class: 'muted small' }, 'No stations found in the feed.')); return; }
-        for (const item of top) {
-          const p = item.p;
-          const already = bikeStations.some((s) => s.id === p.id);
-          bikeNearbyResults.append(h('div', { class: 'row between' },
-            h('span', {}, `${p.name} — ${item.dist.toFixed(1)} mi — ${p.bikesAvailable ?? '?'} bikes, ${p.docksAvailable ?? '?'} docks`),
-            h('button', {
-              disabled: already || bikeStations.length >= 3,
-              onclick: () => { bikeStations.push({ id: p.id, name: p.name }); renderBikeStations(); },
-            }, already ? 'Added' : 'Add')));
-        }
-      } catch (e) {
-        clear(bikeNearbyResults);
-        bikeNearbyResults.append(h('div', { class: 'banner warn' },
-          'Could not reach the Indego station feed from the browser. If this page was loaded over HTTPS, the browser blocks the plain-HTTP feed as mixed content — try loading the device UI over http:// instead. ' + (e && e.message ? `(${e.message})` : '')));
-      } finally {
-        ev.target.disabled = false;
-      }
-    },
-  }, 'Find stations near my stops');
-
   const form = h('div', { class: 'card settings-grid' },
     h('h2', {}, 'Device'),
     h('label', { for: 'set-name' }, 'Device name'), h('div', { class: 'row' }, nameInput, mdnsPreview),
@@ -1440,6 +1479,8 @@ async function renderSettings(root) {
     h('h2', {}, 'Alert ticker'),
     h('label', { for: 'set-ticker-lines' }, 'Height'), tickerLinesSelect,
     h('label', { for: 'set-ticker-speed' }, 'Scroll speed'), h('div', { class: 'row' }, tickerSpeedInput, tickerSpeedVal),
+    h('label', { for: 'set-ticker-show' }, 'Show'), tickerShowSelect,
+    h('p', { class: 'small muted' }, '"Show service alerts" below controls whether alerts are fetched at all; this picks what the ticker shows.'),
     h('p', { class: 'small muted' }, 'Service alerts and detours for your routes appear along the bottom of the main screen. A taller ticker wraps the text and scrolls it upward; lower speeds are easier to read.'),
 
     h('h2', {}, 'Display extras'),
@@ -1468,15 +1509,6 @@ async function renderSettings(root) {
     h('h2', {}, 'Profiles'),
     profilesCard,
 
-    h('h2', {}, 'Indego bikes'),
-    h('label', { class: 'inline' }, bikeEnabled, ' Show Indego bike/dock counts'),
-    bikeListDiv,
-    h('div', { class: 'row', style: 'margin-top:.4rem' }, bikeFindBtn),
-    bikeNearbyResults,
-    h('label', { for: 'bike-manual-id', style: 'margin-top:.6rem' }, 'Or add by station id'),
-    h('div', { class: 'row' }, bikeManualId, bikeManualAdd),
-    h('p', { class: 'small muted' }, 'Station data from Bicycle Transit Systems (Indego).'),
-
     h('h2', {}, 'Header'),
     h('p', { class: 'small muted' }, 'The strip along the top of the main screen is narrow; pick what it shows.'),
     ...headerRows,
@@ -1499,6 +1531,7 @@ async function renderSettings(root) {
           brightness: Number(brightInput.value), rotation: Number(rotSelect.value),
           theme: themeSelect.value, invert_colors: invertInput.checked,
           ticker_lines: Number(tickerLinesSelect.value), ticker_speed: Number(tickerSpeedInput.value),
+          ticker_show: tickerShowSelect.value,
           use_https: httpsInput.checked, tls_verify: tlsInput.checked, logging: loggingInput.checked,
           header: Object.fromEntries(Object.entries(headerInputs).map(([k, cb]) => [k, cb.checked])),
           large_text: largeTextInput.checked,
@@ -1522,7 +1555,6 @@ async function renderSettings(root) {
           end: p.end,
           stops: p.order.filter((k) => p.included.has(k)),
         })),
-        bike: { enabled: bikeEnabled.checked, stations: bikeStations.map((s) => ({ id: s.id, name: s.name })) },
       };
       clear(banner);
       try {

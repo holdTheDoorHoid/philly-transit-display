@@ -328,8 +328,10 @@ Fields added 2026-09-14 (all optional; absent means the default shown above):
 `rotation` is 0, 90, 180, or 270 degrees; 0 is the panel's native portrait orientation (the owner's preference), 90 is landscape. The UI rebuilds its layout when it changes.
 `theme` is `light` (default) or `dark`; both palettes keep every text colour at WCAG AA contrast or
 better. `invert_colors` drives the panel controller's colour-inversion command; its default comes
-from the board build flag `DISPLAY_INVERT_DEFAULT` (on for the 3.5" boards, whose IPS panel shows a
-near-black background as white without it - `docs/hardware.md`). `ticker_lines` (1-8) is the height
+from the board build flag `DISPLAY_INVERT_DEFAULT`, off for every vendored board (`docs/hardware.md`
+"Colour inversion" records the false alarm that briefly turned it on for the 3.5" boards).
+`ticker_show` picks what the alert ticker carries: `both` (default), `alerts`, `detours`, or `off`
+(no ticker at all; `alerts` at the top level still decides whether alerts are fetched). `ticker_lines` (1-8) is the height
 of the alert ticker in text lines: 1 is a sideways marquee, more wraps the text and scrolls it
 upward. `ticker_speed` (5-200) is the scroll speed in pixels per second. All four apply without a
 reboot.
@@ -360,6 +362,8 @@ gear). CORS not needed; the UI is same-origin. A later "settings PIN" is an opt-
 | `GET /api/log/2026-09.csv` | Raw CSV download |
 | `POST /api/ota` | multipart `firmware` field; reboots on success |
 | `POST /api/reboot`, `POST /api/wifi/reset` | Maintenance |
+| `GET /api/debug/ui` | Test hook: current page (main/night/stats/device), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, LVGL pool use, resolution, heap |
+| `POST /api/debug/tap` | Test hook: simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
 
 Arrival object in `/api/state`:
 ```json
@@ -396,8 +400,8 @@ Main screen (portrait by default; every size derives from the runtime resolution
   per stop. Tapping cycles pages exactly as from the arrivals page.
 - Quiet hours (`quiet`): the backlight drops to `brightness` (0 = off) inside the window; any touch
   restores it for `wake_seconds` without changing page.
-- Footer ticker when alerts exist: `17: <alert>` and `17 detour: <detour>` for each distinct
-  detour. Height is `device.ticker_lines` lines of the small font (default 3); one line scrolls
+- Footer ticker when alerts exist and `ticker_show` is not `off`: `17: <alert>` and `17 detour:
+  <detour>` for each distinct detour (either half alone with `alerts` / `detours`). Height is `device.ticker_lines` lines of the small font (default 3); one line scrolls
   sideways, more wrap and scroll upward credits-style, both at `device.ticker_speed` px/s via our
   own `lv_anim` (LVGL's built-in label scroll caps a pass at 10 s, unreadable for a paragraph).
   Static when the text fits.

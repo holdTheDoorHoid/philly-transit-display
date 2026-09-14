@@ -134,6 +134,11 @@ bool validateConfig(const Config &cfg, ConfigError &err) {
     err = {"theme must be \"light\" or \"dark\"", "device.theme"};
     return false;
   }
+  if (cfg.device.ticker_show != "both" && cfg.device.ticker_show != "alerts" && cfg.device.ticker_show != "detours" &&
+      cfg.device.ticker_show != "off") {
+    err = {"ticker_show must be both, alerts, detours, or off", "device.ticker_show"};
+    return false;
+  }
   if (cfg.device.ticker_lines < 1 || cfg.device.ticker_lines > 8) {
     err = {"ticker_lines must be between 1 and 8", "device.ticker_lines"};
     return false;
@@ -269,6 +274,7 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
   device["rotation"] = cfg.device.rotation;
   device["theme"] = cfg.device.theme;
   device["invert_colors"] = cfg.device.invert_colors;
+  device["ticker_show"] = cfg.device.ticker_show;
   device["ticker_lines"] = cfg.device.ticker_lines;
   device["ticker_speed"] = cfg.device.ticker_speed;
   device["tls_verify"] = cfg.device.tls_verify;
@@ -366,6 +372,7 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   result.device.rotation = device["rotation"] | 0;
   result.device.theme = std::string(device["theme"] | "light");
   result.device.invert_colors = device["invert_colors"] | (DISPLAY_INVERT_DEFAULT != 0);
+  result.device.ticker_show = std::string(device["ticker_show"] | "both");
   result.device.ticker_lines = device["ticker_lines"] | 3;
   result.device.ticker_speed = device["ticker_speed"] | 30;
   result.device.tls_verify = device["tls_verify"] | true;

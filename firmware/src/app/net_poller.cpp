@@ -593,10 +593,12 @@ void startNetPoller(uint32_t poll_seconds) {
   xSemaphoreGive(g_wake_sem);
 }
 
-void requestRepoll() {
-  g_invalidate_sched_cache = true;
-  invalidateWeather();
-  invalidateBikes();
+void requestRepoll(bool data_changed) {
+  if (data_changed) {
+    g_invalidate_sched_cache = true;
+    invalidateWeather();
+    invalidateBikes();
+  }
   if (g_wake_sem != nullptr) {
     xSemaphoreGive(g_wake_sem);
   }

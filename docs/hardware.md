@@ -22,13 +22,15 @@ via `lv_display_set_rotation()` in `main.cpp`); they differ only in the touch co
 ### Colour inversion
 
 `esp32_smartdisplay` sends the ST7796's colour-inversion command only when a board file defines
-`DISPLAY_IPS`, and none of the vendored Sunton files do. The owner's `ESP32-3248S035R` has an IPS
-panel: without inversion its near-black UI background rendered as white, and the panel flashed
-white (not black) while the firmware was crash-looping (2026-09-14). So the 3.5" board files carry
-`-D DISPLAY_INVERT_DEFAULT=1`, which seeds the runtime setting `device.invert_colors`
-(`ui::applyInvert()`, Settings > "Invert panel colors"). If a unit shows the light theme as dark,
-an orange route badge instead of blue, or a white flash at boot, flip that setting - no rebuild
-needed. The 2.4"/2.8" board files leave the default off, matching upstream.
+`DISPLAY_IPS`, and none of the vendored Sunton files do; the owner's `ESP32-3248S035R` does not need
+it. (For most of 2026-09-14 this file claimed the opposite. The "white background" that prompted
+that claim was LVGL painting nothing: with no theme compiled in, LVGL's default background opacity
+is 0, so every `bg_color` the UI set without a `bg_opa` was invisible and the white was the
+display's own fill. `main_screen.cpp` `makeBox()` now sets the opacity.) The runtime setting
+`device.invert_colors` (Settings > "Invert panel colors", `ui::applyInvert()`) exists for panels
+that do need it: if a unit shows the light theme as a dark screen with light text, flip it - no
+rebuild needed. The build flag `DISPLAY_INVERT_DEFAULT` (firmware/boards/README.md) seeds it; it
+is unset (off) for every vendored board.
 
 ### TFT panel (ST7796, SPI2_HOST) - same on both variants
 

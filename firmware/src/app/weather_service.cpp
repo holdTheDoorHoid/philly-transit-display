@@ -40,6 +40,17 @@ bool g_per_stop = true;
 bool g_fahrenheit = true;
 uint32_t g_fetched_epoch = 0;
 volatile bool g_invalidate = true;
+std::string g_fingerprint;  // stop coordinates the current grouping was built from
+
+std::string stopsFingerprint(const Config &cfg) {
+  char buf[40];
+  std::string fp;
+  for (const transit::StopConfig &s : cfg.stops) {
+    snprintf(buf, sizeof(buf), "%s:%.4f,%.4f;", s.key.c_str(), s.lat, s.lng);
+    fp += buf;
+  }
+  return fp;
+}
 
 SemaphoreHandle_t mutex() {
   if (g_mutex == nullptr) g_mutex = xSemaphoreCreateMutex();
@@ -135,8 +146,10 @@ void refreshWeather(const Config &cfg, const transit::HttpGet &http) {
   {
     Lock lock;
     if (!lock.held) return;
-    if (g_invalidate || g_fahrenheit != cfg.weather.fahrenheit || g_per_stop != cfg.weather.per_stop) {
+    std::string fp = stopsFingerprint(cfg);
+    if (g_invalidate || g_fahrenheit != cfg.weather.fahrenheit || g_per_stop != cfg.weather.per_stop || fp != g_fingerprint) {
       g_invalidate = false;
+      g_fingerprint = fp;
       regroup(cfg, locs, stops);
       regrouped = true;
     } else {

@@ -1,7 +1,9 @@
 // Top-level UI: owns the three screens and the tap-to-cycle behavior.
 // DESIGN.md SS8: "Tap anywhere cycles Main -> Stats -> Device info -> Main."
 #pragma once
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "../config_store.h"
 
@@ -48,5 +50,25 @@ void onConfigChanged(const Config &cfg);
 
 // Prints LVGL pool usage over serial (sizing LV_MEM_SIZE).
 void logMemory();
+
+// Test hooks for GET /api/debug/ui and POST /api/debug/tap (DESIGN.md SS7): what the screen is
+// doing right now, and a simulated touch (press + click on the LVGL task, exactly the path a
+// finger takes, so quiet-hours wake and page cycling can be exercised without the panel).
+struct UiDebug {
+  std::string page;            // "main", "night", "stats", "device"
+  bool dimmed = false;
+  int brightness = -1;         // percent actually applied
+  bool due_active = false;
+  uint32_t chimes = 0;
+  std::string active_profile;
+  std::vector<std::string> shown_stops;
+  std::vector<std::string> hidden_panels;  // alternatives currently hidden
+  std::string ticker;
+  std::string header_weather;
+  uint32_t lv_used = 0, lv_free = 0, lv_max_used = 0;
+  int32_t hor_res = 0, ver_res = 0;
+};
+UiDebug debugSnapshot();
+void requestTap();
 
 }  // namespace transit_app::ui

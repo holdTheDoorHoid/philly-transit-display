@@ -63,6 +63,7 @@ struct MainScreenCtx {
   lv_obj_t *ticker_box;
   lv_obj_t *ticker_label;
   std::string ticker_text;
+  std::string ticker_show = "both";  // config.device.ticker_show
   int ticker_lines = 1;
   uint16_t ticker_speed = 30;
   // Indego strip (DESIGN.md SS4.9): one label per configured station, above the ticker.
@@ -92,6 +93,9 @@ lv_obj_t *makeLabel(lv_obj_t *parent, const lv_font_t *font, lv_color_t color) {
 // tap-to-cycle handler (DESIGN.md SS8 "tap anywhere") instead of stopping at the child.
 lv_obj_t *makeBox(lv_obj_t *parent) {
   lv_obj_t *o = lv_obj_create(parent);
+  // LVGL's default bg_opa is 0 (no theme is compiled in): a bg_color alone paints nothing.
+  // The first builds set colours without this, which is why the "background" never changed.
+  lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(o, 0, 0);
   lv_obj_set_style_radius(o, 0, 0);
   lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
@@ -109,7 +113,10 @@ void animSetY(void *obj, int32_t v) {
 // Ticker copy: "17: <alert>" then "17 detour: <detour>" for each distinct detour (SEPTA lists
 // the same one twice), one item per line when the ticker is taller than a line, otherwise joined
 // with " • " for the single-line marquee.
-std::string tickerText(const std::vector<transit::Alert> &alerts, bool multiline) {
+std::string tickerText(const std::vector<transit::Alert> &alerts, bool multiline, const std::string &mode) {
+  if (mode == "off") return "";
+  bool want_alerts = (mode == "both" || mode == "alerts");
+  bool want_detours = (mode == "both" || mode == "detours");
   const char *sep = multiline ? "\n" : "   \xE2\x80\xA2   ";
   std::string text;
   std::vector<std::string> seen;
@@ -123,8 +130,10 @@ std::string tickerText(const std::vector<transit::Alert> &alerts, bool multiline
     text += item;
   };
   for (const transit::Alert &al : alerts) {
-    add(al.route + ": " + al.text);
-    for (const std::string &d : al.detours) add(al.route + " detour: " + d);
+    if (want_alerts) add(al.route + ": " + al.text);
+    if (want_detours) {
+      for (const std::string &d : al.detours) add(al.route + " detour: " + d);
+    }
   }
   return text;
 }
@@ -181,6 +190,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   lv_obj_t *screen = lv_obj_create(nullptr);
   lv_obj_set_size(screen, w, h);
   lv_obj_set_style_bg_color(screen, colorBg(), 0);
+  lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_all(screen, 0, 0);
   lv_obj_set_style_border_width(screen, 0, 0);
   lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
@@ -328,6 +338,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   // ---- Alert ticker (only shown when refreshMainScreen finds alerts) ----
   ctx->ticker_lines = std::max<int>(1, std::min<int>(cfg.device.ticker_lines, 8));
   ctx->ticker_speed = cfg.device.ticker_speed;
+  ctx->ticker_show = cfg.device.ticker_show;
   const lv_font_t *ticker_font = fontSmall(h);
   const int32_t ticker_pad = 4;
   const int32_t line_space = 2;
@@ -359,6 +370,17 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_obj_set_user_data(scr, nullptr);
   }, LV_EVENT_DELETE, nullptr);
   return screen;
+}
+
+void mainScreenDebug(lv_obj_t *screen, std::vector<std::string> &hidden_panels, std::string &ticker_text) {
+  auto *ctx = static_cast<MainScreenCtx *>(lv_obj_get_user_data(screen));
+  hidden_panels.clear();
+  ticker_text.clear();
+  if (ctx == nullptr) return;
+  for (const PanelWidgets &pw : ctx->panels) {
+    if (lv_obj_has_flag(pw.panel, LV_OBJ_FLAG_HIDDEN)) hidden_panels.push_back(pw.stop_key);
+  }
+  ticker_text = ctx->ticker_text;
 }
 
 void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap) {
@@ -454,7 +476,9 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
       lv_obj_remove_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
     }
 
-    std::string note = have_data ? stopWeatherNote(pw.stop_key, stop->arrivals.front().effective()) : std::string();
+    std::string note = (have_data && cfg.weather.enabled && cfg.weather.per_stop)
+                           ? stopWeatherNote(pw.stop_key, stop->arrivals.front().effective())
+                           : std::string();
     if (note.empty()) {
       lv_obj_add_flag(pw.weather_note, LV_OBJ_FLAG_HIDDEN);
     } else {
@@ -520,7 +544,7 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
     }
   }
 
-  std::string ticker = tickerText(snap.alerts, ctx->ticker_lines > 1);
+  std::string ticker = tickerText(snap.alerts, ctx->ticker_lines > 1, ctx->ticker_show);
   if (ticker.empty()) {
     if (!ctx->ticker_text.empty()) {
       lv_anim_delete(ctx->ticker_label, nullptr);

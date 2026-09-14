@@ -15,6 +15,9 @@ bool arrivalIsDue(const Config &cfg, const transit::Arrival &a, transit::Epoch n
 
 // Call once per second with the stops currently shown. `quiet` (quiet hours) silences the chime.
 // Returns true while at least one shown arrival is due, so the caller can blink the screen.
+// Test hooks (GET /api/debug/ui).
+uint32_t dueChimesPlayed();
+
 bool dueAlertTick(const Config &cfg, const transit::Snapshot &snap, const std::vector<std::string> &shown_keys,
                   bool quiet, transit::Epoch now);
 

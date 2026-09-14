@@ -78,12 +78,12 @@ DESIGN.md §10 caps the four assets at **60 KB gzipped total**. Current sizes
 | Asset | Raw | Gzip |
 |---|---:|---:|
 | `index.html` | 848 B | 433 B |
-| `app.js` | ~77 KB | ~20.2 KB |
-| `app.css` | ~9.9 KB | ~2.8 KB |
+| `app.js` | ~78 KB | ~20.5 KB |
+| `app.css` | ~10.0 KB | ~2.8 KB |
 | `favicon.svg` | 410 B | 202 B |
-| **Total** | **~88 KB** | **~23.6 KB** |
+| **Total** | **~89 KB** | **~24 KB** |
 
-That leaves roughly 36 KB of headroom under the budget. `build.mjs` prints a warning
+That leaves roughly 35 KB of headroom under the budget. `build.mjs` prints a warning
 (without failing) if the total ever exceeds 60,000 bytes gzip.
 
 ## How the UI maps to the device API
@@ -91,7 +91,7 @@ That leaves roughly 36 KB of headroom under the budget. `build.mjs` prints a war
 | View | Reads | Writes |
 |---|---|---|
 | **Now** | `GET /api/state` every 15 s | — |
-| **Stops** | `GET /api/config`, `GET /api/proxy/stops`, `GET /api/proxy/schedule`, `GET /api/rail/stations` | `PUT /api/config` (reorder, edit, remove, add — always sends the whole config) |
+| **Stops** | `GET /api/config`, `GET /api/proxy/stops`, `GET /api/proxy/schedule`, `GET /api/rail/stations` | `PUT /api/config` (reorder, edit, remove, add stops; enable/add/remove Indego stations — always sends the whole config) |
 | **Stats** | `GET /api/config` (stop picker), `GET /api/stats`, `GET /api/log/index` | — (CSV download links point at `GET /api/log/<file>`) |
 | **Settings** | `GET /api/config`, `GET /api/state` (firmware version) | `PUT /api/config`, `POST /api/ota`, `POST /api/reboot`, `POST /api/wifi/reset` |
 
@@ -115,16 +115,30 @@ destination • stop, or custom text saved as `title_text`) and whether the stop
 computes the on-screen title client-side the same way the firmware will, and shows an
 "alternative to …" hint when `alt_of` is set.
 
+Below the stop list, the Stops page also has an **Indego bikes** card (`bike`, §6,
+max 3 stations): an enabled checkbox, the chosen stations with remove buttons, a
+"Find stations near my stops" lookup that fetches the Bicycle Transit status feed
+directly in the browser and ranks the six nearest stations by great-circle distance
+from stops that have `lat`/`lng` (plain HTTP; if the web UI itself is loaded over
+HTTPS the browser blocks it as mixed content and the button shows a banner explaining
+that instead of failing silently), and a manual station-id add. It's on the Stops page
+rather than Settings because the owner manages bike stations alongside the stops they
+sit near; every change there saves immediately through the same `PUT /api/config`
+pattern as reordering or removing a stop (whole config, `liveConfig` kept in sync, a
+"Saved." banner on success). This card is hidden while the Add Stop wizard is open.
+
+The alert ticker section of Settings has a **Show** select (`device.ticker_show`:
+`both` (default), `alerts`, `detours`, or `off`) that picks what the ticker displays.
+Choosing `off` greys out the Height and Scroll speed controls above it, since there's
+nothing left to size or scroll. This is independent of the "Show service alerts"
+checkbox further down in Settings, which controls whether alerts are fetched from
+SEPTA at all — a muted note under the select says so.
+
 The Settings view additionally covers, in order after the alert ticker section: large
 text / crowding display extras, quiet hours (backlight dims on a schedule, touch wakes
-it), the night clock, "time to leave" LED/screen/chime alerts, up to 4 schedule-based
-**profiles** (each with a name, days, a time window, and its own ordered stop list —
-checkboxes plus ↑/↓ reordering, built from the configured stops), and Indego bike
-stations (§4.9): a manual station-id add, and a "Find stations near my stops" lookup
-that fetches the Bicycle Transit status feed directly in the browser and ranks the six
-nearest stations by great-circle distance from stops that have `lat`/`lng`. That fetch
-is plain HTTP; if the web UI itself is loaded over HTTPS the browser blocks it as mixed
-content and the button shows a banner explaining that instead of failing silently.
+it), the night clock, "time to leave" LED/screen/chime alerts, and up to 4
+schedule-based **profiles** (each with a name, days, a time window, and its own
+ordered stop list — checkboxes plus ↑/↓ reordering, built from the configured stops).
 
 ## Assumptions made (DESIGN.md §7/§9.3 didn't fully pin these down)
 
@@ -162,6 +176,11 @@ if the actual device ends up shaped differently:
 - **Rail station list shape**: `/api/rail/stations` is documented only as "static
   Regional Rail station list." The mock (and client) treat it as an array of either
   plain strings or `{name}` objects.
+- **`device.ticker_show`**: not in DESIGN.md §6 — added so the owner can pick what the
+  alert ticker displays (`both` (default), `alerts`, `detours`, `off`) independently of
+  the existing `alerts` flag, which controls whether alerts are fetched at all. Mock
+  validates it as one of those four strings, `400`-ing with
+  `device.ticker_show` otherwise.
 
 ## Verifying changes
 

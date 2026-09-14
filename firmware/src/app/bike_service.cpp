@@ -16,6 +16,7 @@ SemaphoreHandle_t g_mutex = nullptr;
 BikeView g_view;
 uint32_t g_fetched_ms = 0;
 volatile bool g_invalidate = true;
+std::vector<int> g_fetched_ids;  // station ids of the last fetch: a config change mid-poll must not be missed
 
 SemaphoreHandle_t mutex() {
   if (g_mutex == nullptr) g_mutex = xSemaphoreCreateMutex();
@@ -36,12 +37,12 @@ void refreshBikes(const Config &cfg, const transit::HttpGet &http) {
     }
     return;
   }
-  bool due = g_invalidate || g_fetched_ms == 0 || (millis() - g_fetched_ms) >= kRefreshMs;
-  if (!due) return;
-  g_invalidate = false;
-
   std::vector<int> ids;
   for (const BikeStation &b : cfg.bike.stations) ids.push_back(b.id);
+  bool due = g_invalidate || g_fetched_ms == 0 || ids != g_fetched_ids || (millis() - g_fetched_ms) >= kRefreshMs;
+  if (!due) return;
+  g_invalidate = false;
+  g_fetched_ids = ids;
   indego::StatusStream stream;
   stream.setStationFilter(ids);
   int status = http(indego::statusUrl(), [&](const uint8_t *d, size_t n) { return stream.push(d, n); });

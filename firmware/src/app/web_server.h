@@ -12,6 +12,6 @@ namespace transit_app {
 // (DESIGN.md SS7: "triggers immediate re-poll" - wiring that trigger
 // through to net_poller is left to main.cpp once net_poller supports
 // changing its interval without a reboot).
-void startWebServer(std::function<void()> onConfigChanged = nullptr);
+void startWebServer(std::function<void(bool)> onConfigChanged = nullptr);
 
 }  // namespace transit_app

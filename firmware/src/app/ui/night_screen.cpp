@@ -64,6 +64,7 @@ lv_obj_t *createNightScreen(const Config &cfg) {
   lv_obj_t *screen = lv_obj_create(nullptr);
   lv_obj_set_size(screen, w, h);
   lv_obj_set_style_bg_color(screen, colorBg(), 0);
+  lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(screen, 0, 0);
   lv_obj_set_style_pad_all(screen, 12, 0);
   lv_obj_set_style_pad_row(screen, 6, 0);

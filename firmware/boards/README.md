@@ -80,10 +80,10 @@ See `firmware/extra_scripts/patch_esp32_smartdisplay.py` for the `lv_color16_t` 
 ## `DISPLAY_INVERT_DEFAULT`
 
 Project-specific flag (not from upstream): the boot default for `device.invert_colors`, the
-panel colour-inversion setting. `esp32-3248S035R.json` and `esp32-3248S035C.json` set it to 1
-because the 3.5" IPS panel renders inverted without it (verified on the owner's board,
-`docs/hardware.md` "Colour inversion"). Absent means 0. Users can override it at runtime from
-Settings, so getting this wrong for a variant is a one-click fix rather than a rebuild.
+panel colour-inversion setting. No vendored board sets it (absent means 0); the owner's 3.5"
+panel turned out not to need inversion - see `docs/hardware.md` "Colour inversion" for the
+LVGL background-opacity mistake that made it look as if it did. Set it to 1 in a board file
+only for a variant verified to render inverted; users can override it at runtime from Settings.
 
 ## `LV_FONT_MONTSERRAT_20`
 

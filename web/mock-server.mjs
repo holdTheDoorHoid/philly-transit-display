@@ -72,6 +72,7 @@ function defaultConfig() {
       invert_colors: false,
       ticker_lines: 3,
       ticker_speed: 30,
+      ticker_show: 'both',
       use_https: false,
       tls_verify: true,
       logging: true,
@@ -123,6 +124,9 @@ function validateConfig(cfg) {
   }
   if (d.ticker_speed !== undefined && (!Number.isInteger(d.ticker_speed) || d.ticker_speed < 5 || d.ticker_speed > 200)) {
     return { error: 'ticker_speed must be an integer between 5 and 200', path: 'device.ticker_speed' };
+  }
+  if (d.ticker_show !== undefined && !['both', 'alerts', 'detours', 'off'].includes(d.ticker_show)) {
+    return { error: 'ticker_show must be both, alerts, detours, or off', path: 'device.ticker_show' };
   }
   if (typeof d.tls_verify !== 'boolean') return { error: 'tls_verify must be a boolean', path: 'device.tls_verify' };
   if (typeof d.logging !== 'boolean') return { error: 'logging must be a boolean', path: 'device.logging' };

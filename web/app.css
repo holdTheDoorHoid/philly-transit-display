@@ -118,6 +118,8 @@ button.danger {
 button:disabled { opacity: .5; cursor: not-allowed; }
 button.icon { padding: .35rem .55rem; line-height: 1; }
 
+input:disabled, select:disabled, input:disabled + span { opacity: .5; cursor: not-allowed; }
+
 :focus-visible {
   outline: 3px solid var(--focus);
   outline-offset: 2px;

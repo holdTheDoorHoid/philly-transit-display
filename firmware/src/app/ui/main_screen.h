@@ -6,6 +6,9 @@
 #pragma once
 #include <lvgl.h>
 
+#include <string>
+#include <vector>
+
 #include "../config_store.h"
 #include "transit_core/model.h"
 
@@ -19,6 +22,9 @@ lv_obj_t *createMainScreen(const Config &cfg);
 // every stop panel's rows from `snap`. Panels are matched to `cfg.stops` by
 // StopConfig::key <-> StopSnapshot::key; a configured stop with no matching
 // entry in `snap` shows "no data" instead of stale/wrong numbers.
+// Test hook (GET /api/debug/ui): which alternative panels are currently hidden, and the ticker text.
+void mainScreenDebug(lv_obj_t *screen, std::vector<std::string> &hidden_panels, std::string &ticker_text);
+
 void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const transit::Snapshot &snap);
 
 }  // namespace transit_app::ui
