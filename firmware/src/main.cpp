@@ -15,6 +15,7 @@
 #include <ctime>
 
 #include "app/config_store.h"
+#include "app/hw_probe.h"
 #include "app/net_poller.h"
 #include "app/sd_logger.h"
 #include "app/status_led.h"
@@ -83,9 +84,12 @@ void connectWifiOrOpenPortal(const std::string &ap_name) {
 
 void setup() {
   Serial.begin(115200);
+  delay(200);
+  transit_app::hwProbeEarly();
 
   smartdisplay_init();
   lv_display_set_rotation(lv_display_get_default(), LV_DISPLAY_ROTATION_90);  // panels are wired portrait; DESIGN.md SS3/SS8 want landscape
+  transit_app::hwProbeDisplay();
 
   if (!LittleFS.begin(false)) {
     log_w("main: LittleFS mount failed, formatting");
