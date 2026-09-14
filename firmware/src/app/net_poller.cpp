@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <ctime>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -16,6 +17,8 @@
 #include "sd_logger.h"
 #include "status_led.h"
 #include "transit_core/septa_source.h"
+#include "transit_stats/aggregate.h"
+#include "transit_stats/log_window.h"
 #include "transit_stats/tracker.h"
 
 using transit::Alert;
@@ -88,6 +91,37 @@ class AppScheduleCache : public transit::ScheduleCache {
 };
 
 AppScheduleCache g_sched_cache;
+
+// getStopSummary() cache (DESIGN.md SS8 "Stats page": on-time %, mean late, worst hour, ghost
+// count, sample count, last 30 days). Recomputing this means streaming SD - fine once per UI
+// refresh, not something to redo on every call from whatever task asks (ui/stats_screen.cpp, on
+// the LVGL task). At most kMaxTrackedStops entries (one per configured stop), same bound as
+// ArrivalTracker.
+constexpr int kSummaryWindowDays = 30;
+constexpr uint32_t kSummaryCacheMs = 60 * 1000;
+
+struct SummaryCacheEntry {
+  std::string stop_key;
+  transit_stats::StopSummary summary;
+  uint32_t computed_ms = 0;
+};
+std::vector<SummaryCacheEntry> g_summary_cache;
+
+transit_stats::StopSummary computeStopSummary(const std::string &stop_key) {
+  transit::Epoch now = (transit::Epoch)time(nullptr);
+  transit::Epoch start = now - (transit::Epoch)kSummaryWindowDays * 86400;
+  // Heap-allocated: StatsAggregator's own header docs put sizeof() at just under 8KB, too large
+  // to risk on an arbitrary caller's stack (this can be called from the LVGL task, not just
+  // net_poller's own - see net_poller.h).
+  auto agg = std::make_unique<transit_stats::StatsAggregator>(stop_key, start, now);
+  for (const std::string &month : transit_stats::monthsInWindow(start, now)) {
+    streamLogLines(month + ".csv", [&](const char *line, size_t len) {
+      agg->feedLine(line, len);
+      return true;
+    });
+  }
+  return transit_stats::summarize(*agg);
+}
 
 // Keyed by septaAlertsUrl(); a plain vector rather than std::map since there are at most a
 // handful of distinct alert feeds (DESIGN.md SS6 caps config at 8 stops) and this project already
@@ -399,13 +433,23 @@ PollStatus getPollStatus() {
 }
 
 bool getStopSummary(const std::string &stop_key, transit_stats::StopSummary &out) {
-  (void)stop_key;
-  (void)out;
-  // Implemented in the logging/stats milestone alongside StatsAggregator wiring - see
-  // web_server.cpp's GET /api/stats handler, which streams the CSV itself rather than going
-  // through this accessor (a StopSummary needs a StatsAggregator fed from the log, which only
-  // makes sense to build on demand from a request handler, not kept live in the poller task).
-  return false;
+  uint32_t now_ms = millis();
+  for (auto &e : g_summary_cache) {
+    if (e.stop_key != stop_key) continue;
+    if (now_ms - e.computed_ms >= kSummaryCacheMs) {
+      e.summary = computeStopSummary(stop_key);
+      e.computed_ms = now_ms;
+    }
+    out = e.summary;
+    return true;
+  }
+  SummaryCacheEntry entry;
+  entry.stop_key = stop_key;
+  entry.summary = computeStopSummary(stop_key);
+  entry.computed_ms = now_ms;
+  out = entry.summary;
+  g_summary_cache.push_back(std::move(entry));
+  return true;
 }
 
 }  // namespace transit_app

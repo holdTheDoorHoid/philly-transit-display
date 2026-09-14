@@ -6,6 +6,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <cctype>
 #include <cstring>
 #include <ctime>
 
@@ -212,9 +213,8 @@ void handlePostWifiReset(AsyncWebServerRequest *request) {
   JsonDocument doc;
   doc["ok"] = true;
   sendJson(request, 200, doc);
-  // Mirrors WiFiManager::resetSettings()'s own ESP32 path (WiFiManager.cpp
-  // v2.0.17): enable STA, then erase credentials, then reboot so main.cpp's
-  // WiFiManager::autoConnect() finds no saved network and opens the portal.
+  // Enable STA, erase the ESP-IDF's persisted Wi-Fi credentials, then reboot so main.cpp's
+  // wifi_portal::connectWifiOrPortal() finds nothing to reconnect with and opens the setup AP.
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
   scheduleRestart();
@@ -248,6 +248,67 @@ void handleRailStations(AsyncWebServerRequest *request) {
     arr.add(transit::kRailStationNames[i]);
   }
   sendJson(request, 200, doc);
+}
+
+// DESIGN.md SS9.3: queued to proxy_worker.cpp's task since it streams one or more monthly CSV
+// files off SD (never instant, and never something to do on the async server's own task).
+void handleGetStats(AsyncWebServerRequest *request) {
+  if (!request->hasParam("stop")) {
+    sendError(request, 400, "stop is required");
+    return;
+  }
+  std::string stop_key = request->getParam("stop")->value().c_str();
+  int days = request->hasParam("days") ? atoi(request->getParam("days")->value().c_str()) : 30;
+  queueStatsRequest(request, stop_key, days);
+}
+
+// DESIGN.md SS7: "[ { "file": "2026-09.csv", "bytes": 123456 } ]". Fast (a directory listing of
+// at most a handful of monthly files), so this runs directly on the web server's own task.
+void handleLogIndex(AsyncWebServerRequest *request) {
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (const LogFileInfo &f : listLogFiles()) {
+    JsonObject o = arr.add<JsonObject>();
+    o["file"] = f.name;
+    o["bytes"] = f.bytes;
+  }
+  sendJson(request, 200, doc);
+}
+
+// GET /api/log/<file>.csv - only "YYYY-MM.csv" is accepted (guards against path traversal /
+// reading anything else off the card, DESIGN.md SS12's "same posture as a printer" notwithstanding
+// - there's no reason this endpoint should ever open a file other than one of its own logs).
+// AsyncWebServer streams the returned File incrementally itself; this handler just opens it.
+bool isLogFilename(const std::string &name) {
+  // "YYYY-MM.csv": 4 digits, '-', 2 digits, ".csv" = 11 characters.
+  if (name.size() != 11 || name.compare(7, 4, ".csv") != 0) return false;
+  for (size_t i = 0; i < 7; ++i) {
+    if (i == 4) {
+      if (name[i] != '-') return false;
+    } else if (!isdigit(static_cast<unsigned char>(name[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool handleLogDownload(AsyncWebServerRequest *request) {
+  std::string url = request->url().c_str();
+  const std::string prefix = "/api/log/";
+  if (url.rfind(prefix, 0) != 0) return false;
+  std::string filename = url.substr(prefix.size());
+  if (!isLogFilename(filename)) {
+    sendError(request, 400, "not a log filename");
+    return true;
+  }
+  File f = openLogFile(filename);
+  if (!f) {
+    sendError(request, 404, "no log for that month");
+    return true;
+  }
+  AsyncWebServerResponse *response = request->beginResponse(f, filename.c_str(), "text/csv", true);
+  request->send(response);
+  return true;
 }
 
 #ifdef TRANSIT_HAVE_WEB_ASSETS
@@ -299,13 +360,14 @@ void startWebServer(std::function<void()> onConfigChanged) {
   g_server.on("/api/rail/stations", HTTP_GET, handleRailStations);
   startProxyWorker();
 
+  g_server.on("/api/stats", HTTP_GET, handleGetStats);
+  g_server.on("/api/log/index", HTTP_GET, handleLogIndex);
+  // "/api/log/<file>.csv" - matched with a regex-free prefix check in onNotFound below instead of
+  // a wildcard pattern, to keep the matcher simple.
+
   // DESIGN.md SS7 routes not implemented in this skeleton.
-  for (const char *path : {"/api/stats", "/api/log/index", "/api/ota"}) {
-    g_server.on(path, HTTP_GET, sendNotImplemented);
-  }
+  g_server.on("/api/ota", HTTP_GET, sendNotImplemented);
   g_server.on("/api/ota", HTTP_POST, sendNotImplemented);
-  // "/api/log/<file>.csv" - matched with a regex-free prefix check below via
-  // onNotFound instead of a wildcard pattern, to keep the matcher simple.
 
 #ifdef TRANSIT_HAVE_WEB_ASSETS
   registerWebAssets();
@@ -316,8 +378,7 @@ void startWebServer(std::function<void()> onConfigChanged) {
 #endif
 
   g_server.onNotFound([](AsyncWebServerRequest *request) {
-    if (request->url().startsWith("/api/log/")) {
-      sendNotImplemented(request);
+    if (request->url().startsWith("/api/log/") && handleLogDownload(request)) {
       return;
     }
     request->send(404, "application/json", "{\"error\":\"not found\"}");

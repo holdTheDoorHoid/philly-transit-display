@@ -39,9 +39,8 @@ void resetTargetEventCb(lv_event_t *e) {
     lv_label_set_text(ctx->reset_label, "reset Wi-Fi: hold 5 s");
     if (code == LV_EVENT_RELEASED && ctx->press_start_ms != 0 && held >= kWifiResetHoldMs) {
       log_w("device_info_screen: Wi-Fi reset gesture confirmed, erasing credentials and rebooting");
-      // Mirrors WiFiManager::resetSettings()'s ESP32 path - see
-      // web_server.cpp's /api/wifi/reset handler for the same logic and its
-      // source citation.
+      // Same as web_server.cpp's /api/wifi/reset handler: erase the ESP-IDF's persisted STA
+      // credentials so main.cpp's wifi_portal::connectWifiOrPortal() opens the setup AP again.
       WiFi.mode(WIFI_STA);
       WiFi.disconnect(true, true);
       delay(200);

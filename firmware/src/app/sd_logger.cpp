@@ -7,6 +7,7 @@
 #include <SPI.h>
 #endif
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 
@@ -28,6 +29,15 @@ std::string monthPath(const char *month) {
   p += "/";
   p += month;
   p += ".csv";
+  return p;
+}
+
+// filename is already a full name like "2026-09.csv" (as listLogFiles()/GET /api/log/index hand
+// back) - just directory-qualify it, no month/extension gymnastics needed.
+std::string logFilePath(const std::string &filename) {
+  std::string p(kLogDir);
+  p += "/";
+  p += filename;
   return p;
 }
 }  // namespace
@@ -130,6 +140,62 @@ bool appendLine(const char *month, const char *line) {
   (void)month;
   (void)line;
   return false;
+#endif
+}
+
+std::vector<LogFileInfo> listLogFiles() {
+  std::vector<LogFileInfo> out;
+#ifdef BOARD_HAS_TF
+  if (!g_status.mounted) return out;
+  File dir = SD.open(kLogDir);
+  if (!dir || !dir.isDirectory()) return out;
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    if (!f.isDirectory()) {
+      out.push_back({f.name(), (uint64_t)f.size()});
+    }
+    f.close();
+  }
+  dir.close();
+  std::sort(out.begin(), out.end(), [](const LogFileInfo &a, const LogFileInfo &b) { return a.name < b.name; });
+#endif
+  return out;
+}
+
+bool streamLogLines(const std::string &filename, const std::function<bool(const char *, size_t)> &each) {
+#ifdef BOARD_HAS_TF
+  if (!g_status.mounted) return false;
+  std::string path = logFilePath(filename);
+  File f = SD.open(path.c_str(), FILE_READ);
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    return false;
+  }
+  constexpr size_t kLineBufCap = 512;
+  char buf[kLineBufCap];
+  bool keep_going = true;
+  while (keep_going && f.available()) {
+    size_t n = f.readBytesUntil('\n', buf, kLineBufCap - 1);
+    if (n == 0) break;
+    buf[n] = '\0';
+    keep_going = each(buf, n);
+  }
+  f.close();
+  return true;
+#else
+  (void)filename;
+  (void)each;
+  return false;
+#endif
+}
+
+File openLogFile(const std::string &filename) {
+#ifdef BOARD_HAS_TF
+  if (!g_status.mounted) return File();
+  std::string path = logFilePath(filename);
+  return SD.open(path.c_str(), FILE_READ);
+#else
+  (void)filename;
+  return File();
 #endif
 }
 

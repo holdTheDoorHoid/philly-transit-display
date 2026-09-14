@@ -1,10 +1,11 @@
-// Worker task for the setup-wizard proxy endpoints (DESIGN.md SS7):
-//   GET /api/proxy/stops?route=<route>       -> SEPTA Stops/index.php, verbatim
-//   GET /api/proxy/schedule?stop_id=<id>     -> SEPTA BusSchedules/index.php, verbatim
-// Async web handlers must never block on a network round trip (that would stall every other
-// request and starve LVGL's own network task, DESIGN.md SS5), so these two routes only queue a
-// job here and return immediately; this file's own task does the actual SEPTA fetch and calls
-// request->send() itself once it has a result.
+// Background IO worker task, shared by two DESIGN.md SS7 needs that both take too long to run
+// directly on the async web server's own task:
+//   GET /api/proxy/stops?route=<route>    -> SEPTA Stops/index.php, verbatim (network)
+//   GET /api/proxy/schedule?stop_id=<id>  -> SEPTA BusSchedules/index.php, verbatim (network)
+//   GET /api/stats?stop=<key>&days=<n>    -> transit_stats::StatsAggregator over SD (disk IO)
+// All three only queue a job here and return immediately; this file's own task does the actual
+// work and calls request->send() itself once it has a result, so neither a slow SEPTA round trip
+// nor a multi-file SD scan ever blocks other requests or starves LVGL (DESIGN.md SS5).
 #pragma once
 #include <ESPAsyncWebServer.h>
 
@@ -23,5 +24,10 @@ void queueStopsProxy(AsyncWebServerRequest *request, const std::string &route);
 
 // Same contract as queueStopsProxy, for BusSchedules by `stop_id`.
 void queueScheduleProxy(AsyncWebServerRequest *request, const std::string &stop_id);
+
+// Queues a GET /api/stats job: streams the relevant monthly CSV files (transit_stats::
+// monthsInWindow over the last `days` days) through a StatsAggregator for `stop_key` and responds
+// with the DESIGN.md SS9.3 JSON shape. Same request-ownership/disconnect-guard contract as above.
+void queueStatsRequest(AsyncWebServerRequest *request, const std::string &stop_key, int days);
 
 }  // namespace transit_app
