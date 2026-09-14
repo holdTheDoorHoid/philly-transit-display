@@ -1,8 +1,12 @@
 #include "ui.h"
 
+#include <esp32_smartdisplay.h>
+
+#include <algorithm>
 #include <ctime>
 
 #include "../demo_data.h"
+#include "../net_poller.h"
 #include "device_info_screen.h"
 #include "main_screen.h"
 #include "stats_screen.h"
@@ -13,6 +17,16 @@ namespace transit_app::ui {
 namespace {
 
 enum class Page { Main, Stats, DeviceInfo };
+
+// DESIGN.md SS3: the demo Snapshot is kept for screen work with no Wi-Fi/SEPTA reachable
+// (-DDEMO_DATA, off by default - see web_server.cpp's GET /api/state, which gates the same way).
+transit::Snapshot currentSnapshot() {
+#ifdef DEMO_DATA
+  return buildDemoSnapshot((transit::Epoch)time(nullptr));
+#else
+  return getSnapshot();
+#endif
+}
 
 lv_obj_t *g_main_screen = nullptr;
 lv_obj_t *g_stats_screen = nullptr;
@@ -29,6 +43,7 @@ void onScreenTapped(lv_event_t *e) {
     case Page::Main:
       g_page = Page::Stats;
       lv_screen_load(g_stats_screen);
+      refreshStatsScreen(g_stats_screen);
       break;
     case Page::Stats:
       g_page = Page::DeviceInfo;
@@ -48,7 +63,7 @@ void init(const Config &cfg) {
   g_cfg = cfg;
 
   g_main_screen = createMainScreen(g_cfg);
-  g_stats_screen = createStatsScreen();
+  g_stats_screen = createStatsScreen(g_cfg);
   g_device_info_screen = createDeviceInfoScreen(g_cfg);
 
   lv_obj_add_event_cb(g_main_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
@@ -56,7 +71,7 @@ void init(const Config &cfg) {
   lv_obj_add_event_cb(g_device_info_screen, onScreenTapped, LV_EVENT_CLICKED, nullptr);
 
   g_page = Page::Main;
-  refreshMainScreen(g_main_screen, g_cfg, buildDemoSnapshot((transit::Epoch)time(nullptr)));
+  refreshMainScreen(g_main_screen, g_cfg, currentSnapshot());
   lv_screen_load(g_main_screen);
   g_initialized = true;
 }
@@ -107,14 +122,23 @@ void tick() {
   }
   switch (g_page) {
     case Page::Main:
-      refreshMainScreen(g_main_screen, g_cfg, buildDemoSnapshot((transit::Epoch)time(nullptr)));
+      refreshMainScreen(g_main_screen, g_cfg, currentSnapshot());
       break;
     case Page::DeviceInfo:
       refreshDeviceInfoScreen(g_device_info_screen);
       break;
     case Page::Stats:
+      // Stats are a 30-day rollup (DESIGN.md SS8); no need to re-stream the SD card at the same
+      // ~1Hz cadence as the live arrivals screen. getStopSummary() itself is cached for 60s
+      // (net_poller.cpp), so this just re-reads that cache while the page is visible.
+      refreshStatsScreen(g_stats_screen);
       break;
   }
+}
+
+void applyBrightness(uint8_t percent) {
+  percent = std::min<uint8_t>(percent, 100);
+  smartdisplay_lcd_set_backlight((float)percent / 100.0f);
 }
 
 }  // namespace transit_app::ui

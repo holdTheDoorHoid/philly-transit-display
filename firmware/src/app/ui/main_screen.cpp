@@ -1,10 +1,9 @@
-// Panel/row *structure* comes from `cfg.stops` (real config) rather than
-// from the Snapshot, so the screen looks and is laid out the way it will
-// once transit_core produces real Snapshots: the config says which stops
-// and how many rows each gets; the Snapshot (today: demo_data.h's
-// hardcoded one) supplies the numbers that fill those rows in. A configured
-// stop with no matching StopSnapshot::key in the current Snapshot renders a
-// "no data" row instead of stale or fabricated numbers.
+// Panel/row *structure* comes from `cfg.stops` (real config) rather than from the Snapshot: the
+// config says which stops and how many rows each gets; the Snapshot (net_poller's real one, or
+// demo_data.h's hardcoded one under -DDEMO_DATA - see ui.cpp's currentSnapshot()) supplies the
+// numbers that fill those rows in. A configured stop with no matching StopSnapshot::key in the
+// current Snapshot, or one whose poll failed, renders a "no data"/"poll failed" row instead of
+// stale or fabricated numbers (DESIGN.md SS8).
 #include "main_screen.h"
 
 #include <WiFi.h>
@@ -56,7 +55,14 @@ std::string panelTitle(const StopConfig &s) {
   } else {
     snprintf(buf, sizeof(buf), "%s %s %s %s %s", s.route.c_str(), LV_SYMBOL_RIGHT, s.headsign.c_str(), "\xC2\xB7" /* middle dot */, s.stop_name.c_str());
   }
-  return std::string(buf);
+  std::string title(buf);
+  // DESIGN.md SS4.6/SS8: subway has no realtime source in v1 (mergeStop() falls back to
+  // BusSchedules-only, Status::Scheduled for every row) - the panel says so up front rather than
+  // making the user infer it from every row showing "sched".
+  if (s.mode == transit::Mode::Subway) {
+    title += " \xC2\xB7 schedule only";
+  }
+  return title;
 }
 
 const StopSnapshot *findStopSnapshot(const Snapshot &snap, const std::string &key) {
@@ -241,6 +247,9 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
   bool stale = age_s > 90;  // DESIGN.md SS8: header turns amber when stale
   if (age_s < 0) {
     lv_label_set_text(ctx->updated_label, "updated --");
+  } else if (stale) {
+    // DESIGN.md SS8: "header turns amber with 'stale 4 min'".
+    lv_label_set_text_fmt(ctx->updated_label, "stale %ld min", (long)(age_s / 60));
   } else {
     lv_label_set_text_fmt(ctx->updated_label, "updated %ld s ago", (long)age_s);
   }
@@ -252,6 +261,17 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
     if (have_data) {
       lv_obj_add_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
     } else {
+      // DESIGN.md SS8: "no data: panel shows the reason" - distinguish "the whole poll failed"
+      // from "this stop just has nothing upcoming right now" rather than one generic message.
+      if (stop == nullptr) {
+        lv_label_set_text(pw.no_data_label, "no data");
+      } else if (!snap.last_poll_ok) {
+        lv_label_set_text(pw.no_data_label, snap.last_error.empty() ? "poll failed" : ("poll failed: " + snap.last_error).c_str());
+      } else if (!stop->ok) {
+        lv_label_set_text(pw.no_data_label, stop->error.empty() ? "unavailable" : stop->error.c_str());
+      } else {
+        lv_label_set_text(pw.no_data_label, "no arrivals");
+      }
       lv_obj_remove_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
     }
 
