@@ -43,7 +43,7 @@ does not respond after flashing, try the other touch variant of the same size.</
   <li>Once connected, open <code>http://transit-display.local</code> to choose your routes and stops.</li>
 </ol>
 <p class="note">Source, issues, and the design notes: <a href="https://github.com/holdTheDoorHoid/philly-transit-display">github.com/holdTheDoorHoid/philly-transit-display</a>.
-The firmware only ever talks to SEPTA and an NTP time server; there is no account and no cloud.</p>
+The firmware talks only to SEPTA, Open-Meteo (weather), Bicycle Transit Systems (Indego) and an NTP time server; there is no account and no cloud.</p>
 <script>
   const sel = document.getElementById('variant'), btn = document.getElementById('btn');
   sel.addEventListener('change', () => btn.setAttribute('manifest', `manifests/${sel.value}.json`));
