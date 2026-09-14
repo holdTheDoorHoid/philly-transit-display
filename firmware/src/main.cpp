@@ -11,6 +11,7 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <esp32_smartdisplay.h>
+#include <esp_mac.h>
 
 #include <ctime>
 
@@ -41,10 +42,13 @@ void pumpLvgl() {
 }
 
 std::string wifiApName() {
-  String mac = WiFi.macAddress();  // "AA:BB:CC:DD:EE:FF"
-  mac.replace(":", "");
-  String last4 = mac.substring(mac.length() - 4);
-  return std::string("TransitDisplay-") + last4.c_str();
+  // WiFi.macAddress() returns zeros before the Wi-Fi driver is started, so read
+  // the factory MAC from efuse directly (observed "TransitDisplay-0000" otherwise).
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "TransitDisplay-%02X%02X", mac[4], mac[5]);
+  return std::string(buf);
 }
 
 // DESIGN.md main.cpp task: "3 minute portal timeout then retry loop; show

@@ -112,6 +112,8 @@ def patch_file(path):
 
 
 DC_AS_CMD_PHASE_RE = re.compile(r"[ \t]*\.dc_as_cmd_phase\s*=\s*\w+,\n")
+DC_AS_CMD_PHASE_LOG_FMT_RE = re.compile(r"dc_as_cmd_phase:%d, ")
+DC_AS_CMD_PHASE_LOG_ARG_RE = re.compile(r"\w+\.flags\.dc_as_cmd_phase, ")
 
 
 def patch_dc_as_cmd_phase(path):
@@ -126,6 +128,12 @@ def patch_dc_as_cmd_phase(path):
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     patched, n = DC_AS_CMD_PHASE_RE.subn("", text)
+    # The same files also mention the field inside log_d() format strings and
+    # argument lists, which only get compiled at CORE_DEBUG_LEVEL >= 4 - strip
+    # those too so verbose builds work.
+    patched, n2 = DC_AS_CMD_PHASE_LOG_FMT_RE.subn("", patched)
+    patched, n3 = DC_AS_CMD_PHASE_LOG_ARG_RE.subn("", patched)
+    n += n2 + n3
     if n == 0:
         return False
     with open(path, "w", encoding="utf-8") as f:
@@ -152,6 +160,30 @@ def patch_xpt2046_internal_header(path):
     with open(path, "w", encoding="utf-8") as f:
         f.write(text.replace(old, new))
     print("patch_esp32_smartdisplay: patched %s (driver/ -> esp_private/ for spi_common_internal.h)" % path)
+    return True
+
+
+DRAW_BUF_SIZEOF_RE = re.compile(r"sizeof\(lv_color_t\) \* LVGL_BUFFER_PIXELS")
+
+
+def patch_draw_buffer_pixel_size(path):
+    """Fifth bug: every lvgl_panel_*.c sizes the LVGL draw buffer as
+    sizeof(lv_color_t) * LVGL_BUFFER_PIXELS, but in LVGL 9 lv_color_t is the
+    3-byte RGB888 struct regardless of LV_COLOR_DEPTH, while these panels
+    render RGB565 (2 bytes). On a 320x480 board with the stock
+    LVGL_BUFFER_PIXELS this asks for 115,200 bytes, which is larger than the
+    biggest free block on a PSRAM-less ESP32 running Arduino core 3.x, so
+    heap_caps_malloc() returns NULL and lv_display_set_buffers() asserts at
+    boot (observed on the owner's ESP32-3248S035R, 2026-09-14). Use the
+    2-byte lv_color16_t, which is what the flush callback actually writes."""
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    patched, n = DRAW_BUF_SIZEOF_RE.subn("sizeof(lv_color16_t) * LVGL_BUFFER_PIXELS", text)
+    if n == 0:
+        return False
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(patched)
+    print("patch_esp32_smartdisplay: patched %s (draw buffer sized with lv_color16_t)" % path)
     return True
 
 
@@ -200,6 +232,8 @@ def main():
     for name in os.listdir(src_dir):
         if name.endswith(".c"):
             patch_dc_as_cmd_phase(os.path.join(src_dir, name))
+            if name.startswith("lvgl_panel_"):
+                patch_draw_buffer_pixel_size(os.path.join(src_dir, name))
 
 
 main()

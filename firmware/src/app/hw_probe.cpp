@@ -56,6 +56,16 @@ void hwProbeEarly() {
   Serial.printf("[probe] chip=%s rev=%u cores=%u cpu=%uMHz\n", ESP.getChipModel(), (unsigned)ESP.getChipRevision(), (unsigned)ESP.getChipCores(), (unsigned)ESP.getCpuFreqMHz());
   Serial.printf("[probe] flash=%u bytes psram=%u bytes\n", (unsigned)ESP.getFlashChipSize(), (unsigned)ESP.getPsramSize());
   Serial.printf("[probe] heap free=%u largest=%u\n", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  {
+    // The LVGL draw buffer is the largest single allocation at boot; report whether the
+    // sizes the board definition implies would even fit (DESIGN.md SS5 memory rules).
+    const size_t sizes[] = {115200, 76800, 30720};
+    for (size_t n : sizes) {
+      void *p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      Serial.printf("[probe] heap_caps_malloc(%u, INTERNAL|8BIT) -> %s\n", (unsigned)n, p ? "ok" : "NULL");
+      free(p);
+    }
+  }
   Serial.printf("[probe] mac=%02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
   // A GT911 only answers after its reset line is released; INT low during
