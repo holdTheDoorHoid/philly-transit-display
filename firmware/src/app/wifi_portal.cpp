@@ -199,9 +199,11 @@ void startPortal(const std::string &ap_name) {
 void connectWifiOrPortal(const std::string &ap_name, const std::function<void()> &pump) {
   setStatusLed(LedState::Connecting);
   WiFi.mode(WIFI_STA);
-  WiFi.begin();  // reconnect with whatever the ESP-IDF Wi-Fi driver has persisted in NVS, if any
-
-  uint32_t deadline = millis() + kStoredCredsTimeoutMs;
+  // Reconnect with whatever the ESP-IDF Wi-Fi driver has persisted in NVS, if any. With no
+  // stored SSID the core fails immediately (ESP_ERR_WIFI_SSID, WL_CONNECT_FAILED), so do not
+  // sit through the timeout in that case.
+  wl_status_t began = WiFi.begin();
+  uint32_t deadline = millis() + (began == WL_CONNECT_FAILED ? 0 : kStoredCredsTimeoutMs);
   while (WiFi.status() != WL_CONNECTED && (int32_t)(millis() - deadline) < 0) {
     pump();
     delay(kPumpIntervalMs);
