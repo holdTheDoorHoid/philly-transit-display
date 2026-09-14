@@ -24,4 +24,9 @@ void showWifiSetupScreen(const std::string &ap_name);
 // init() has run.
 void tick();
 
+// Applies `percent` (0-100, config.device.brightness) to the panel backlight via
+// esp32_smartdisplay's smartdisplay_lcd_set_backlight(). Call once at boot (after init()) and
+// again whenever PUT /api/config changes device.brightness (DESIGN.md task 8).
+void applyBrightness(uint8_t percent);
+
 }  // namespace transit_app::ui

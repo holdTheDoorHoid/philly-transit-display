@@ -82,7 +82,7 @@ scan();
 )HTML";
 
 void sendPortalPage(AsyncWebServerRequest *request) {
-  request->send_P(200, "text/html", kPortalHtml);
+  request->send(200, "text/html", kPortalHtml);
 }
 
 void handleScan(AsyncWebServerRequest *request) {

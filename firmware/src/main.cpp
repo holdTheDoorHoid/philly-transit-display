@@ -86,7 +86,10 @@ void setup() {
     log_e("main: mDNS.begin() failed");
   }
 
-  transit_app::startWebServer(transit_app::requestRepoll);
+  transit_app::startWebServer([]() {
+    transit_app::requestRepoll();
+    transit_app::ui::applyBrightness(transit_app::getActiveConfig().device.brightness);
+  });
 
   transit_app::SdStatus sd = transit_app::mountSd();
   if (sd.mounted) {
@@ -100,6 +103,7 @@ void setup() {
   transit_app::setStatusLed(LedState::Off);
 
   transit_app::ui::init(cfg);
+  transit_app::ui::applyBrightness(cfg.device.brightness);
   transit_app::startNetPoller(cfg.device.poll_seconds);
 
   log_i("main: setup complete, free heap %u bytes", (unsigned)ESP.getFreeHeap());
