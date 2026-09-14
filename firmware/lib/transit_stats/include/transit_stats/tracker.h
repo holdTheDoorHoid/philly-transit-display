@@ -16,7 +16,7 @@ namespace transit_stats {
 
 // Hard caps, per DESIGN's "never load a month into memory" / bounded-heap requirement.
 constexpr size_t kMaxTrackedStops = 8;          // matches config.json's 8-stop maximum (§6)
-constexpr size_t kMaxTrackedTripsPerStop = 12;  // live trips + pending scheduled trips, combined (16 cost ~4 KB more RAM)
+constexpr size_t kMaxTrackedTripsPerStop = 8;  // live trips + pending scheduled trips, combined (16 cost ~4 KB more RAM)
 
 // Kind of thing a tracked-trip slot holds.
 enum class TrackedKind : uint8_t { LiveTrip, ScheduledPending };

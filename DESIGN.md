@@ -483,6 +483,15 @@ SEPTA is fetched over plain HTTP by default for memory reasons (see section 2); 
 verification is a settings toggle. OTA accepts any image on the LAN in v1; a settings PIN is a documented
 follow-up. No telemetry. Wi-Fi credentials live only in the ESP32 NVS.
 
+### 12.1 Memory posture (2026-09-14)
+The classic ESP32 has ~320 KB of DRAM and no PSRAM; with LVGL, Wi-Fi, the async web server and the
+feature set of §6 there is ~75-80 KB of heap free at runtime. Big long-lived objects are allocated
+before Wi-Fi, every large allocation is `nothrow`, proxied bodies stream through LittleFS, and
+`/api/state` answers 503 instead of a truncated document when it cannot be built. Known limit: four
+simultaneous `/api/state` requests can leave the last one as an empty HTTP 200 (the network stack's
+send buffer, not the handler); the device stays up. Scripted clients should treat an empty 200 as a
+retry. See `firmware/README.md` "Memory and flash budget" for the numbers and the knobs.
+
 ## 13. Milestones
 
 - **M0** Repo, design, skeleton, CI that builds every env and runs host tests.

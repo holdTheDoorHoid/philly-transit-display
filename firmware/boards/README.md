@@ -91,3 +91,10 @@ The 240-tall boards (`esp32-2432S028R`, `esp32-2432S028Rv3`, `esp32-2432S024R`,
 `esp32-2432S024C`) pass `-D LV_FONT_MONTSERRAT_20=1` because `ui_common.cpp`'s `fontBig()` uses
 size 20 for the big minutes on panels under 320 px tall. `lv_conf.h` defaults it to 0, which
 keeps ~22 KB of glyph bitmaps out of the 3.5" build (firmware/README.md "Memory and flash budget").
+
+## `LVGL_BUFFER_PIXELS` on the 3.5" boards
+
+`esp32-3248S035R.json` and `esp32-3248S035C.json` size the draw buffer at 1/20 of the screen
+(7,680 px, 15 KB) rather than the 1/16 used earlier; the 4 KB went back to the heap when the
+2026-09-14 features shrank it (firmware/README.md). Rendering a full screen takes a few more
+flushes; not visible in practice.

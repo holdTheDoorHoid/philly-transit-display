@@ -32,7 +32,7 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 
 | Build | Flash | Static RAM |
 |---|---:|---:|
-| Everything incl. weather, Indego, profiles, night page, 48 px font (current) | 1,857,930 B (97.8 %) | 99,380 B (30.3 %) |
+| Everything incl. weather, Indego, profiles, night page, 48 px font (current) | 1,858,446 B (97.8 %) | 95,300 B (29.1 %) |
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
 
@@ -50,9 +50,20 @@ the interview features did:
 - No `sscanf` anywhere (transit_core, weather_core parse by hand): drops newlib's float scanf.
   ~9 KB.
 - The big-digits font is a 21-glyph subset (`src/fonts/README.md`), ~13 KB instead of ~60.
-`LV_MEM_SIZE` is 40 KB (was 32; the night page, bike strip and crowding labels took the pool to
-93 %), which is static RAM the heap no longer gets: expect ~65-80 KB free heap and a ~26-45 KB
-largest block at runtime now.
+`LV_MEM_SIZE` is 36 KB (was 32; the night page, bike strip and crowding labels took the pool to
+93 %, it is ~82 % used at boot now with ~6 KB spare for text changes). Static RAM the heap no
+longer gets, so three other things were shrunk the same day to keep ~75-80 KB of heap free at
+runtime with a 40+ KB largest block: the arrival tracker keeps 8 trips per stop instead of 12
+(`transit_stats/tracker.h`, ~5 KB), the 3.5" draw buffer is 1/20 of the screen instead of 1/16
+(board JSON, ~4 KB), and the UI caches the visible-stop list per build instead of copying the
+stop vector several times a second.
+
+Concurrency limit: the async web server handles one request at a time but queues the responses,
+and with this little heap the fourth of four *simultaneous* `/api/state` requests can go out as
+an HTTP 200 with an empty body (AsyncTCP's send buffer allocation fails; the device stays up -
+measured 2026-09-14 with three rounds of seven concurrent requests, no reboot). The web UI issues
+one state request at a time, so this only matters for scripted clients: treat an empty 200 as a
+retry.
 
 Gotcha: PlatformIO does not recompile the LVGL library when only `include/lv_conf.h` changes,
 so a config edit can look like it had no effect. Run `pio run -t clean` (or delete

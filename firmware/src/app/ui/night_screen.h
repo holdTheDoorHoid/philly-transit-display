@@ -4,6 +4,9 @@
 #pragma once
 #include <lvgl.h>
 
+#include <string>
+#include <vector>
+
 #include "../config_store.h"
 #include "transit_core/model.h"
 
@@ -15,6 +18,7 @@ void refreshNightScreen(lv_obj_t *screen, const Config &cfg, const transit::Snap
 // True when the night page should be up: every stop the main page shows (profiles.h) has data
 // and none of them has an arrival within after_min. A stop with no data at all keeps the
 // arrivals page (its "no data"/"poll failed" reason is the more useful thing to show).
-bool nightConditionMet(const Config &cfg, const transit::Snapshot &snap, transit::Epoch now);
+bool nightConditionMet(const Config &cfg, const transit::Snapshot &snap, const std::vector<std::string> &shown_keys,
+                       transit::Epoch now);
 
 }  // namespace transit_app::ui

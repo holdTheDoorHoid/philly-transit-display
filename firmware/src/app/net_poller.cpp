@@ -428,7 +428,8 @@ void logHeapHeartbeat() {
   // heap health stays visible over serial regardless of debug verbosity.
   size_t free_heap = ESP.getFreeHeap();
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  Serial.printf("[net_poller] free_heap=%u largest_block=%u\n", (unsigned)free_heap, (unsigned)largest);
+  Serial.printf("[net_poller] free_heap=%u largest_block=%u stack_free=%u\n", (unsigned)free_heap, (unsigned)largest,
+                (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
 
 void pollOnce() {

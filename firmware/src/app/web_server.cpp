@@ -156,8 +156,15 @@ void serializeSnapshot(const Snapshot &snap, JsonObject out) {
 }
 
 void sendJson(AsyncWebServerRequest *request, int code, JsonDocument &doc) {
+  // Under memory pressure (several concurrent requests on a ~65 KB heap) ArduinoJson silently
+  // truncates the document and String silently stays empty; both used to go out as an empty
+  // HTTP 200. A 503 lets the web UI keep the last good state and try again on its next poll.
   String body;
-  serializeJson(doc, body);
+  bool ok = !doc.overflowed() && serializeJson(doc, body) > 0 && body.length() > 0;
+  if (!ok) {
+    request->send(503, "application/json", "{\"error\":\"out of memory building the response, retry\"}");
+    return;
+  }
   request->send(code, "application/json", body);
 }
 

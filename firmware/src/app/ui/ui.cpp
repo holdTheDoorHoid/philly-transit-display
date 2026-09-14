@@ -50,6 +50,7 @@ bool g_dimmed = false;            // quiet hours have the backlight down
 uint32_t g_wake_until_ms = 0;     // touch during quiet hours: normal brightness until then
 bool g_swallow_click = false;     // the press that woke the screen must not change page
 int g_applied_brightness = -1;
+std::vector<std::string> g_shown_keys;  // stops the arrivals page shows (profiles.h), per build
 
 // Config handed over from another task (web server); applied on the LVGL task in tick().
 SemaphoreHandle_t g_pending_mutex = nullptr;
@@ -70,6 +71,8 @@ lv_display_rotation_t rotationEnum(uint16_t degrees) {
 
 void buildScreens() {
   g_active_profile = activeProfileIndex(g_cfg, time(nullptr));
+  g_shown_keys.clear();
+  for (const transit::StopConfig &s : visibleStops(g_cfg, time(nullptr))) g_shown_keys.push_back(s.key);
   g_main_screen = createMainScreen(g_cfg);
   g_night_screen = createNightScreen(g_cfg);
   g_stats_screen = createStatsScreen(g_cfg);
@@ -80,16 +83,9 @@ void buildScreens() {
   }
 }
 
-// The keys of the stops the arrivals page currently shows (profiles.h), for the due alert.
-std::vector<std::string> shownStopKeys() {
-  std::vector<std::string> keys;
-  for (const transit::StopConfig &s : visibleStops(g_cfg, time(nullptr))) keys.push_back(s.key);
-  return keys;
-}
-
 // Loads the arrivals page or the night clock, whichever the data calls for (Page::Main only).
 void showMainOrNight(const transit::Snapshot &snap) {
-  bool night = nightConditionMet(g_cfg, snap, (transit::Epoch)time(nullptr));
+  bool night = nightConditionMet(g_cfg, snap, g_shown_keys, (transit::Epoch)time(nullptr));
   lv_obj_t *want = night ? g_night_screen : g_main_screen;
   if (lv_screen_active() != want) lv_screen_load(want);
   g_night = night;
@@ -263,7 +259,7 @@ void tick() {
 
   bool dimmed = applyQuietHours();
   transit::Snapshot snap = currentSnapshot();
-  dueAlertTick(g_cfg, snap, shownStopKeys(), dimmed, (transit::Epoch)time(nullptr));
+  dueAlertTick(g_cfg, snap, g_shown_keys, dimmed, (transit::Epoch)time(nullptr));
 
   switch (g_page) {
     case Page::Main:

@@ -34,14 +34,20 @@ const transit::StopSnapshot *findStop(const transit::Snapshot &snap, const std::
 
 }  // namespace
 
-bool nightConditionMet(const Config &cfg, const transit::Snapshot &snap, transit::Epoch now) {
-  if (!cfg.device.night.enabled || snap.generated == 0) return false;
-  std::vector<transit::StopConfig> shown = visibleStops(cfg, (time_t)now);
-  if (shown.empty()) return false;
+bool nightConditionMet(const Config &cfg, const transit::Snapshot &snap, const std::vector<std::string> &shown_keys,
+                       transit::Epoch now) {
+  if (!cfg.device.night.enabled || snap.generated == 0 || shown_keys.empty()) return false;
   transit::Epoch horizon = (transit::Epoch)cfg.device.night.after_min * 60;
-  for (const transit::StopConfig &s : shown) {
-    if (!s.alt_of.empty()) continue;  // alternatives don't keep the lights on
-    const transit::StopSnapshot *st = findStop(snap, s.key);
+  for (const std::string &key : shown_keys) {
+    const transit::StopConfig *sc = nullptr;
+    for (const transit::StopConfig &s : cfg.stops) {
+      if (s.key == key) {
+        sc = &s;
+        break;
+      }
+    }
+    if (sc == nullptr || !sc->alt_of.empty()) continue;  // alternatives don't keep the lights on
+    const transit::StopSnapshot *st = findStop(snap, key);
     if (st == nullptr || !st->ok) return false;
     for (const transit::Arrival &a : st->arrivals) {
       transit::Epoch eff = a.effective();
