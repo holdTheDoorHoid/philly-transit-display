@@ -13,12 +13,25 @@ namespace transit_app::ui {
 // smartdisplay_init()/lv_display_set_rotation() have run.
 void init(const Config &cfg);
 
-// Full-screen "connect to <ap_name> to set up Wi-Fi" message, shown while
-// WiFiManager's captive portal is open. May be called before init() (it
-// creates and loads its own throwaway screen) - main.cpp wires this to
-// WiFiManager::setAPCallback(), which only fires if there's no saved
-// network to reconnect to.
-void showWifiSetupScreen(const std::string &ap_name);
+// Full-screen "join this network, then open http://192.168.4.1" message, shown while the setup
+// portal is open (wifi_portal.cpp). Carries the AP's name, its WPA2 password in the big font, and
+// a QR code of the standard `WIFI:` URI so a phone can join by pointing its camera at the panel
+// instead of typing ten characters (DESIGN.md SS12, review F02/F10). May be called before init():
+// it creates and loads its own screen.
+void showWifiSetupScreen(const std::string &ap_name, const std::string &password);
+
+// Full-screen "Connecting to <ssid>..." message with the line "Tap the screen to open Wi-Fi setup
+// instead", shown while wifi_portal.cpp retries a *provisioned* device's stored network (review
+// F10: a router reboot must not put the owner's home credentials back on the air in an open
+// setup AP). Also creates and loads its own screen, and attaches the tap handler consumeTap()
+// reads. Safe to call repeatedly - later calls only update the text.
+void showConnectingScreen(const std::string &ssid, const std::string &detail);
+
+// Reads and clears the "the screen was tapped" flag. For callers that run before init(), where
+// tick() is not pumping yet - wifi_portal.cpp's retry loop uses it to decide whether the owner
+// asked for the setup portal. Both a real touch on the connecting screen and POST /api/debug/tap
+// set the flag.
+bool consumeTap();
 
 // Refreshes the currently visible screen (clock, Wi-Fi bars, "updated Ns
 // ago", the demo Snapshot's arrivals, device info fields). Call this

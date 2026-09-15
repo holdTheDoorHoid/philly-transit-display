@@ -140,7 +140,12 @@
 #define LV_DRAW_SW_SUPPORT_XRGB8888 0
 #define LV_DRAW_SW_SUPPORT_L8       0
 #define LV_DRAW_SW_SUPPORT_AL88     0
-#define LV_DRAW_SW_SUPPORT_I1       0
+/* I1 (1 bit per pixel, palettised) is on for ONE reason: lv_qrcode draws into an I1 canvas, and
+ * the Wi-Fi setup screen shows a QR code of the setup AP's credentials (DESIGN.md SS12, review
+ * F02). Without this the QR object exists but nothing is blended onto the RGB565 draw buffer -
+ * a blank square, no warning. Costs the I1->RGB565 blend routine in flash; measured in
+ * firmware/README.md's flash table. */
+#define LV_DRAW_SW_SUPPORT_I1       1
 #if LV_USE_DRAW_SW == 1
     /* Set the number of draw unit.
      * > 1 requires an operating system enabled in `LV_USE_OS`
@@ -552,7 +557,8 @@
     #define LV_USE_CALENDAR_HEADER_DROPDOWN 1
 #endif  /*LV_USE_CALENDAR*/
 
-#define LV_USE_CANVAS     0
+/*The QR code widget is an lv_canvas subclass (lv_qrcode.c); nothing else in this UI uses one.*/
+#define LV_USE_CANVAS     1
 
 #define LV_USE_CHART      0
 
@@ -735,8 +741,9 @@
 /*RLE decompress library*/
 #define LV_USE_RLE 0
 
-/*QR code library*/
-#define LV_USE_QRCODE 0
+/*QR code library: the Wi-Fi setup screen's "point your camera here to join" code (ui.cpp,
+ *DESIGN.md SS12 / review F02). Requires LV_USE_CANVAS and LV_DRAW_SW_SUPPORT_I1 above.*/
+#define LV_USE_QRCODE 1
 
 /*Barcode code library*/
 #define LV_USE_BARCODE 0

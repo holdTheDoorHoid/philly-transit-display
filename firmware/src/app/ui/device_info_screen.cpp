@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 
+#include "../auth.h"
 #include "../sd_logger.h"
 #include "ui_common.h"
 
@@ -21,6 +22,7 @@ struct DeviceInfoCtx {
   lv_obj_t *mdns_label;
   lv_obj_t *ssid_label;
   lv_obj_t *rssi_label;
+  lv_obj_t *pin_label;
   lv_obj_t *sd_label;
   lv_obj_t *heap_label;
   lv_obj_t *reset_label;
@@ -86,6 +88,12 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
   ctx->mdns_label = addRow(screen, fontSmall(h));
   ctx->ssid_label = addRow(screen, fontSmall(h));
   ctx->rssi_label = addRow(screen, fontSmall(h));
+  // One of the two ways the owner learns the admin PIN (auth.h); the other is the serial console
+  // at boot. Both need physical possession of the display, which is the point: there is no
+  // network path to it. Printed here rather than hidden behind a gesture because someone who can
+  // read this screen can already unplug the device, press-and-hold to wipe its Wi-Fi, or walk off
+  // with it - the PIN is not what is protecting it from them.
+  ctx->pin_label = addRow(screen, fontSmall(h));
   ctx->sd_label = addRow(screen, fontSmall(h));
   ctx->heap_label = addRow(screen, fontSmall(h));
 
@@ -125,6 +133,7 @@ void refreshDeviceInfoScreen(lv_obj_t *screen) {
   lv_label_set_text_fmt(ctx->mdns_label, "mDNS: http://%s/", ctx->mdns_host.c_str());
   lv_label_set_text_fmt(ctx->ssid_label, "SSID: %s", connected ? WiFi.SSID().c_str() : "(none)");
   lv_label_set_text_fmt(ctx->rssi_label, "RSSI: %d dBm", connected ? WiFi.RSSI() : 0);
+  lv_label_set_text_fmt(ctx->pin_label, "Web PIN: %s", auth::pin().c_str());
 
   SdStatus sd = getSdStatus();
   if (sd.mounted) {

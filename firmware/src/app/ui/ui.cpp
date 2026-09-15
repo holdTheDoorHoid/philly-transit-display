@@ -42,6 +42,11 @@ lv_obj_t *g_stats_screen = nullptr;
 lv_obj_t *g_device_info_screen = nullptr;
 lv_obj_t *g_wifi_setup_screen = nullptr;
 lv_obj_t *g_wifi_setup_ssid_label = nullptr;
+lv_obj_t *g_wifi_setup_pass_label = nullptr;
+lv_obj_t *g_wifi_setup_qr = nullptr;
+lv_obj_t *g_connecting_screen = nullptr;       // "Connecting to <ssid>..." while retrying stored creds
+lv_obj_t *g_connecting_ssid_label = nullptr;
+lv_obj_t *g_connecting_detail_label = nullptr;
 Config g_cfg;
 Page g_page = Page::Main;
 bool g_initialized = false;
@@ -189,45 +194,118 @@ void init(const Config &cfg) {
   g_initialized = true;
 }
 
-void showWifiSetupScreen(const std::string &ap_name) {
-  // DESIGN.md main.cpp task: "3 minute portal timeout then retry loop" -
-  // this can be called more than once per boot, so the screen is built
-  // once and reused (only the SSID label text is updated on repeat calls)
-  // rather than leaking a new lv_obj_t tree on every retry.
+namespace {
+
+// A full-screen, centred column used by both pre-init screens below. Not shared with the three
+// real screens on purpose: those are rebuilt on every config change, these two exist only before
+// ui::init() has run and are never rebuilt.
+lv_obj_t *makeMessageScreen(int32_t w, int32_t h) {
+  lv_obj_t *screen = lv_obj_create(nullptr);
+  lv_obj_set_size(screen, w, h);
+  lv_obj_set_style_bg_color(screen, colorBg(), 0);
+  lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+  lv_obj_set_style_pad_all(screen, 10, 0);
+  lv_obj_set_style_border_width(screen, 0, 0);
+  lv_obj_set_style_pad_row(screen, 6, 0);
+  lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(screen, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+  return screen;
+}
+
+lv_obj_t *makeCentredLabel(lv_obj_t *parent, const lv_font_t *font, lv_color_t color) {
+  lv_obj_t *l = lv_label_create(parent);
+  lv_obj_set_style_text_font(l, font, 0);
+  lv_obj_set_style_text_color(l, color, 0);
+  lv_obj_set_width(l, lv_pct(96));
+  lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+  return l;
+}
+
+}  // namespace
+
+void showWifiSetupScreen(const std::string &ap_name, const std::string &password) {
+  // Built once and reused (only the text is updated on repeat calls) rather than leaking an
+  // lv_obj_t tree - and, more to the point here, a second QR canvas out of LVGL's 36 KB pool.
   if (g_wifi_setup_screen == nullptr) {
     int32_t w, h;
     screenSize(w, h);
 
-    lv_obj_t *screen = lv_obj_create(nullptr);
-    lv_obj_set_size(screen, w, h);
-    lv_obj_set_style_bg_color(screen, colorBg(), 0);
-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_all(screen, 16, 0);
-    lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(screen, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *screen = makeMessageScreen(w, h);
 
-    lv_obj_t *title = lv_label_create(screen);
-    lv_obj_set_style_text_font(title, fontBody(h), 0);
-    lv_obj_set_style_text_color(title, colorText(), 0);
+    lv_obj_t *title = makeCentredLabel(screen, fontBody(h), colorText());
     lv_label_set_text(title, "Wi-Fi setup");
 
-    g_wifi_setup_ssid_label = lv_label_create(screen);
-    lv_obj_set_style_text_font(g_wifi_setup_ssid_label, fontBig(h), 0);
-    lv_obj_set_style_text_color(g_wifi_setup_ssid_label, colorEarly(), 0);
+    g_wifi_setup_ssid_label = makeCentredLabel(screen, fontBody(h), colorEarly());
 
-    lv_obj_t *hint = lv_label_create(screen);
-    lv_obj_set_style_text_font(hint, fontSmall(h), 0);
-    lv_obj_set_style_text_color(hint, colorSubtext(), 0);
-    lv_obj_set_width(hint, lv_pct(90));
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(hint, "Connect a phone or laptop to this Wi-Fi network, then open http://192.168.4.1 to set up your home Wi-Fi.");
+    lv_obj_t *pass_caption = makeCentredLabel(screen, fontSmall(h), colorSubtext());
+    lv_label_set_text(pass_caption, "password");
+
+    g_wifi_setup_pass_label = makeCentredLabel(screen, fontBig(h), colorText());
+
+    // The QR carries the standard `WIFI:` join URI, which every current phone camera understands,
+    // so the ten-character password never has to be typed (review F02/F10: the password only
+    // exists because an open setup AP broadcasts the owner's home credentials in the clear, and a
+    // password nobody can type would just get replaced by a worse one).
+    //
+    // Sized off the panel: a third of the shorter edge leaves room for the text above it on the
+    // 240-tall boards and still gives ~3 px per QR module. LVGL allocates the canvas as a 1-bit
+    // draw buffer from its own pool (~2.5 KB at this size) - affordable only because this screen
+    // exists before ui::init() has built the three real ones, and the device reboots out of the
+    // portal either way.
+    int32_t qr_size = (w < h ? w : h) / 3;
+    if (qr_size > 150) qr_size = 150;
+    g_wifi_setup_qr = lv_qrcode_create(screen);
+    lv_qrcode_set_size(g_wifi_setup_qr, qr_size);
+    // Fixed black-on-white, not the theme colours: a QR reader needs the dark modules dark and a
+    // light quiet zone around them, which an inverted dark palette would not give it.
+    lv_qrcode_set_dark_color(g_wifi_setup_qr, lv_color_black());
+    lv_qrcode_set_light_color(g_wifi_setup_qr, lv_color_white());
+    lv_qrcode_set_quiet_zone(g_wifi_setup_qr, true);
+
+    lv_obj_t *hint = makeCentredLabel(screen, fontSmall(h), colorSubtext());
+    lv_label_set_text(hint, "Join this network, then open http://192.168.4.1 to set up your home Wi-Fi.");
 
     g_wifi_setup_screen = screen;
   }
 
   lv_label_set_text(g_wifi_setup_ssid_label, ap_name.c_str());
+  lv_label_set_text(g_wifi_setup_pass_label, password.c_str());
+  if (g_wifi_setup_qr != nullptr) {
+    // WIFI:T:WPA;S:<ssid>;P:<pass>;; - the de-facto standard both Android and iOS cameras read.
+    // No escaping pass here: the SSID is "TransitDisplay-XXXX" and the password comes from
+    // auth.cpp's alphanumeric alphabet, so neither can contain the \ ; , : " that the format
+    // would need escaped. If either ever becomes user-supplied, escape them first.
+    std::string payload = "WIFI:T:WPA;S:" + ap_name + ";P:" + password + ";;";
+    lv_qrcode_update(g_wifi_setup_qr, payload.c_str(), (uint32_t)payload.size());
+  }
   lv_screen_load(g_wifi_setup_screen);
+}
+
+void showConnectingScreen(const std::string &ssid, const std::string &detail) {
+  if (g_connecting_screen == nullptr) {
+    int32_t w, h;
+    screenSize(w, h);
+
+    lv_obj_t *screen = makeMessageScreen(w, h);
+    // The whole screen is the tap target: this is the only way into the setup portal on a device
+    // that already has credentials (review F10), and the owner should not have to find a button.
+    lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(screen, [](lv_event_t *) { g_tap_requested = true; }, LV_EVENT_CLICKED, nullptr);
+
+    g_connecting_ssid_label = makeCentredLabel(screen, fontBody(h), colorText());
+    g_connecting_detail_label = makeCentredLabel(screen, fontSmall(h), colorSubtext());
+
+    lv_obj_t *hint = makeCentredLabel(screen, fontSmall(h), colorEarly());
+    lv_label_set_text(hint, "Tap the screen to open Wi-Fi setup instead");
+
+    g_connecting_screen = screen;
+  }
+
+  lv_label_set_text_fmt(g_connecting_ssid_label, "Connecting to %s...", ssid.c_str());
+  lv_label_set_text(g_connecting_detail_label, detail.c_str());
+  if (lv_screen_active() != g_connecting_screen) lv_screen_load(g_connecting_screen);
 }
 
 void tick() {
@@ -323,6 +401,12 @@ UiDebug debugSnapshot() {
 
 void requestTap() {
   g_tap_requested = true;
+}
+
+bool consumeTap() {
+  if (!g_tap_requested) return false;
+  g_tap_requested = false;
+  return true;
 }
 
 void applyBrightness(uint8_t percent) {
