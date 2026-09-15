@@ -5,7 +5,11 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#include <cctype>
+#include <cmath>
 #include <set>
+
+#include "transit_core/septa.h"
 
 using transit::Mode;
 using transit::StopConfig;
@@ -69,6 +73,167 @@ const StopConfig *findStopByKey(const std::vector<StopConfig> &stops, const std:
     if (s.key == key) return &s;
   }
   return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Bounded, type-checked ingestion (DESIGN.md SS6; review F07)
+// ---------------------------------------------------------------------------
+//
+// WHY these helpers exist: the old reader used ArduinoJson's `doc["x"] | default` idiom straight
+// into the destination field, which narrows silently. `brightness: 256` became 0 in a uint8_t and
+// `poll_seconds: 65566` became 30 in a uint16_t - both then passed validateConfig() and were
+// saved, so a PUT that should have been a 400 quietly wrote a config the owner did not ask for.
+// Every number is now read as int64/double, range-checked against the range the destination type
+// and DESIGN.md SS6 allow, and only then narrowed; every string is length-checked and rejected for
+// control characters while it is still a JsonVariant, before it is copied anywhere.
+//
+// Booleans keep the `|` idiom on purpose: a wrong-typed boolean falls back to the documented
+// default, which cannot wrap, truncate or grow a buffer.
+
+constexpr size_t kMaxNameLen = 32;        // also the mDNS label limit in practice
+constexpr size_t kMaxTzLen = 64;          // POSIX TZ strings are far shorter than this
+constexpr size_t kMaxStopFieldLen = 64;   // key/route/stop_id/direction/headsign/label/stop_name/station/title_text/alt_of
+constexpr size_t kMaxProfileNameLen = 32;
+constexpr size_t kMaxBikeNameLen = 48;
+constexpr size_t kMaxEnumLen = 32;        // theme, ticker_show, crowding, units, style ... validated by value later
+constexpr size_t kMaxClockLen = 8;        // "HH:MM"
+constexpr size_t kMaxDaysEntries = 7;
+
+bool hasControlChars(const std::string &s) {
+  for (char c : s) {
+    unsigned char u = (unsigned char)c;
+    if (u < 0x20 || u == 0x7F) return true;
+  }
+  return false;
+}
+
+// One JSON value -> one bounded std::string. Shared by readStr() (object fields) and the bare
+// string arrays (a profile's stop keys).
+bool checkStr(JsonVariantConst v, size_t max_len, const std::string &path, std::string &out, ConfigError &err) {
+  if (!v.is<const char *>()) {
+    err = {path + " must be a string", path};
+    return false;
+  }
+  const char *s = v.as<const char *>();
+  out.assign(s != nullptr ? s : "");
+  if (out.size() > max_len) {
+    err = {path + " must be at most " + std::to_string(max_len) + " characters", path};
+    return false;
+  }
+  if (hasControlChars(out)) {
+    // A newline or NUL in a label would break the CSV log, the JSON echo and the LVGL label all
+    // at once; there is no legitimate config value that contains one.
+    err = {path + " must not contain control characters", path};
+    return false;
+  }
+  return true;
+}
+
+bool readStr(JsonVariantConst parent, const char *key, size_t max_len, const char *def, const std::string &path, std::string &out,
+             ConfigError &err) {
+  JsonVariantConst v = parent[key];
+  if (v.isNull()) {
+    out = def;
+    return true;
+  }
+  return checkStr(v, max_len, path, out, err);
+}
+
+bool readInt(JsonVariantConst parent, const char *key, int64_t lo, int64_t hi, int64_t def, const std::string &path, int64_t &out,
+             ConfigError &err) {
+  JsonVariantConst v = parent[key];
+  if (v.isNull()) {
+    out = def;
+    return true;
+  }
+  if (!v.is<int64_t>()) {
+    err = {path + " must be a whole number", path};
+    return false;
+  }
+  out = v.as<int64_t>();
+  if (out < lo || out > hi) {
+    err = {path + " must be between " + std::to_string(lo) + " and " + std::to_string(hi), path};
+    return false;
+  }
+  return true;
+}
+
+bool readNum(JsonVariantConst parent, const char *key, double lo, double hi, double def, const std::string &path, double &out,
+             ConfigError &err) {
+  JsonVariantConst v = parent[key];
+  if (v.isNull()) {
+    out = def;
+    return true;
+  }
+  if (!v.is<double>()) {
+    err = {path + " must be a number", path};
+    return false;
+  }
+  out = v.as<double>();
+  if (!std::isfinite(out)) {
+    // "1e400" parses to infinity rather than failing; an infinite latitude then poisons every
+    // distance/weather calculation downstream (DESIGN.md SS4.8).
+    err = {path + " must be a finite number", path};
+    return false;
+  }
+  if (out < lo || out > hi) {
+    err = {path + " must be between " + std::to_string((int)lo) + " and " + std::to_string((int)hi), path};
+    return false;
+  }
+  return true;
+}
+
+// The device name becomes "<name>.local", the mDNS service instance and the DHCP hostname, where
+// anything outside [a-z0-9-] is either refused by the resolver or silently mangled. DNS is
+// case-insensitive, so an upper-case name is lowered here (the "slugify" step) rather than
+// refused; a character with no slug is refused, because guessing what the owner meant by
+// "Mike's Display" would produce a name they cannot predict or type.
+bool slugifyDeviceName(std::string &name, ConfigError &err) {
+  for (char &c : name) c = (char)tolower((unsigned char)c);
+  if (name.empty()) return true;  // validateConfig() owns the "must not be empty" message
+  for (char c : name) {
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') continue;
+    err = {"device.name may only contain letters, digits and '-' (it is used as the mDNS hostname)", "device.name"};
+    return false;
+  }
+  if (name.front() == '-' || name.back() == '-') {
+    err = {"device.name must not start or end with '-'", "device.name"};
+    return false;
+  }
+  return true;
+}
+
+bool equalsIgnoreCase(const std::string &a, const char *b) {
+  size_t i = 0;
+  for (; i < a.size(); ++i) {
+    if (b[i] == '\0') return false;
+    if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+  }
+  return b[i] == '\0';
+}
+
+// A Regional Rail stop's line may arrive as the code ("PAO") or as the display name that the
+// SEPTA Arrivals/TrainView responses and the web UI's own picker use ("Paoli/Thorndale") - review
+// F30. Only the code matches anything downstream (transit_core/septa.h's mergeRail() and the
+// alert suffix), so a display name used to be stored verbatim and then silently matched no
+// trains at all. Normalise to the code here, once, at the only place configs enter the system.
+// An empty line stays empty: DESIGN.md SS6 documents that as "all lines at this station".
+bool normalizeRailLine(std::string &line, const std::string &path, ConfigError &err) {
+  if (line.empty()) return true;
+  for (size_t i = 0; i < transit::kRailLineCount; ++i) {
+    if (equalsIgnoreCase(line, transit::kRailLines[i].code)) {
+      line = transit::kRailLines[i].code;  // canonical upper case
+      return true;
+    }
+  }
+  for (size_t i = 0; i < transit::kRailLineCount; ++i) {
+    if (equalsIgnoreCase(line, transit::kRailLines[i].display_name)) {
+      line = transit::kRailLines[i].code;
+      return true;
+    }
+  }
+  err = {"unknown Regional Rail line; use a line code such as PAO", path};
+  return false;
 }
 
 }  // namespace
@@ -375,19 +540,29 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
 
 bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   Config result;
-  result.version = doc["version"] | 1;
+  int64_t n = 0;
+  double d = 0;
+
+  if (!readInt(doc, "version", 0, 1000, 1, "version", n, err)) return false;
+  result.version = (int)n;
 
   JsonVariantConst device = doc["device"];
-  result.device.name = std::string(device["name"] | "transit-display");
-  result.device.tz = std::string(device["tz"] | "EST5EDT,M3.2.0,M11.1.0");
-  result.device.poll_seconds = device["poll_seconds"] | 30;
-  result.device.brightness = device["brightness"] | 80;
-  result.device.rotation = device["rotation"] | 0;
-  result.device.theme = std::string(device["theme"] | "light");
+  if (!readStr(device, "name", kMaxNameLen, "transit-display", "device.name", result.device.name, err)) return false;
+  if (!slugifyDeviceName(result.device.name, err)) return false;
+  if (!readStr(device, "tz", kMaxTzLen, "EST5EDT,M3.2.0,M11.1.0", "device.tz", result.device.tz, err)) return false;
+  if (!readInt(device, "poll_seconds", 5, 600, 30, "device.poll_seconds", n, err)) return false;
+  result.device.poll_seconds = (uint16_t)n;
+  if (!readInt(device, "brightness", 0, 100, 80, "device.brightness", n, err)) return false;
+  result.device.brightness = (uint8_t)n;
+  if (!readInt(device, "rotation", 0, 270, 0, "device.rotation", n, err)) return false;
+  result.device.rotation = (uint16_t)n;  // validateConfig() rejects anything but 0/90/180/270
+  if (!readStr(device, "theme", kMaxEnumLen, "light", "device.theme", result.device.theme, err)) return false;
   result.device.invert_colors = device["invert_colors"] | (DISPLAY_INVERT_DEFAULT != 0);
-  result.device.ticker_show = std::string(device["ticker_show"] | "both");
-  result.device.ticker_lines = device["ticker_lines"] | 3;
-  result.device.ticker_speed = device["ticker_speed"] | 30;
+  if (!readStr(device, "ticker_show", kMaxEnumLen, "both", "device.ticker_show", result.device.ticker_show, err)) return false;
+  if (!readInt(device, "ticker_lines", 1, 8, 3, "device.ticker_lines", n, err)) return false;
+  result.device.ticker_lines = (uint8_t)n;
+  if (!readInt(device, "ticker_speed", 5, 200, 30, "device.ticker_speed", n, err)) return false;
+  result.device.ticker_speed = (uint16_t)n;
   // use_https / tls_verify (v0.1.0-0.1.1) are accepted and ignored: the TLS mode is gone (http_fetch.h).
   result.device.logging = device["logging"] | true;
   JsonVariantConst header = device["header"];
@@ -398,21 +573,24 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   result.device.header.updated = header["updated"] | true;
   result.device.large_text = device["large_text"] | false;
   // v0.1.0 configs stored a boolean show_crowding; honour it when the newer string is absent.
-  if (device["crowding"].is<const char *>()) {
-    result.device.crowding = std::string(device["crowding"].as<const char *>());
-  } else {
+  if (device["crowding"].isNull()) {
     result.device.crowding = (device["show_crowding"] | true) ? "words" : "off";
+  } else if (!readStr(device, "crowding", kMaxEnumLen, "words", "device.crowding", result.device.crowding, err)) {
+    return false;
   }
-  result.device.crowding_icons = std::string(device["crowding_icons"] | "seats");
+  if (!readStr(device, "crowding_icons", kMaxEnumLen, "seats", "device.crowding_icons", result.device.crowding_icons, err)) return false;
   JsonVariantConst quiet = device["quiet"];
   result.device.quiet.enabled = quiet["enabled"] | false;
-  result.device.quiet.start = std::string(quiet["start"] | "23:00");
-  result.device.quiet.end = std::string(quiet["end"] | "06:00");
-  result.device.quiet.brightness = quiet["brightness"] | 0;
-  result.device.quiet.wake_seconds = quiet["wake_seconds"] | 30;
+  if (!readStr(quiet, "start", kMaxClockLen, "23:00", "device.quiet.start", result.device.quiet.start, err)) return false;
+  if (!readStr(quiet, "end", kMaxClockLen, "06:00", "device.quiet.end", result.device.quiet.end, err)) return false;
+  if (!readInt(quiet, "brightness", 0, 50, 0, "device.quiet.brightness", n, err)) return false;
+  result.device.quiet.brightness = (uint8_t)n;
+  if (!readInt(quiet, "wake_seconds", 5, 300, 30, "device.quiet.wake_seconds", n, err)) return false;
+  result.device.quiet.wake_seconds = (uint16_t)n;
   JsonVariantConst night = device["night"];
   result.device.night.enabled = night["enabled"] | true;
-  result.device.night.after_min = night["after_min"] | 60;
+  if (!readInt(night, "after_min", 15, 240, 60, "device.night.after_min", n, err)) return false;
+  result.device.night.after_min = (uint16_t)n;
 
   JsonVariantConst stops = doc["stops"];
   if (!stops.isNull()) {
@@ -420,35 +598,50 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
       err = {"stops must be an array", "stops"};
       return false;
     }
+    JsonArrayConst arr = stops.as<JsonArrayConst>();
+    // Capped while ingesting, not after: eight StopConfigs is ~1 KB of std::string on a heap with
+    // ~75 KB free, and a PUT with a thousand of them must not be built before it is refused.
+    if (arr.size() > kMaxStops) {
+      err = {"at most " + std::to_string(kMaxStops) + " stops are allowed", "stops"};
+      return false;
+    }
     size_t i = 0;
-    for (JsonVariantConst v : stops.as<JsonArrayConst>()) {
+    for (JsonVariantConst v : arr) {
       StopConfig s;
-      s.key = std::string(v["key"] | "");
-      std::string mode_str = std::string(v["mode"] | "bus");
+      if (!readStr(v, "key", kMaxStopFieldLen, "", field("stops", i, "key"), s.key, err)) return false;
+      std::string mode_str;
+      if (!readStr(v, "mode", kMaxEnumLen, "bus", field("stops", i, "mode"), mode_str, err)) return false;
       if (!stringToMode(mode_str, s.mode)) {
         err = {"unknown mode \"" + mode_str + "\" (expected bus/trolley/subway/rail)", field("stops", i, "mode")};
         return false;
       }
-      s.station = std::string(v["station"] | "");
-      s.direction = std::string(v["direction"] | "");
-      s.headsign = std::string(v["headsign"] | "");
-      s.label = std::string(v["label"] | "");
-      s.stop_name = std::string(v["stop_name"] | "");
-      s.show = v["show"] | 3;
-      s.lat = v["lat"] | 0.0;
-      s.lng = v["lng"] | 0.0;
-      s.title_style = std::string(v["title_style"] | "label_dest");
-      s.title_text = std::string(v["title_text"] | "");
-      s.alt_of = std::string(v["alt_of"] | "");
-      s.alt_after_min = v["alt_after_min"] | 15;
+      if (!readStr(v, "station", kMaxStopFieldLen, "", field("stops", i, "station"), s.station, err)) return false;
+      if (!readStr(v, "direction", kMaxStopFieldLen, "", field("stops", i, "direction"), s.direction, err)) return false;
+      if (!readStr(v, "headsign", kMaxStopFieldLen, "", field("stops", i, "headsign"), s.headsign, err)) return false;
+      if (!readStr(v, "label", kMaxStopFieldLen, "", field("stops", i, "label"), s.label, err)) return false;
+      if (!readStr(v, "stop_name", kMaxStopFieldLen, "", field("stops", i, "stop_name"), s.stop_name, err)) return false;
+      if (!readInt(v, "show", 1, 4, 3, field("stops", i, "show"), n, err)) return false;
+      s.show = (uint8_t)n;
+      if (!readNum(v, "lat", -90, 90, 0.0, field("stops", i, "lat"), d, err)) return false;
+      s.lat = d;
+      if (!readNum(v, "lng", -180, 180, 0.0, field("stops", i, "lng"), d, err)) return false;
+      s.lng = d;
+      if (!readStr(v, "title_style", kMaxEnumLen, "label_dest", field("stops", i, "title_style"), s.title_style, err)) return false;
+      if (!readStr(v, "title_text", kMaxStopFieldLen, "", field("stops", i, "title_text"), s.title_text, err)) return false;
+      if (!readStr(v, "alt_of", kMaxStopFieldLen, "", field("stops", i, "alt_of"), s.alt_of, err)) return false;
+      if (!readInt(v, "alt_after_min", 0, 255, 15, field("stops", i, "alt_after_min"), n, err)) return false;
+      s.alt_after_min = (uint8_t)n;  // validateConfig() applies the 5-60 rule when alt_of is set
       if (s.mode == Mode::Rail) {
         // DESIGN.md SS6's rail example uses "line", not "route"; model.h's
         // StopConfig folds both into `route` (see its doc comment).
-        s.route = std::string(v["line"] | "");
+        if (!readStr(v, "line", kMaxStopFieldLen, "", field("stops", i, "route"), s.route, err)) return false;
+        if (!normalizeRailLine(s.route, field("stops", i, "route"), err)) return false;
         s.stop_id = "";
       } else {
-        s.route = std::string(v["route"] | "");
-        s.stop_id = std::string(v["stop_id"] | "");
+        // Bus/trolley/subway route ids are SEPTA's own strings ("17", "T4", "G1") and are stored
+        // exactly as sent - only Regional Rail has a code-vs-display-name ambiguity to resolve.
+        if (!readStr(v, "route", kMaxStopFieldLen, "", field("stops", i, "route"), s.route, err)) return false;
+        if (!readStr(v, "stop_id", kMaxStopFieldLen, "", field("stops", i, "stop_id"), s.stop_id, err)) return false;
       }
       result.stops.push_back(s);
       ++i;
@@ -459,7 +652,8 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   JsonVariantConst weather = doc["weather"];
   result.weather.enabled = weather["enabled"] | true;
   result.weather.per_stop = weather["per_stop"] | true;
-  std::string units = std::string(weather["units"] | "f");
+  std::string units;
+  if (!readStr(weather, "units", kMaxEnumLen, "f", "weather.units", units, err)) return false;
   if (units != "f" && units != "c") {
     err = {"weather.units must be \"f\" or \"c\"", "weather.units"};
     return false;
@@ -467,41 +661,79 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   result.weather.fahrenheit = (units == "f");
   JsonVariantConst due = doc["due"];
   result.due.enabled = due["enabled"] | true;
-  result.due.minutes = due["minutes"] | 3;
+  if (!readInt(due, "minutes", 1, 15, 3, "due.minutes", n, err)) return false;
+  result.due.minutes = (uint8_t)n;
   result.due.led = due["led"] | true;
   result.due.screen = due["screen"] | true;
   result.due.chime = due["chime"] | false;
+
   JsonVariantConst profiles = doc["profiles"];
   if (profiles.is<JsonArrayConst>()) {
-    for (JsonVariantConst pv : profiles.as<JsonArrayConst>()) {
+    JsonArrayConst parr = profiles.as<JsonArrayConst>();
+    if (parr.size() > kMaxProfiles) {
+      err = {"at most " + std::to_string(kMaxProfiles) + " profiles are allowed", "profiles"};
+      return false;
+    }
+    size_t i = 0;
+    for (JsonVariantConst pv : parr) {
       ProfileConfig p;
-      p.name = std::string(pv["name"] | "");
+      if (!readStr(pv, "name", kMaxProfileNameLen, "", field("profiles", i, "name"), p.name, err)) return false;
       JsonVariantConst days = pv["days"];
       if (days.is<JsonArrayConst>()) {
-        for (JsonVariantConst d : days.as<JsonArrayConst>()) {
-          int day = d | -1;
+        if (days.as<JsonArrayConst>().size() > kMaxDaysEntries) {
+          err = {"days may list each of the 7 weekdays at most once", field("profiles", i, "days")};
+          return false;
+        }
+        for (JsonVariantConst dv : days.as<JsonArrayConst>()) {
+          int day = dv | -1;
           if (day >= 0 && day <= 6) p.days |= (uint8_t)(1u << day);
         }
       }
-      p.start = std::string(pv["start"] | "05:30");
-      p.end = std::string(pv["end"] | "10:00");
+      if (!readStr(pv, "start", kMaxClockLen, "05:30", field("profiles", i, "start"), p.start, err)) return false;
+      if (!readStr(pv, "end", kMaxClockLen, "10:00", field("profiles", i, "end"), p.end, err)) return false;
       JsonVariantConst ps = pv["stops"];
       if (ps.is<JsonArrayConst>()) {
-        for (JsonVariantConst k : ps.as<JsonArrayConst>()) p.stops.push_back(std::string(k | ""));
+        if (ps.as<JsonArrayConst>().size() > kMaxStops) {
+          err = {"a profile may list at most " + std::to_string(kMaxStops) + " stops", field("profiles", i, "stops")};
+          return false;
+        }
+        for (JsonVariantConst kv : ps.as<JsonArrayConst>()) {
+          std::string key;
+          if (!checkStr(kv, kMaxStopFieldLen, field("profiles", i, "stops"), key, err)) return false;
+          // A duplicated key would draw the same panel twice and halve the space the other stops
+          // get, so it is a 400 rather than something visibleStops() has to paper over.
+          for (const std::string &seen : p.stops) {
+            if (seen == key) {
+              err = {"profile stop '" + key + "' is listed twice", field("profiles", i, "stops")};
+              return false;
+            }
+          }
+          p.stops.push_back(key);
+        }
       }
       result.profiles.push_back(p);
+      ++i;
     }
   }
+
   JsonVariantConst bike = doc["bike"];
   result.bike.enabled = bike["enabled"] | false;
-  result.bike.style = std::string(bike["style"] | "icons");
+  if (!readStr(bike, "style", kMaxEnumLen, "icons", "bike.style", result.bike.style, err)) return false;
   JsonVariantConst stations = bike["stations"];
   if (stations.is<JsonArrayConst>()) {
-    for (JsonVariantConst sv : stations.as<JsonArrayConst>()) {
+    JsonArrayConst sarr = stations.as<JsonArrayConst>();
+    if (sarr.size() > kMaxBikeStations) {
+      err = {"at most " + std::to_string(kMaxBikeStations) + " bike stations are allowed", "bike.stations"};
+      return false;
+    }
+    size_t i = 0;
+    for (JsonVariantConst sv : sarr) {
       BikeStation b;
-      b.id = sv["id"] | 0;
-      b.name = std::string(sv["name"] | "");
+      if (!readInt(sv, "id", 0, 2000000000, 0, field("bike.stations", i, "id"), n, err)) return false;
+      b.id = (int)n;
+      if (!readStr(sv, "name", kMaxBikeNameLen, "", field("bike.stations", i, "name"), b.name, err)) return false;
       result.bike.stations.push_back(b);
+      ++i;
     }
   }
 
@@ -527,51 +759,130 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   return true;
 }
 
-bool loadConfig(Config &cfg) {
-  if (!LittleFS.exists(kConfigPath)) {
-    log_w("config_store: %s does not exist", kConfigPath);
-    return false;
-  }
-  File f = LittleFS.open(kConfigPath, "r");
-  if (!f) {
-    log_e("config_store: failed to open %s for reading", kConfigPath);
-    return false;
-  }
+// ---------------------------------------------------------------------------
+// Durable save (DESIGN.md SS6; review F09)
+// ---------------------------------------------------------------------------
+//
+// The old saveConfig() truncated /config.json and streamed the new document straight into it.
+// A power cut, a full filesystem or a short write between those two steps left a truncated file
+// where the config used to be, and the next boot silently reverted the device to defaults - every
+// stop the owner had added, gone. The sequence below never has the live file in a half-written
+// state: everything lands in a temp file that is verified by reading it back and re-validating it
+// before the old file is rotated to /config.prev.json and the temp file takes its place. If the
+// power goes out in the middle, the worst case is that /config.json is missing and
+// /config.prev.json is intact, which loadConfig() handles.
+namespace {
+SemaphoreHandle_t g_save_mutex = nullptr;
+bool g_config_recovered = false;
 
+SemaphoreHandle_t saveMutex() {
+  if (g_save_mutex == nullptr) g_save_mutex = xSemaphoreCreateMutex();
+  return g_save_mutex;
+}
+
+// Parses one file into `cfg`. Returns false (with a log line naming the reason) for missing,
+// unreadable, malformed or invalid content.
+bool readConfigFile(const char *path, Config &cfg) {
+  if (!LittleFS.exists(path)) return false;
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    log_e("config_store: failed to open %s for reading", path);
+    return false;
+  }
   JsonDocument doc;
   DeserializationError parse_err = deserializeJson(doc, f);
   f.close();
   if (parse_err) {
-    log_e("config_store: %s is not valid JSON: %s", kConfigPath, parse_err.c_str());
+    log_e("config_store: %s is not valid JSON: %s", path, parse_err.c_str());
     return false;
   }
-
   ConfigError verr;
   Config parsed;
   if (!jsonToConfig(doc.as<JsonVariant>(), parsed, verr)) {
-    log_e("config_store: %s failed validation at %s: %s", kConfigPath, verr.path.c_str(), verr.message.c_str());
+    log_e("config_store: %s failed validation at %s: %s", path, verr.path.c_str(), verr.message.c_str());
     return false;
   }
   cfg = parsed;
   return true;
 }
+}  // namespace
+
+bool loadConfig(Config &cfg) {
+  g_config_recovered = false;
+  if (readConfigFile(kConfigPath, cfg)) {
+    Serial.printf("[config] loaded %s\n", kConfigPath);
+    return true;
+  }
+  if (readConfigFile(kConfigPrevPath, cfg)) {
+    // Reported in GET /api/state as config_recovered so the web UI can tell the owner their last
+    // save did not survive, instead of them noticing days later that a setting reverted.
+    g_config_recovered = true;
+    Serial.printf("[config] %s was unusable; recovered from %s\n", kConfigPath, kConfigPrevPath);
+    log_w("config_store: recovered the previous config from %s", kConfigPrevPath);
+    return true;
+  }
+  Serial.printf("[config] no usable config file\n");
+  return false;
+}
+
+bool configRecovered() { return g_config_recovered; }
 
 bool saveConfig(const Config &cfg) {
   JsonDocument doc;
   configToJson(cfg, doc);
+  size_t want = measureJson(doc);
+  if (want == 0) {
+    log_e("config_store: serialized config measured 0 bytes");
+    return false;
+  }
 
-  File f = LittleFS.open(kConfigPath, "w");
-  if (!f) {
-    log_e("config_store: failed to open %s for writing", kConfigPath);
+  SemaphoreHandle_t mutex = saveMutex();
+  // Serialized against itself: PUT /api/config runs on the async web server's task while
+  // main.cpp can still be writing defaults, and two writers interleaving on one temp file would
+  // produce exactly the corrupt file this function exists to avoid.
+  if (mutex != nullptr && xSemaphoreTake(mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    log_e("config_store: timed out waiting for the save lock");
     return false;
   }
-  size_t written = serializeJson(doc, f);
-  f.close();
-  if (written == 0) {
-    log_e("config_store: serializeJson wrote 0 bytes to %s", kConfigPath);
-    return false;
-  }
-  return true;
+  bool ok = false;
+  do {
+    File f = LittleFS.open(kConfigTmpPath, "w");
+    if (!f) {
+      log_e("config_store: failed to open %s for writing", kConfigTmpPath);
+      break;
+    }
+    size_t written = serializeJson(doc, f);
+    f.close();
+    if (written != want) {
+      // A short write is what a full LittleFS looks like from here: the File API reports success
+      // per chunk and simply stops accepting bytes. Anything but an exact match is a failure, so
+      // PUT /api/config answers 500 and the live /config.json is left alone.
+      log_e("config_store: short write to %s (%u of %u bytes)", kConfigTmpPath, (unsigned)written, (unsigned)want);
+      LittleFS.remove(kConfigTmpPath);
+      break;
+    }
+    Config verify;
+    if (!readConfigFile(kConfigTmpPath, verify)) {
+      log_e("config_store: %s did not read back as a valid config", kConfigTmpPath);
+      LittleFS.remove(kConfigTmpPath);
+      break;
+    }
+    if (LittleFS.exists(kConfigPath)) {
+      LittleFS.remove(kConfigPrevPath);  // rename() will not overwrite an existing target
+      if (!LittleFS.rename(kConfigPath, kConfigPrevPath)) {
+        log_w("config_store: could not rotate %s to %s; saving anyway", kConfigPath, kConfigPrevPath);
+        LittleFS.remove(kConfigPath);
+      }
+    }
+    if (!LittleFS.rename(kConfigTmpPath, kConfigPath)) {
+      log_e("config_store: could not rename %s to %s", kConfigTmpPath, kConfigPath);
+      LittleFS.remove(kConfigTmpPath);
+      break;
+    }
+    ok = true;
+  } while (false);
+  if (mutex != nullptr) xSemaphoreGive(mutex);
+  return ok;
 }
 
 namespace {

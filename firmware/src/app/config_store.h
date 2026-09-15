@@ -12,6 +12,11 @@
 namespace transit_app {
 
 constexpr const char *kConfigPath = "/config.json";
+// Safe-save companions (DESIGN.md SS6, review F09): the new document is written to the .tmp path
+// and verified there, the outgoing one is rotated to .prev, and only then does .tmp become
+// /config.json. loadConfig() falls back to .prev when /config.json is missing or unreadable.
+constexpr const char *kConfigTmpPath = "/config.json.tmp";
+constexpr const char *kConfigPrevPath = "/config.prev.json";
 constexpr size_t kMaxStops = 8;  // DESIGN.md SS6: "Maximum 8 stops."
 
 // Board build flag (firmware/boards/*.json): whether this board's panel shows correct colours
@@ -138,21 +143,41 @@ Config defaultConfig();
 // fills `err` and returns false. Does not touch the filesystem.
 bool validateConfig(const Config &cfg, ConfigError &err);
 
-// Reads and parses kConfigPath from an already-mounted LittleFS. Returns
-// false (leaving `cfg` unchanged) if the file is missing, unreadable,
-// malformed JSON, or fails validateConfig(). Callers should fall back to
-// defaultConfig() + saveConfig() in that case (see main.cpp).
+// Reads and parses kConfigPath from an already-mounted LittleFS, falling back
+// to kConfigPrevPath (the copy rotated out by the previous successful save) if
+// the live file is missing, unreadable, malformed JSON, or fails
+// validateConfig(). Returns false (leaving `cfg` unchanged) only when neither
+// file is usable; callers should fall back to defaultConfig() + saveConfig()
+// in that case (see main.cpp). Which file was used is logged, and
+// configRecovered() reports it for GET /api/state.
 bool loadConfig(Config &cfg);
 
-// Serializes `cfg` and writes it to kConfigPath, replacing any existing
-// file. Does not validate - call validateConfig() first if the source is
-// untrusted (e.g. a PUT /api/config body). Returns false on a filesystem
-// error.
+// True when the last loadConfig() had to fall back to kConfigPrevPath. Surfaced
+// as `config_recovered` in GET /api/state (DESIGN.md SS7) so the owner learns
+// that a save did not survive instead of discovering a reverted setting later.
+bool configRecovered();
+
+// Serializes `cfg`, writes it to kConfigTmpPath, verifies the byte count, reads
+// it back and re-validates it, rotates the current file to kConfigPrevPath, and
+// only then renames the temp file over kConfigPath. Returns false - leaving the
+// live config untouched - on any filesystem error or short write, so
+// PUT /api/config answers 500 rather than replacing a good config with a
+// truncated one (review F09). Serialized with a mutex: the web server task and
+// main.cpp can both call it. Does not validate `cfg` itself - call
+// validateConfig() first if the source is untrusted (e.g. a PUT body).
 bool saveConfig(const Config &cfg);
 
 // JSON <-> Config, split out from load/saveConfig so web_server.cpp can
 // reuse the same (de)serialization for GET/PUT /api/config without a round
 // trip through the filesystem.
+//
+// jsonToConfig() is the ONLY place untrusted configuration enters the firmware, so it is where
+// every type check, length cap and range check lives (review F07): numbers are read as int64/
+// double and range-checked before they are narrowed to the uint8_t/uint16_t fields, strings are
+// length-capped and rejected for control characters, arrays are capped before they are built, and
+// a Regional Rail line given as a display name ("Paoli/Thorndale") is normalised to its code
+// ("PAO"). It returns false with `err` filled - message plus a JSON path such as
+// "stops[1].stop_id" - for the first violation, which becomes the 400 body.
 void configToJson(const Config &cfg, JsonDocument &doc);
 bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err);
 
