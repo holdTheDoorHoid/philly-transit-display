@@ -7,21 +7,76 @@
 #include <SPI.h>
 #endif
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <string>
+
+#include "transit_stats/events.h"
 
 namespace transit_app {
 
 namespace {
 constexpr const char *kLogDir = "/transit-log";
-// DESIGN.md SS9.1's event log header.
-constexpr const char *kCsvHeader = "ts,event,stop_key,route,dir,trip,vehicle,scheduled_ts,predicted_ts,actual_ts,late_min,horizon_s,headway_s,note";
+// No header constant here on purpose: transit_stats::csvHeader() is the single source of truth
+// (DESIGN.md SS9.1, F24). The copy that used to live here said 14 columns while the rows written
+// under it had 21.
 
 SdStatus g_status;
 
+// g_status is written by the poller task (appendLine, mountSd) and read by the AsyncTCP task
+// (GET /api/state) and the LVGL task (device-info screen). It holds a std::string, so a portMUX
+// critical section is not an option - a mutex it is (F26). Held only for struct copies, never
+// across an SD operation.
+SemaphoreHandle_t g_status_mutex = nullptr;
+
+SemaphoreHandle_t statusMutex() {
+  if (g_status_mutex == nullptr) g_status_mutex = xSemaphoreCreateMutex();
+  return g_status_mutex;
+}
+
+struct StatusLock {
+  StatusLock() : held(xSemaphoreTake(statusMutex(), pdMS_TO_TICKS(200)) == pdTRUE) {}
+  ~StatusLock() {
+    if (held) xSemaphoreGive(statusMutex());
+  }
+  bool held;
+};
+
+// One log download at a time (F26): see acquireLogReader() in the header for why two open files
+// is not two concurrent readers. Atomic because the web server task takes it and the response's
+// disconnect callback (AsyncTCP task) releases it.
+std::atomic<bool> g_log_reader_busy{false};
+
 #ifdef BOARD_HAS_TF
 SPIClass g_sd_spi(VSPI);
+
+// Cheap "is the card still there?" probe, used only after an operation has already failed. Note
+// that SD.cardType() alone cannot answer it - the core caches the type from mount time and keeps
+// reporting it after the card is physically pulled - so this also asks the filesystem for the
+// directory we know we created, which is a real round trip to the card.
+bool cardStillPresent() {
+  return SD.cardType() != CARD_NONE && SD.exists(kLogDir);
+}
+
+// Records a write failure. `gone` marks the card unmounted so the device stops claiming logging
+// is healthy (F26): a pulled card otherwise keeps `mounted` true, free space frozen at whatever
+// it was, and every row silently dropped.
+void noteWriteFailure(const char *reason, bool gone) {
+  StatusLock lock;
+  if (!lock.held) return;
+  g_status.dropped_rows++;
+  g_status.last_write_ok = false;
+  g_status.error = reason;
+  if (gone) {
+    g_status.mounted = false;
+    g_status.free_bytes = 0;
+  }
+}
 #endif
 
 std::string monthPath(const char *month) {
@@ -40,6 +95,11 @@ std::string logFilePath(const std::string &filename) {
   p += filename;
   return p;
 }
+
+bool isMounted() {
+  StatusLock lock;
+  return lock.held && g_status.mounted;
+}
 }  // namespace
 
 SdStatus mountSd() {
@@ -50,13 +110,17 @@ SdStatus mountSd() {
   Serial.printf("[heap] sd-begin  free=%u largest=%u\n", (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   if (!began) {
     log_w("sd_logger: SD.begin() failed (no card, or not readable)");
+    StatusLock lock;
     g_status = SdStatus{};
+    g_status.error = "no card";
     return g_status;
   }
   if (SD.cardType() == CARD_NONE) {
     log_w("sd_logger: SD card slot reports no card");
     SD.end();
+    StatusLock lock;
     g_status = SdStatus{};
+    g_status.error = "no card";
     return g_status;
   }
 
@@ -64,7 +128,10 @@ SdStatus mountSd() {
     SD.mkdir(kLogDir);
   }
 
+  StatusLock lock;
   g_status.mounted = true;
+  g_status.last_write_ok = true;
+  g_status.error.clear();
   g_status.total_bytes = SD.totalBytes();
   g_status.used_bytes = SD.usedBytes();
   g_status.free_bytes = g_status.total_bytes > g_status.used_bytes ? g_status.total_bytes - g_status.used_bytes : 0;
@@ -72,18 +139,22 @@ SdStatus mountSd() {
   return g_status;
 #else
   log_w("sd_logger: this board's JSON does not define BOARD_HAS_TF; no SD slot");
+  StatusLock lock;
   g_status = SdStatus{};
+  g_status.error = "no SD slot on this board";
   return g_status;
 #endif
 }
 
 SdStatus getSdStatus() {
+  StatusLock lock;
+  if (!lock.held) return SdStatus{};
   return g_status;
 }
 
 uint64_t logBytes() {
 #ifdef BOARD_HAS_TF
-  if (!g_status.mounted) {
+  if (!isMounted()) {
     return 0;
   }
   File dir = SD.open(kLogDir);
@@ -106,7 +177,7 @@ uint64_t logBytes() {
 
 bool appendLine(const char *month, const char *line) {
 #ifdef BOARD_HAS_TF
-  if (!g_status.mounted) {
+  if (!isMounted()) {
     return false;
   }
 
@@ -116,12 +187,18 @@ bool appendLine(const char *month, const char *line) {
   uint64_t total = SD.totalBytes();
   uint64_t used = SD.usedBytes();
   uint64_t free_bytes = total > used ? total - used : 0;
-  g_status.total_bytes = total;
-  g_status.used_bytes = used;
-  g_status.free_bytes = free_bytes;
+  {
+    StatusLock lock;
+    if (lock.held) {
+      g_status.total_bytes = total;
+      g_status.used_bytes = used;
+      g_status.free_bytes = free_bytes;
+    }
+  }
   constexpr uint64_t kMinFreeBytes = 50ULL * 1024 * 1024;
   if (free_bytes < kMinFreeBytes) {
     log_w("sd_logger: refusing to log, only %llu MB free (< 50 MB minimum)", free_bytes / (1024ULL * 1024));
+    noteWriteFailure("disk full", false);
     return false;
   }
 
@@ -130,14 +207,42 @@ bool appendLine(const char *month, const char *line) {
 
   File f = SD.open(path.c_str(), FILE_APPEND);
   if (!f) {
-    log_e("sd_logger: failed to open %s for append", path.c_str());
+    // Either the card went away or both file handles are in use (the mount allows 2, and a log
+    // download holds one for its whole life - see acquireLogReader). Both drop this row; only one
+    // of them means the card is gone.
+    bool gone = !cardStillPresent();
+    log_e("sd_logger: failed to open %s for append (%s)", path.c_str(), gone ? "card removed" : "card busy");
+    noteWriteFailure(gone ? "card removed" : "card busy", gone);
     return false;
   }
+  // F26: println() returns what it actually committed. A card pulled mid-write, or a full FAT,
+  // returns a short count rather than failing, so ignoring this wrote half a row and called it a
+  // success. Header and row are checked separately because a short header corrupts the file for
+  // every later reader, not just this row.
+  bool ok = true;
   if (needs_header) {
-    f.println(kCsvHeader);
+    const char *header = transit_stats::csvHeader();
+    size_t want = strlen(header) + 1;  // println appends '\n'
+    if (f.println(header) < want) ok = false;
   }
-  f.println(line);
+  if (ok) {
+    size_t want = strlen(line) + 1;
+    if (f.println(line) < want) ok = false;
+  }
   f.close();
+  if (!ok) {
+    bool gone = !cardStillPresent();
+    log_e("sd_logger: short write on %s (%s)", path.c_str(), gone ? "card removed" : "write failed");
+    noteWriteFailure(gone ? "card removed" : "short write", gone);
+    return false;
+  }
+  {
+    StatusLock lock;
+    if (lock.held) {
+      g_status.last_write_ok = true;
+      g_status.error.clear();
+    }
+  }
   return true;
 #else
   (void)month;
@@ -149,7 +254,7 @@ bool appendLine(const char *month, const char *line) {
 std::vector<LogFileInfo> listLogFiles() {
   std::vector<LogFileInfo> out;
 #ifdef BOARD_HAS_TF
-  if (!g_status.mounted) return out;
+  if (!isMounted()) return out;
   File dir = SD.open(kLogDir);
   if (!dir || !dir.isDirectory()) return out;
   for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
@@ -166,19 +271,54 @@ std::vector<LogFileInfo> listLogFiles() {
 
 bool streamLogLines(const std::string &filename, const std::function<bool(const char *, size_t)> &each) {
 #ifdef BOARD_HAS_TF
-  if (!g_status.mounted) return false;
+  if (!isMounted()) return false;
   std::string path = logFilePath(filename);
   File f = SD.open(path.c_str(), FILE_READ);
   if (!f || f.isDirectory()) {
-    if (f) f.close();
+    if (f) {
+      f.close();
+    } else if (!cardStillPresent()) {
+      // The card went away under us; say so rather than letting every stats scan read as
+      // "that month has no data" (F26).
+      StatusLock lock;
+      if (lock.held) {
+        g_status.mounted = false;
+        g_status.error = "card removed";
+      }
+    }
     return false;
   }
-  constexpr size_t kLineBufCap = 512;
+  // F25/DESIGN.md SS9.1: one buffer of exactly the bounded-record size the writer promises, so a
+  // legal record always fits and anything that does not is, by definition, damaged.
+  constexpr size_t kLineBufCap = transit_stats::kMaxCsvLineBytes + 1;
   char buf[kLineBufCap];
   bool keep_going = true;
   while (keep_going && f.available()) {
-    size_t n = f.readBytesUntil('\n', buf, kLineBufCap - 1);
-    if (n == 0) break;
+    size_t before = f.position();
+    size_t n = f.readBytesUntil('\n', buf, transit_stats::kMaxCsvLineBytes);
+    if (n == 0) {
+      // readBytesUntil() returns 0 for a BLANK LINE and at EOF alike; the file position is what
+      // tells them apart (a blank line consumed its '\n', EOF consumed nothing). A blank line
+      // must be skipped, never treated as the end of the file - this loop used to `break` on it,
+      // which silently discarded every record after the first blank line in a month.
+      if (f.position() == before) break;
+      continue;
+    }
+    if (n == transit_stats::kMaxCsvLineBytes) {
+      // The buffer filled. Either this is a legal maximum-length record whose '\n' is the very
+      // next byte, or the line is longer than any record this project writes.
+      int c = f.read();
+      if (c == '\r') c = f.read();
+      if (c != '\n' && c != -1) {
+        // Damaged/foreign line: skip forward to the next '\n' rather than handing the caller two
+        // fragments that each look like a record. One bad line costs exactly that line.
+        while (f.available()) {
+          int d = f.read();
+          if (d == '\n' || d < 0) break;
+        }
+        continue;
+      }
+    }
     buf[n] = '\0';
     keep_going = each(buf, n);
   }
@@ -193,13 +333,110 @@ bool streamLogLines(const std::string &filename, const std::function<bool(const 
 
 File openLogFile(const std::string &filename) {
 #ifdef BOARD_HAS_TF
-  if (!g_status.mounted) return File();
+  if (!isMounted()) return File();
   std::string path = logFilePath(filename);
   return SD.open(path.c_str(), FILE_READ);
 #else
   (void)filename;
   return File();
 #endif
+}
+
+bool acquireLogReader() {
+  bool expected = false;
+  return g_log_reader_busy.compare_exchange_strong(expected, true);
+}
+
+void releaseLogReader() {
+  g_log_reader_busy.store(false);
+}
+
+// ---- LogExport --------------------------------------------------------------------------------
+
+LogExport::LogExport(const std::string &filename) {
+#ifdef BOARD_HAS_TF
+  if (!isMounted()) return;
+  std::string path = logFilePath(filename);
+  file_ = SD.open(path.c_str(), FILE_READ);
+  if (!file_ || file_.isDirectory()) {
+    if (file_) file_.close();
+    return;
+  }
+  open_ = true;
+  line_.resize(transit_stats::kMaxCsvLineBytes + 1);
+#else
+  (void)filename;
+#endif
+}
+
+LogExport::~LogExport() {
+#ifdef BOARD_HAS_TF
+  if (file_) file_.close();
+#endif
+}
+
+bool LogExport::nextLine() {
+#ifdef BOARD_HAS_TF
+  while (file_.available()) {
+    size_t before = file_.position();
+    size_t n = file_.readBytesUntil('\n', &line_[0], transit_stats::kMaxCsvLineBytes);
+    if (n == 0) {
+      if (file_.position() == before) return false;  // EOF, not a blank line
+      continue;                                      // blank line: skip (DESIGN.md SS9.1)
+    }
+    if (n == transit_stats::kMaxCsvLineBytes) {
+      int c = file_.read();
+      if (c == '\r') c = file_.read();
+      if (c != '\n' && c != -1) {
+        while (file_.available()) {
+          int d = file_.read();
+          if (d == '\n' || d < 0) break;
+        }
+        continue;  // over-long record: skip whole, never split (F25)
+      }
+    }
+    line_len_ = n;
+    return true;
+  }
+  return false;
+#else
+  return false;
+#endif
+}
+
+size_t LogExport::fill(uint8_t *buf, size_t max) {
+  if (!open_ || done_ || max == 0) return 0;
+  size_t written = 0;
+  while (written < max) {
+    if (pending_pos_ < pending_.size()) {
+      size_t take = std::min(max - written, pending_.size() - pending_pos_);
+      memcpy(buf + written, pending_.data() + pending_pos_, take);
+      written += take;
+      pending_pos_ += take;
+      continue;
+    }
+    pending_.clear();
+    pending_pos_ = 0;
+    if (!header_sent_) {
+      // Exactly one header, always the current schema, whatever the file's own first line says
+      // (DESIGN.md SS9.1 "Export"): a month spanning a schema change has a v1 header on disk.
+      header_sent_ = true;
+      pending_ = transit_stats::csvHeader();
+      pending_ += '\n';
+      continue;
+    }
+    if (!nextLine()) {
+      done_ = true;
+      break;
+    }
+    std::string normalized;
+    if (!transit_stats::normalizeCsvLine(line_.data(), line_len_, normalized)) {
+      continue;  // header row, blank, or damaged: skip, keep streaming (DESIGN.md SS9.1)
+    }
+    pending_ = std::move(normalized);
+    pending_ += '\n';
+  }
+  return written;
 }
 
 }  // namespace transit_app
