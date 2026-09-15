@@ -482,7 +482,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | Method, path | Purpose |
 |---|---|
 | `GET /` , `/app.js`, `/app.css`, `/favicon.svg` | Web UI, served gzip with `Cache-Control: max-age=3600`, ETag = firmware build id |
-| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes}, last_poll {ok, age_s, error}, `stops[]` each with `arrivals[]` (§8 shape), `ok`, `health`, `source_ts` and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8), plus `board` (the PlatformIO env this image was built for, e.g. `cyd-3248S035R`), `auth {pin_required}` and `config_recovered` (§6) |
+| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes, dropped_rows, write_ok, error} (§9.1), last_poll {ok, age_s, error}, `stops[]` each with `arrivals[]` (§8 shape), `ok`, `health`, `source_ts`, `source_age_s` (-1 when the feed carried no timestamp) and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, stale, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8; `age_s` is the main location's last successful fetch, `stale` once that is over an hour old), plus `board` (the PlatformIO env this image was built for, e.g. `cyd-3248S035R`), `auth {pin_required}` and `config_recovered` (§6) |
 | `GET /api/config` | Current config (§6) |
 | `PUT /api/config` | Replace config; validates; persists; triggers immediate re-poll. 400 on error |
 | `GET /api/proxy/stops?route=17` | Streams SEPTA `Stops` for a route to the browser (setup only) |
