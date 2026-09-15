@@ -60,9 +60,29 @@ transit::Snapshot getSnapshot();
 // Returns a copy of the latest poll diagnostics, safe to call from any task.
 PollStatus getPollStatus();
 
-// Returns the current per-stop stats summary (DESIGN.md SS8 "Stats page") for `stop_key`, or
-// false if that stop has never been observed (never configured, or evicted - see
-// transit_stats::ArrivalTracker). Safe to call from any task (UI, web server).
-bool getStopSummary(const std::string &stop_key, transit_stats::StopSummary &out);
+// What getStopSummary() can tell a caller without going anywhere near the SD card (F27).
+struct StopSummaryView {
+  // false = nothing has been computed for this stop yet. The caller must render that as "loading"
+  // or "no data yet", NEVER as `summary`'s zeroes: "0% on time, n=0" is a specific, wrong claim.
+  bool has_value = false;
+  bool pending = false;   // a refresh is queued; the poller will do it in its next idle slice
+  uint32_t age_s = 0;     // seconds since `summary` was computed (0 when !has_value)
+  // DESIGN.md SS9.2: how many of `summary.samples` carry an inference marker. Every `arrive` row
+  // in this log is an inference; this is the count that says which method was recorded, and the
+  // UI shows it so a derived arrival is never presented as a measured one.
+  uint32_t inferred = 0;
+  transit_stats::StopSummary summary;
+};
+
+// The current per-stop stats summary (DESIGN.md SS8 "Stats page") for `stop_key`.
+//
+// NON-BLOCKING (F27), and that is the point. It used to stream a month of SD log per stop
+// synchronously, on whichever task called it - which is ui/stats_screen.cpp on the LVGL task, so
+// opening the stats page with several stops configured froze touch and the clock for as long as
+// the card took. Now it returns what is cached, says how old that is and whether anything is
+// cached at all, and registers a refresh; the poller task does the scanning in its idle slices,
+// one stop per slice, at most every 10 minutes per stop. Safe to call from any task, as often as
+// the UI likes.
+StopSummaryView getStopSummary(const std::string &stop_key);
 
 }  // namespace transit_app
