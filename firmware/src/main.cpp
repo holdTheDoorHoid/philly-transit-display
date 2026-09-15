@@ -14,6 +14,7 @@
 
 #include <ctime>
 
+#include "app/auth.h"
 #include "app/config_store.h"
 #include "app/http_fetch.h"
 #include "app/hw_probe.h"
@@ -41,6 +42,40 @@ void pumpLvgl() {
   lv_tick_inc(now - last_tick_ms);
   last_tick_ms = now;
   lv_timer_handler();
+}
+
+// Set by the PUT /api/config callback (which runs on the async web server's task) and acted on
+// in loop(). MDNS.end()/begin() and configTzTime() both talk to lwIP and the SNTP module from the
+// calling task; doing that from the AsyncTCP task is how the SNTP/dns_clear_cache panic below was
+// first hit, and mDNS restarts from a foreign task have their own history. So the callback only
+// raises a flag and the main task does the work. Volatile, one-way, idempotent: no lock needed.
+volatile bool g_apply_network_settings = false;
+std::string g_applied_name;
+std::string g_applied_tz;
+
+// DESIGN.md SS6: device.name is the mDNS hostname and device.tz drives every local-time display.
+// Both used to need a reboot to take effect after a save (review F31) - the web UI reported the
+// new name while the device was still answering on the old one, and a timezone change left the
+// clock, the quiet-hours window and the profile windows an hour out until someone power-cycled.
+void applyNetworkSettings() {
+  Config cfg = transit_app::getActiveConfig();
+  if (cfg.device.name != g_applied_name) {
+    MDNS.end();
+    if (MDNS.begin(cfg.device.name.c_str())) {
+      MDNS.addService("http", "tcp", 80);
+      log_i("main: mDNS restarted at http://%s.local/", cfg.device.name.c_str());
+    } else {
+      log_e("main: mDNS.begin() failed after a rename");
+    }
+    g_applied_name = cfg.device.name;
+  }
+  if (cfg.device.tz != g_applied_tz) {
+    // Not re-priming DNS here: the warm-up in setup() (see its comment) only has to happen once
+    // per boot, and by now SNTP has a resolved server and is running.
+    configTzTime(cfg.device.tz.c_str(), "pool.ntp.org");
+    log_i("main: timezone applied: %s", cfg.device.tz.c_str());
+    g_applied_tz = cfg.device.tz;
+  }
 }
 
 std::string wifiApName() {
@@ -99,6 +134,12 @@ void setup() {
   transit_app::connectWifiOrPortal(wifiApName(), pumpLvgl);
   heapStage("wifi");
 
+  // Idempotent: wifi_portal.cpp already called this as soon as it powered the radio up (auth.h
+  // explains why it has to be after that, not in setup()). Kept here so the dependency is visible
+  // at the point the web server and the device info screen - both of which read the PIN - are
+  // about to start.
+  transit_app::auth::begin();
+
   // Prime Arduino's DNS state before SNTP starts. NetworkManager::hostByName() calls
   // dns_clear_cache() from the CALLER's task the first time it sees an IP; if SNTP's own lookup of
   // pool.ntp.org is in flight at that moment, lwIP runs the SNTP callback without the core lock
@@ -109,6 +150,7 @@ void setup() {
     WiFi.hostByName("pool.ntp.org", ntp_ip);
   }
   configTzTime(cfg.device.tz.c_str(), "pool.ntp.org");
+  g_applied_tz = cfg.device.tz;
 
   if (MDNS.begin(cfg.device.name.c_str())) {
     MDNS.addService("http", "tcp", 80);
@@ -116,10 +158,12 @@ void setup() {
   } else {
     log_e("main: mDNS.begin() failed");
   }
+  g_applied_name = cfg.device.name;
 
   transit_app::startWebServer([](bool data_changed) {
     transit_app::requestRepoll(data_changed);
     transit_app::ui::onConfigChanged(transit_app::getActiveConfig());  // applied on the LVGL task
+    g_apply_network_settings = true;                                   // mDNS/timezone, applied in loop()
   });
   heapStage("web");
 
@@ -148,6 +192,11 @@ void setup() {
 
 void loop() {
   pumpLvgl();
+
+  if (g_apply_network_settings) {
+    g_apply_network_settings = false;
+    applyNetworkSettings();
+  }
 
   static uint32_t last_ui_refresh_ms = 0;
   uint32_t now = millis();
