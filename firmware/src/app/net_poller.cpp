@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -43,6 +44,14 @@ namespace transit_app {
 namespace {
 
 constexpr uint32_t kFetchTimeoutMs = 15000;
+// Alerts/weather/bikes/liveness are OPTIONAL work (F12): none of them is what the screen is for,
+// and every second one spends is a second the arrivals are older. A shorter timeout (and so, via
+// http_fetch's 2x rule, a 16 s absolute ceiling instead of 30 s) keeps one sulking endpoint from
+// eating a whole poll interval.
+constexpr uint32_t kOptionalFetchTimeoutMs = 8000;
+// Optional work is skipped entirely when the next transit poll is this close. Arrivals are the
+// product; a weather refresh that makes them late is a bad trade at any price.
+constexpr uint32_t kOptionalWorkReserveMs = 5000;
 constexpr uint32_t kTaskStackBytes = 10240;
 constexpr UBaseType_t kTaskPriority = 1;
 
@@ -58,6 +67,15 @@ constexpr int64_t kUrgentEtaS = 180;    // "any arrival is under 3 min" -> poll 
 constexpr uint32_t kUrgentIntervalS = 15;
 constexpr uint32_t kBaseBackoffS = 30;
 constexpr uint32_t kMaxBackoffS = 300;  // "cap 5 min"
+// route_has_live_vehicles feeds the tracker's noshow-vs-outage rule, which is about 10-minute
+// windows (DESIGN.md SS9.1), so a minute-old answer is as good as a fresh one - and this costs a
+// TransitView request per route, which is exactly the kind of thing that must not sit between the
+// user and their arrivals (F12).
+constexpr uint32_t kLivenessRefreshMs = 60 * 1000;
+// Past this, a cached liveness answer is not used at all: "we have not checked in five minutes"
+// must read as "we do not know" (false, the conservative value - the tracker then folds a missing
+// scheduled trip into an outage rather than claiming a no-show), never as "the route is quiet".
+constexpr uint32_t kLivenessMaxAgeMs = 5 * 60 * 1000;
 
 SemaphoreHandle_t g_mutex = nullptr;
 SemaphoreHandle_t g_wake_sem = nullptr;  // given to wake the poller task early (config change)
@@ -134,27 +152,40 @@ class AppScheduleCache : public transit::ScheduleCache {
 
 AppScheduleCache g_sched_cache;
 
-// getStopSummary() cache (DESIGN.md SS8 "Stats page": on-time %, mean late, worst hour, ghost
-// count, sample count, last 30 days). Recomputing this means streaming SD - fine once per UI
-// refresh, not something to redo on every call from whatever task asks (ui/stats_screen.cpp, on
-// the LVGL task). At most kMaxTrackedStops entries (one per configured stop), same bound as
-// ArrivalTracker.
+// ---- stats-page summary cache (F27, DESIGN.md SS8 "Stats page") -------------------------------
+//
+// Computing one of these streams a month of CSV off the SD card - seconds on a slow card, times
+// the number of configured stops. getStopSummary() used to do that work INLINE, on whichever task
+// asked, and the asker is ui/stats_screen.cpp running on the LVGL task: opening the stats page
+// froze touch and the clock for as long as the card took. So the call is now non-blocking. It
+// returns whatever is cached (saying how old that is, and whether anything is cached at all) and
+// marks the entry for refresh; the poller task does the actual scanning in its idle slices, one
+// stop per slice, so a five-stop refresh is spread over five slices instead of one long stall.
 constexpr int kSummaryWindowDays = 30;
-constexpr uint32_t kSummaryCacheMs = 60 * 1000;
+// Per-stop refresh floor. A summary over 30 days does not move meaningfully in ten minutes, and
+// the scan is the single most expensive thing this device does.
+constexpr uint32_t kSummaryRefreshMs = 10 * 60 * 1000;
 
 struct SummaryCacheEntry {
   std::string stop_key;
   transit_stats::StopSummary summary;
+  // DESIGN.md SS9.2: how many of those arrivals carry an inference marker. Kept next to the
+  // summary rather than inside it because StopSummary is a library type and this is the only
+  // caller that wants the number (StatsAggregator::inferredCount()).
+  uint32_t inferred = 0;
+  bool has_value = false;   // false: never computed, the screen must say "loading", not "0%"
+  bool requested = true;    // a refresh is wanted (new entry, aged out, or config changed)
   uint32_t computed_ms = 0;
 };
 std::vector<SummaryCacheEntry> g_summary_cache;
 
-transit_stats::StopSummary computeStopSummary(const std::string &stop_key) {
+// Fills `out_inferred` alongside the summary. Runs ONLY on the poller task (see above).
+transit_stats::StopSummary computeStopSummary(const std::string &stop_key, uint32_t &out_inferred) {
+  out_inferred = 0;
   transit::Epoch now = (transit::Epoch)time(nullptr);
   transit::Epoch start = now - (transit::Epoch)kSummaryWindowDays * 86400;
   // Heap-allocated: StatsAggregator's own header docs put sizeof() at just under 8KB, too large
-  // to risk on an arbitrary caller's stack (this can be called from the LVGL task, not just
-  // net_poller's own - see net_poller.h).
+  // to risk on the poller task's 10 KB stack alongside the rest of a poll cycle.
   std::unique_ptr<transit_stats::StatsAggregator> agg(new (std::nothrow) transit_stats::StatsAggregator(stop_key, start, now));
   if (!agg) {
     Serial.println("[net_poller] StatsAggregator allocation failed; summary unavailable");
@@ -166,6 +197,7 @@ transit_stats::StopSummary computeStopSummary(const std::string &stop_key) {
       return true;
     });
   }
+  out_inferred = agg->inferredCount();
   return transit_stats::summarize(*agg);
 }
 
@@ -187,6 +219,18 @@ AlertCacheEntry &findOrCreateAlertsEntry(const std::string &url) {
   }
   g_alerts_cache.push_back({url, {}, 0});
   return g_alerts_cache.back();
+}
+
+// Everything the alerts cache already holds, with no network at all. This is what goes onto the
+// first Snapshot of a cycle (F12): the ticker is already showing these, and withholding the
+// arrivals until a 5-minute-cadence alerts fetch finishes trades the thing the device is for
+// against the thing at the bottom of the screen.
+std::vector<Alert> cachedAlerts() {
+  std::vector<Alert> out;
+  for (const auto &e : g_alerts_cache) {
+    out.insert(out.end(), e.alerts.begin(), e.alerts.end());
+  }
+  return out;
 }
 
 // transit_core's HttpGet glue: http_fetch.cpp owns retry/backoff/TLS (DESIGN.md SS5), this just
@@ -232,25 +276,33 @@ std::string stopIdFromUrl(const std::string &url) {
   return p == std::string::npos ? url : url.substr(p + 8);
 }
 
-transit::HttpGet makeHttpGet() {
-  return [](const std::string &url, std::function<bool(const uint8_t *, size_t)> onData) -> int {
+// transit_core's completeness-aware transport (F13). Everything the poller fetches goes through
+// this rather than the legacy HttpGet, because via HttpGet transit_core has to ASSUME a body
+// arrived whole (adaptHttpGet, source.h) - and a TripUpdates feed cut off halfway still reports
+// HTTP 200, so the stops the missing half would have filled came back empty and "successful".
+// With a real FetchResult those stops are marked Health::ScheduleOnly with "live feed truncated"
+// instead (septa_source.cpp), which is the difference between a quiet afternoon and a broken one.
+transit::HttpGetEx makeHttpGetEx(uint32_t timeout_ms) {
+  return [timeout_ms](const std::string &url,
+                      std::function<bool(const uint8_t *, size_t)> onData) -> transit::FetchResult {
     // BusSchedules is tiny (~1 KB) and flaky, so buffer it and retry on the error shape before
     // handing the consumer a single clean delivery; everything else streams straight through.
     if (url.find("BusSchedules") != std::string::npos) {
-      int status = -1;
+      transit::FetchResult result;
       constexpr int kAttempts = 4;
       for (int attempt = 0; attempt < kAttempts; ++attempt) {
         std::vector<uint8_t> body;
         bool overflow = false;
         ReplyInfo reply;
-        status = transit_app::get(
+        transit::FetchResult transport = transit_app::getEx(
             url.c_str(),
             [&](const uint8_t *d, size_t n) {
               if (body.size() + n > 4096) { overflow = true; return false; }
               body.insert(body.end(), d, d + n);
               return true;
             },
-            kFetchTimeoutMs, &reply);
+            timeout_ms, &reply);
+        int status = transport.status;
         if (overflow || (!body.empty() && !isSeptaErrorBody(body))) {
           // Judge the service day here as well as in transit_core (fetchPlausibleSchedule): only
           // this layer sees which backend answered, and only a fresh connection without the
@@ -271,15 +323,36 @@ transit::HttpGet makeHttpGet() {
           } else {
             pinScheduleBackend(reply.set_cookie);
           }
-          if (!body.empty()) onData(body.data(), body.size());
-          return status;
+          result.status = status;
+          // This layer buffers the body before delivering it, so "complete" means the WHOLE body
+          // was buffered: the transport reached the end of it AND our own 4 KB cap did not cut it
+          // short. Reporting complete=true after an overflow would hand transit_core a truncated
+          // schedule labelled good, which is how a stop ends up showing half its trips.
+          result.complete = transport.complete && !overflow;
+          result.bytes = body.size();
+          if (!body.empty() && !onData(body.data(), body.size())) result.aborted = true;
+          return result;
         }
-        if (body.empty() && status > 0) return status;  // empty non-error reply: nothing to retry for
+        if (body.empty() && status > 0) {  // empty non-error reply: nothing to retry for
+          result.status = status;
+          result.complete = transport.complete;
+          return result;
+        }
+        result.status = status;
         vTaskDelay(pdMS_TO_TICKS(400 * (attempt + 1)));
       }
-      return status;
+      return result;
     }
-    return transit_app::get(url.c_str(), std::move(onData), kFetchTimeoutMs);
+    return transit_app::getEx(url.c_str(), std::move(onData), timeout_ms);
+  };
+}
+
+// The legacy HttpGet form, for the collaborators that only want a status code (weather_service,
+// bike_service - both buffer a bounded body and judge it themselves, so completeness adds
+// nothing they can act on). One transport, two shapes: never two transports.
+transit::HttpGet plainFrom(const transit::HttpGetEx &ex) {
+  return [ex](const std::string &url, std::function<bool(const uint8_t *, size_t)> onData) -> int {
+    return ex(url, std::move(onData)).status;
   };
 }
 
@@ -287,10 +360,17 @@ transit::HttpGet makeHttpGet() {
 // config.alerts. Kept separate from pollBusStops()/pollRailStops() because SeptaSource's alerts
 // fetch is per-route rather than part of that orchestration (source.h) - see NOTES.md 7b for why
 // the prefix differs per mode.
+// `have_time` is checked before EVERY route's request (F12): a device with eight configured
+// routes would otherwise commit to eight sequential fetches once the first one came due, and the
+// arrivals behind them would age by however long that took.
 std::vector<Alert> collectAlerts(const std::vector<StopConfig> &stops, bool alerts_enabled,
-                                  const transit::HttpGet &http) {
+                                  const transit::HttpGetEx &http,
+                                  const std::function<bool()> &have_time, bool *fetched_any) {
+  if (fetched_any != nullptr) *fetched_any = false;
   if (!alerts_enabled) {
+    bool had = !g_alerts_cache.empty();
     g_alerts_cache.clear();
+    if (fetched_any != nullptr) *fetched_any = had;  // clearing the ticker is a change worth publishing
     return {};
   }
 
@@ -307,10 +387,12 @@ std::vector<Alert> collectAlerts(const std::vector<StopConfig> &stops, bool aler
     AlertCacheEntry &entry = findOrCreateAlertsEntry(url);
     bool stale = entry.fetched_ms == 0 || (now_ms - entry.fetched_ms) >= kAlertsRefreshMs;
     if (!stale) continue;
+    if (have_time && !have_time()) break;  // out of budget: keep the cached alerts, poll instead
 
     std::vector<Alert> fetched;
-    src.fetchAlerts(s.mode, s.route, &fetched, http);
-    entry.fetched_ms = now_ms;
+    src.fetchAlertsEx(s.mode, s.route, &fetched, http);
+    if (fetched_any != nullptr) *fetched_any = true;
+    entry.fetched_ms = millis();
     entry.alerts = std::move(fetched);  // replaces even with an empty result - matches SEPTA's
                                          // own "no current alerts" being indistinguishable from a
                                          // transient miss (NOTES.md SS4/7b); the alerts ticker is
@@ -335,35 +417,65 @@ std::vector<Alert> collectAlerts(const std::vector<StopConfig> &stops, bool aler
 // any vehicle on this route right now" signal that pollBusStops() (septa_source.h) fetches
 // internally but doesn't expose (it only returns the merged per-stop Snapshot). Rather than
 // duplicate pollBusStops' own orchestration/parsing to get at it, this does one extra
-// SeptaSource::fetchTransitView() per distinct bus/trolley route - the same public method
-// pollBusStops uses - purely for this boolean. Routes are typically 1-2 for this device (DESIGN.md
-// SS6 caps at 8 stops total), so the extra ~1-3KB request per route per poll cycle is a bounded,
-// deliberate cost documented in firmware/README.md rather than a parsing-logic duplication.
-std::vector<std::pair<std::string, bool>> routeLiveness(const std::vector<StopConfig> &stops,
-                                                          const transit::HttpGet &http) {
-  std::vector<std::pair<std::string, bool>> live;
+// SeptaSource::fetchTransitViewEx() per distinct bus/trolley route - the same public method
+// pollBusStops uses - purely for this boolean.
+//
+// F12: it is now CACHED and scheduled like the other optional work, instead of running inline on
+// every single poll. It used to add one TransitView round trip per route to the critical path
+// between SEPTA and the screen, at the same 15-30 s cadence as the arrivals themselves, for a
+// boolean that only decides whether a missed scheduled trip is written as a `noshow` or folded
+// into an `outage` (DESIGN.md SS9.1) - a 10-minute-scale judgement.
+struct LivenessEntry {
+  std::string route;
+  bool live = false;
+  uint32_t fetched_ms = 0;
+};
+std::vector<LivenessEntry> g_liveness_cache;
+
+void refreshRouteLiveness(const std::vector<StopConfig> &stops, const transit::HttpGetEx &http,
+                          const std::function<bool()> &have_time) {
   transit::SeptaSource src;
+  std::vector<std::string> live_keys;
   for (const auto &s : stops) {
     if (s.mode != Mode::Bus && s.mode != Mode::Trolley) continue;
     if (s.route.empty()) continue;
-    bool already = false;
-    for (const auto &kv : live) {
-      if (kv.first == s.route) {
-        already = true;
+    if (std::find(live_keys.begin(), live_keys.end(), s.route) != live_keys.end()) continue;
+    live_keys.push_back(s.route);
+
+    LivenessEntry *entry = nullptr;
+    for (auto &e : g_liveness_cache) {
+      if (e.route == s.route) {
+        entry = &e;
         break;
       }
     }
-    if (already) continue;
+    if (entry != nullptr && entry->fetched_ms != 0 && (millis() - entry->fetched_ms) < kLivenessRefreshMs) continue;
+    if (have_time && !have_time()) break;
+
     std::vector<TvVehicle> tv;
-    src.fetchTransitView(s.route, &tv, http);
-    live.push_back({s.route, !tv.empty()});
+    src.fetchTransitViewEx(s.route, &tv, http);
+    if (entry == nullptr) {
+      g_liveness_cache.push_back({s.route, !tv.empty(), millis()});
+    } else {
+      entry->live = !tv.empty();
+      entry->fetched_ms = millis();
+    }
   }
-  return live;
+  // Drop routes no longer configured, so a stale answer cannot outlive the stop it belonged to.
+  g_liveness_cache.erase(std::remove_if(g_liveness_cache.begin(), g_liveness_cache.end(),
+                                         [&](const LivenessEntry &e) {
+                                           return std::find(live_keys.begin(), live_keys.end(), e.route) == live_keys.end();
+                                         }),
+                          g_liveness_cache.end());
 }
 
-bool routeIsLive(const std::vector<std::pair<std::string, bool>> &live, const std::string &route) {
-  for (const auto &kv : live) {
-    if (kv.first == route) return kv.second;
+// Unknown reads as false, which is the conservative answer: the tracker then treats a scheduled
+// trip that never appeared as part of an outage rather than asserting the bus did not run.
+bool routeIsLive(const std::string &route) {
+  for (const auto &e : g_liveness_cache) {
+    if (e.route != route) continue;
+    if (e.fetched_ms == 0 || (millis() - e.fetched_ms) > kLivenessMaxAgeMs) return false;
+    return e.live;
   }
   return false;
 }
@@ -387,7 +499,17 @@ std::string currentLocalMonth() {
   return std::string(buf);
 }
 
-// DESIGN.md SS9.1 v2 columns the tracker cannot know: the weather at the event (arrive/ghost/
+// DESIGN.md SS9.1 log schema v3: the `temp_c` column is CELSIUS, always. The forecast held here is
+// in whatever unit the DISPLAY is configured for (weather.fahrenheit, DESIGN.md SS4.8), so this is
+// the conversion transit_stats/events.h means when it says "the app layer must never log degrees
+// Fahrenheit into this column". Before v3 the column simply carried the device unit with nothing
+// in the row saying which, so the owner's month of logs was only interpretable by someone who also
+// knew how the device had been set up.
+int32_t toCelsius(double value, bool fahrenheit) {
+  return (int32_t)lround(fahrenheit ? (value - 32.0) * 5.0 / 9.0 : value);
+}
+
+// DESIGN.md SS9.1 v2/v3 columns the tracker cannot know: the weather at the event (arrive/ghost/
 // noshow rows, from the main forecast hour nearest ev.ts) and whether an alert (1) or a detour (2)
 // applied to the route at that moment (every stop event).
 void annotateEvents(std::vector<transit_stats::LogEvent> &events, const std::vector<transit::Alert> &alerts) {
@@ -401,42 +523,77 @@ void annotateEvents(std::vector<transit_stats::LogEvent> &events, const std::vec
       flag = std::max<uint8_t>(flag, al.detours.empty() ? 1 : 2);
     }
     ev.alert = flag;
-    if (ev.event == EventType::Pred || !wx.enabled || !wx.main.valid()) continue;
+    // A stale forecast is not the weather at ev.ts; leaving temp/wx unset (null) says "unknown",
+    // which is what DESIGN.md SS9.1's "empty means unknown, never coerced" asks for (F29).
+    if (ev.event == EventType::Pred || !wx.enabled || wx.stale || !wx.main.valid()) continue;
     const weather::Hour *h = wx.main.at(ev.ts);
     if (h != nullptr && h->code >= 0) {
-      ev.temp = (int32_t)lround(h->temp);
+      ev.temp = toCelsius(h->temp, wx.fahrenheit);
       ev.wx = h->code;
     } else {
-      ev.temp = (int32_t)lround(wx.main.temp);
+      ev.temp = toCelsius(wx.main.temp, wx.fahrenheit);
       ev.wx = wx.main.code;
     }
   }
 }
 
 // DESIGN.md SS9.1 `bike` rows: one per configured Indego station per local clock hour, taken from
-// the last successful refresh (bike_service.cpp polls every 5 min, so the sample is that fresh).
-int g_bike_logged_hour = -1;  // tm_yday * 24 + tm_hour of the last rows written
+// the last successful refresh (bike_service.cpp polls every 5 min, so a healthy sample is that
+// fresh).
+//
+// F29 - a `bike` row is a claim that "this is what the docks held at ts", so three rules:
+//   * Only log a sample we actually observed near `now`. bike_service deliberately keeps serving
+//     the last good counts to the DISPLAY when the 400 KB feed fails (better than a blank panel),
+//     but writing those into the log as this hour's observation is inventing data. A sample older
+//     than kBikeSampleMaxAgeS is not logged at all.
+//   * Never log the SAME fetch twice. The hour id alone did exactly that across an hour boundary:
+//     one unchanged, hours-old sample became a fresh hourly observation every hour it survived.
+//   * Unknown stays unknown. `ebikes` was coerced to 0 for a station whose feed entry has no
+//     e-bike count, which reads back as "this station has no e-bikes" - the exact confusion
+//     DESIGN.md SS9.1's "empty means unknown, never coerced to 0" exists to prevent.
+constexpr uint32_t kBikeSampleMaxAgeS = 15 * 60;
+int g_bike_logged_hour = -1;          // tm_yday * 24 + tm_hour of the last rows written
+uint32_t g_bike_logged_epoch = 0;     // fetched_epoch of the sample those rows came from
 void logBikeSamples(const Config &cfg, time_t now, const std::string &month) {
   if (!cfg.bike.enabled) return;
   BikeView bikes = getBikes();
   if (bikes.fetched_epoch == 0 || bikes.stations.empty()) return;
+  // `now` is stamped at the start of the cycle and refreshBikes() ran inside it, so a sample
+  // fetched seconds ago can carry a fetched_epoch slightly LATER than now. That is an age of
+  // zero, not a reason to skip the freshest sample we will ever have.
+  uint32_t now_u = (uint32_t)now;
+  uint32_t age_s = bikes.fetched_epoch > now_u ? 0 : now_u - bikes.fetched_epoch;
+  if (age_s > kBikeSampleMaxAgeS) return;
+  if (bikes.fetched_epoch == g_bike_logged_epoch) return;
   struct tm lt;
   localtime_r(&now, &lt);
   int hour_id = lt.tm_yday * 24 + lt.tm_hour;
   if (hour_id == g_bike_logged_hour) return;
+  bool wrote_any = false;
   for (const indego::Station &st : bikes.stations) {
     if (st.bikes < 0) continue;  // missing from the feed: nothing to sample
     transit_stats::LogEvent ev;
     ev.ts = (transit::Epoch)now;
     ev.event = transit_stats::EventType::Bike;
     ev.stop_key = "indego-" + std::to_string(st.id);
-    ev.note = st.name;
+    // Vendor-supplied free text goes through the library's own sanitiser so the value written is
+    // the value a reader gets back (transit_stats/events.h).
+    ev.note = transit_stats::sanitizeLogField(st.name, transit_stats::kMaxCsvTextChars);
     ev.bikes = st.bikes;
-    ev.ebikes = st.ebikes < 0 ? 0 : st.ebikes;
-    ev.docks = st.docks;
-    appendLine(month.c_str(), transit_stats::toCsv(ev).c_str());
+    if (st.ebikes >= 0) ev.ebikes = st.ebikes;  // else: left unset = unknown, never 0
+    if (st.docks >= 0) ev.docks = st.docks;
+    if (appendLine(month.c_str(), transit_stats::toCsv(ev).c_str())) {
+      wrote_any = true;
+    } else {
+      Serial.printf("[net_poller] SD write dropped a bike row for %s\n", ev.stop_key.c_str());
+    }
   }
-  g_bike_logged_hour = hour_id;
+  // Only claim the hour once something landed: a card that was busy this cycle gets another try
+  // on the next poll instead of losing the hour entirely.
+  if (wrote_any) {
+    g_bike_logged_hour = hour_id;
+    g_bike_logged_epoch = bikes.fetched_epoch;
+  }
 }
 
 // One long-lived ArrivalTracker across the device's uptime (DESIGN.md SS9.1); registerStop() is
@@ -485,9 +642,125 @@ void logHeapHeartbeat() {
                 (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
 
-void pollOnce() {
+// Publishes a Snapshot to every reader (UI, web server) and moves the LED with it. Called more
+// than once per cycle (F12): the arrivals go out the moment they exist, and again when the alerts
+// that belong to the same Snapshot arrive.
+void publishSnapshot(const Snapshot &snap) {
+  if (xSemaphoreTake(g_mutex, portMAX_DELAY) == pdTRUE) {
+    g_status.has_polled = true;
+    g_status.ok = snap.last_poll_ok;
+    g_status.last_http_status = snap.last_poll_ok ? 200 : 0;
+    g_status.last_poll_epoch = (uint32_t)snap.generated;
+    g_status.last_error = snap.last_error;
+    g_snapshot = snap;
+    xSemaphoreGive(g_mutex);
+  }
+
+  if (snap.last_poll_ok) {
+    flashPollOk();
+    setStatusLed(LedState::Off);
+  } else {
+    setStatusLed(LedState::Error);
+  }
+}
+
+// DESIGN.md SS7 / model.h: last_poll_ok is "every stop's required sources succeeded" - which is
+// just the AND of StopSnapshot::ok now that failure is reported per stop (septa_source.h) - and
+// last_error is the FIRST failing stop's own error, not a global one. Recomputed over the merged
+// stop list rather than taken from the two sub-snapshots so the two always agree with what the
+// per-stop panels show.
+void summarizePollHealth(Snapshot &snap) {
+  snap.last_poll_ok = true;
+  snap.last_error.clear();
+  for (const StopSnapshot &s : snap.stops) {
+    if (s.ok) continue;
+    snap.last_poll_ok = false;
+    if (snap.last_error.empty()) snap.last_error = s.error.empty() ? "stop unavailable" : s.error;
+  }
+}
+
+// Computes how long to sleep before the next cycle, per DESIGN.md SS4.7: the configured
+// poll_seconds normally, 15s when an arrival is imminent, or exponential backoff (30/60/120s,
+// capped at 5 min) after a failed cycle.
+uint32_t nextIntervalS(const Config &cfg, bool ok, bool urgent, uint32_t &consecutive_failures) {
+  if (!ok) {
+    consecutive_failures = std::min<uint32_t>(consecutive_failures + 1, 4);
+    uint32_t backoff = kBaseBackoffS << (consecutive_failures - 1);
+    return std::min(backoff, kMaxBackoffS);
+  }
+  consecutive_failures = 0;
+  return urgent ? std::min<uint32_t>(cfg.device.poll_seconds, kUrgentIntervalS) : cfg.device.poll_seconds;
+}
+
+// Computes at most ONE requested stats summary, on the poller task, and stores it (F27). Returns
+// true if it did work, so the idle loop can re-check its deadline afterwards.
+//
+// The cache mutex is deliberately NOT held across the scan: the scan is the slow part (a month of
+// CSV off SD), and holding g_mutex through it would block getSnapshot() - i.e. the LVGL task's
+// 1 Hz redraw - for exactly as long as the scan takes, which is the freeze this change exists to
+// remove. Take, release, scan, take, store.
+bool computeOneRequestedSummary() {
+  std::string key;
+  if (g_mutex == nullptr) return false;
+  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
+  for (const auto &e : g_summary_cache) {
+    if (e.requested) {
+      key = e.stop_key;
+      break;
+    }
+  }
+  xSemaphoreGive(g_mutex);
+  if (key.empty()) return false;
+
+  uint32_t inferred = 0;
+  transit_stats::StopSummary summary = computeStopSummary(key, inferred);
+
+  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    for (auto &e : g_summary_cache) {
+      if (e.stop_key != key) continue;
+      e.summary = summary;
+      e.inferred = inferred;
+      e.has_value = true;
+      e.requested = false;
+      e.computed_ms = millis();
+      break;
+    }
+    xSemaphoreGive(g_mutex);
+  }
+  return true;
+}
+
+// Drops cached summaries for stops that are no longer configured (F27), so the stats page cannot
+// keep answering for a stop the user removed.
+void evictUnconfiguredSummaries(const std::vector<StopConfig> &stops) {
+  if (g_mutex == nullptr) return;
+  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+  g_summary_cache.erase(std::remove_if(g_summary_cache.begin(), g_summary_cache.end(),
+                                        [&](const SummaryCacheEntry &e) {
+                                          for (const auto &s : stops) {
+                                            if (s.key == e.stop_key) return false;
+                                          }
+                                          return true;
+                                        }),
+                         g_summary_cache.end());
+  xSemaphoreGive(g_mutex);
+}
+
+// One poll cycle. Returns the millis() deadline of the NEXT transit poll, which is also the
+// budget the optional work below is measured against.
+//
+// F12 - the ORDER here is the whole point. This function used to fetch alerts, weather, bikes and
+// one TransitView per route for the liveness flag, then feed the tracker and write to SD, and only
+// after all of that publish the Snapshot. Every one of those is a network round trip on the same
+// task, so a slow alerts endpoint and a 400 KB bike feed sat between SEPTA's answer and the
+// screen: arrivals that were fetched at :00 reached the display at :12, and `generated` said :00,
+// so the header cheerfully reported them as fresh. The arrivals are the product; they are
+// published the instant they exist, and everything else runs afterwards on its own clock.
+uint32_t pollOnce(uint32_t &consecutive_failures) {
   Config cfg = getActiveConfig();
-  transit::HttpGet http = makeHttpGet();
+  transit::HttpGetEx http = makeHttpGetEx(kFetchTimeoutMs);
+  transit::HttpGetEx http_opt = makeHttpGetEx(kOptionalFetchTimeoutMs);
+  transit::HttpGet http_opt_plain = plainFrom(http_opt);
   transit::Epoch now = (transit::Epoch)time(nullptr);
 
   if (g_invalidate_sched_cache) {
@@ -510,23 +783,51 @@ void pollOnce() {
   Snapshot rail_snap = transit::pollRailStops(rail_like, now, http);
 
   Snapshot combined;
-  combined.generated = now;
-  combined.last_poll_ok = bus_snap.last_poll_ok && rail_snap.last_poll_ok;
-  combined.last_error = !bus_snap.last_poll_ok ? bus_snap.last_error
-                         : !rail_snap.last_poll_ok ? rail_snap.last_error
-                                                    : "";
   combined.stops = std::move(bus_snap.stops);
   combined.stops.insert(combined.stops.end(), rail_snap.stops.begin(), rail_snap.stops.end());
-  combined.alerts = collectAlerts(cfg.stops, cfg.alerts, http);
-  refreshWeather(cfg, http);  // DESIGN.md SS4.8: 10 min cadence per location, no-op otherwise
-  refreshBikes(cfg, http);    // DESIGN.md SS4.9: 5 min cadence, streams the 400 KB feed
+  summarizePollHealth(combined);
+  // Stamped HERE, not at the top of the function: `generated` is what the header's "updated 12 s
+  // ago" and the staleness amber are measured from, so it has to be when the data became visible,
+  // not when the cycle started.
+  combined.generated = (transit::Epoch)time(nullptr);
+  // Alerts belong to the Snapshot, and whatever the cache holds is what the ticker already shows;
+  // publishing without them is never a reason to withhold the arrivals (F12). A second publish
+  // follows below if a fetch brings new ones.
+  combined.alerts = cachedAlerts();
+  publishSnapshot(combined);
+
+  // From here on everything is optional. The next transit poll's deadline is fixed first, so each
+  // piece of work can ask whether it still has room rather than finding out afterwards.
+  bool urgent = anyArrivalUrgent(combined, combined.generated);
+  uint32_t interval_s = nextIntervalS(cfg, combined.last_poll_ok, urgent, consecutive_failures);
+  if (g_last_poll_unsynced) interval_s = std::min<uint32_t>(interval_s, 10);  // re-poll soon once NTP lands
+  const uint32_t deadline_ms = millis() + interval_s * 1000UL;
+  // std::function, not auto: it is handed to collectAlerts()/refreshRouteLiveness() by const
+  // reference, and an `auto` lambda would be wrapped into a fresh std::function (a heap
+  // allocation) at each call site.
+  const std::function<bool()> have_time = [deadline_ms]() {
+    return (int32_t)(deadline_ms - millis()) > (int32_t)kOptionalWorkReserveMs;
+  };
+
+  if (have_time()) {
+    bool alerts_fetched = false;
+    combined.alerts = collectAlerts(cfg.stops, cfg.alerts, http_opt, have_time, &alerts_fetched);
+    // Only when something actually came back: a cycle where every alert feed was still fresh must
+    // not re-publish an identical Snapshot and reset the header's "updated N s ago".
+    if (alerts_fetched) publishSnapshot(combined);  // same stops, now with the alerts for them
+  }
+  if (have_time()) refreshWeather(cfg, http_opt_plain);  // DESIGN.md SS4.8: 10 min per location
+  if (have_time()) refreshBikes(cfg, http_opt_plain);    // DESIGN.md SS4.9: 5 min, 400 KB streamed
 
   // DESIGN.md SS9: feed every StopSnapshot to the tracker and append any resulting LogEvents to
-  // the current month's CSV. Done before the mutex swap below so a slow SD write never holds up
-  // readers of the live Snapshot.
+  // the current month's CSV. This runs on EVERY cycle regardless of the budget - it is not
+  // optional work. observe() is what maintains the outage bookkeeping and the two-consecutive-
+  // -misses rule (tracker.h); skipping a cycle would make the tracker believe it saw a poll it
+  // never saw. Only the liveness REFRESH above it is skippable, and an unknown liveness answers
+  // false, which suppresses a noshow rather than inventing one.
   if (cfg.device.logging) {
     syncTrackerRegistrations(cfg.stops);
-    std::vector<std::pair<std::string, bool>> live_by_route = routeLiveness(bus_like, http);
+    refreshRouteLiveness(bus_like, http_opt, have_time);
     std::vector<transit_stats::LogEvent> events;
     for (const auto &stop : combined.stops) {
       const StopConfig *sc = nullptr;
@@ -536,53 +837,39 @@ void pollOnce() {
           break;
         }
       }
-      bool route_live = sc && routeIsLive(live_by_route, sc->route);
-      if (tracker() != nullptr && now >= kSaneClockEpoch) tracker()->observe(stop, now, route_live, combined.last_poll_ok, events);
+      bool route_live = sc && routeIsLive(sc->route);
+      // F17: the PER-STOP verdict, not the combined one. tracker.h is explicit that poll_ok is a
+      // statement about THIS stop's data - passing the AND of every stop meant one stop's failing
+      // schedule endpoint froze every other stop's inference too, and (worse, before per-stop
+      // health existed) a stop whose own fetch failed could be observed as a successful poll with
+      // no arrivals, which is how a network timeout produced `arrive` and `ghost` rows.
+      if (tracker() != nullptr && now >= kSaneClockEpoch) tracker()->observe(stop, now, route_live, stop.ok, events);
     }
     if (now >= kSaneClockEpoch) {
       std::string month = currentLocalMonth();
       if (!events.empty()) {
         annotateEvents(events, combined.alerts);
+        uint32_t dropped = 0;
         for (const auto &ev : events) {
           std::string line = transit_stats::toCsv(ev);
-          appendLine(month.c_str(), line.c_str());
+          if (!appendLine(month.c_str(), line.c_str())) dropped++;
+        }
+        if (dropped > 0) {
+          // F24/F26: a row that did not reach the card is a hole in the statistics, not a
+          // non-event. Say so where the owner can see it.
+          SdStatus sd = getSdStatus();
+          Serial.printf("[net_poller] SD dropped %u of %u log rows (%s); %u dropped since boot\n",
+                        (unsigned)dropped, (unsigned)events.size(),
+                        sd.error.empty() ? "unknown reason" : sd.error.c_str(), (unsigned)sd.dropped_rows);
         }
       }
       logBikeSamples(cfg, (time_t)now, month);
     }
   }
 
+  evictUnconfiguredSummaries(cfg.stops);
   logHeapHeartbeat();
-
-  if (xSemaphoreTake(g_mutex, portMAX_DELAY) == pdTRUE) {
-    g_status.has_polled = true;
-    g_status.ok = combined.last_poll_ok;
-    g_status.last_http_status = combined.last_poll_ok ? 200 : 0;
-    g_status.last_poll_epoch = (uint32_t)now;
-    g_status.last_error = combined.last_error;
-    g_snapshot = combined;
-    xSemaphoreGive(g_mutex);
-  }
-
-  if (combined.last_poll_ok) {
-    flashPollOk();
-    setStatusLed(LedState::Off);
-  } else {
-    setStatusLed(LedState::Error);
-  }
-}
-
-// Computes how long to sleep before the next cycle, per DESIGN.md SS4.7: the configured
-// poll_seconds normally, 15s when an arrival is imminent, or exponential backoff (30/60/120s,
-// capped at 5 min) after a failed cycle.
-uint32_t nextIntervalS(const Config &cfg, bool ok, bool urgent, uint32_t &consecutive_failures) {
-  if (!ok) {
-    consecutive_failures = std::min<uint32_t>(consecutive_failures + 1, 4);
-    uint32_t backoff = kBaseBackoffS << (consecutive_failures - 1);
-    return std::min(backoff, kMaxBackoffS);
-  }
-  consecutive_failures = 0;
-  return urgent ? std::min<uint32_t>(cfg.device.poll_seconds, kUrgentIntervalS) : cfg.device.poll_seconds;
+  return deadline_ms;
 }
 
 void pollerTask(void * /*arg*/) {
@@ -602,24 +889,24 @@ void pollerTask(void * /*arg*/) {
   }
   uint32_t consecutive_failures = 0;
   for (;;) {
-    pollOnce();
+    // pollOnce() publishes the arrivals as soon as it has them and returns the deadline it set
+    // for the next cycle (F12), so the interval is derived once, in the place that also budgets
+    // the optional work against it.
+    uint32_t deadline = pollOnce(consecutive_failures);
 
-    Config cfg = getActiveConfig();
-    Snapshot snap = getSnapshot();
-    bool ok = snap.last_poll_ok;
-    bool urgent = anyArrivalUrgent(snap, (transit::Epoch)time(nullptr));
-    uint32_t interval_s = nextIntervalS(cfg, ok, urgent, consecutive_failures);
-    if (g_last_poll_unsynced) interval_s = std::min<uint32_t>(interval_s, 10);  // re-poll soon once NTP lands
-
-    // Blocks for up to interval_s, but wakes immediately if requestRepoll() gives the semaphore
+    // Blocks until the deadline, but wakes immediately if requestRepoll() gives the semaphore
     // (DESIGN.md SS7: PUT /api/config "triggers immediate re-poll").
-    // Sleep in slices so queued web jobs (setup-wizard proxies, /api/stats) run on this task
-    // instead of needing a stack of their own; a config change (requestRepoll) ends the wait.
-    uint32_t deadline = millis() + interval_s * 1000UL;
+    // Sleep in slices so queued web jobs (setup-wizard proxies, /api/stats) and the stats-page
+    // summary scans run on this task instead of needing a stack of their own.
     while ((int32_t)(millis() - deadline) < 0) {
       if (xSemaphoreTake(g_wake_sem, pdMS_TO_TICKS(250)) == pdTRUE) break;
-      while (runQueuedProxyJob()) {
-      }
+      // ONE job per slice, then look at the clock again (F12). `while (runQueuedProxyJob()) {}`
+      // drained the whole queue back to back without ever checking it: two queued jobs - a
+      // 400 KB Stops proxy and a 30-day stats scan are both seconds of work - could push the
+      // next transit poll a long way past its deadline, and nothing in the loop noticed.
+      if (runQueuedProxyJob() && (int32_t)(millis() - deadline) >= 0) break;
+      // At most one stop's stats summary per slice, same reason (F27).
+      if (computeOneRequestedSummary() && (int32_t)(millis() - deadline) >= 0) break;
     }
   }
 }
@@ -679,24 +966,37 @@ PollStatus getPollStatus() {
   return copy;
 }
 
-bool getStopSummary(const std::string &stop_key, transit_stats::StopSummary &out) {
+StopSummaryView getStopSummary(const std::string &stop_key) {
+  StopSummaryView view;
+  if (g_mutex == nullptr) return view;
+  // Short wait, and give up rather than block: this runs on the LVGL task, which must never wait
+  // on another task's lock (DESIGN.md SS5). A missed refresh costs one screen update.
+  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return view;
   uint32_t now_ms = millis();
+  SummaryCacheEntry *entry = nullptr;
   for (auto &e : g_summary_cache) {
-    if (e.stop_key != stop_key) continue;
-    if (now_ms - e.computed_ms >= kSummaryCacheMs) {
-      e.summary = computeStopSummary(stop_key);
-      e.computed_ms = now_ms;
+    if (e.stop_key == stop_key) {
+      entry = &e;
+      break;
     }
-    out = e.summary;
-    return true;
   }
-  SummaryCacheEntry entry;
-  entry.stop_key = stop_key;
-  entry.summary = computeStopSummary(stop_key);
-  entry.computed_ms = now_ms;
-  out = entry.summary;
-  g_summary_cache.push_back(std::move(entry));
-  return true;
+  if (entry == nullptr) {
+    // First ask for this stop: register it and let the poller do the scan. The caller gets
+    // has_value = false, which the stats screen renders as "loading" - never as zeroes.
+    g_summary_cache.push_back(SummaryCacheEntry{});
+    entry = &g_summary_cache.back();
+    entry->stop_key = stop_key;
+    entry->requested = true;
+  } else if (entry->has_value && (now_ms - entry->computed_ms) >= kSummaryRefreshMs) {
+    entry->requested = true;  // aged out; the poller picks it up in its next idle slice
+  }
+  view.has_value = entry->has_value;
+  view.pending = entry->requested;
+  view.age_s = entry->has_value ? (now_ms - entry->computed_ms) / 1000u : 0;
+  view.inferred = entry->inferred;
+  view.summary = entry->summary;
+  xSemaphoreGive(g_mutex);
+  return view;
 }
 
 }  // namespace transit_app

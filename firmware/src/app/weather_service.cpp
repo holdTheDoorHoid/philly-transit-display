@@ -19,12 +19,28 @@ constexpr double kShareKm = 1.5;
 constexpr int kForecastHours = 6;
 constexpr size_t kBodyCap = 3072;  // a 6-hour response is ~900 B
 
+// Failure backoff (F29). Before this, `due` was `!loc.ok || age >= kRefreshMs`, and `!loc.ok`
+// stays true until the FIRST success - so a location that had never answered was refetched on
+// every poll cycle, i.e. every 30 s (every 15 s with a bus due), forever. That is the exact
+// opposite of what a failing endpoint deserves, it is rude to a free no-key API, and it spent the
+// poller's budget on the one request least likely to work. 1 min, then 5, then 10 and stay there.
+uint32_t retryDelayMs(uint8_t consecutive_failures) {
+  if (consecutive_failures <= 1) return 1u * 60 * 1000;
+  if (consecutive_failures == 2) return 5u * 60 * 1000;
+  return 10u * 60 * 1000;
+}
+
 struct Location {
   double lat = 0;
   double lng = 0;
   weather::Forecast forecast;
-  uint32_t fetched_ms = 0;
-  bool ok = false;
+  // These three used to be one field, which is why a failed fetch could look like a fresh one:
+  // `fetched_ms` was stamped on every attempt so the data could age without the age moving.
+  uint32_t attempted_ms = 0;    // last attempt, success or not - drives the backoff
+  uint32_t fetched_ms = 0;      // last SUCCESS - drives freshness and staleness
+  uint32_t fetched_epoch = 0;   // wall clock of that success, for the API's fetched_epoch
+  uint8_t consecutive_failures = 0;
+  bool ok = false;              // a forecast is present (possibly old - check fetched_ms)
 };
 
 struct StopLocation {
@@ -104,12 +120,31 @@ bool fetchLocation(Location &loc, bool fahrenheit, const transit::HttpGet &http)
   bool ok = !body.empty() && weather::parseOpenMeteo(body.data(), body.size(), &f, &err);
   Serial.printf("[weather] %.4f,%.4f: HTTP %d, %u bytes%s%s\n", loc.lat, loc.lng, status, (unsigned)body.size(),
                 ok ? ", " : ", parse failed: ", ok ? weather::codeText(f.code) : err.c_str());
+  loc.attempted_ms = millis();  // stamped on every attempt: this is what the backoff measures
   if (ok) {
     loc.forecast = std::move(f);
     loc.ok = true;
+    loc.fetched_ms = loc.attempted_ms;  // only a SUCCESS makes the data young again
+    loc.fetched_epoch = (uint32_t)time(nullptr);
+    loc.consecutive_failures = 0;
+  } else if (loc.consecutive_failures < 250) {
+    loc.consecutive_failures++;
   }
-  loc.fetched_ms = millis();  // even on failure: don't hammer the API every 30 s
   return ok;
+}
+
+// Age of a location's data in seconds, or -1 if it has never succeeded. Measured from millis()
+// rather than the wall clock so an NTP step (the device polls before NTP lands - net_poller.cpp)
+// cannot invent an hour of age or erase one. Unsigned subtraction handles the 49-day wrap.
+int32_t locationAgeS(const Location &loc) {
+  if (!loc.ok || loc.fetched_ms == 0) return -1;
+  return (int32_t)((millis() - loc.fetched_ms) / 1000u);
+}
+
+// Callers must hold the lock. "Fresh" = we have it AND it is younger than kWeatherStaleAfterS.
+bool locationFresh(const Location &loc) {
+  int32_t age = locationAgeS(loc);
+  return age >= 0 && (uint32_t)age <= kWeatherStaleAfterS;
 }
 
 std::string clockText(int64_t epoch) {
@@ -158,11 +193,17 @@ void refreshWeather(const Config &cfg, const transit::HttpGet &http) {
     }
   }
 
-  bool any_fetched = false;
   for (Location &loc : locs) {
-    bool due = regrouped || !loc.ok || (millis() - loc.fetched_ms) >= kRefreshMs;
+    bool due;
+    if (regrouped || loc.attempted_ms == 0) {
+      due = true;  // a config change, or a location never tried
+    } else if (loc.consecutive_failures > 0) {
+      due = (millis() - loc.attempted_ms) >= retryDelayMs(loc.consecutive_failures);
+    } else {
+      due = (millis() - loc.fetched_ms) >= kRefreshMs;  // DESIGN.md SS4.8: 10 min per location
+    }
     if (!due) continue;
-    if (fetchLocation(loc, cfg.weather.fahrenheit, http)) any_fetched = true;
+    fetchLocation(loc, cfg.weather.fahrenheit, http);
   }
 
   Lock lock;
@@ -172,7 +213,11 @@ void refreshWeather(const Config &cfg, const transit::HttpGet &http) {
   g_per_stop = cfg.weather.per_stop;
   g_locations = std::move(locs);
   g_stops = std::move(stops);
-  if (any_fetched && !g_locations.empty() && g_locations[0].ok) g_fetched_epoch = (uint32_t)time(nullptr);
+  // MAIN location only (F29). This used to be bumped whenever ANY location fetched successfully
+  // while location 0 merely had `ok` still true from some earlier poll - so a second stop's
+  // forecast refreshing made the header's hours-old temperature report as seconds old, which is
+  // the one thing the timestamp exists to prevent.
+  g_fetched_epoch = g_locations.empty() ? 0 : g_locations[0].fetched_epoch;
 }
 
 WeatherView getWeather() {
@@ -182,13 +227,20 @@ WeatherView getWeather() {
   v.enabled = g_enabled;
   v.fahrenheit = g_fahrenheit;
   v.fetched_epoch = g_fetched_epoch;
-  if (!g_locations.empty() && g_locations[0].ok) v.main = g_locations[0].forecast;
+  if (!g_locations.empty()) {
+    v.age_s = locationAgeS(g_locations[0]);
+    v.stale = v.age_s >= 0 && (uint32_t)v.age_s > kWeatherStaleAfterS;
+    // The forecast is handed over even when stale so the web UI can show it next to its own age
+    // and decide; only the DEVICE's header and notes go silent, because there is no room on a
+    // 480x320 panel to caption a number with how old it is (DESIGN.md SS8).
+    if (g_locations[0].ok) v.main = g_locations[0].forecast;
+  }
   return v;
 }
 
 std::string headerWeatherText() {
   Lock lock;
-  if (!lock.held || !g_enabled || g_locations.empty() || !g_locations[0].ok) return "";
+  if (!lock.held || !g_enabled || g_locations.empty() || !locationFresh(g_locations[0])) return "";
   const weather::Forecast &f = g_locations[0].forecast;
   char buf[48];
   snprintf(buf, sizeof(buf), "%d\xC2\xB0 %s", (int)lround(f.temp), weather::codeText(f.code));
@@ -210,7 +262,7 @@ static WeatherIcon iconForCode(int code, bool night) {
 
 WeatherIcon headerWeatherIcon() {
   Lock lock;
-  if (!lock.held || !g_enabled || g_locations.empty() || !g_locations[0].ok) return WeatherIcon::None;
+  if (!lock.held || !g_enabled || g_locations.empty() || !locationFresh(g_locations[0])) return WeatherIcon::None;
   time_t now = time(nullptr);
   struct tm lt;
   localtime_r(&now, &lt);
@@ -220,7 +272,7 @@ WeatherIcon headerWeatherIcon() {
 
 std::string headerWeatherTemp() {
   Lock lock;
-  if (!lock.held || !g_enabled || g_locations.empty() || !g_locations[0].ok) return "";
+  if (!lock.held || !g_enabled || g_locations.empty() || !locationFresh(g_locations[0])) return "";
   char buf[16];
   snprintf(buf, sizeof(buf), "%d\xC2\xB0", (int)lround(g_locations[0].forecast.temp));
   return buf;
@@ -229,7 +281,9 @@ std::string headerWeatherTemp() {
 std::string stopWeatherNote(const std::string &stop_key, int64_t first_arrival_epoch) {
   Lock lock;
   if (!lock.held || !g_enabled || !g_per_stop || first_arrival_epoch <= 0) return "";
-  if (g_locations.empty() || !g_locations[0].ok) return "";
+  // The note is judged AGAINST the header's conditions, so a stale main forecast makes the whole
+  // comparison meaningless, not just the header (F29).
+  if (g_locations.empty() || !locationFresh(g_locations[0])) return "";
   int idx = 0;
   for (const StopLocation &s : g_stops) {
     if (s.key == stop_key) {
@@ -237,7 +291,7 @@ std::string stopWeatherNote(const std::string &stop_key, int64_t first_arrival_e
       break;
     }
   }
-  if ((size_t)idx >= g_locations.size() || !g_locations[(size_t)idx].ok) idx = 0;
+  if ((size_t)idx >= g_locations.size() || !locationFresh(g_locations[(size_t)idx])) idx = 0;
   const weather::Hour *h = g_locations[(size_t)idx].forecast.at(first_arrival_epoch);
   if (h == nullptr) return "";
   if (!weather::notable(*h, g_locations[0].forecast.code)) return "";

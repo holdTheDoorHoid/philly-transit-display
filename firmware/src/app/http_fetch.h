@@ -9,6 +9,8 @@
 #include <functional>
 #include <string>
 
+#include "transit_core/source.h"  // transit::FetchResult / transit::HttpGetEx
+
 namespace transit_app {
 
 // Response headers a caller may want back from get(). SEPTA's BusSchedules is served by an AWS
@@ -61,9 +63,41 @@ const std::string &scheduleCookie();
 int get(const char *url, std::function<bool(const uint8_t *, size_t)> onData, uint32_t timeout_ms,
         ReplyInfo *reply = nullptr);
 
-// Plain HTTP only (v0.1.2): an https:// URL is fetched over http://. The optional TLS mode was
-// removed to free ~100 KB of flash; it was off by default because a TLS session needs ~40 KB of
-// heap with two 16 KB contiguous buffers that the classic ESP32 (no PSRAM) running LVGL, Wi-Fi
-// and a web server cannot spare, and SEPTA, Open-Meteo and Bicycle Transit all serve plain http.
+// Same request, same retry policy, but reporting what the transport actually knows about the body
+// (review finding F13). A status code alone cannot answer "did we receive ALL of it?": a
+// connection dropped halfway through the 150 KB TripUpdates feed still reports 200, and the
+// decoder then sees a short-but-syntactically-fine feed - the stops the missing half would have
+// filled come back empty and "successful" (transit_core/source.h). Fields, in the same terms
+// transit::FetchResult documents:
+//
+//   status    the HTTP status of the kept response, or 0 when no response was obtained at all
+//             (transit_core's HttpGet contract; get()'s negative HTTPClient error codes are
+//             folded to 0 here, because transit_core tests `status == 0` for "unreachable").
+//   complete  the body reached its end. For a Content-Length response that means the bytes
+//             delivered equal HTTPClient::getSize(); for a chunked one it means writeToStream()
+//             returned a non-negative count, which the core's HTTPClient.cpp only does after the
+//             terminating zero-length chunk (any earlier drop returns CONNECTION_LOST /
+//             READ_TIMEOUT / STREAM_WRITE). A body with neither framing (EOF-delimited) is
+//             complete when the peer closed the connection, which IS its framing.
+//   aborted   WE stopped it: `onData` returned false. Not a transport failure - the caller asked.
+//   bytes     body bytes handed to `onData` (including the chunk a refusing onData rejected).
+//
+// A request that hit the absolute deadline below is `complete = false`, never a short success.
+transit::FetchResult getEx(const char *url, std::function<bool(const uint8_t *, size_t)> onData,
+                           uint32_t timeout_ms, ReplyInfo *reply = nullptr);
+
+// Absolute per-request deadline (F13): 2x `timeout_ms`, capped at 30 s, armed when the attempt
+// starts and enforced inside the body sink. HTTPClient's own timeout is per read, so a peer that
+// trickles one byte before each window expires can hold the caller forever - and the caller here
+// is the poller task, so "forever" means the display stops updating. When the deadline fires the
+// transfer is cut and the result is reported incomplete.
+uint32_t absoluteDeadlineMs(uint32_t timeout_ms);
+
+// Plain HTTP only. The optional TLS mode shipped in v0.1.0-0.1.1 and was removed in v0.1.2; HTTPS
+// is DEFERRED by the owner's decision (DESIGN.md SS2 "Transport"), not merely unimplemented, so an
+// https:// URL here is deliberately fetched over http:// rather than refused. The reasons stand:
+// TLS cost ~100 KB of flash, a session needs ~40 KB of heap with two 16 KB contiguous buffers that
+// the classic ESP32 (no PSRAM) running LVGL, Wi-Fi and a web server cannot spare, and SEPTA,
+// Open-Meteo and Bicycle Transit all serve plain http. Revisit only with DESIGN.md SS2.
 
 }  // namespace transit_app

@@ -1,5 +1,7 @@
 #include "stats_screen.h"
 
+#include <cstdio>
+#include <string>
 #include <vector>
 
 #include "../net_poller.h"
@@ -20,19 +22,41 @@ struct StatsScreenCtx {
   std::vector<StatsRow> rows;
 };
 
-void formatRow(lv_obj_t *label_widget, const std::string &prefix, const transit_stats::StopSummary &s) {
+void formatRow(lv_obj_t *label_widget, const std::string &prefix, const StopSummaryView &v) {
+  // F27: the summary is computed on the poller task now, so the first visit to this page finds
+  // nothing cached. Say so. Rendering StopSummary's default zeroes here would read as "0% on
+  // time, no samples", which is a claim, not a blank.
+  if (!v.has_value) {
+    lv_label_set_text_fmt(label_widget, "%s: loading\xE2\x80\xA6", prefix.c_str());
+    return;
+  }
+  const transit_stats::StopSummary &s = v.summary;
   if (s.samples == 0) {
     lv_label_set_text_fmt(label_widget, "%s: no data yet", prefix.c_str());
     return;
   }
-  if (s.worst_hour >= 0) {
-    lv_label_set_text_fmt(label_widget, "%s: %.0f%% on-time, %+.1fm avg, worst %dh, %u ghosts (n=%u)", prefix.c_str(),
-                           (double)s.on_time_pct, (double)s.mean_late_min, (int)s.worst_hour, (unsigned)s.ghosts,
-                           (unsigned)s.samples);
+
+  char buf[96];
+  std::string body;
+  if (s.has_on_time) {
+    snprintf(buf, sizeof buf, "%.0f%% on-time, %+.1fm avg", (double)s.on_time_pct, (double)s.mean_late_min);
   } else {
-    lv_label_set_text_fmt(label_widget, "%s: %.0f%% on-time, %+.1fm avg, %u ghosts (n=%u)", prefix.c_str(),
-                           (double)s.on_time_pct, (double)s.mean_late_min, (unsigned)s.ghosts, (unsigned)s.samples);
+    // DESIGN.md SS9.2 (F21): with no arrival whose lateness we ever learned there is no
+    // percentage. A dash is the answer; "0%" would be the worst possible one.
+    snprintf(buf, sizeof buf, "on-time --");
   }
+  body = buf;
+  if (s.worst_hour >= 0) {
+    snprintf(buf, sizeof buf, ", worst %dh", (int)s.worst_hour);
+    body += buf;
+  }
+  // "N inferred" is not a footnote: every `arrive` row in this log is derived from a prediction
+  // that stopped being published, never from a measured passage (DESIGN.md SS9.2), and the page
+  // has to say so next to the numbers built on it.
+  snprintf(buf, sizeof buf, ", %u ghosts (n=%u, %u inferred)", (unsigned)s.ghosts, (unsigned)s.samples,
+           (unsigned)v.inferred);
+  body += buf;
+  lv_label_set_text_fmt(label_widget, "%s: %s", prefix.c_str(), body.c_str());
 }
 
 }  // namespace
@@ -90,13 +114,10 @@ void refreshStatsScreen(lv_obj_t *screen) {
   if (ctx == nullptr) {
     return;
   }
+  // getStopSummary() never touches SD from here any more (F27) - it returns the cached value and
+  // asks the poller task for a refresh - so this is safe to call at the screen's own cadence.
   for (const StatsRow &row : ctx->rows) {
-    transit_stats::StopSummary summary;
-    if (getStopSummary(row.stop_key, summary)) {
-      formatRow(row.widget, row.label, summary);
-    } else {
-      lv_label_set_text_fmt(row.widget, "%s: no data yet", row.label.c_str());
-    }
+    formatRow(row.widget, row.label, getStopSummary(row.stop_key));
   }
 }
 

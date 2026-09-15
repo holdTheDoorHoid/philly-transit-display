@@ -79,9 +79,9 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 
 | Build (`cyd-3248S035R`) | Flash | Static RAM |
 |---|---:|---:|
-| Current, with the hardening pass (PIN, Host check, OTA board check, WPA2 setup AP + QR) | 1,785,370 B (93.9 %) | 95,580 B (29.2 %) |
-| The same build with the QR widget compiled out | 1,767,926 B (93.0 %) | 95,580 B |
-| Before the hardening pass (v0.1.2) | 1,741,770 B (91.6 %) | 95,268 B |
+| Current: the 2026-09-15 review fixes combined (PIN, Host check, OTA board check, WPA2 setup AP + QR, transport completeness, transit-first polling, per-stop health on the panels, checked SD writes, log export) | see the build output (`pio run` prints it; ~1.81 MB, ~95 %) | ~95.6 KB (29.2 %) |
+| Hardening pass alone, with the QR widget compiled out | 1,767,926 B (93.0 %) | 95,580 B |
+| Before the review fixes (v0.1.2) | 1,741,770 B (91.6 %) | 95,268 B |
 | Everything incl. weather, Indego, profiles, night page, 48 px font | 1,858,446 B (97.8 %) | 95,300 B (29.1 %) |
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
@@ -163,7 +163,15 @@ Rules that fell out of this, all learned the hard way (each one was a boot loop 
 - No second worker task: the poller drains the web job queue between polls. The AsyncTCP task
   stack is capped at 8 KB (`CONFIG_ASYNC_TCP_STACK_SIZE`; the library default is 16 KB).
 - Proxied SEPTA bodies (stop lists up to ~18 KB) stream into a LittleFS temp file and are served
-  from it; nothing network-sized is ever held in a growing buffer.
+  from it; nothing network-sized is ever held in a growing buffer. There are two such files and
+  each is *leased* to one response for its whole life (released by the request's disconnect
+  callback); a third concurrent proxy job gets a 503 instead of overwriting a file someone is
+  still reading.
+- SD is mounted with `max_open_files = 2` and the poller holds one whenever it appends a row or
+  scans a month for a stats summary, so log downloads take a single-reader lease
+  (`acquireLogReader()` in `sd_logger.h`) and a second concurrent one is refused with a 503.
+- Nothing on the LVGL task touches SD or the network. The stats page's `getStopSummary()` returns
+  a cached value plus its age; the poller recomputes one stop per idle slice.
 - LVGL's static pool is 32 KB (`LV_MEM_SIZE`); the draw buffer is 1/16 of the screen in RGB565
   (`LVGL_BUFFER_PIXELS` in `boards/*.json`). The `[lvmem]` boot line shows pool usage.
 - The ESP32's static `.bss` budget is separate from, and much smaller than, the heap: a ~14 KB
