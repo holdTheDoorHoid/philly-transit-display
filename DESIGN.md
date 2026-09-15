@@ -491,7 +491,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | `GET /api/stats?stop=<key>&days=30` | Aggregates (§9.3) computed by streaming the log |
 | `GET /api/stats/overview?days=7` | Every stop and Indego station in one pass (§9.3), for the Stats page's comparison table |
 | `GET /api/log/index` | `[ { "file": "2026-09.csv", "bytes": 123456 } ]` |
-| `GET /api/log/2026-09.csv` | Raw CSV download |
+| `GET /api/log/2026-09.csv` | CSV download, PIN-protected (§12). The month is re-emitted in one explicit schema (v3, §9.1) whatever mix of row versions it holds; formula-leading text is quote-prefixed in the export only. One download at a time: a second concurrent one gets 503 `{"error":"a log download is already running, try again"}` |
 | `POST /api/ota` | multipart `firmware` field; reboots on success. One at a time. No file → 400 `no firmware file`; too little heap or a fragmented one → 503 naming which check failed; an image built for a different board → 400 `firmware is for a different board (expected <board>)`; larger than the OTA slot → 413. Answers 200 only after the final chunk arrived *and* `Update.end()` succeeded |
 | `POST /api/reboot`, `POST /api/wifi/reset` | Maintenance |
 | `POST /api/pin` | Body `{"pin":"new"}`, authenticated with the **current** PIN in `X-Pin`. New PIN: 4–32 printable ASCII, no whitespace. → `{"ok":true}`, or 400 with the rule that was broken. No reset-by-network path: recovery is the serial console or the device info screen (§12) |
