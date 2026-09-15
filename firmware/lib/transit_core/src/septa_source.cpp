@@ -319,7 +319,10 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
   // The stream's own bounded buffer, not a vector of ours: every matching entity used to be
   // appended without any total limit, so a feed with many matching entities grew the heap until
   // the device died (see gtfsrt_stream.h retainUpdates()).
-  GtfsRtStream stream;
+  // Declared out here because the merge loop below reads stream.retained() directly rather than
+  // copying it into a vector of its own. A subway-only config never feeds this stream, so it is
+  // built with a zero-byte entity buffer in that case and reserves nothing at all.
+  GtfsRtStream stream(rt_routes.empty() ? 0 : 4096);
   bool rt_ok = true;
   std::string rt_error;
   if (!rt_routes.empty()) {
