@@ -148,8 +148,29 @@ curl -s 'https://www3.septa.org/api/BusSchedules/index.php?stop_id=1286'
 ```
 **Yes - BusSchedules returns real scheduled subway trips, under route id `B1`, not `BSL`.**
 Subway schedule-only display (DESIGN.md 4.6) is possible with zero extra work beyond what
-BusSchedules already does for bus stops - `mergeStop()` doesn't require `SchedEntry::route` to
-equal `StopConfig::route` for exactly this reason (see merge.h's comment).
+BusSchedules already does for bus stops, as long as the two id schemes are mapped.
+
+**Correction, 2026-09-15 (adversarial review F14).** The original implementation handled this by
+not filtering `sched` on route at all - `mergeStop()` matched `SchedEntry`s by direction only.
+That is wrong for bus and trolley: `BusSchedules` is scoped by `stop_id`, and a shared stop's
+response carries *every* route serving it. At a corner served by both 17 and 2, route 17's panel
+showed route 2's scheduled departures, and a live route-17 arrival could match (and consume)
+route 2's scheduled time, corrupting its lateness column. `schedRouteMatches()` (merge.h/merge.cpp)
+now does the mapping explicitly and is applied in both the live-matching pass and the
+schedule-only fallback:
+
+| `StopConfig::mode` | rule |
+|---|---|
+| Bus, Trolley | exact match on route id, case-insensitive |
+| Subway | the configured id itself, plus its GTFS ids from this section: `BSL` -> `B1`/`B2`/`B3`, `MFL` -> `L1`/`L2` |
+| Subway, id not in that table | accept anything the station's `stop_id` returned |
+
+The last row is the deliberate loose end: `NHSL` and the owl variants `BSO`/`MFO` appear in the
+Alerts listing (7b) but their GTFS-static route ids were never confirmed here, and a subway
+station's `stop_id` serves one line anyway, so there is no other route's schedule at that stop to
+confuse it with. That licence is scoped to `Mode::Subway` and nothing else. `B2`/`B3`/`L2` are
+included from `routes.txt` rather than from a live BusSchedules response - only `B1` was seen
+live (stop 1286) - so those three are inference, not verification.
 
 Everything else about a subway station's route id stayed consistent with DESIGN.md's existing
 note: `TransitView?route=BSL` and `Stops?req1=BSL` both still return `[]` (re-verified via the
@@ -258,8 +279,56 @@ soonest logic here is the portable part, the cookie is glue-layer.
   explicitly rather than trusting HTTP status (§1, §2).
 - `TvVehicle::late` documents the 998/999 sentinel; `mergeStop()` treats `|late| >= 900` as
   "not known" (§3).
-- `mergeStop()` matches `SchedEntry` by direction only, never by route id, so subway's `B1` vs.
-  `BSL` mismatch (§7a) doesn't break schedule-only display.
+- `mergeStop()` matches `SchedEntry` by direction plus `schedRouteMatches()`, a mode-aware route
+  map, so subway's `B1` vs. `BSL` mismatch (§7a) doesn't break schedule-only display while a
+  shared bus stop's other routes stay out of this route's panel (§7a correction, review F14).
 - `alertRouteIdFor()` special-cases `Mode::Subway` to the `rr_route_` prefix (§7b) and uses the
   `kRailLines` table (not a formula) for `Mode::Rail` (§7b).
 - `kRailStationNames` omits the six station names that don't work, rather than guessing (§6).
+
+## 10. What the 2026-09-15 adversarial review changed, and what is still unverified
+
+No new live captures were taken for this pass - everything below is a correctness fix argued from
+the data already recorded in this file, and each is covered by a regression test in
+`firmware/test/test_core/` that asserts the corrected behaviour.
+
+- **Schedule/route matching (§7a above).** The verified fact is unchanged - BusSchedules keys
+  subway trips as `B1` - but the way the code coped with it was too broad. See the correction in
+  §7a for the mapping now used and what in it is inference rather than observation.
+- **Negative service information.** A `SKIPPED` stop_time_update with no predicted time used to
+  become a zero-time row, get deleted as stale, and leave its scheduled counterpart on screen as
+  an ordinary upcoming bus - the detour disappeared and was replaced by a promise. Skipped rows
+  are now kept on their matched scheduled time and consume that schedule entry. Trip-level
+  `CANCELED` was being parsed and discarded (the trip then showed as scheduled); it is now
+  surfaced on `StopTimeUpdate` and suppresses the schedule row it matches. **Not verified live:**
+  no capture in this project's fixtures contains a `SKIPPED` or trip-level `CANCELED` update - the
+  317-entity TripUpdates fixture (§5) has none - so these paths are exercised only by synthetic
+  protobuf built in `test_gtfsrt_stream.cpp`. The *wire* decoding is verified against the real
+  fixture; the *semantics* follow the GTFS-RT spec, not an observed SEPTA behaviour. If SEPTA
+  turns out to publish skips some other way (e.g. by simply omitting the stop), this is the note
+  to revisit.
+- **Feed age.** `FeedHeader.timestamp` was decoded and then unused, so a cached or replayed body -
+  well-formed, full of future predictions - was indistinguishable from a live one. It now rides on
+  every `StopTimeUpdate` and becomes `StopSnapshot::source_ts`; more than 5 minutes stale, or more
+  than 5 minutes in the future, demotes the stop to `Health::Stale`. The 5-minute figure is
+  derived from DESIGN.md 4.7's 30 s poll interval (ten missed cycles), not measured against
+  SEPTA's own publication cadence - worth checking against a long capture of header timestamps if
+  the stale banner ever appears spuriously.
+- **Retention bounds.** The 4 KB per-entity cap (§5) bounds one decoded entity, not the total
+  kept; every matching update was appended to an unbounded vector. `GtfsRtStream::retainUpdates()`
+  now holds at most 64 updates (12 per stop+route), keeping the nearest, and the JSON parsers cap
+  their own output (24 schedule entries and rail arrivals, 48 TransitView vehicles, 48-character
+  identifiers). The real feeds are far under every one of these - the largest real BusSchedules
+  answer seen here is 12 entries - so nothing is dropped in normal operation; `ParseResult::dropped`
+  and the stream's counters say when it is.
+- **Failure reporting.** Fetch and parse failures used to produce successful, empty stop
+  snapshots. `GtfsRtStream::finish()` now reports Complete/Truncated/Malformed, `HttpGetEx`
+  lets the transport say whether the whole body arrived, and each stop carries its own `ok`/
+  `health`/`error` fed from the sources that stop actually depends on. §1's workaround survives
+  intact and is regression-tested: the *body* is what decides success, so a valid schedule served
+  under HTTP 501 still counts as a good answer.
+- **Number parsing.** `parseSignedMinutes()` accumulated digits with no bound (signed overflow -
+  undefined behaviour, not a wrapped value); `jsonToInt64`/`jsonToDouble` used `atoll`/`atof`,
+  which are UB out of range. All hand-written numeric parsing in transit_core now goes through
+  `numparse.h`, which bounds the digit count before accumulating. The test binary is run under
+  `-fsanitize=undefined,address` clean.

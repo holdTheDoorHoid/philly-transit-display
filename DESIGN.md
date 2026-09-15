@@ -85,7 +85,17 @@ Device behaviour: stream the HTTP body; parse the top-level `FeedMessage` increm
 each `entity` (field 2, length-delimited) buffer at most `GTFSRT_MAX_ENTITY` (4096) bytes, skip
 larger ones; decode only if `trip.route_id` is in the configured set; emit stop_time_updates for
 configured stop_ids. Stop sequences let us know when a bus has passed our stop. Schedule
-relationship `SKIPPED` (1) on our stop means detour — show it.
+relationship `SKIPPED` (1) on our stop means detour — show it, including when the update carries no
+time at all (it is then shown at the scheduled time it matches, and that schedule row is consumed
+so the same trip is not also advertised as running). The **trip-level** `schedule_relationship` in
+`TripDescriptor` is a different enum with overlapping numbers: `CANCELED` (3) there means the trip
+is not running, so it is shown as nothing at all and suppresses its matching scheduled row.
+`NO_DATA` (2) at the stop level is not a prediction — no time is invented for it, and the schedule
+row stands in for that trip.
+
+The feed's `FeedHeader.timestamp` is carried through to every decoded update and on to
+`StopSnapshot.source_ts` (§7): a cached or replayed body is well-formed and full of future
+predictions, so the header timestamp is the only thing that distinguishes it from a live one.
 
 Rail RT feeds (`septarail-pa-us/...`) are 3-4 KB but the Arrivals JSON API is richer; not used in v1.
 
@@ -136,8 +146,13 @@ Delaware Valley University.
 Subway (B and L lines): `TransitView?route=BSL` and `Stops?req1=BSL` return `[]`, and the bus
 GTFS-RT feed carries no subway trips (verified). **Verified 2026-09-13:** BusSchedules does serve
 subway station stop_ids, keyed by the GTFS route ids `B1` (Broad Street) and `L1` (Market-Frankford),
-not `BSL`/`MFL` (fixture `busschedules_bsl_1286.json`). So v1 shows subway stops schedule-only;
-`mergeStop` does not require the schedule's route id to equal the configured one. The UI labels
+not `BSL`/`MFL` (fixture `busschedules_bsl_1286.json`). So v1 shows subway stops schedule-only.
+`mergeStop` maps between the two id schemes explicitly (`schedRouteMatches()`, `merge.h`): bus and
+trolley require an exact route match, because a shared stop's `BusSchedules` response carries every
+route serving it and matching on direction alone put route 2's departures under route 17's panel;
+`Mode::Subway` accepts the configured id plus its known GTFS ids (`BSL` → `B1`/`B2`/`B3`, `MFL` →
+`L1`/`L2`), and — only for subway, whose station stop_ids serve one line — accepts anything for a
+line whose GTFS ids this project has not verified. The UI labels
 such rows `sched` and the stop panel says "schedule only" for subway.
 Alerts for subway and Regional Rail use the `rr_route_` prefix (`rr_route_bsl`, `rr_route_mfl`,
 `rr_route_trent`); Regional Rail line codes need a lookup table, not a formula. Bus and trolley
@@ -360,7 +375,7 @@ gear). CORS not needed; the UI is same-origin. A later "settings PIN" is an opt-
 | Method, path | Purpose |
 |---|---|
 | `GET /` , `/app.js`, `/app.css`, `/favicon.svg` | Web UI, served gzip with `Cache-Control: max-age=3600`, ETag = firmware build id |
-| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes}, last_poll {ok, age_s, error}, `stops[]` each with `arrivals[]` (§8 shape) and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8) |
+| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes}, last_poll {ok, age_s, error}, `stops[]` each with `arrivals[]` (§8 shape), `ok`, `health`, `source_ts` and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8) |
 | `GET /api/config` | Current config (§6) |
 | `PUT /api/config` | Replace config; validates; persists; triggers immediate re-poll. 400 on error |
 | `GET /api/proxy/stops?route=17` | Streams SEPTA `Stops` for a route to the browser (setup only) |
@@ -379,10 +394,24 @@ Arrival object in `/api/state`:
 ```json
 { "trip": "3667", "vehicle": "7477", "destination": "20th-Johnston",
   "predicted": 1789353562, "scheduled": 1789352700, "eta_s": 1262,
-  "late_min": 13, "late_known": true, "status": "live", "seats": "FEW_SEATS_AVAILABLE" }
+  "late_min": 13, "late_known": true, "status": "live", "seats": "FEW_SEATS_AVAILABLE",
+  "sched_trip": "281757" }
 ```
 `status` ∈ `live` (has RT prediction), `scheduled` (schedule only), `skipped` (RT says the stop
-is skipped), `unknown`.
+is skipped), `unknown`. `sched_trip` is the static-GTFS trip id (`BusSchedules` `trip_id`) this
+row was matched to, `""` if none — it is what lets §9's tracker reconcile the scheduled and live
+records for one trip. A `skipped` row may have no `predicted` at all: the feed often reports a
+skip with no time, and it is then shown at its matched scheduled time rather than dropped.
+
+Each `stops[]` entry carries its own health, because the sources differ per stop and one
+failing must not condemn the others (`transit::StopSnapshot`, `lib/transit_core/model.h`):
+
+| Field | Meaning |
+|---|---|
+| `ok` | every source **this stop** needs answered with usable, current data. A bus stop needs TripUpdates + TransitView + BusSchedules; a subway stop needs BusSchedules only (§4.6); a rail stop needs Arrivals. `last_poll.ok` is the AND of these. |
+| `error` | short human reason when `!ok`: `"live feed truncated"`, `"SEPTA schedule unavailable"`, `"live feed stale"` |
+| `health` | what the rows shown are worth: `live` (a fresh realtime prediction), `schedule_only` (scheduled times only — subway, or a live source that failed or had nothing), `stale` (the feed's own timestamp is more than 5 min old, or more than 5 min in the future; live rows are demoted to `scheduled` or dropped), `unavailable` (a needed source failed and there is nothing trustworthy to show) |
+| `source_ts` | when SEPTA **produced** the data (GTFS-RT `FeedHeader.timestamp`, else the newest TransitView vehicle timestamp), as opposed to when we fetched it. `0` = the feed published none, so its age is unknown; freshness is never invented from the fetch time. |
 
 ## 8. Display UI (LVGL 9)
 
