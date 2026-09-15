@@ -97,7 +97,15 @@ Rules that fell out of this, all learned the hard way (each one was a boot loop 
 - No second worker task: the poller drains the web job queue between polls. The AsyncTCP task
   stack is capped at 8 KB (`CONFIG_ASYNC_TCP_STACK_SIZE`; the library default is 16 KB).
 - Proxied SEPTA bodies (stop lists up to ~18 KB) stream into a LittleFS temp file and are served
-  from it; nothing network-sized is ever held in a growing buffer.
+  from it; nothing network-sized is ever held in a growing buffer. There are two such files and
+  each is *leased* to one response for its whole life (released by the request's disconnect
+  callback); a third concurrent proxy job gets a 503 instead of overwriting a file someone is
+  still reading.
+- SD is mounted with `max_open_files = 2` and the poller holds one whenever it appends a row or
+  scans a month for a stats summary, so log downloads take a single-reader lease
+  (`acquireLogReader()` in `sd_logger.h`) and a second concurrent one is refused with a 503.
+- Nothing on the LVGL task touches SD or the network. The stats page's `getStopSummary()` returns
+  a cached value plus its age; the poller recomputes one stop per idle slice.
 - LVGL's static pool is 32 KB (`LV_MEM_SIZE`); the draw buffer is 1/16 of the screen in RGB565
   (`LVGL_BUFFER_PIXELS` in `boards/*.json`). The `[lvmem]` boot line shows pool usage.
 - The ESP32's static `.bss` budget is separate from, and much smaller than, the heap: a ~14 KB

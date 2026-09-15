@@ -169,6 +169,25 @@ alerts use `bus_route_<id>` including the T, G, D, and K letter routes.
 Open, GET, parse, close. Never hold a TLS socket across the idle gap. Back off exponentially on
 failure (30 s → 60 s → 120 s → cap 5 min) and show "stale N min" on screen.
 
+**Transit first (2026-09-15).** TripUpdates + TransitView + BusSchedules are the *only* fetches on
+the path between SEPTA and the screen. The poller publishes the `Snapshot` — stamping `generated`
+at that moment — the instant the stops have merged, and *then* runs alerts, weather, Indego, route
+liveness and the SD log, each on its own due time. Before this, all of those sat in front of the
+publish, so a slow alerts endpoint and a 400 KB bike feed could put twelve seconds between the
+arrivals being fetched and their appearing, with `generated` claiming they were fresh. Alerts
+belong to the same `Snapshot`, so a cycle that fetches new ones publishes a *second* time (same
+stops, plus alerts) rather than withholding the arrivals until they arrive. Optional work is
+skipped entirely when the next transit poll is less than 5 s away, uses a shorter per-request
+timeout than the transit fetches, and checks the remaining budget between items.
+
+**Request deadlines.** Every request carries an absolute deadline of 2× its timeout, capped at
+30 s, enforced inside the body sink: HTTP client timeouts are per *read*, so a peer trickling one
+byte per window can hold the poller task — and therefore the display — indefinitely. A body cut
+off by that deadline is reported *incomplete*, never as a short success. Completeness is reported
+by the transport, not guessed: a connection dropped halfway through the 150 KB TripUpdates feed
+still reports HTTP 200, and the stops the missing half would have filled then look empty and
+successful. See `transit::FetchResult` / `HttpGetEx` in `transit_core/source.h`.
+
 ### 4.8 Weather (Open-Meteo)
 `http://api.open-meteo.com/v1/forecast?latitude=39.9279&longitude=-75.1771&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m&hourly=weather_code,precipitation_probability,temperature_2m&forecast_hours=6&timezone=auto&wind_speed_unit=mph&temperature_unit=fahrenheit`
 (~900 B, verified 2026-09-14 over plain HTTP, no redirect). `current.weather_code` is a WMO
@@ -232,6 +251,28 @@ its stack did not fit (see `firmware/README.md`, Memory and flash budget). Share
 swapped whole (never mutated in place). SD writes happen from a low-priority logger task fed by a
 FreeRTOS queue. Web handlers only read the Snapshot and the config; stats requests stream the CSV
 through the aggregator inside the handler in chunks small enough to keep the heap flat.
+
+**Nothing on the LVGL task may touch SD or the network** (2026-09-15). That includes the stats
+page: `getStopSummary()` is non-blocking and returns the cached summary with its age plus a
+"nothing computed yet" flag, and the poller task recomputes summaries in its idle slices — one
+stop per slice, at most every 10 minutes per stop or on request, evicting stops that are no longer
+configured. It used to stream a month of CSV per stop synchronously on whichever task asked, so
+opening the stats page froze touch and the clock for as long as the card took.
+
+**The idle loop runs one deferred job per slice** and re-checks the poll deadline afterwards.
+Draining the whole queue back to back (a 400 KB stop-list proxy and a 30-day stats scan are each
+seconds of work) pushed the next transit poll well past its deadline with nothing noticing.
+
+**The two LittleFS proxy temp files are leased**, not alternated. A file is held for the whole
+life of the response that serves it and released by the request's disconnect callback (which fires
+on both completion and abort); with both leased a new job answers `503 {"error":"busy, try
+again"}`. Alternating an index only works for exactly two requests in flight: a third rewrote a
+file that was still being streamed, and the client got two half-responses spliced together under
+a 200.
+
+**The SD mount allows two open files**, and the poller holds one whenever it appends a row or
+scans for a summary, so downloads take a single-reader lease (`acquireLogReader()`); a second
+concurrent download gets a 503 rather than a truncated file.
 
 Memory rules: no full framebuffer; LVGL partial buffer is 1/10 of the screen in RGB565 (the library default of 1/4 with 3-byte pixels does not fit, see `firmware/boards/README.md`); large long-lived objects (ArrivalTracker ~16 KB, StatsAggregator ~8 KB) are heap-allocated, never file-scope globals, because the ESP32's static .bss budget is separate from and much smaller than the heap; one
 TLS connection at a time; ArduinoJson documents sized from measured payloads (§4) with 25 %
@@ -441,7 +482,10 @@ Main screen (portrait by default; every size derives from the runtime resolution
   recolor, one label per station.
 - Night page (`night`): when every shown stop has nothing within `after_min`, the arrivals page is
   replaced by a big clock, the date, the header weather, and `17 Southbound: next 5:12a (sched)`
-  per stop. Tapping cycles pages exactly as from the arrivals page.
+  per stop. Tapping cycles pages exactly as from the arrivals page. A stop whose `health` is
+  `Stale` or `Unavailable` **keeps the arrivals page up**: "nothing is due" and "we cannot see what
+  is due" are different answers and only the first earns the clock. `ScheduleOnly` does not block
+  it — a subway stop only ever has schedule rows.
 - Quiet hours (`quiet`): the backlight drops to `brightness` (0 = off) inside the window; any touch
   restores it for `wake_seconds` without changing page.
 - Footer ticker when alerts exist and `ticker_show` is not `off`: `17: <alert>` and `17 detour:
@@ -453,11 +497,24 @@ Main screen (portrait by default; every size derives from the runtime resolution
   screens rebuild in the new palette on a config change. `device.invert_colors` fixes panels that
   render inverted (§6).
 - Stale data: header turns amber with dark text and "stale 4 min"; no data: panel shows the reason.
+  Per stop, that same caption line also carries the stop's **health** (`StopSnapshot::health`,
+  §4.7) whether or not there are rows under it: `schedule only` when the rows are timetable rather
+  than tracking, `stale N min` measured from `source_ts` (when SEPTA produced the data, *not* when
+  we fetched it — a feed re-fetched every 30 s is always "just fetched"), and the stop's own
+  `error` text when it is `Unavailable`. Three schedule rows with no caption look exactly like
+  three live ones. Rows are shown whenever the stop has rows, not only when its whole fetch
+  succeeded: a truncated live feed with a good schedule is `ok=false` *and* has times worth
+  showing. `Unavailable` is the one state that shows the reason and no rows. A `Skipped` row with
+  no prediction renders from its scheduled time with the orange `skip` badge; a row with neither
+  time shows `--`.
 - Tap anywhere cycles Main → Stats → Device info → Main. Stats page: per stop, last 30 days:
-  on-time %, mean late, worst hour, ghost count, sample count. Device page: IP, mDNS URL, SSID,
-  RSSI, SD status, free heap, firmware version, "reset Wi-Fi: hold 5 s".
+  on-time %, mean late, worst hour, ghost count, sample count, and how many of those arrivals were
+  inferred (§9.2). On-time % is a **dash**, never `0%`, when no arrival's lateness was ever known;
+  a stop whose summary has not been computed yet reads `loading…`, never zeroes. Device page: IP,
+  mDNS URL, SSID, RSSI, SD status, free heap, firmware version, "reset Wi-Fi: hold 5 s".
 - Sizes derive from `lv_display_get_horizontal_resolution()` so 320x240 gets 2 rows per stop
-  and smaller fonts; 480x320 gets 3 rows.
+  and smaller fonts; 480x320 gets 3 rows. That is the per-panel **capacity**; each stop actually
+  gets its own `show` (1..4, §6) clamped to it, so a stop asking for one row gets one.
 
 ## 9. Logging and statistics
 
@@ -497,6 +554,10 @@ historical month downloads in one explicit schema, and prefixes any text field s
 `= + - @` with a single quote so spreadsheets treat it as text. That prefixing happens **only in
 the export**, never in the stored file — a log you cannot byte-compare against the device is not a
 log. (A 21-column row's temperature is passed through unchanged; see the unit note above.)
+The firmware side of that is `transit_app::LogExport` (`sd_logger.h`): it opens one monthly file,
+emits `csvHeader()` once whatever the file's own first line says, and streams every stored line
+through `normalizeCsvLine()` into an AsyncWebServer chunked response. The raw file stays available
+verbatim; this is the "open it in a spreadsheet" path, not a replacement for it.
 
 **A failed poll is not an observation** (the governing rule, 2026-09-15). While polling for a stop
 is failing, `ArrivalTracker::observe()` records the outage and changes nothing else: no `arrive`,
@@ -540,7 +601,11 @@ Events emitted by `ArrivalTracker` from the stream of `StopSnapshot`s:
 - `bike` — one row per configured Indego station per hour (`bike.stations`, §6), built by the app
   layer, not `ArrivalTracker`. `stop_key` = `indego-<station id>` (e.g. `indego-3468`); route/dir/
   trip/vehicle are empty; `note` = the station's display name; `bikes`/`ebikes`/`docks` carry that
-  hour's Bicycle Transit status feed counts (§4.9).
+  hour's Bicycle Transit status feed counts (§4.9). A row is written only from a sample actually
+  observed within the last 15 minutes, and never twice from the same fetch: the display
+  deliberately keeps showing the last good counts when the 400 KB feed fails, but writing those
+  into the log as *this* hour's observation would be inventing data. An unknown e-bike count stays
+  empty; it used to be written as `0`, which reads back as "this station has no e-bikes".
 
 New columns (all optional; empty means unknown, never coerced to 0):
 - `seats` — crowding token, one of `empty`, `open`, `few`, `standing`, `packed`, `full`; set on
@@ -553,6 +618,18 @@ New columns (all optional; empty means unknown, never coerced to 0):
   the app layer on `pred`/`arrive`/`ghost`/`noshow` rows.
 - `bikes`, `ebikes`, `docks` — `bike` rows only (see above).
 Rotation: a new file each month; refuse to log when SD free space < 50 MB and show a warning.
+
+**A write that did not land is not a non-event** (2026-09-15). `File::println()` returns the bytes
+it actually committed, and a card that has been pulled or has filled up returns a short count
+rather than failing, so a writer that ignores the return value writes half a row and reports
+success. Every append checks both the header and the row, counts a failure in `sd.dropped_rows`,
+clears `sd.write_ok` and records a short `sd.error` — all three on `GET /api/state` — and logs a
+line on the serial console. A card that has gone away is marked **unmounted** with "card removed"
+rather than continuing to report free space and healthy logging.
+
+**Temperature is logged in Celsius by the app layer**, converting from whatever unit the display
+is configured for, and is left empty when the forecast behind it is stale (over an hour old): an
+unknown value is empty, never a stale one dressed as current.
 
 ### 9.2 Stats definitions
 - On-time: SEPTA's definition, no more than 59 s early and no more than 5 min 59 s late.
