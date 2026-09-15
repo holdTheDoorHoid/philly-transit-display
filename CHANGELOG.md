@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.2 - 2026-09-15
 
 - Logging: every arrival row now records SEPTA's crowding estimate, the weather at the event
   (temperature and WMO code) and whether an alert or detour applied to the route; one `bike`
