@@ -193,7 +193,10 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   int32_t w, h;
   screenSize(w, h);
   bool large = cfg.device.large_text;
-  int rows = rowsPerStop(h, large);
+  // The screen's CAPACITY per panel (DESIGN.md SS8: 320x240 gets 2, 480x320 gets 3, large-text
+  // always 2). How many rows a given stop actually gets is its own `show` clamped to this - see
+  // the panel loop below (F31).
+  int row_capacity = rowsPerStop(h, large);
   const lv_font_t *minutes_font = large ? fontHuge() : fontBig(h);
 
   lv_obj_t *screen = lv_obj_create(nullptr);
@@ -298,7 +301,13 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_label_set_text(pw.no_data_label, "no data yet");
     lv_obj_add_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
 
-    for (int r = 0; r < rows; ++r) {
+    // DESIGN.md SS6/SS8: each stop shows `show` arrival rows (1..4). F31 - this loop used to run to
+    // the screen's capacity for every panel, so the per-stop setting was accepted by the config
+    // schema, echoed back by GET /api/config, and then ignored by the only thing that could act on
+    // it: a stop asking for 1 row still got 3. Capacity is still the ceiling - four 48 px rows do
+    // not fit a 240 px panel however politely they are requested.
+    int panel_rows = std::min<int>(row_capacity, std::max<int>(1, (int)s.show));
+    for (int r = 0; r < panel_rows; ++r) {
       lv_obj_t *row = makeBox(panel);
       lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
       lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
@@ -527,14 +536,24 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
   ctx->blink_phase = !ctx->blink_phase;
   for (PanelWidgets &pw : ctx->panels) {
     const StopSnapshot *stop = findStopSnapshot(snap, pw.stop_key);
-    bool have_data = stop != nullptr && stop->ok && !stop->arrivals.empty();
+    // F31: rows are shown whenever the stop HAS rows, not only when its whole fetch succeeded.
+    // StopSnapshot::ok and ::health answer different questions (model.h): a stop whose live feed
+    // arrived truncated is ok=false and Health::ScheduleOnly with a perfectly good set of
+    // scheduled times on it. Testing `ok` alone blanked those - the user lost the schedule they
+    // could have used because the realtime half failed. Health::Unavailable is the one case with
+    // nothing trustworthy behind it, so that one shows the reason and no rows.
+    bool has_rows = stop != nullptr && !stop->arrivals.empty();
+    bool have_data = has_rows && stop->health != transit::Health::Unavailable;
 
     // DESIGN.md SS6 alt_of: an alternative panel appears only while its primary stop has nothing
     // within alt_after_min (or no data), and disappears again when a bus is close.
     if (!pw.alt_of.empty()) {
       const StopSnapshot *primary = findStopSnapshot(snap, pw.alt_of);
       bool primary_far = true;
-      if (primary != nullptr && primary->ok) {
+      // Same rule as the panel above (F31): schedule-only rows are rows. Testing `ok` here made a
+      // primary whose live feed failed look like a primary with nothing coming, which popped the
+      // alternative up over a stop that had a bus due in four minutes on the timetable.
+      if (primary != nullptr && primary->health != transit::Health::Unavailable) {
         for (const Arrival &a : primary->arrivals) {
           transit::Epoch eff = a.effective();
           if (eff > 0 && eff - (transit::Epoch)now < (transit::Epoch)pw.alt_after_min * 60) {
@@ -550,20 +569,52 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
         continue;
       }
     }
-    if (have_data) {
+    // DESIGN.md SS8: "Stale data: ... 'stale 4 min'; no data: panel shows the reason". F31 - the
+    // caption now carries the stop's HEALTH as well as its emptiness, because they are different
+    // facts and the user needs both: three schedule rows with no caption look exactly like three
+    // live rows, and a panel that has quietly stopped updating looks exactly like a quiet stop.
+    // Same styling as the old reason line; it is the same question ("why does this look like
+    // this?"), asked whether or not there are rows underneath.
+    std::string caption;
+    if (stop == nullptr) {
+      caption = snap.generated == 0 ? "no data yet" : "no data";
+    } else {
+      switch (stop->health) {
+        case transit::Health::Unavailable:
+          caption = stop->error.empty() ? "unavailable" : stop->error;
+          break;
+        case transit::Health::Stale: {
+          // Measured from source_ts - when SEPTA produced the data - not from our own fetch time.
+          // A feed we re-fetch every 30 seconds is always "just fetched"; what went stale is what
+          // the agency last published (model.h). source_ts == 0 means the feed published no
+          // timestamp at all, and an age we do not know must not be invented.
+          int64_t age_s = stop->source_ts > 0 ? ((int64_t)now - (int64_t)stop->source_ts) : -1;
+          if (age_s >= 0) {
+            char buf[32];
+            snprintf(buf, sizeof buf, "stale %ld min", (long)(age_s / 60));
+            caption = buf;
+          } else {
+            caption = stop->error.empty() ? "stale" : stop->error;
+          }
+          break;
+        }
+        case transit::Health::ScheduleOnly:
+          // Not an error: a subway stop has no realtime source at all (DESIGN.md SS4.6), and a bus
+          // stop lands here when the live feed failed but the schedule did not. Either way the
+          // times below are timetable, not tracking, and the badge column's grey "sched" says that
+          // per row while this says it once for the panel.
+          caption = stop->error.empty() ? "schedule only" : ("schedule only: " + stop->error);
+          break;
+        default:
+          if (!stop->ok) caption = stop->error.empty() ? "unavailable" : stop->error;
+          break;
+      }
+      if (caption.empty() && !has_rows) caption = "no arrivals";
+    }
+    if (caption.empty()) {
       lv_obj_add_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
     } else {
-      // DESIGN.md SS8: "no data: panel shows the reason" - distinguish "the whole poll failed"
-      // from "this stop just has nothing upcoming right now" rather than one generic message.
-      if (stop == nullptr) {
-        lv_label_set_text(pw.no_data_label, "no data");
-      } else if (!snap.last_poll_ok) {
-        lv_label_set_text(pw.no_data_label, snap.last_error.empty() ? "poll failed" : ("poll failed: " + snap.last_error).c_str());
-      } else if (!stop->ok) {
-        lv_label_set_text(pw.no_data_label, stop->error.empty() ? "unavailable" : stop->error.c_str());
-      } else {
-        lv_label_set_text(pw.no_data_label, "no arrivals");
-      }
+      lv_label_set_text(pw.no_data_label, caption.c_str());
       lv_obj_remove_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -609,9 +660,18 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
         lv_obj_remove_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
       }
 
+      // Arrival::effective() is predicted-or-scheduled, which is what makes a Status::Skipped row
+      // with predicted == 0 render from its SCHEDULED time (F31): SEPTA publishes a skipped stop
+      // by dropping the prediction, not by moving it, so the timetable entry is all there is - and
+      // the orange "skip" badge from badgeFor() is what turns that time into "this bus is coming
+      // past at 4:12 but not stopping here". A row with neither time is a row we cannot place;
+      // "--" says so, where the old code passed 0 through and drew "Now".
       transit::Epoch eff = a.effective();
-      transit::Epoch eta_s = eff > 0 ? (eff - (transit::Epoch)now) : 0;
-      lv_label_set_text(rw.minutes, etaLabel(eta_s, eff).c_str());
+      if (eff <= 0) {
+        lv_label_set_text(rw.minutes, "--");
+      } else {
+        lv_label_set_text(rw.minutes, etaLabel(eff - (transit::Epoch)now, eff).c_str());
+      }
       // DESIGN.md SS6 due.screen: the minutes blink while this bus is within due.minutes.
       bool blink = cfg.due.screen && arrivalIsDue(cfg, a, (transit::Epoch)now) && ctx->blink_phase;
       lv_obj_set_style_text_color(rw.minutes, blink ? colorLate() : colorText(), 0);

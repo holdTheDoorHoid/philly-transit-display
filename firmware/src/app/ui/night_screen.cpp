@@ -49,6 +49,15 @@ bool nightConditionMet(const Config &cfg, const transit::Snapshot &snap, const s
     if (sc == nullptr || !sc->alt_of.empty()) continue;  // alternatives don't keep the lights on
     const transit::StopSnapshot *st = findStop(snap, key);
     if (st == nullptr || !st->ok) return false;
+    // F13: "nothing is due" and "we cannot see what is due" are different answers, and only the
+    // first one earns the clock page. A Stale or Unavailable stop has no trustworthy rows - an
+    // Unavailable one usually has no rows at all - so an emptiness test alone reads a broken feed
+    // as a quiet night and hides the error behind a big friendly clock. StopSnapshot::ok is
+    // already false for both (model.h), which the check above catches; health is tested too
+    // because a stop can be ok=false for one source while another kept rows on screen, and
+    // because ScheduleOnly - which IS trustworthy, just schedule-derived - must NOT block the
+    // night page or a subway stop could never reach it.
+    if (st->health == transit::Health::Stale || st->health == transit::Health::Unavailable) return false;
     for (const transit::Arrival &a : st->arrivals) {
       transit::Epoch eff = a.effective();
       if (eff > 0 && eff - now < horizon) return false;
@@ -135,6 +144,14 @@ void refreshNightScreen(lv_obj_t *screen, const Config &cfg, const transit::Snap
 
   for (NightRow &row : ctx->rows) {
     const transit::StopSnapshot *st = findStop(snap, row.stop_key);
+    // F13: nightConditionMet() keeps the page off while a stop is Stale/Unavailable, but the page
+    // can already be up when one goes that way. Say why rather than "no departures listed", which
+    // is a claim about the service when it is really a claim about our own eyesight.
+    if (st != nullptr && (st->health == transit::Health::Stale || st->health == transit::Health::Unavailable)) {
+      lv_label_set_text_fmt(row.widget, "%s: %s", row.label.c_str(),
+                            st->error.empty() ? "no live data" : st->error.c_str());
+      continue;
+    }
     const transit::Arrival *next = nullptr;
     if (st != nullptr) {
       for (const transit::Arrival &a : st->arrivals) {
