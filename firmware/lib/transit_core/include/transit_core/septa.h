@@ -33,12 +33,34 @@ namespace transit {
 // (this project builds with -fno-exceptions). On failure, `items` is empty and `error` holds a
 // short human-readable reason (either SEPTA's own `{"error": "..."}` message, verbatim, or a
 // description of why the shape didn't match what was expected).
+//
+// `dropped` counts items the parser refused to retain because it hit its own size cap (see
+// kMaxSchedEntries etc. below). It is not an error - the kept items are valid - but a caller that
+// wants to tell the user "showing the first N of many" can read it. `ok` stays true.
 template <typename T>
 struct ParseResult {
   bool ok = true;
   std::string error;
   std::vector<T> items;
+  uint32_t dropped = 0;
 };
+
+// --- Retention caps (DESIGN.md 12.1: ~75-80 KB of heap at runtime) ---------------------------
+// Every one of these parsers turns an agency-controlled response body into a std::vector. The
+// bodies are 1-4 KB in practice, but "in practice" is not a bound: nothing in the protocol stops
+// SEPTA (or anything between us and SEPTA) from returning a response with thousands of entries,
+// and an unbounded push_back loop would then exhaust the heap and take the device down. Each
+// parser reserves its cap once and then keeps only that many items, choosing WHICH to keep by
+// what a transit display actually needs (the soonest arrivals - a far-future row is worthless
+// next to the next bus). Real payloads are far under these numbers, so nothing is dropped in
+// normal operation; see ParseResult::dropped when it is.
+constexpr size_t kMaxTvVehicles = 48;     // one route's tracked vehicles (real: 5-25)
+constexpr size_t kMaxSchedEntries = 24;   // BusSchedules entries per stop, nearest kept (real: 4-12)
+constexpr size_t kMaxRailArrivals = 24;   // Arrivals trains per station, nearest kept (real: 10)
+constexpr size_t kMaxAlerts = 16;         // alert objects per route (real: 0-2)
+// Longest identifier/label string retained from any SEPTA response; longer values are truncated.
+// The real ids are 3-8 characters and the longest headsign seen is ~20 ("Lansdale/Doylestown").
+constexpr size_t kMaxIdChars = 48;
 
 // One vehicle from TransitView/index.php?route=<route> (DESIGN.md 4.3).
 struct TvVehicle {
@@ -137,5 +159,15 @@ extern const size_t kRailLineCount;
 
 // Looks up `code` (case-sensitive, e.g. "FOX") in kRailLines; returns nullptr if not found.
 const RailLine* findRailLine(const std::string& code);
+
+// Same table, but accepts EITHER the short code ("PAO") or the display name ("Paoli/Thorndale"),
+// case-insensitively in both cases. Returns nullptr if neither matches.
+//
+// Why both: StopConfig::route for Mode::Rail is documented as the line CODE, but configs written
+// before that was settled carry the display name that Arrivals itself reports (the string the
+// stop-picker UI showed). Accepting both here means such a config keeps working instead of
+// silently filtering every train away (an unrecognized code matches nothing by design - see
+// mergeRail()), and gives the config layer one place to normalise a legacy value from.
+const RailLine* findRailLineByName(const std::string& code_or_display_name);
 
 }  // namespace transit

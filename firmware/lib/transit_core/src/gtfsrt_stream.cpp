@@ -87,6 +87,75 @@ void GtfsRtStream::setRouteFilter(std::vector<std::string> routes) {
   route_filter_ = std::move(routes);
 }
 
+void GtfsRtStream::retainUpdates(size_t max_total, size_t max_per_stop_route) {
+  max_retained_ = max_total;
+  max_per_stop_route_ = max_per_stop_route;
+  retained_.clear();
+  retained_.reserve(max_total);  // the only allocation this buffer ever makes
+}
+
+const std::vector<StopTimeUpdate>& GtfsRtStream::retained() const { return retained_; }
+
+// Time to rank a retained update by, for the "keep the nearest" eviction rule. An update with no
+// time of its own (SKIPPED/NO_DATA - see StopRel) is ranked at the feed's own timestamp rather
+// than at 0: it is a statement about imminent service, so it should not be evicted in favour of
+// a prediction two hours out, but it should not outrank everything either.
+static int64_t rankOf(const StopTimeUpdate& u) {
+  int64_t t = u.predictedTime();
+  return t != 0 ? t : u.feed_timestamp;
+}
+
+void GtfsRtStream::retain(StopTimeUpdate&& u) {
+  if (max_retained_ == 0) return;
+
+  // Per-(stop, route) cap first: one busy route must not crowd every other configured stop out
+  // of the global cap.
+  size_t same_key = 0, worst_key_idx = retained_.size();
+  int64_t worst_key_rank = 0;
+  for (size_t i = 0; i < retained_.size(); ++i) {
+    if (retained_[i].stop_id != u.stop_id || retained_[i].route_id != u.route_id) continue;
+    ++same_key;
+    int64_t r = rankOf(retained_[i]);
+    if (worst_key_idx == retained_.size() || r > worst_key_rank) {
+      worst_key_idx = i;
+      worst_key_rank = r;
+    }
+  }
+  if (same_key >= max_per_stop_route_) {
+    ++updates_dropped_by_cap_;
+    if (worst_key_idx < retained_.size() && rankOf(u) < worst_key_rank) {
+      retained_[worst_key_idx] = std::move(u);
+    }
+    return;
+  }
+
+  if (retained_.size() < max_retained_) {
+    retained_.push_back(std::move(u));
+    return;
+  }
+
+  // Global cap: evict the farthest-future retained update, if this one is nearer.
+  size_t worst = 0;
+  int64_t worst_rank = rankOf(retained_[0]);
+  for (size_t i = 1; i < retained_.size(); ++i) {
+    int64_t r = rankOf(retained_[i]);
+    if (r > worst_rank) {
+      worst = i;
+      worst_rank = r;
+    }
+  }
+  ++updates_dropped_by_cap_;
+  if (rankOf(u) < worst_rank) retained_[worst] = std::move(u);
+}
+
+void GtfsRtStream::assignCapped(std::string* dst, const uint8_t* data, size_t len) {
+  if (len > kMaxIdentifierChars) {
+    len = kMaxIdentifierChars;
+    ++identifiers_truncated_;
+  }
+  dst->assign(reinterpret_cast<const char*>(data), len);
+}
+
 void GtfsRtStream::setStopFilter(std::vector<std::string> stops) {
   stop_filter_ = std::move(stops);
 }
@@ -113,10 +182,20 @@ bool GtfsRtStream::push(const uint8_t* data, size_t len) {
   return !error_;
 }
 
-void GtfsRtStream::finish() {
-  // No framing terminator exists in protobuf; a mid-entity/mid-header state here means the
-  // body was truncated. Leave counters as they are - the caller already knows the transfer
-  // was incomplete because push() will have returned before the expected content-length.
+FeedStatus GtfsRtStream::finish() { return feedStatus(); }
+
+FeedStatus GtfsRtStream::feedStatus() const {
+  // No framing terminator exists in protobuf, so "complete" is precisely "the last byte landed on
+  // a top-level field boundary": state kTag with no partially-accumulated varint. Anything else
+  // means the body stopped arriving mid-field. This is the whole reason finish() reports rather
+  // than returning void - a connection cut halfway through the 150 KB feed is otherwise
+  // indistinguishable from a legitimately short one, and every stop it should have carried comes
+  // back silently empty (F13).
+  if (error_) return FeedStatus::Malformed;
+  if (state_ != State::kTag || varint_shift_ != 0 || varint_value_ != 0) {
+    return FeedStatus::Truncated;
+  }
+  return FeedStatus::Complete;
 }
 
 void GtfsRtStream::feedByte(uint8_t b) {
@@ -246,17 +325,25 @@ void GtfsRtStream::decodeHeader(const uint8_t* buf, size_t len) {
 void GtfsRtStream::decodeEntity(const uint8_t* buf, size_t len) {
   size_t off = 0;
   FieldRef f;
+  bool matched = false;
   while (readNextField(buf, len, off, f)) {
     if (f.field == 3 && f.wiretype == 2) {  // trip_update
-      decodeTripUpdate(f.data, f.len);
+      decodeTripUpdate(f.data, f.len, &matched);
     }
     // field 1 (id) is not needed; vehicle-position/alert entities (fields 2/4) are ignored.
   }
+  // readNextField() stops both at the clean end of the message and on bad framing; `off` short of
+  // `len` distinguishes them. A malformed entity is skipped (the outer stream already knows its
+  // exact byte length, so the next entity still parses) but counted, so a caller can tell
+  // "nothing matched" apart from "the feed is partly corrupt" - see entitiesMalformed().
+  if (off < len) ++entities_malformed_;
+  if (matched) ++entities_matched_;
 }
 
-void GtfsRtStream::decodeTripUpdate(const uint8_t* buf, size_t len) {
+void GtfsRtStream::decodeTripUpdate(const uint8_t* buf, size_t len, bool* matched) {
   std::string trip_id, route_id, vehicle_id;
   int direction_id = -1;
+  uint8_t trip_relationship = 0;
 
   // Pass 1: trip descriptor + vehicle descriptor (order-independent in the wire format).
   {
@@ -264,7 +351,8 @@ void GtfsRtStream::decodeTripUpdate(const uint8_t* buf, size_t len) {
     FieldRef f;
     while (readNextField(buf, len, off, f)) {
       if (f.field == 1 && f.wiretype == 2) {
-        decodeTripDescriptor(f.data, f.len, &trip_id, &route_id, &direction_id);
+        decodeTripDescriptor(f.data, f.len, &trip_id, &route_id, &direction_id,
+                              &trip_relationship);
       } else if (f.field == 3 && f.wiretype == 2) {
         decodeVehicleDescriptor(f.data, f.len, &vehicle_id);
       }
@@ -280,25 +368,31 @@ void GtfsRtStream::decodeTripUpdate(const uint8_t* buf, size_t len) {
     FieldRef f;
     while (readNextField(buf, len, off, f)) {
       if (f.field == 2 && f.wiretype == 2) {
-        decodeStopTimeUpdate(f.data, f.len, trip_id, route_id, vehicle_id, direction_id);
+        decodeStopTimeUpdate(f.data, f.len, trip_id, route_id, vehicle_id, direction_id,
+                              trip_relationship, matched);
       }
     }
   }
 }
 
 void GtfsRtStream::decodeTripDescriptor(const uint8_t* buf, size_t len, std::string* trip_id,
-                                         std::string* route_id, int* direction_id) {
+                                         std::string* route_id, int* direction_id,
+                                         uint8_t* trip_relationship) {
   size_t off = 0;
   FieldRef f;
   while (readNextField(buf, len, off, f)) {
     if (f.field == 1 && f.wiretype == 2) {
-      trip_id->assign(reinterpret_cast<const char*>(f.data), f.len);
+      assignCapped(trip_id, f.data, f.len);
     } else if (f.field == 5 && f.wiretype == 2) {
-      route_id->assign(reinterpret_cast<const char*>(f.data), f.len);
+      assignCapped(route_id, f.data, f.len);
     } else if (f.field == 6 && f.wiretype == 0) {
       *direction_id = static_cast<int>(f.varint);
+    } else if (f.field == 4 && f.wiretype == 0) {
+      // Trip-level schedule_relationship (TripRel). Surfaced - but into its OWN field, never
+      // merged with the stop-level one: a CANCELED trip used to be parsed and thrown away here,
+      // which is how a cancelled trip kept being displayed as an ordinary scheduled arrival.
+      *trip_relationship = f.varint > 255 ? 0 : static_cast<uint8_t>(f.varint);
     }
-    // field 4 (schedule_relationship) is parsed-and-skipped; see the header comment for why.
   }
 }
 
@@ -308,7 +402,7 @@ void GtfsRtStream::decodeVehicleDescriptor(const uint8_t* buf, size_t len,
   FieldRef f;
   while (readNextField(buf, len, off, f)) {
     if (f.field == 1 && f.wiretype == 2) {
-      vehicle_id->assign(reinterpret_cast<const char*>(f.data), f.len);
+      assignCapped(vehicle_id, f.data, f.len);
     }
     // field 2 (label) is not needed.
   }
@@ -316,7 +410,8 @@ void GtfsRtStream::decodeVehicleDescriptor(const uint8_t* buf, size_t len,
 
 void GtfsRtStream::decodeStopTimeUpdate(const uint8_t* buf, size_t len,
                                          const std::string& trip_id, const std::string& route_id,
-                                         const std::string& vehicle_id, int direction_id) {
+                                         const std::string& vehicle_id, int direction_id,
+                                         uint8_t trip_relationship, bool* matched) {
   uint32_t stop_sequence = 0;
   std::string stop_id;
   int64_t arrival_time = 0, departure_time = 0;
@@ -330,13 +425,13 @@ void GtfsRtStream::decodeStopTimeUpdate(const uint8_t* buf, size_t len,
     if (f.field == 1 && f.wiretype == 0) {
       stop_sequence = static_cast<uint32_t>(f.varint);
     } else if (f.field == 4 && f.wiretype == 2) {
-      stop_id.assign(reinterpret_cast<const char*>(f.data), f.len);
+      assignCapped(&stop_id, f.data, f.len);
     } else if (f.field == 2 && f.wiretype == 2) {
       decodeStopTimeEvent(f.data, f.len, &arrival_delay, &arrival_time, &has_arrival);
     } else if (f.field == 3 && f.wiretype == 2) {
       decodeStopTimeEvent(f.data, f.len, &departure_delay, &departure_time, &has_departure);
     } else if (f.field == 5 && f.wiretype == 0) {
-      schedule_relationship = static_cast<uint8_t>(f.varint);
+      schedule_relationship = f.varint > 255 ? 0 : static_cast<uint8_t>(f.varint);
     }
   }
 
@@ -354,10 +449,17 @@ void GtfsRtStream::decodeStopTimeUpdate(const uint8_t* buf, size_t len,
   out.arrival_delay = arrival_delay;
   out.departure_delay = departure_delay;
   out.schedule_relationship = schedule_relationship;
+  out.trip_schedule_relationship = trip_relationship;
+  // Carried per-update, not just queryable from the stream, so a merge that is handed a plain
+  // vector<StopTimeUpdate> (as mergeStop is) can still tell how old the predictions are.
+  out.feed_timestamp = header_timestamp_;
   out.has_arrival_time = has_arrival;
   out.has_departure_time = has_departure;
 
+  ++updates_matched_;
+  if (matched) *matched = true;
   if (on_update_) on_update_(out);
+  retain(std::move(out));
 }
 
 void GtfsRtStream::decodeStopTimeEvent(const uint8_t* buf, size_t len, int32_t* delay,
@@ -377,6 +479,11 @@ void GtfsRtStream::decodeStopTimeEvent(const uint8_t* buf, size_t len, int32_t* 
 
 uint32_t GtfsRtStream::entitiesSeen() const { return entities_seen_; }
 uint32_t GtfsRtStream::entitiesSkippedTooLarge() const { return entities_skipped_too_large_; }
+uint32_t GtfsRtStream::entitiesMatched() const { return entities_matched_; }
+uint32_t GtfsRtStream::entitiesMalformed() const { return entities_malformed_; }
+uint32_t GtfsRtStream::updatesMatched() const { return updates_matched_; }
+uint32_t GtfsRtStream::updatesDroppedByCap() const { return updates_dropped_by_cap_; }
+uint32_t GtfsRtStream::identifiersTruncated() const { return identifiers_truncated_; }
 int64_t GtfsRtStream::headerTimestamp() const { return header_timestamp_; }
 
 }  // namespace transit

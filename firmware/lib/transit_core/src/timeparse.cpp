@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "transit_core/numparse.h"
+
 namespace transit {
 
 namespace {
@@ -58,16 +60,17 @@ int64_t transitionNaiveEpoch(int year, const DstTransitionRule& rule) {
   return days * 86400 + static_cast<int64_t>(rule.hour) * 3600;
 }
 
-// Reads up to `max_digits` decimal digits at *p into `out`; advances p. False if none.
+// Reads an unsigned run of at most `max_digits` decimal digits at *p into `out`; advances p.
+// False if there are none, if there are MORE than max_digits (a date field with too many digits
+// is malformed input, not a field to silently truncate - see numparse.h for why every number
+// parser in this library bounds the digit count rather than the accumulated value), or if the
+// value somehow leaves int range. No sign is accepted: none of these fields is ever signed, and
+// letting "-" through here would make "09/-1/26" parse.
 bool readInt(const char*& p, int& out, int max_digits) {
-  int n = 0, digits = 0;
-  while (*p >= '0' && *p <= '9' && digits < max_digits) {
-    n = n * 10 + (*p - '0');
-    ++p;
-    ++digits;
-  }
-  if (digits == 0) return false;
-  out = n;
+  if (*p == '-' || *p == '+') return false;
+  int64_t v = 0;
+  if (!parseIntBounded(&p, max_digits, 0, 999999, &v)) return false;
+  out = static_cast<int>(v);
   return true;
 }
 
