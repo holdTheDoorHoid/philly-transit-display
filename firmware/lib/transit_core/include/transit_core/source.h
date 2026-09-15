@@ -33,6 +33,48 @@ namespace transit {
 using HttpGet =
     std::function<int(const std::string& url, std::function<bool(const uint8_t*, size_t)> onData)>;
 
+// What a transport can tell us beyond the status code. A status code alone cannot answer the one
+// question that matters for a streamed body: did we receive ALL of it? A connection dropped
+// halfway through the 150 KB TripUpdates feed still reports 200, and the decoder then sees a
+// short-but-syntactically-fine feed - the stops the missing half would have filled come back
+// empty and "successful". `complete` is the transport saying it reached the end of the body
+// (Content-Length satisfied, or a clean chunked/EOF termination), not a guess.
+struct FetchResult {
+  int status = 0;        // HTTP status code; 0 if the request could not be made at all
+  bool complete = false; // the whole body arrived
+  bool aborted = false;  // WE stopped it: onData returned false (e.g. a size cap was hit)
+  size_t bytes = 0;      // body bytes handed to onData
+};
+
+// Streaming GET with completeness reporting. Same contract as HttpGet otherwise. This is what
+// SeptaSource, pollBusStops() and pollRailStops() take; HttpGet remains for callers (and the
+// TransitSource interface) that have nothing better to report.
+using HttpGetEx = std::function<FetchResult(const std::string& url,
+                                             std::function<bool(const uint8_t*, size_t)> onData)>;
+
+// Wraps a plain HttpGet as an HttpGetEx. The wrapped transport cannot report completeness, so
+// this assumes the body was complete unless onData refused a chunk - the best available reading,
+// and the behaviour every caller had before FetchResult existed. Used by the legacy overloads
+// and by tests whose fake transport replays a whole fixture.
+inline HttpGetEx adaptHttpGet(HttpGet http) {
+  return [http](const std::string& url,
+                 std::function<bool(const uint8_t*, size_t)> onData) -> FetchResult {
+    FetchResult r;
+    bool refused = false;
+    r.status = http(url, [&](const uint8_t* data, size_t len) {
+      if (!onData(data, len)) {
+        refused = true;
+        return false;
+      }
+      r.bytes += len;
+      return true;
+    });
+    r.aborted = refused;
+    r.complete = !refused;
+    return r;
+  };
+}
+
 // Caches BusSchedules results per stop_id (DESIGN.md 4.7: cache 10 minutes, "also on config
 // change"). transit_core defines only the interface - it has no clock or persistent storage of
 // its own. The Arduino glue layer supplies a concrete implementation (e.g. backed by millis()

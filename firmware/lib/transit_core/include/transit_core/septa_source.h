@@ -38,15 +38,40 @@ std::string alertRouteIdFor(Mode mode, const std::string& route);
 // septaAlertsUrl returns "" (no URL) under the same conditions alertRouteIdFor() returns "".
 std::string septaAlertsUrl(Mode mode, const std::string& route);
 
+// What one SEPTA fetch actually achieved: the transport's own report plus the verdict on the
+// body. Returning only an HTTP status (what these methods used to do) threw away the parser's
+// error message and made "SEPTA answered 200 with a body we could not understand"
+// indistinguishable from success - which is how a stop with no usable data ended up displayed as
+// a stop with nothing due.
+//
+// `ok` is judged from the BODY, never from the status code alone: SEPTA has been observed
+// serving perfectly valid BusSchedules JSON under HTTP 501 and a genuine {"error": ...} under
+// HTTP 400 (NOTES.md 1), so validating the payload is the only reliable test and is deliberately
+// preserved here.
+struct FetchOutcome {
+  FetchResult transport;
+  bool ok = false;      // usable data was parsed out of the response
+  std::string error;    // short, human-readable, empty when ok
+};
+
 // SEPTA implementation of TransitSource (DESIGN.md 11).
+//
+// Every fetch has two forms:
+//   fetchX(..., HttpGet)     legacy: returns the HTTP status, keeps working for callers that
+//                            have no completeness information to give (the TransitSource
+//                            interface, the firmware's alerts/TransitView helpers).
+//   fetchXEx(..., HttpGetEx) returns a FetchOutcome, and is what pollBusStops()/pollRailStops()
+//                            use so a failure can reach the per-stop health fields.
+// The legacy forms are implemented on top of the Ex ones through adaptHttpGet(), so there is one
+// implementation of each fetch, not two.
 //
 // Memory: SeptaSource itself holds no members (stateless; one vtable pointer, 4 bytes on
 // ESP32). Each fetch method owns exactly one transient std::vector<uint8_t> body buffer, capped
 // at kJsonBodyCap (16 KB, generous headroom over the ~1-4 KB real payloads - DESIGN.md 4.3-4.6)
 // and freed when the method returns; fetchRealtime never buffers a body at all (see
 // gtfsrt_stream.h). pollBusStops()/pollRailStops() additionally hold the merged StopTimeUpdate/
-// TvVehicle/SchedEntry/RailArrival vectors for one poll cycle - bounded by the feed's real size
-// (a few hundred StopTimeUpdate structs at most) and freed on return.
+// TvVehicle/SchedEntry/RailArrival vectors for one poll cycle - each bounded by its own retention
+// cap (GtfsRtStream::retainUpdates, septa.h's kMax* constants) and freed on return.
 class SeptaSource : public TransitSource {
  public:
   int fetchRealtime(GtfsRtStream& stream, HttpGet http) override;
@@ -62,6 +87,20 @@ class SeptaSource : public TransitSource {
 
   // Regional Rail Arrivals for one station. Same out-param contract as fetchSchedule.
   int fetchRailArrivals(const std::string& station, std::vector<RailArrival>* out, HttpGet http);
+
+  // Completeness-aware forms. `ok` means "usable data": for the realtime feed, a body that
+  // arrived whole and framed correctly (GtfsRtStream::finish() == FeedStatus::Complete); for the
+  // JSON endpoints, a body that parsed and was not SEPTA's {"error": ...} shape. A truncated
+  // body is a failure even under HTTP 200.
+  FetchOutcome fetchRealtimeEx(GtfsRtStream& stream, HttpGetEx http);
+  FetchOutcome fetchScheduleEx(const std::string& stop_id, std::vector<SchedEntry>* out,
+                                HttpGetEx http);
+  FetchOutcome fetchAlertsEx(Mode mode, const std::string& route,
+                              std::vector<transit::Alert>* out, HttpGetEx http);
+  FetchOutcome fetchTransitViewEx(const std::string& route, std::vector<TvVehicle>* out,
+                                   HttpGetEx http);
+  FetchOutcome fetchRailArrivalsEx(const std::string& station, std::vector<RailArrival>* out,
+                                    HttpGetEx http);
 };
 
 // SEPTA's BusSchedules backend is not consistent across requests: some of the servers behind it
@@ -77,10 +116,18 @@ class SeptaSource : public TransitSource {
 // still written to *out so a genuinely sparse overnight schedule is displayed) or nothing usable
 // came back at all (*out untouched). Callers cache a false result only briefly (ScheduleCache::
 // putSuspect).
+//
+// `fetched_ok` (when non-null) reports whether ANY attempt produced usable data, which is a
+// different question from whether the answer looked plausible: a stop whose schedule endpoint
+// failed outright must mark that stop unavailable, while a stop that merely got a wrong-service-
+// day answer still has data to show.
 constexpr int kScheduleFetchAttempts = 3;
 constexpr Epoch kSchedulePlausibleS = 2 * 3600;
 bool fetchPlausibleSchedule(SeptaSource& src, const std::string& stop_id, Epoch now, HttpGet http,
-                            std::vector<SchedEntry>* out);
+                            std::vector<SchedEntry>* out, bool* fetched_ok = nullptr);
+bool fetchPlausibleSchedule(SeptaSource& src, const std::string& stop_id, Epoch now,
+                            HttpGetEx http, std::vector<SchedEntry>* out,
+                            bool* fetched_ok = nullptr);
 
 // Orchestrates one full poll cycle for every Mode::Bus/Mode::Trolley/Mode::Subway entry in
 // `configs` (DESIGN.md 4.7, 11):
@@ -94,11 +141,22 @@ bool fetchPlausibleSchedule(SeptaSource& src, const std::string& stop_id, Epoch 
 //      makes a subway stop come out schedule-only with no special-casing (see merge.h).
 // Mode::Rail configs are ignored here - see pollRailStops(). Never buffers the ~150 KB
 // TripUpdates body whole; opens exactly one connection per distinct URL needed, per DESIGN.md 5.
+//
+// Failure is reported PER STOP, not globally (DESIGN.md 7). Each source's outcome is routed to
+// the stops that actually depend on it, via mergeStop()'s SourceStatus: a BusSchedules failure
+// for one subway station marks that station Unavailable and leaves every bus stop alone, while a
+// truncated TripUpdates body marks the bus stops (which still show their schedule rows, flagged
+// Health::ScheduleOnly) and leaves the subway alone. Snapshot::last_poll_ok is then simply "every
+// stop's required sources succeeded", and last_error the first stop error seen.
+Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGetEx http,
+                      ScheduleCache& cache);
 Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet http,
                       ScheduleCache& cache);
 
 // Orchestrates one poll cycle for every Mode::Rail entry in `configs`: one Arrivals fetch per
-// distinct station, then mergeRail() per StopConfig sharing that station.
+// distinct station, then mergeRail() per StopConfig sharing that station. One station failing
+// marks only the stops configured for that station, not the whole poll.
+Snapshot pollRailStops(const std::vector<StopConfig>& configs, Epoch now, HttpGetEx http);
 Snapshot pollRailStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet http);
 
 }  // namespace transit
