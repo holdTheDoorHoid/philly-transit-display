@@ -12,7 +12,10 @@ node web/mock-server.mjs            # listens on :8080
 node web/mock-server.mjs 8090       # or a specific port
 ```
 
-Then open `http://localhost:8080/`. The mock server implements every route in
+Then open `http://localhost:8080/`. **The mock device's PIN is `123456`** — the UI asks
+for it the first time you save something (see "Admin PIN" below).
+
+The mock server implements every route in
 DESIGN.md §7 using Node built-ins only (`node:http`, `node:fs`, `node:path`,
 `node:zlib`* , `node:crypto`, `node:url`) and the real SEPTA fixtures in
 `firmware/test/fixtures/`:
@@ -24,8 +27,16 @@ DESIGN.md §7 using Node built-ins only (`node:http`, `node:fs`, `node:path`,
   northbound stop 21297) with one `live`, one `scheduled`, and one `skipped` arrival
   row each, plus a Regional Rail (30th Street, northbound) panel from
   `arrivals_30th.json`. Add `?stale=1` to simulate a failed poll (amber "stale" banner
-  in the Now view). One alert (from `alerts_bus_17.json`) is included with its HTML
-  advisory text stripped to plain text.
+  in the Now view), `?recovered=1` to set `config_recovered` (the Settings page's
+  "restored its previous settings" notice). One alert (from `alerts_bus_17.json`) is
+  included with its HTML advisory text stripped to plain text. Also carries
+  `auth: { pin_required: true }`, `board: "cyd-3248S035R"` and `config_recovered`.
+  Each stop carries `health` (`live` | `schedule_only` | `stale` | `unavailable`) and
+  `source_age_s`: southbound 17 is `live`, northbound 17 is deliberately `stale`
+  (480 s, so the Now page shows a "stale 8 min" chip), and the rail panel is
+  `schedule_only`. The northbound `live` arrival deliberately has `late_known: false`
+  — a live prediction with no lateness figure, which is the case the Now page has to
+  label "live" rather than "sched".
 - `GET`/`PUT /api/config` — in-memory config seeded with the exact example from
   DESIGN.md §6 (routes 17 southbound/northbound + Regional Rail north). `PUT`
   validates server-side and returns `400 { error, path }` on the same rules described
@@ -39,22 +50,59 @@ DESIGN.md §7 using Node built-ins only (`node:http`, `node:fs`, `node:path`,
 - `GET /api/rail/stations` returns `firmware/test/fixtures/rail_stations.json` if
   that file exists (it doesn't yet — that fixture belongs to another agent), else a
   ~55-station built-in list covering all Regional Rail lines.
-- `GET /api/stats?stop=&days=` returns deterministic synthetic aggregates in the
-  §9.3 shape (same `stop`+`days` always produces the same numbers), plus two fields
-  not yet in §9.3: `crowding: { by_hour, by_weekday }` (0-5 mean crowding level and a
-  6-bucket level distribution per bin) and `wait_by_hour` (mean/max gap between buses
-  and ghost/no-show counts, per hour). Add `&empty=1` to get the zero-sample "no data
-  yet" shape, useful for testing that UI state.
-- `GET /api/stats/overview?days=` — new endpoint, not in §9.3: one summary row per
-  configured stop (`stop`, `samples`, `on_time_pct`, `mean_late_min`, `ghost`,
-  `noshow`, `last_seen_ts`) for the Stats page's all-stops table, plus `bikes`
-  (per-station `by_hour` Indego availability, empty when `bike.enabled` is off). A
+- `GET /api/stats?stop=&days=` returns deterministic synthetic aggregates (same
+  `stop`+`days` always produces the same numbers) with the firmware's final key names:
+  `samples`, `inferred`, `unobserved`, `late_known`, `on_time_pct` and `mean_late_min`
+  (both JSON `null` when `late_known` is 0), `by_hour`, `by_weekday`, `headway`,
+  `ghost`, `noshow`, `outage_min` (includes ongoing/partial outages),
+  `forecast_stability[]` (the renamed `prediction[]`, per-bucket keys
+  `mean_abs_revision_s` / `mean_revision_s` replacing `mae_s` / `bias_s`),
+  `crowding: { by_hour, by_weekday }`, `wait_by_hour`, `wait_basis`
+  (`"half_mean_gap"`), `coverage` (0..1 fraction of the window polled successfully).
+  `unobserved` tracks `1 - coverage` so the two agree. Add `&empty=1` for the
+  zero-sample "no data yet" shape, or `&nolate=1` to force `on_time_pct: null` so the
+  UI's "no lateness data" wording can be checked — rail stops always take that path.
+- `GET /api/stats/overview?days=` — one summary row per configured stop (`stop`,
+  `samples`, `inferred`, `late_known`, nullable `on_time_pct` / `mean_late_min`,
+  `ghost`, `noshow`, `outage_min`, `coverage`, `last_seen_ts`) for the Stats page's
+  all-stops table, plus `bikes` (per-station `samples` and `by_hour` Indego
+  availability, empty when `bike.enabled` is off), top-level `samples` and `inferred`,
+  `excluded_stops` (2, standing for stop keys still in the logs that the fixed-size
+  aggregator had no room for), `excluded_bikes` and `coverage`. The rail stop's row
+  deliberately has `on_time_pct: null` so the table's "no data" path is visible. A
   stop's row reuses `buildStats`'s own PRNG sequence so its numbers match what you see
   after selecting it in the per-stop detail below.
-- `GET /api/log/index` / `GET /api/log/<file>` — a synthetic two-file index and CSV
-  content using the exact §9.1 header and column order.
-- `POST /api/ota` drains the multipart body and replies after a short simulated
-  delay; `POST /api/reboot` and `POST /api/wifi/reset` reply `200` immediately.
+- `GET /api/log/index` (open) / `GET /api/log/<file>` (**PIN-protected**) — a
+  synthetic two-file index and CSV content in **log schema v3**:
+  `ts,event,stop_key,route,dir,trip,sched_trip,vehicle,scheduled_ts,predicted_ts,`
+  `actual_ts,late_min,horizon_s,headway_s,seats,temp_c,note`. Temperature is
+  `temp_c`, in Celsius; anything that displays it converts to the device's own unit
+  setting first.
+- `POST /api/ota` (**PIN-protected**) drains the multipart body and replies after a
+  short simulated delay. A second upload while one is in flight gets `409`, and an
+  upload whose filename contains `wrongboard` gets `400` with a board-mismatch
+  message, so the UI's wording for both can be checked.
+  `POST /api/reboot` and `POST /api/wifi/reset` (**PIN-protected**) reply `200`.
+- `POST /api/pin` (**PIN-protected**) takes `{"pin":"new"}` (4-32 printable ASCII, no
+  spaces) and changes the PIN for the rest of the process's life.
+
+### Admin PIN
+
+The mock mirrors the firmware's gate so the unlock flow can be exercised without
+hardware. Everything that changes the device — `PUT /api/config`, `POST /api/reboot`,
+`POST /api/wifi/reset`, `POST /api/ota`, `POST /api/pin` — plus `GET
+/api/log/<file>.csv` wants an `X-Pin` header:
+
+| Condition | Response |
+|---|---|
+| header absent | `401 {"error":"pin required"}` (does not count as an attempt) |
+| header wrong | `401 {"error":"wrong pin"}` |
+| 5 wrong in a row | `429 {"error":"too many attempts","retry_s":60}` for 60 s |
+
+The starting PIN is **`123456`**; restart the server to reset it (and to clear a
+lockout). The browser remembers whatever you type in `localStorage` under `ptd_pin`;
+`localStorage.removeItem('ptd_pin')` in the console, or the Settings page's "Forget
+PIN on this browser" button, puts you back to the first-save prompt.
 
 \* `node:zlib` is only used by `build.mjs`; the mock server itself doesn't gzip
 anything (see above).
@@ -83,16 +131,31 @@ runs `node web/build.mjs --check` and fails the build if you forget.
 DESIGN.md §10 caps the four assets at **60 KB gzipped total**. Current sizes
 (`node web/build.mjs` prints these on every run):
 
-| Asset | Raw | Gzip |
-|---|---:|---:|
-| `index.html` | 848 B | 433 B |
-| `app.js` | ~101 KB | ~26.0 KB |
-| `app.css` | ~12.6 KB | ~3.4 KB |
-| `favicon.svg` | 410 B | 202 B |
-| **Total** | **~115 KB** | **~30.0 KB** |
+| Asset | On disk | Embedded | Gzip |
+|---|---:|---:|---:|
+| `index.html` | 848 B | 886 B | 455 B |
+| `app.js` | ~137 KB | ~122 KB | ~32.3 KB |
+| `app.css` | ~14.8 KB | ~13.2 KB | ~3.3 KB |
+| `favicon.svg` | 410 B | 410 B | 202 B |
+| **Total** | **~153 KB** | **~137 KB** | **~36.2 KB** |
 
-That leaves roughly 29 KB of headroom under the budget. `build.mjs` prints a warning
+That leaves roughly 22 KB of headroom under the budget. `build.mjs` prints a warning
 (without failing) if the total ever exceeds 60,000 bytes gzip.
+
+**"Embedded" is smaller than "on disk" because `build.mjs` strips whole-line comments
+from `app.js`/`app.css` before gzipping** — about 16 KB of source comments, worth
+~4.8 KB gzipped, which is what pays for commenting the files at the density the rest of
+the repo uses. `web/` on disk, the mock server, and anything you read or debug locally
+are untouched; only the copy baked into flash is trimmed. `index.html` goes the other
+way (886 B embedded vs 848 B on disk) because the cache-busting `?v=<etag>` query
+strings are added after the strip.
+
+The stripper is deliberately conservative — a line only goes if it is *entirely* a
+comment, so a trailing `// note` after code survives — and it is guarded twice:
+`assertNoMultilineStrings()` refuses to run if the source ever grows a template literal
+spanning lines (the one construct a whole-line rule could corrupt), and `assertParses()`
+compiles the result with `new Function` before it is embedded. To read exactly what ends
+up on the device, gunzip `APP_JS_GZ` out of the generated header.
 
 ## How the UI maps to the device API
 
@@ -100,8 +163,19 @@ That leaves roughly 29 KB of headroom under the budget. `build.mjs` prints a war
 |---|---|---|
 | **Now** | `GET /api/state` every 15 s | — |
 | **Stops** | `GET /api/config`, `GET /api/proxy/stops`, `GET /api/proxy/schedule`, `GET /api/rail/stations` | `PUT /api/config` (reorder, edit, remove, add stops; enable/add/remove Indego stations — always sends the whole config) |
-| **Stats** | `GET /api/config` (stop picker/labels), `GET /api/stats/overview` (all-stops table + Indego charts), `GET /api/stats` (per-stop detail), `GET /api/log/index` | — (CSV download links point at `GET /api/log/<file>`) |
-| **Settings** | `GET /api/config`, `GET /api/state` (firmware version) | `PUT /api/config`, `POST /api/ota`, `POST /api/reboot`, `POST /api/wifi/reset` |
+| **Stats** | `GET /api/config` (stop picker/labels), `GET /api/stats/overview` (all-stops table + Indego charts), `GET /api/stats` (per-stop detail), `GET /api/log/index` | `GET /api/log/<file>.csv` (PIN, fetched as a Blob) |
+| **Settings** | `GET /api/config`, `GET /api/state` (firmware version, board, `config_recovered`, `auth`) | `PUT /api/config`, `POST /api/ota`, `POST /api/reboot`, `POST /api/wifi/reset`, `POST /api/pin` (all PIN) |
+
+Every write, plus the CSV downloads, goes through the PIN wrapper: `fetchJSON(url,
+opts, true)` adds `X-Pin` from `localStorage.ptd_pin`, and a `401` opens the modal
+("This device asks for its PIN before changing settings…"), stores what you type and
+replays the request once. A second `401` says the PIN was not accepted rather than
+echoing the firmware's `wrong pin`; a `429` reports the wait from `retry_s` and does
+**not** retry. `uploadFirmware` does the same through `XMLHttpRequest`
+(`setRequestHeader('X-Pin', …)`), and words `409` as "already installing an update"
+and `400` with the firmware's own message (wrong board, bad image). The CSV links are
+buttons, not `<a href>`: a plain link cannot carry the header, so `downloadLog()`
+fetches the bytes and hands them over as a Blob + object URL + synthetic click.
 
 The Now view polls `/api/state` every 15 seconds while active and stops polling when
 you navigate away (hash routing: `#/now`, `#/stops`, `#/stats`, `#/settings`).
@@ -114,6 +188,29 @@ unreachable) → direction (learned from `/api/proxy/schedule`) → label/rows �
 subway, or `rail-<station-slug>-<N|S|both>` for Regional Rail, and the whole config
 object is sent to `PUT /api/config` on save; a `400` response's `{ error, path }` is
 shown inline in the wizard.
+
+Leaflet's CSS and JS are pinned to 1.9.4 and loaded with Subresource Integrity plus
+`crossorigin="anonymous"` (`LEAFLET_*_SRI` in `app.js`; the comment there records the
+`curl … | openssl dgst -sha384 -binary | openssl base64 -A` command that produced the
+hashes). A hash mismatch makes the browser drop the file, the loader times out, and
+the wizard falls back to its list-only view — the same path as being offline. Stop
+names from SEPTA go into Leaflet tooltips as an element built with `h()`, never as a
+string: Leaflet renders string tooltip content through `innerHTML`.
+
+The route step has a **Service type** select (Bus / Trolley) that sets the stop's
+`mode`. It guesses from the route id as you type — `/^(T\d|G1|D\d|10|11|13|15|34|36|
+101|102)$/` means trolley — and stops guessing once you change it yourself. The
+stop edit form carries the same select, so a stop the old wizard saved as `bus` can
+be corrected in place.
+
+Regional Rail's line filter is a **dropdown of SEPTA line codes**, not free text: the
+firmware matches on the code (`PAO`), never the public name ("Paoli/Thorndale"), so
+the old text box produced a filter that silently matched nothing. The chosen code is
+written to **both** `route` and `line` — DESIGN.md §6 documents rail `line` as mapping
+onto `StopConfig::route`, and writing both leaves no stale display name behind.
+Editing a stop that still holds a display name pre-selects the matching code
+(`railLineCode()`), and anything unrecognised falls back to "Any line" rather than
+inventing a filter.
 
 Each configured stop's edit form (§6 "Fields added 2026-09-14") also sets how its
 title is shown on screen (`title_style`: label → destination, label only, route →
@@ -128,9 +225,11 @@ max 3 stations): an enabled checkbox, an **Indego style** select (`bike.style`:
 `icons` (default) or `words` — picks how counts are drawn on the Now page, see below),
 the chosen stations with remove buttons, a "Find stations near my stops" lookup that
 fetches the Bicycle Transit status feed directly in the browser and ranks the six
-nearest stations by great-circle distance from stops that have `lat`/`lng` (plain
-HTTP; if the web UI itself is loaded over HTTPS the browser blocks it as mixed content
-and the button shows a banner explaining that instead of failing silently), and a
+nearest stations by great-circle distance from stops that have `lat`/`lng`
+(`https://bts-status.bicycletransit.workers.dev/phl` — verified 2026-09-15 to answer
+over TLS with `Access-Control-Allow-Origin: *`, so it works whichever scheme the page
+was loaded over and no longer needs the old "load the UI over http://" advice; a
+failure now reads as "no internet connection right now"), and a
 manual station-id add. It's on the Stops page rather than Settings because the owner
 manages bike stations alongside the stops they sit near; every change there saves
 immediately through the same `PUT /api/config` pattern as reordering or removing a
@@ -204,6 +303,77 @@ only knows the boolean `device.show_crowding` still works: the UI reads `crowdin
 present and otherwise treats `show_crowding === false` as `off`, anything else as
 `words`; it never sends `show_crowding` back. On the Now page, an arrival with no
 recognized seats value (blank or `NOT_AVAILABLE`) shows no crowding element at all.
+
+### Arrival badges and per-stop health (Now page)
+
+`badgeFor()` reads the arrival's `status` first and `late_known` only after it, because
+they answer different questions: `status` says whether the device has a live prediction,
+`late_known` says whether SEPTA also supplied a lateness figure. `live` + `late_known:
+false` therefore renders an outlined **live** badge with the title "live ETA, lateness
+unknown", *not* "sched / no live tracking" — that older wording claimed the trip was
+untracked whenever the lateness happened to be missing. `scheduled` → `sched`,
+`skipped` → `skipped`, anything else → `sched`.
+
+Each stop also carries `health`, `source_ts` (when SEPTA produced the data) and
+`source_age_s`. `stopHealthChip()` draws a chip in the panel's title bar for `stale`
+("stale 8 min", amber), `unavailable` ("unavailable: <error>", red) and `schedule_only`
+("schedule only", grey); `live` and a missing `health` draw nothing, so a healthy panel
+stays quiet. It prefers `source_age_s` and falls back to computing the age from
+`source_ts`.
+
+**`ok` is false for a stale stop as well as an unreachable one.** A stale stop still has
+usable — if old — times, so `renderStopPanels` only replaces the rows with the red error
+banner when the stop is *not* stale or has no rows at all; a stale stop keeps its
+arrivals, gets the amber chip, and shows the short human `error` text as a muted line
+above them. Treating `!ok` as "show nothing" would throw away the only information the
+panel has.
+
+A `status: "skipped"` arrival may carry `predicted: 0`; `fmtEta()` already falls back to
+`scheduled` for its clock time. Arrivals also carry `sched_trip` (the matched static trip
+id, possibly empty); the UI stores nothing and displays nothing from it today.
+
+### Wording rules on the Stats page
+
+Two rules the firmware's own honesty depends on:
+
+1. **Never render a bare 0 for a missing value.** `fmtCount` / `fmtPct` / `fmtMinutes`
+   turn `null` into `"no data"`. A stop with no lateness data is not a stop that was 0 %
+   on time, and the all-stops table shows "no data" rather than a red 0 % chip.
+2. **Always show the sample count beside a percentage.** The on-time tile carries "of
+   143 with lateness data" and the sentence under the tiles reads "On time: 71 % of 143
+   with lateness data (190 arrivals)."
+
+Three more pieces of wording come straight from the data:
+
+- **Arrivals are inferred**, not measured — the device works them out from the bus
+  vanishing from the live feed. Said under the tiles, with the `inferred` count, and
+  followed by `unobserved`: trips that fell in a stretch when the device was not polling,
+  so nothing is known about them. `unobserved` is distinct from ghosts and no-shows,
+  which are failures the device actually watched happen.
+- **Forecast stability** replaces the old "prediction accuracy by horizon". The device
+  has no measured arrival time to compute error against, so what it reports is how far
+  the forecast was *revised* while the bus was in sight: `forecast_stability[]`, one
+  bucket per horizon, bar = `mean_abs_revision_s`, dot = `mean_revision_s`. The
+  bar-and-dot rendering is unchanged; only the labels are. Read defensively — an object
+  carrying a histogram draws too, and the pre-rename `prediction[]` with `mae_s`/`bias_s`
+  still renders under the new heading rather than leaving a blank card.
+- **`wait_basis`** names the estimator, so the page says "Typical wait is estimated as
+  half the average gap between buses" instead of asserting a method the firmware may
+  have changed. Unknown values are de-underscored and shown as-is.
+
+Counts are read as `data.samples ?? data.arrivals` and `data.late_known ??
+data.late_known_n`, so a rename on the firmware side does not blank the page.
+`coverage` is accepted as either a 0-1 fraction or a 0-100 percentage.
+
+### Setting hints
+
+Every control on Settings, and the Indego card and stop edit form on Stops, has a
+`<p class="hint">` under it in plain language — what the setting does, and what changes
+if you flip it. They exist because the owner is not a programmer and an unexplained
+setting is one nobody dares touch. The shared ones (rows to show, title style,
+alternative-of, rail line, bus/trolley) live in `HINT_*` constants near the top of
+`app.js` so the add wizard and the edit form cannot drift apart. The CSS selector is
+`p.hint`, deliberately not `.hint`, so it does not also catch `footer.hint`.
 
 ## Assumptions made (DESIGN.md §7/§9.3 didn't fully pin these down)
 
