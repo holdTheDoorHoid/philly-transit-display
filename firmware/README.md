@@ -32,7 +32,9 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 
 | Build | Flash | Static RAM |
 |---|---:|---:|
-| Everything incl. weather, Indego, profiles, night page, 48 px font (current) | 1,858,446 B (97.8 %) | 95,300 B (29.1 %) |
+| After the 2026-09-15 review fixes (`rf/data`: transport completeness, transit-first polling, per-stop health on the panels, checked SD writes, log export) | 1,769,374 B (93.1 %) | 95,332 B (29.1 %) |
+| Same branch point, before those fixes | 1,760,398 B (92.6 %) | 95,268 B (29.1 %) |
+| Everything incl. weather, Indego, profiles, night page, 48 px font | 1,858,446 B (97.8 %) | 95,300 B (29.1 %) |
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
 
