@@ -433,29 +433,81 @@ Main screen (portrait by default; every size derives from the runtime resolution
 ## 9. Logging and statistics
 
 ### 9.1 Event log (SD, `/transit-log/YYYY-MM.csv`)
-Header row on file creation. Columns (log schema v2, since 2026-09-14):
+Header row on file creation. Columns (log schema v3, since 2026-09-15):
 ```
-ts,event,stop_key,route,dir,trip,vehicle,scheduled_ts,predicted_ts,actual_ts,late_min,horizon_s,headway_s,note,seats,temp,wx,alert,bikes,ebikes,docks
+ts,event,stop_key,route,dir,trip,vehicle,scheduled_ts,predicted_ts,actual_ts,late_min,horizon_s,headway_s,note,seats,temp_c,wx,alert,bikes,ebikes,docks
 ```
-Rows written before 2026-09-14 have only the first 14 columns, through `note`; the reader accepts
-both shapes (a 21-column row is v2, a 14-column row is v1 with `seats` and the six trailing
-columns unknown) and never rewrites old rows to add the new columns.
+Three shapes exist and all three must keep parsing; nothing ever rewrites old rows:
+
+| schema | since | shape |
+|---|---|---|
+| v1 | (initial) | 14 columns, through `note`. `seats` and the six trailing columns unknown. |
+| v2 | 2026-09-14 | 21 columns. `temp` is whatever unit the device was displaying. |
+| v3 | 2026-09-15 | the same 21 columns, `temp` renamed `temp_c` and **always Celsius**. |
+
+**Temperature unit (v3, 2026-09-15).** The column used to hold the device-unit temperature with
+nothing in the row saying which unit that was, so a log was only interpretable if you also knew
+how the device had been configured — and the owner's unit was logging °F. From 2026-09-15 the
+column is Celsius always; the app converts for display. v2 and v3 rows are the same shape and are
+*not* distinguishable row by row: only the file's header (`temp` vs `temp_c`) and the cutover date
+say which unit a given row is in. Rows before 2026-09-15 on the owner's device are °F.
+
+`transit_stats::csvHeader()` is the **single source of truth** for the header line, and
+`csvSchemaVersion()` returns 3. No other file may spell the column list out again (sd_logger.cpp
+used to keep its own copy, which stayed at 14 columns while rows grew to 21).
+
+**Bounded records.** A complete record never exceeds `kMaxCsvLineBytes` (512) and never contains a
+CR or LF inside a field: `toCsv()` replaces control characters with a space and truncates free-text
+fields (64 chars for `note`/`trip`/`vehicle`, 32 for `stop_key`/`route`/`dir`/`seats`). That is
+what lets a reader work a line at a time with a fixed 512-byte buffer without tracking quote state.
+Readers must skip — never abort on — a blank line, a header row, or a record that fails to parse:
+one damaged record must cost exactly that record and nothing after it.
+
+**Export.** `normalizeCsvLine()` rewrites a v1 or v2 row as a full 21-column row so a mixed
+historical month downloads in one explicit schema, and prefixes any text field starting with
+`= + - @` with a single quote so spreadsheets treat it as text. That prefixing happens **only in
+the export**, never in the stored file — a log you cannot byte-compare against the device is not a
+log. (A 21-column row's temperature is passed through unchanged; see the unit note above.)
+
+**A failed poll is not an observation** (the governing rule, 2026-09-15). While polling for a stop
+is failing, `ArrivalTracker::observe()` records the outage and changes nothing else: no `arrive`,
+`ghost`, `noshow` or headway can ever be produced by a network timeout, and tracked trips are
+frozen rather than reaped. Inference resumes only from fresh, successful observations, and a
+disappearance must be confirmed by **two consecutive successful polls**
+(`kMissesBeforeInference`) before anything is concluded from it — one missing observation is
+routinely a partial GTFS-RT feed (§4.2), not a bus. Callers must pass `poll_ok` honestly.
 
 Events emitted by `ArrivalTracker` from the stream of `StopSnapshot`s:
 - `pred` — a prediction snapshot for (stop, trip) at the first sighting and when the ETA first drops
   under 900, 600, 300, 120 s. `horizon_s` = predicted − ts at that moment. `seats` is the
   crowding token current at that sighting (see below).
-- `arrive` — inferred actual arrival: the stop's `stop_time_update` for that trip disappears (bus
-  passed: its sequence advanced beyond ours or the trip vanished while predicted within ±120 s of
-  now). `actual_ts` = last predicted time if it is within 120 s of now, else now. Include
-  `late_min` from TransitView at that moment and `scheduled_ts` = nearest BusSchedules entry to
-  (`actual_ts` − late) within 10 min, if any. `headway_s` = gap since the previous `arrive` for the
-  same stop and direction. `seats` is the last crowding token seen for that trip before it vanished.
-- `ghost` — a tracked trip vanished while its prediction was still > 180 s in the future and it never
-  arrived.
+- `arrive` — **inferred** passage, never a measured one: the stop's `stop_time_update` for that
+  trip stopped being published on two consecutive successful polls. `actual_ts` = the last
+  predicted time when the trip vanished within ±120 s of it, else the first missing observation's
+  timestamp. `note` records which inference was used — `inferred` (vanished near its prediction),
+  `late-vanish` (still being predicted well after it should have arrived), `unobserved` (closed
+  after an outage; see below) — and `horizon_s` carries the horizon that was left at the moment we
+  lost sight of it. Include `late_min` from TransitView at that moment and `scheduled_ts` = nearest
+  BusSchedules entry to (`actual_ts` − late) within 10 min, if any. `headway_s` = gap since the
+  previous `arrive` for the same stop and direction — see the continuity rules in §9.2. `seats` is
+  the last crowding token seen for that trip before it vanished.
+  A live trip retires the pending scheduled record it corresponds to (matched by trip id, or by
+  equal scheduled time, since SEPTA's static and realtime trip ids differ — §4.4), so one bus can
+  never produce both an `arrive` and a `noshow`.
+- `ghost` — a tracked trip vanished (again, confirmed over two successful polls) while its
+  prediction was still > 180 s in the future and it never arrived.
 - `noshow` — a scheduled departure passed by more than 10 min without any live trip matched to it,
-  while the route had at least one live vehicle (otherwise it is an `outage`).
-- `outage` — polling failed for more than 5 min; one line at start and one at end (`note`).
+  while the route had at least one live vehicle (otherwise it is an `outage`). A pending scheduled
+  record whose deadline passed *during an outage* is dropped silently instead: we were not
+  watching, so "the bus never came" is not something we know.
+- `outage` — polling failed for more than 5 min; one line at start and one at end (`note="end"`).
+  **The start row's `ts` is the first failed poll**, not the moment the 5-minute threshold was
+  crossed (otherwise every outage is short by the detection delay — a 600 s outage recorded 299 s);
+  the detection delay itself is kept in `horizon_s`. This is the one kind of row whose `ts` can be
+  earlier than the row before it in the file. On recovery, a trip whose predicted time passed while
+  the device was blind is closed as an `arrive` with `note="unobserved"` and no `headway_s` — an
+  explicit "a bus probably passed and we did not see it", never a fabricated ordinary arrival, and
+  never counted twice if the trip is still being predicted when polling comes back.
 - `bike` — one row per configured Indego station per hour (`bike.stations`, §6), built by the app
   layer, not `ArrivalTracker`. `stop_key` = `indego-<station id>` (e.g. `indego-3468`); route/dir/
   trip/vehicle are empty; `note` = the station's display name; `bikes`/`ebikes`/`docks` carry that
@@ -466,8 +518,8 @@ New columns (all optional; empty means unknown, never coerced to 0):
   `pred`/`arrive` rows only, from SEPTA's `estimated_seat_availability`
   (EMPTY→`empty`, MANY_SEATS_AVAILABLE→`open`, FEW_SEATS_AVAILABLE→`few`,
   STANDING_ROOM_ONLY→`standing`, CRUSHED_STANDING_ROOM_ONLY→`packed`, FULL→`full`).
-- `temp`, `wx` — device-unit temperature and WMO weather code at `ts` (§4.8), filled in by the app
-  layer on `pred`/`arrive`/`ghost`/`noshow` rows.
+- `temp_c`, `wx` — temperature in **Celsius** (schema v3, see above) and WMO weather code at `ts`
+  (§4.8), filled in by the app layer on `pred`/`arrive`/`ghost`/`noshow` rows.
 - `alert` — 0 none, 1 a service alert was active for the route, 2 a detour was active; filled in by
   the app layer on `pred`/`arrive`/`ghost`/`noshow` rows.
 - `bikes`, `ebikes`, `docks` — `bike` rows only (see above).
@@ -475,26 +527,60 @@ Rotation: a new file each month; refuse to log when SD free space < 50 MB and sh
 
 ### 9.2 Stats definitions
 - On-time: SEPTA's definition, no more than 59 s early and no more than 5 min 59 s late.
+  **The denominator is arrivals with a KNOWN `late_min`, not all arrivals** (`late_known`). An
+  arrival whose lateness we never learned is not evidence that the bus was late; counting it as a
+  miss made one on-time bus plus one unknown read as "50% on time". With `late_known` = 0 the
+  answer is *no data* — JSON `null`, and `StopSummary::has_on_time` false — never `0`.
 - Lateness by hour (24 bins) and weekday (7 bins): count, mean, and a −10..+60 min histogram per
   bin (approximate median from the histogram).
 - Headway: actual `headway_s` vs scheduled gap; bunching = actual < 40 % of scheduled;
   gap = actual > 175 % of scheduled. Report counts and a histogram of the ratio.
+  Only **positive** gaps of at most 3 h count: a negative or zero `headway_s` is corrupt or
+  ambiguous (the aggregator ignores it defensively), and a longer one is a service break rather
+  than a wait. The tracker never writes a headway at all across a poll outage, a local
+  service-day boundary, a gap over 4 h, an `unobserved` closure, or a stop re-registered onto a
+  different route/direction: a headway claims two buses were consecutive, and if we cannot see
+  that they were, we do not make the claim. When several trips are inferred to have passed in one
+  observation they are sorted by inferred passage time before headways are computed (slot order
+  used to produce negative gaps); two passages inferred at the same instant get **no** headway
+  rather than a 0.
+- "Typical wait" is **half the mean observed gap** (`wait_basis: "half_mean_gap"` in the response)
+  — the random-arrival expectation *if* buses were evenly spaced, over the gaps that survive the
+  filters above. It is not a measured wait, and the UI must not present it as one.
 - Ghost and noshow counts per route/direction/day.
-- Prediction accuracy: for each `arrive`, error = predicted (at horizon bucket 120/300/600/900) −
-  actual, reported as mean absolute error and bias per bucket.
+- **Forecast stability** (renamed from "prediction accuracy", 2026-09-15): for each `arrive`,
+  revision = predicted (at horizon bucket 120/300/600/900) − the final inferred arrival time,
+  reported as `mean_abs_revision_s` and `mean_revision_s` per bucket. This is *not* accuracy:
+  `actual_ts` is itself derived from the last prediction, so the forecast is being compared with
+  itself and a feed that is confidently wrong and never revises scores perfectly. What it honestly
+  measures is **how much the forecast moved between first sighting and the final inferred
+  arrival**. Never label it error, and never present an `arrive` row's `actual_ts` as a measured
+  passage time — every arrival in this log is an inference, and `inferred` counts the ones whose
+  `note` says which inference it was.
+- Coverage: the fraction of the requested window with successful polling, derived from `outage`
+  rows by overlapping each outage interval with the window (including an interval that started
+  before the window and one still open at its end). Outages shorter than 5 minutes are not logged,
+  so coverage is an upper bound on real coverage, never a lower one.
 
 ### 9.3 `/api/stats` response
 ```json
-{ "stop": "17-21332", "days": 30, "samples": 812, "on_time_pct": 71.4, "mean_late_min": 3.2,
+{ "stop": "17-21332", "days": 30, "samples": 812, "late_known": 763,
+  "on_time_pct": 71.4, "mean_late_min": 3.2, "inferred": 812, "unobserved": 6, "coverage": 0.9832,
   "by_hour": [ { "h": 8, "n": 41, "mean": 5.1, "p50": 4, "p90": 12 } ],
   "by_weekday": [ ... ],
   "headway": { "n": 700, "bunched": 61, "gapped": 44, "ratio_hist": [ ... ] },
   "ghost": 9, "noshow": 4, "outage_min": 37,
-  "prediction": [ { "horizon_s": 300, "n": 500, "mae_s": 74, "bias_s": 21 } ],
+  "forecast_stability": [ { "horizon_s": 300, "n": 500, "mean_abs_revision_s": 74,
+                            "mean_revision_s": 21 } ],
   "crowding": { "by_hour": [ {"h":0,"n":12,"mean":1.4,"dist":[0,7,3,2,0,0]} ],
                 "by_weekday": [ {"wd":0,"n":0,"mean":0,"dist":[0,0,0,0,0,0]} ] },
-  "wait_by_hour": [ {"h":8,"n":14,"mean_gap_s":540,"max_gap_s":1320,"ghost":1,"noshow":0} ] }
+  "wait_by_hour": [ {"h":8,"n":14,"mean_gap_s":540,"max_gap_s":1320,"ghost":1,"noshow":0} ],
+  "wait_basis": "half_mean_gap" }
 ```
+`on_time_pct` and `mean_late_min` are `null` (not `0`) whenever `late_known` is 0, and every
+response carries `samples`, `late_known`, `inferred`, `unobserved` and `coverage` so the UI can
+always distinguish "nothing happened" from "we could not see" (§9.2). `outage_min` is the overlap
+of every outage interval with the requested window, including one still running.
 `by_hour`/`by_weekday` always carry 24/7 entries, in hour/weekday order, even for hours with no
 samples. `crowding` is built from `arrive` rows with a known `seats` (log schema v2, §9.1):
 `dist[6]` is a count per crowding level in the order empty/open/few/standing/packed/full, and
@@ -508,16 +594,24 @@ fixed-size accumulators (< 9 KB).
 configured stop and Indego station (`OverviewAggregator`), rather than one pass per stop like
 `/api/stats` above — a cheap landing-page summary, not the detailed per-stop breakdown:
 ```json
-{ "days": 7,
-  "stops": [ { "stop": "17-21332", "samples": 812, "on_time_pct": 71.4, "mean_late_min": 3.2,
-               "ghost": 9, "noshow": 4, "last_seen_ts": 1757900000 } ],
-  "bikes": [ { "station": "indego-3468", "name": "Snyder & Dorrance",
-               "by_hour": [ {"h":0,"n":7,"bikes":4.3,"ebikes":2.1,"docks":8.6} ] } ] }
+{ "days": 7, "samples": 812, "inferred": 812,
+  "stops": [ { "stop": "17-21332", "samples": 812, "late_known": 763, "on_time_pct": 71.4,
+               "mean_late_min": 3.2, "inferred": 812, "ghost": 9, "noshow": 4,
+               "outage_min": 37, "coverage": 0.9832, "last_seen_ts": 1757900000 } ],
+  "bikes": [ { "station": "indego-3468", "name": "Snyder & Dorrance", "samples": 168,
+               "by_hour": [ {"h":0,"n":7,"bikes":4.3,"ebikes":2.1,"docks":8.6} ] } ],
+  "excluded_stops": 2, "excluded_bikes": 0 }
 ```
-`stops[]`/`bikes[]` carry one entry per distinct stop_key/Indego station actually seen in the
-window, in first-seen order, up to config's own caps (8 stops, 3 bike stations, §6) — a row for
-any key beyond that is ignored, not evicted. `on_time_pct`/`mean_late_min` use the same
-definitions as above; `last_seen_ts` is the max `ts` of any row (any event type) for that stop.
+The caller passes the **currently configured** stop keys and Indego station keys to
+`OverviewAggregator`, and those get reserved slots, in that order, ahead of anything else in the
+window — a reserved key appears even with zero rows ("just added, no data yet" is a real answer).
+Remaining slots go to other keys in first-seen order, up to config's own caps (8 stops, 3 bike
+stations, §6). Keys beyond that are counted in `excluded_stops`/`excluded_bikes`, which the UI
+must disclose rather than present a partial list as the whole truth: without the reservation, a
+month in which the user changed stops filled all eight slots with the stops they *used* to watch
+and silently dropped the ones on the screen. `samples`/`inferred` at the top level are totals over
+the stops actually listed. `on_time_pct`/`mean_late_min` use the same definitions (and the same
+`null` rule) as §9.2; `last_seen_ts` is the max `ts` of any row (any event type) for that stop.
 Each bike station's `by_hour` is a 24-entry, always-present per-local-hour breakdown of that
 hour's `bike` rows; `name` is the display name from the most recently seen row. Fixed-size
 accumulators, aiming under 2 KB.
