@@ -97,3 +97,84 @@ void test_dst_mid_summer_is_edt() {
   TEST_ASSERT_EQUAL_INT64(1783180800, parseBusScheduleTime("07/04/26 12:00 pm", &ok));
   TEST_ASSERT_TRUE(ok);
 }
+
+// =============================================================================================
+// F32 (2026-09-15 review): the shared checked-integer helper every hand-written parser in
+// transit_core now goes through, plus the date/time parsers' own digit bounds.
+// =============================================================================================
+
+#include "transit_core/numparse.h"
+
+void test_parse_int_bounded_rejects_overlong_digit_runs() {
+  int64_t v = 0;
+
+  const char* ok = "1440";
+  const char* p = ok;
+  TEST_ASSERT_TRUE(transit::parseIntBounded(&p, 4, -1440, 1440, &v));
+  TEST_ASSERT_EQUAL_INT64(1440, v);
+  TEST_ASSERT_EQUAL_CHAR('\0', *p);  // advanced past the number
+
+  // One digit too many is refused outright rather than truncated or wrapped - this is the case
+  // that used to be signed-overflow UB.
+  const char* too_long = "99999";
+  p = too_long;
+  TEST_ASSERT_FALSE(transit::parseIntBounded(&p, 4, -1440, 1440, &v));
+  TEST_ASSERT_EQUAL_PTR(too_long, p);  // and the cursor did not move
+
+  const char* absurd = "999999999999999999999999999";
+  p = absurd;
+  TEST_ASSERT_FALSE(transit::parseIntBounded(&p, 4, -1440, 1440, &v));
+  p = absurd;
+  TEST_ASSERT_FALSE(transit::parseIntBounded(&p, transit::kMaxSafeDigits, INT64_MIN, INT64_MAX, &v));
+
+  // In range but outside the caller's bounds.
+  const char* over = "1441";
+  p = over;
+  TEST_ASSERT_FALSE(transit::parseIntBounded(&p, 4, -1440, 1440, &v));
+
+  // Signs, extrema and non-numbers.
+  const char* neg = "-1440";
+  p = neg;
+  TEST_ASSERT_TRUE(transit::parseIntBounded(&p, 4, -1440, 1440, &v));
+  TEST_ASSERT_EQUAL_INT64(-1440, v);
+  const char* nothing = "abc";
+  p = nothing;
+  TEST_ASSERT_FALSE(transit::parseIntBounded(&p, 4, -1440, 1440, &v));
+
+  // The widest safe run: 18 digits accumulate without leaving int64.
+  const char* wide = "999999999999999999";
+  p = wide;
+  TEST_ASSERT_TRUE(transit::parseIntBounded(&p, transit::kMaxSafeDigits, INT64_MIN, INT64_MAX, &v));
+  TEST_ASSERT_EQUAL_INT64(999999999999999999LL, v);
+}
+
+void test_parse_int_strict_rejects_trailing_garbage() {
+  int64_t v = 0;
+  TEST_ASSERT_TRUE(transit::parseIntStrict("  42  ", 4, 0, 100, &v));
+  TEST_ASSERT_EQUAL_INT64(42, v);
+  TEST_ASSERT_FALSE(transit::parseIntStrict("42x", 4, 0, 100, &v));
+  TEST_ASSERT_FALSE(transit::parseIntStrict("", 4, 0, 100, &v));
+  TEST_ASSERT_FALSE(transit::parseIntStrict("4 2", 4, 0, 100, &v));
+}
+
+// The date parsers bound each field's digit count too, so an over-long field is a parse error
+// rather than a silently truncated one.
+void test_time_parsers_reject_overlong_fields() {
+  bool ok = true;
+  TEST_ASSERT_EQUAL_INT64(0, parseBusScheduleTime("099/13/26 10:25 pm", &ok));
+  TEST_ASSERT_FALSE(ok);
+  ok = true;
+  TEST_ASSERT_EQUAL_INT64(0, parseBusScheduleTime("09/13/26 100:25 pm", &ok));
+  TEST_ASSERT_FALSE(ok);
+  ok = true;
+  TEST_ASSERT_EQUAL_INT64(0, parseArrivalsTime("20260-09-13 22:24:00", &ok));
+  TEST_ASSERT_FALSE(ok);
+  ok = true;
+  TEST_ASSERT_EQUAL_INT64(0, parseBusScheduleTime("-9/13/26 10:25 pm", &ok));
+  TEST_ASSERT_FALSE(ok);
+
+  // The valid shapes still parse (same values as the tests above).
+  ok = false;
+  TEST_ASSERT_EQUAL_INT64(1789352700, parseBusScheduleTime("09/13/26 10:25 pm", &ok));
+  TEST_ASSERT_TRUE(ok);
+}

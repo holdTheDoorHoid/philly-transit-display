@@ -253,3 +253,416 @@ void test_merge_stop_dedupes_scheduled_rows_by_trip_id() {
   TEST_ASSERT_EQUAL_INT64(now + 600, snap.arrivals[0].scheduled);
   TEST_ASSERT_EQUAL_STRING("280909", snap.arrivals[1].trip.c_str());
 }
+
+// =============================================================================================
+// Regression tests for the 2026-09-15 adversarial review. Each asserts the CORRECT behaviour;
+// the review's own harness asserted the defective one.
+// =============================================================================================
+
+namespace {
+
+// A BusSchedules entry, built inline rather than from a fixture so the route/direction/time
+// combination under test is unambiguous.
+SchedEntry sched(const std::string& route, const std::string& trip_id, const std::string& dir,
+                  Epoch when, const std::string& desc = "") {
+  SchedEntry e;
+  e.route = route;
+  e.trip_id = trip_id;
+  e.direction = dir;
+  e.direction_desc = desc;
+  e.scheduled = when;
+  return e;
+}
+
+// One GTFS-RT stop_time_update. `arrival` of 0 means "the feed gave no time for this stop".
+StopTimeUpdate rtUpdate(const std::string& trip, const std::string& route, const std::string& stop,
+                         int dir, Epoch arrival, Epoch feed_ts = 0) {
+  StopTimeUpdate u;
+  u.trip_id = trip;
+  u.route_id = route;
+  u.stop_id = stop;
+  u.direction_id = dir;
+  u.feed_timestamp = feed_ts;
+  if (arrival != 0) {
+    u.arrival_time = arrival;
+    u.has_arrival_time = true;
+  }
+  return u;
+}
+
+StopConfig busCfg(const std::string& route, const std::string& stop, const std::string& dir) {
+  StopConfig c;
+  c.key = route + "-" + stop;
+  c.mode = Mode::Bus;
+  c.route = route;
+  c.stop_id = stop;
+  c.direction = dir;
+  return c;
+}
+
+}  // namespace
+
+// --- F14: schedules from another route must not be merged into this route's panel -------------
+
+// Reproduction from the review: cfg.route "17" plus a SchedEntry for route "2" in the same
+// direction used to come back as one arrival, because `sched` was filtered by direction only.
+void test_merge_stop_ignores_other_route_schedule_entries() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  std::vector<SchedEntry> s = {sched("2", "999001", "1", now + 600, "Other Route")};
+
+  StopSnapshot snap = mergeStop(cfg, {}, {}, s, now);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(snap.arrivals.size()));
+
+  // ...and the same stop's own route still works, so this is a filter, not a blanket refusal.
+  s.push_back(sched("17", "281757", "1", now + 900, "20th-Johnston"));
+  StopSnapshot snap2 = mergeStop(cfg, {}, {}, s, now);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap2.arrivals.size()));
+  TEST_ASSERT_EQUAL_STRING("281757", snap2.arrivals[0].trip.c_str());
+}
+
+// The other half of F14: a live route-17 arrival used to consume route 2's scheduled time, which
+// both corrupted its "scheduled" column and hid route 2's own row.
+void test_merge_stop_live_arrival_does_not_match_other_route_schedule() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  std::vector<StopTimeUpdate> rt = {rtUpdate("3667", "17", "21332", 1, now + 300)};
+  std::vector<SchedEntry> s = {sched("2", "999001", "1", now + 300, "Other Route")};
+
+  StopSnapshot snap = mergeStop(cfg, rt, {}, s, now);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_EQUAL_STRING("3667", snap.arrivals[0].trip.c_str());
+  TEST_ASSERT_EQUAL_INT64(0, snap.arrivals[0].scheduled);        // no cross-route match
+  TEST_ASSERT_EQUAL_STRING("", snap.arrivals[0].sched_trip.c_str());
+}
+
+// Route matching is case-insensitive for bus/trolley (SEPTA's letter routes are upper case in
+// every feed seen, but the config is user-entered).
+void test_sched_route_matches_is_case_insensitive_for_bus() {
+  StopConfig cfg = busCfg("t4", "1234", "0");
+  TEST_ASSERT_TRUE(schedRouteMatches(cfg, sched("T4", "1", "0", 0)));
+  TEST_ASSERT_FALSE(schedRouteMatches(cfg, sched("T5", "1", "0", 0)));
+  cfg.route.clear();  // no route configured: no filter
+  TEST_ASSERT_TRUE(schedRouteMatches(cfg, sched("anything", "1", "0", 0)));
+}
+
+// Subway must keep working through the alias map: the fixture busschedules_bsl_1286.json is
+// keyed "B1" for a station configured as "BSL" (NOTES.md 7a).
+void test_merge_stop_subway_route_alias_from_fixture() {
+  auto sched_body = transit_test::readFixture("busschedules_bsl_1286.json");
+  ParseResult<SchedEntry> parsed = parseBusSchedules(sched_body.data(), sched_body.size());
+  TEST_ASSERT_TRUE(parsed.ok);
+  TEST_ASSERT_EQUAL_STRING("B1", parsed.items[0].route.c_str());  // the alias form, as captured
+
+  StopConfig cfg;
+  cfg.key = "bsl-snyder";
+  cfg.mode = Mode::Subway;
+  cfg.route = "BSL";
+  cfg.stop_id = "1286";
+  cfg.direction = "0";
+  TEST_ASSERT_TRUE(schedRouteMatches(cfg, parsed.items[0]));
+
+  StopSnapshot snap = mergeStop(cfg, {}, {}, parsed.items, 1789350000);
+  TEST_ASSERT_EQUAL_UINT32(4, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_TRUE(snap.health == Health::ScheduleOnly);
+
+  // A subway station whose schedule came back under some *other* line's id is still rejected.
+  SchedEntry foreign = sched("L1", "700001", "0", 1789350600);
+  TEST_ASSERT_FALSE(schedRouteMatches(cfg, foreign));
+}
+
+// A subway line whose GTFS route ids this project never verified (NHSL, the owl variants) takes
+// whatever BusSchedules returned for the station - see schedRouteMatches() for why that is safe
+// for subway specifically and is not extended to bus or trolley.
+void test_sched_route_matches_unknown_subway_accepts_any() {
+  StopConfig cfg;
+  cfg.mode = Mode::Subway;
+  cfg.route = "NHSL";
+  TEST_ASSERT_TRUE(schedRouteMatches(cfg, sched("NHS", "1", "0", 0)));
+
+  StopConfig bus = busCfg("NHSL", "1", "0");  // same id, bus mode: no such licence
+  TEST_ASSERT_FALSE(schedRouteMatches(bus, sched("NHS", "1", "0", 0)));
+}
+
+// The matched static trip id is kept on the arrival so transit_stats can reconcile the scheduled
+// and live records for one trip later.
+void test_merge_stop_keeps_matched_static_trip_id() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  std::vector<StopTimeUpdate> rt = {rtUpdate("3667", "17", "21332", 1, now + 300)};
+  std::vector<SchedEntry> s = {sched("17", "281757", "1", now + 240, "20th-Johnston"),
+                               sched("17", "281756", "1", now + 1800, "20th-Johnston")};
+
+  StopSnapshot snap = mergeStop(cfg, rt, {}, s, now);
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_EQUAL_STRING("281757", snap.arrivals[0].sched_trip.c_str());  // live row, matched
+  TEST_ASSERT_EQUAL_INT64(now + 240, snap.arrivals[0].scheduled);
+  // A schedule-only row is its own static trip.
+  TEST_ASSERT_EQUAL_STRING("281756", snap.arrivals[1].sched_trip.c_str());
+  TEST_ASSERT_EQUAL_STRING("281756", snap.arrivals[1].trip.c_str());
+}
+
+// --- F16: skipped and cancelled trips must not reappear as ordinary arrivals ------------------
+
+// The review's exact case: a SKIPPED update with no predicted time used to make a zero-time row
+// (deleted as stale), after which its scheduled counterpart was printed as a normal bus.
+void test_merge_stop_skipped_without_time_is_shown_and_consumes_schedule() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  StopTimeUpdate u = rtUpdate("3667", "17", "21332", 1, 0);
+  u.schedule_relationship = static_cast<uint8_t>(StopRel::Skipped);
+  std::vector<SchedEntry> s = {sched("17", "281757", "1", now + 600, "20th-Johnston")};
+
+  StopSnapshot snap = mergeStop(cfg, {u}, {}, s, now);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_TRUE(snap.arrivals[0].status == Status::Skipped);
+  TEST_ASSERT_EQUAL_STRING("3667", snap.arrivals[0].trip.c_str());
+  TEST_ASSERT_EQUAL_INT64(0, snap.arrivals[0].predicted);        // no time invented
+  TEST_ASSERT_EQUAL_INT64(now + 600, snap.arrivals[0].scheduled);  // shown at the scheduled time
+  TEST_ASSERT_EQUAL_STRING("281757", snap.arrivals[0].sched_trip.c_str());
+}
+
+// Same trip, but the feed did give a time: the row keeps it and still matches its schedule entry.
+void test_merge_stop_skipped_with_time_keeps_prediction() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  StopTimeUpdate u = rtUpdate("3667", "17", "21332", 1, now + 300);
+  u.schedule_relationship = static_cast<uint8_t>(StopRel::Skipped);
+  std::vector<SchedEntry> s = {sched("17", "281757", "1", now + 240, "20th-Johnston")};
+
+  StopSnapshot snap = mergeStop(cfg, {u}, {}, s, now);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_TRUE(snap.arrivals[0].status == Status::Skipped);
+  TEST_ASSERT_EQUAL_INT64(now + 300, snap.arrivals[0].predicted);
+  TEST_ASSERT_EQUAL_INT64(now + 240, snap.arrivals[0].scheduled);
+}
+
+// A trip-level CANCELED must not be displayed at all, and must suppress the schedule row it
+// would otherwise have been matched to.
+void test_merge_stop_canceled_trip_suppresses_its_schedule_row() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  StopTimeUpdate u = rtUpdate("3667", "17", "21332", 1, now + 300);
+  u.trip_schedule_relationship = static_cast<uint8_t>(TripRel::Canceled);
+  TEST_ASSERT_TRUE(u.tripCanceled());
+  std::vector<SchedEntry> s = {sched("17", "281757", "1", now + 300, "20th-Johnston"),
+                               sched("17", "281756", "1", now + 1800, "20th-Johnston")};
+
+  StopSnapshot snap = mergeStop(cfg, {u}, {}, s, now);
+  // The cancelled trip's own row and its scheduled counterpart are both gone; the later,
+  // unrelated trip is untouched.
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_EQUAL_STRING("281756", snap.arrivals[0].trip.c_str());
+  TEST_ASSERT_TRUE(snap.arrivals[0].status == Status::Scheduled);
+}
+
+// NO_DATA is not a prediction: no time is invented, and the schedule row stands in for it.
+void test_merge_stop_no_data_leaves_the_schedule_row() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  StopTimeUpdate u = rtUpdate("3667", "17", "21332", 1, 0);
+  u.schedule_relationship = static_cast<uint8_t>(StopRel::NoData);
+  std::vector<SchedEntry> s = {sched("17", "281757", "1", now + 600, "20th-Johnston")};
+
+  StopSnapshot snap = mergeStop(cfg, {u}, {}, s, now);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_TRUE(snap.arrivals[0].status == Status::Scheduled);
+  TEST_ASSERT_EQUAL_STRING("281757", snap.arrivals[0].trip.c_str());
+  TEST_ASSERT_EQUAL_INT64(0, snap.arrivals[0].predicted);
+  TEST_ASSERT_EQUAL_INT64(now + 600, snap.arrivals[0].scheduled);
+  TEST_ASSERT_TRUE(snap.health == Health::ScheduleOnly);
+}
+
+// The fourth shape, for contrast with the three above: no realtime at all for this trip.
+void test_merge_stop_plain_schedule_row_is_distinct() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  std::vector<SchedEntry> s = {sched("17", "281757", "1", now + 600, "20th-Johnston")};
+
+  StopSnapshot snap = mergeStop(cfg, {}, {}, s, now);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_TRUE(snap.arrivals[0].status == Status::Scheduled);
+  TEST_ASSERT_EQUAL_STRING("20th-Johnston", snap.arrivals[0].destination.c_str());
+  TEST_ASSERT_TRUE(snap.ok);
+}
+
+// --- F15: a feed is only live while its own timestamp says so ---------------------------------
+
+void test_merge_stop_fresh_feed_is_live() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  std::vector<StopTimeUpdate> rt = {rtUpdate("3667", "17", "21332", 1, now + 300, now - 20)};
+  std::vector<SchedEntry> s = {sched("17", "281757", "1", now + 240, "20th-Johnston")};
+
+  StopSnapshot snap = mergeStop(cfg, rt, {}, s, now);
+  TEST_ASSERT_TRUE(snap.health == Health::Live);
+  TEST_ASSERT_TRUE(snap.ok);
+  TEST_ASSERT_EQUAL_INT64(now - 20, snap.source_ts);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_TRUE(snap.arrivals[0].status == Status::Live);
+}
+
+// A replayed/cached feed: well-formed, full of future predictions, and half an hour old.
+void test_merge_stop_old_feed_is_stale_with_no_live_rows() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  std::vector<StopTimeUpdate> rt = {rtUpdate("3667", "17", "21332", 1, now + 300, now - 1800)};
+  std::vector<SchedEntry> s = {sched("17", "281757", "1", now + 240, "20th-Johnston")};
+
+  StopSnapshot snap = mergeStop(cfg, rt, {}, s, now);
+  TEST_ASSERT_TRUE(snap.health == Health::Stale);
+  TEST_ASSERT_FALSE(snap.ok);
+  TEST_ASSERT_EQUAL_INT64(now - 1800, snap.source_ts);
+  for (const auto& a : snap.arrivals) {
+    TEST_ASSERT_TRUE(a.status != Status::Live);
+    TEST_ASSERT_EQUAL_INT64(0, a.predicted);  // the stale prediction itself is not shown
+  }
+  // The matched schedule time survives as an ordinary scheduled row.
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_TRUE(snap.arrivals[0].status == Status::Scheduled);
+  TEST_ASSERT_EQUAL_INT64(now + 240, snap.arrivals[0].scheduled);
+}
+
+void test_merge_stop_future_dated_feed_is_stale() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  std::vector<StopTimeUpdate> rt = {rtUpdate("3667", "17", "21332", 1, now + 300, now + 3600)};
+  StopSnapshot snap = mergeStop(cfg, rt, {}, {}, now);
+  TEST_ASSERT_TRUE(snap.health == Health::Stale);
+  TEST_ASSERT_FALSE(snap.ok);
+  // No schedule to fall back on, so the untrustworthy row is dropped rather than shown.
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(snap.arrivals.size()));
+}
+
+// A feed with no header timestamp is "unknown age", not "stale" - see merge.h.
+void test_merge_stop_missing_feed_timestamp_keeps_live_rows() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  std::vector<StopTimeUpdate> rt = {rtUpdate("3667", "17", "21332", 1, now + 300, 0)};
+  StopSnapshot snap = mergeStop(cfg, rt, {}, {}, now);
+  TEST_ASSERT_TRUE(snap.health == Health::Live);
+  TEST_ASSERT_EQUAL_INT64(now, snap.source_ts);  // best honest answer: when we assembled it
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+}
+
+// --- F13: a failed source has to reach the stop it belongs to ---------------------------------
+
+void test_merge_stop_subway_schedule_failure_is_unavailable() {
+  StopConfig cfg;
+  cfg.key = "bsl-snyder";
+  cfg.mode = Mode::Subway;
+  cfg.route = "BSL";
+  cfg.stop_id = "1286";
+  SourceStatus bad;
+  bad.schedule_ok = false;
+
+  StopSnapshot snap = mergeStop(cfg, {}, {}, {}, 1789351200, bad);
+  TEST_ASSERT_FALSE(snap.ok);
+  TEST_ASSERT_TRUE(snap.health == Health::Unavailable);
+  TEST_ASSERT_TRUE(snap.error.find("schedule") != std::string::npos);
+
+  // A subway stop has no realtime source, so a TripUpdates failure must not touch it.
+  SourceStatus rt_down;
+  rt_down.live_ok = false;
+  rt_down.vehicles_ok = false;
+  StopSnapshot fine = mergeStop(cfg, {}, {}, {}, 1789351200, rt_down);
+  TEST_ASSERT_TRUE(fine.ok);
+}
+
+// A bus stop whose live feed was truncated still shows its schedule - flagged, not silent.
+void test_merge_stop_live_failure_falls_back_to_schedule_only() {
+  StopConfig cfg = busCfg("17", "21332", "1");
+  Epoch now = 1789351200;
+  std::vector<SchedEntry> s = {sched("17", "281757", "1", now + 600, "20th-Johnston")};
+  SourceStatus bad;
+  bad.live_ok = false;
+
+  StopSnapshot snap = mergeStop(cfg, {}, {}, s, now, bad);
+  TEST_ASSERT_FALSE(snap.ok);
+  TEST_ASSERT_TRUE(snap.health == Health::ScheduleOnly);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_TRUE(snap.error.find("live feed") != std::string::npos);
+}
+
+// --- F30: a rail config that still carries the display name keeps working ---------------------
+
+void test_merge_rail_accepts_line_display_name_in_config() {
+  auto body = transit_test::readFixture("arrivals_30th.json");
+  ParseResult<RailArrival> r = parseRailArrivals(body.data(), body.size());
+
+  StopConfig cfg;
+  cfg.key = "rail-30th-N-fox";
+  cfg.mode = Mode::Rail;
+  cfg.station = "30th Street Station";
+  cfg.direction = "N";
+  cfg.route = "Fox Chase";  // the display name, not the "FOX" code
+
+  StopSnapshot snap = mergeRail(cfg, r.items, 1789352000);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_EQUAL_STRING("5878", snap.arrivals[0].trip.c_str());
+  TEST_ASSERT_TRUE(snap.ok);
+  TEST_ASSERT_EQUAL_INT64(1789352000, snap.source_ts);
+}
+
+void test_merge_rail_failed_fetch_marks_the_stop() {
+  StopConfig cfg;
+  cfg.key = "rail-30th-N";
+  cfg.mode = Mode::Rail;
+  cfg.station = "30th Street Station";
+  SourceStatus bad;
+  bad.live_ok = false;
+
+  StopSnapshot snap = mergeRail(cfg, {}, 1789352000, bad);
+  TEST_ASSERT_FALSE(snap.ok);
+  TEST_ASSERT_TRUE(snap.health == Health::Unavailable);
+  TEST_ASSERT_TRUE(snap.error.size() > 0);
+}
+
+// --- F32: the rail status minute parser must not overflow -------------------------------------
+
+namespace {
+
+// Runs one RailArrival::status string through mergeRail and reports what it made of it.
+void checkStatus(const char* status, bool expect_known, int expect_min) {
+  RailArrival ra;
+  ra.direction = "N";
+  ra.train_id = "1";
+  ra.depart = 2000000000;
+  ra.sched = 2000000000;
+  ra.status = status;
+
+  StopConfig cfg;
+  cfg.key = "rail";
+  cfg.mode = Mode::Rail;
+  StopSnapshot snap = mergeRail(cfg, {ra}, 1999999000);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(snap.arrivals.size()));
+  TEST_ASSERT_EQUAL_INT(expect_known ? 1 : 0, snap.arrivals[0].late_known ? 1 : 0);
+  if (expect_known) TEST_ASSERT_EQUAL_INT16(expect_min, snap.arrivals[0].late_min);
+}
+
+}  // namespace
+
+void test_parse_signed_minutes_bounds_and_garbage() {
+  // The values that must keep working.
+  checkStatus("On Time", true, 0);
+  checkStatus("3 min", true, 3);
+  checkStatus("-2 min", true, -2);
+  checkStatus("13 minutes", true, 13);
+  checkStatus("1440 min", true, 1440);   // the largest lateness this code will believe
+  checkStatus("-1440 mins", true, -1440);
+
+  // Out of range, and the digit string that used to be signed-overflow UB (confirmed by the
+  // review with UBSan). Both must simply read as "lateness not known", never as a number.
+  checkStatus("1441 min", false, 0);
+  checkStatus("99999 min", false, 0);
+  checkStatus("999999999999999999999999999 min", false, 0);
+  checkStatus("-999999999999999999999999999 min", false, 0);
+
+  // Shapes that are not a minute count at all.
+  checkStatus("Delayed", false, 0);
+  checkStatus("Suspended", false, 0);
+  checkStatus("3 min later", false, 0);  // trailing garbage
+  checkStatus("3min", false, 0);
+  checkStatus("min", false, 0);
+  checkStatus("", false, 0);
+}

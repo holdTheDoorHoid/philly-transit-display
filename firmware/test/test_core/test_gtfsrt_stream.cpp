@@ -254,3 +254,222 @@ void test_gtfsrt_empty_stream_has_zero_counts() {
   TEST_ASSERT_EQUAL_INT64(0, stream.headerTimestamp());
   stream.finish();
 }
+
+// =============================================================================================
+// Regression tests for the 2026-09-15 adversarial review (F06 retention bounds, F13 truncation
+// detection, F15 feed age, F16 trip-level CANCELED).
+// =============================================================================================
+
+namespace {
+
+// buildEntity() with the extra fields these tests need: a trip-level schedule_relationship, and
+// a stop_time_update that carries no time at all (what a real SKIPPED update usually looks like).
+std::vector<uint8_t> buildEntityEx(const std::string& id, const std::string& trip_id,
+                                    const std::string& route_id, const std::string& stop_id,
+                                    int64_t arrival_time, int trip_relationship,
+                                    int stop_relationship) {
+  std::vector<uint8_t> td;
+  append(td, stringField(1, trip_id));
+  if (trip_relationship >= 0) append(td, varintField(4, static_cast<uint64_t>(trip_relationship)));
+  append(td, stringField(5, route_id));
+  append(td, varintField(6, 0));
+
+  std::vector<uint8_t> stu;
+  append(stu, varintField(1, 1));
+  if (arrival_time != 0) {
+    append(stu, lenDelimField(2, varintField(2, static_cast<uint64_t>(arrival_time))));
+  }
+  append(stu, stringField(4, stop_id));
+  if (stop_relationship >= 0) append(stu, varintField(5, static_cast<uint64_t>(stop_relationship)));
+
+  std::vector<uint8_t> tu;
+  append(tu, lenDelimField(1, td));
+  append(tu, lenDelimField(2, stu));
+
+  std::vector<uint8_t> entity;
+  append(entity, stringField(1, id));
+  append(entity, lenDelimField(3, tu));
+  return entity;
+}
+
+}  // namespace
+
+// --- F06: retained data must be bounded, and bounded in favour of the NEAREST arrivals --------
+
+// The review's case: a feed whose entities all match. Every one of them used to be appended to
+// the caller's vector with no limit at all.
+void test_gtfsrt_retention_cap_holds_at_the_cap_with_500_matching_entities() {
+  const int64_t kBase = 1789352333;
+  std::vector<uint8_t> msg;
+  append(msg, lenDelimField(1, buildHeader(kBase)));
+  // Deliberately farthest-first, so "keep the nearest" has to actually evict rather than just
+  // stop accepting: entity i arrives at kBase + (500 - i) * 60.
+  for (int i = 0; i < 500; ++i) {
+    append(msg, wrapTopLevelEntity(buildEntityEx("e" + std::to_string(i), "t" + std::to_string(i),
+                                                  "17", "21332", kBase + (500 - i) * 60, -1, -1)));
+  }
+
+  GtfsRtStream stream;
+  stream.setRouteFilter({"17"});
+  stream.setStopFilter({"21332"});
+  stream.retainUpdates();  // defaults: 64 total, 12 per (stop, route)
+  TEST_ASSERT_TRUE(stream.push(msg.data(), msg.size()));
+  TEST_ASSERT_TRUE(stream.finish() == transit::FeedStatus::Complete);
+
+  TEST_ASSERT_EQUAL_UINT32(500, stream.entitiesSeen());
+  TEST_ASSERT_EQUAL_UINT32(500, stream.entitiesMatched());
+  TEST_ASSERT_EQUAL_UINT32(500, stream.updatesMatched());
+  // All 500 are the same (stop, route), so the per-pair cap is what binds here.
+  TEST_ASSERT_EQUAL_UINT32(12, static_cast<uint32_t>(stream.retained().size()));
+  TEST_ASSERT_EQUAL_UINT32(488, stream.updatesDroppedByCap());
+
+  // What survived is the 12 nearest, i.e. the last 12 entities in wire order.
+  int64_t worst = 0;
+  for (const auto& u : stream.retained()) {
+    TEST_ASSERT_TRUE(u.arrival_time >= kBase + 60);
+    TEST_ASSERT_TRUE(u.arrival_time <= kBase + 12 * 60);
+    if (u.arrival_time > worst) worst = u.arrival_time;
+  }
+  TEST_ASSERT_EQUAL_INT64(kBase + 12 * 60, worst);
+}
+
+// With many distinct (stop, route) pairs it is the global cap that binds, and it binds hard.
+void test_gtfsrt_retention_global_cap_across_many_stops() {
+  const int64_t kBase = 1789352333;
+  std::vector<uint8_t> msg;
+  append(msg, lenDelimField(1, buildHeader(kBase)));
+  for (int i = 0; i < 500; ++i) {
+    append(msg, wrapTopLevelEntity(buildEntityEx("e" + std::to_string(i), "t" + std::to_string(i),
+                                                  "17", "stop" + std::to_string(i),
+                                                  kBase + (500 - i) * 60, -1, -1)));
+  }
+
+  GtfsRtStream stream;
+  stream.setRouteFilter({"17"});
+  stream.retainUpdates();
+  TEST_ASSERT_TRUE(stream.push(msg.data(), msg.size()));
+  stream.finish();
+
+  TEST_ASSERT_EQUAL_UINT32(64, static_cast<uint32_t>(stream.retained().size()));
+  TEST_ASSERT_EQUAL_UINT32(436, stream.updatesDroppedByCap());
+  for (const auto& u : stream.retained()) {
+    TEST_ASSERT_TRUE(u.arrival_time <= kBase + 64 * 60);  // the nearest 64 kept
+  }
+}
+
+// Identifiers are bounded too: the wire format allows any length, and a retained update holds
+// four of them.
+void test_gtfsrt_long_identifiers_are_truncated() {
+  std::string long_trip(500, 'T');
+  std::vector<uint8_t> msg;
+  append(msg, lenDelimField(1, buildHeader(1000)));
+  append(msg, wrapTopLevelEntity(buildEntityEx("e", long_trip, "17", "S1", 1111, -1, -1)));
+
+  GtfsRtStream stream;
+  stream.setRouteFilter({"17"});
+  stream.setStopFilter({"S1"});
+  std::vector<StopTimeUpdate> updates;
+  stream.onUpdate([&](const StopTimeUpdate& u) { updates.push_back(u); });
+  TEST_ASSERT_TRUE(stream.push(msg.data(), msg.size()));
+  stream.finish();
+
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(updates.size()));
+  TEST_ASSERT_EQUAL_UINT32(GtfsRtStream::kMaxIdentifierChars,
+                            static_cast<uint32_t>(updates[0].trip_id.size()));
+  TEST_ASSERT_TRUE(stream.identifiersTruncated() > 0);
+}
+
+// --- F13: finish() has to say whether the body actually finished -------------------------------
+
+void test_gtfsrt_complete_body_reports_complete() {
+  std::vector<uint8_t> body = transit_test::readFixture("septa_bus_tripupdates.pb");
+  GtfsRtStream stream;
+  TEST_ASSERT_TRUE(stream.push(body.data(), body.size()));
+  TEST_ASSERT_TRUE(stream.finish() == transit::FeedStatus::Complete);
+}
+
+void test_gtfsrt_truncated_body_reports_truncated() {
+  std::vector<uint8_t> body = transit_test::readFixture("septa_bus_tripupdates.pb");
+  GtfsRtStream stream;
+  stream.setRouteFilter({"17"});
+  stream.setStopFilter({"21332"});
+  // One byte short of the end, which lands inside the final entity's payload: a dropped
+  // connection, not a short feed. (Any mid-entity cut does; this one is deterministic.)
+  TEST_ASSERT_TRUE(stream.push(body.data(), body.size() - 1));
+  TEST_ASSERT_TRUE(stream.finish() == transit::FeedStatus::Truncated);
+  TEST_ASSERT_TRUE(stream.entitiesSeen() > 0);  // it decoded what it got - but said so
+}
+
+void test_gtfsrt_empty_body_is_complete_not_truncated() {
+  GtfsRtStream stream;
+  TEST_ASSERT_TRUE(stream.finish() == transit::FeedStatus::Complete);
+}
+
+// A nested message that does not decode is skipped and counted; the entities after it still
+// parse, so the feed as a whole is not condemned.
+void test_gtfsrt_malformed_entity_is_counted_not_fatal() {
+  std::vector<uint8_t> msg;
+  append(msg, lenDelimField(1, buildHeader(1000)));
+  // An "entity" whose declared inner length runs past its own bytes.
+  std::vector<uint8_t> bad;
+  append(bad, tagBytes(3, 2));
+  append(bad, encodeVarint(200));  // claims 200 bytes of trip_update...
+  bad.push_back(0x01);             // ...and provides one
+  append(msg, lenDelimField(2, bad));
+  append(msg, wrapTopLevelEntity(buildEntityEx("B", "B1", "17", "S1", 222, -1, -1)));
+
+  GtfsRtStream stream;
+  stream.setRouteFilter({"17"});
+  stream.setStopFilter({"S1"});
+  std::vector<StopTimeUpdate> updates;
+  stream.onUpdate([&](const StopTimeUpdate& u) { updates.push_back(u); });
+  TEST_ASSERT_TRUE(stream.push(msg.data(), msg.size()));
+  TEST_ASSERT_TRUE(stream.finish() == transit::FeedStatus::Complete);
+
+  TEST_ASSERT_EQUAL_UINT32(1, stream.entitiesMalformed());
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(updates.size()));
+  TEST_ASSERT_EQUAL_STRING("B1", updates[0].trip_id.c_str());
+}
+
+// --- F15/F16: the trip-level relationship and the feed timestamp reach the caller --------------
+
+void test_gtfsrt_trip_level_canceled_is_surfaced() {
+  std::vector<uint8_t> msg;
+  append(msg, lenDelimField(1, buildHeader(1789352333)));
+  append(msg, wrapTopLevelEntity(buildEntityEx("A", "A1", "17", "S1", 1789353000,
+                                                3 /* CANCELED */, -1)));
+  append(msg, wrapTopLevelEntity(buildEntityEx("B", "B1", "17", "S1", 1789353100, -1,
+                                                1 /* stop-level SKIPPED */)));
+
+  GtfsRtStream stream;
+  stream.setRouteFilter({"17"});
+  stream.setStopFilter({"S1"});
+  std::vector<StopTimeUpdate> updates;
+  stream.onUpdate([&](const StopTimeUpdate& u) { updates.push_back(u); });
+  TEST_ASSERT_TRUE(stream.push(msg.data(), msg.size()));
+  stream.finish();
+
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(updates.size()));
+  TEST_ASSERT_TRUE(updates[0].tripCanceled());
+  TEST_ASSERT_FALSE(updates[0].stopSkipped());  // the two enums stay separate
+  TEST_ASSERT_FALSE(updates[1].tripCanceled());
+  TEST_ASSERT_TRUE(updates[1].stopSkipped());
+  // Every update carries the feed's own header timestamp, so a merge that only sees the updates
+  // can still judge how old the predictions are.
+  TEST_ASSERT_EQUAL_INT64(1789352333, updates[0].feed_timestamp);
+  TEST_ASSERT_EQUAL_INT64(1789352333, updates[1].feed_timestamp);
+}
+
+void test_gtfsrt_fixture_updates_carry_the_header_timestamp() {
+  std::vector<uint8_t> body = transit_test::readFixture("septa_bus_tripupdates.pb");
+  GtfsRtStream stream;
+  stream.setRouteFilter({"17"});
+  stream.setStopFilter({"21332"});
+  stream.retainUpdates();
+  TEST_ASSERT_TRUE(stream.push(body.data(), body.size()));
+  stream.finish();
+  TEST_ASSERT_TRUE(stream.retained().size() > 0);
+  for (const auto& u : stream.retained()) {
+    TEST_ASSERT_EQUAL_INT64(1789352333, u.feed_timestamp);
+  }
+}

@@ -324,3 +324,249 @@ void test_poll_bus_stops_marks_wrong_day_schedule_as_suspect() {
   TEST_ASSERT_NOT_NULL(st);
   TEST_ASSERT_TRUE(st->arrivals.size() > 0);  // best effort still displayed
 }
+
+// =============================================================================================
+// Regression tests for the 2026-09-15 adversarial review (F13: fetch/parse failures must not
+// come back as successful, empty stop snapshots).
+// =============================================================================================
+
+namespace {
+
+// Like makeFixtureHttp, but speaks HttpGetEx so a transport can report an incomplete body, and
+// lets each URL carry its own status/completeness. `body` is either a fixture name or, when
+// prefixed with "raw:", literal bytes.
+struct FakeReply {
+  std::string body;      // fixture name, or "raw:<bytes>"
+  int status = 200;
+  bool complete = true;
+  size_t truncate_to = 0;  // 0 = deliver it all
+};
+
+std::vector<uint8_t> replyBytes(const FakeReply& r) {
+  std::vector<uint8_t> body;
+  if (r.body.rfind("raw:", 0) == 0) {
+    std::string lit = r.body.substr(4);
+    body.assign(lit.begin(), lit.end());
+  } else if (!r.body.empty()) {
+    body = transit_test::readFixture(r.body);
+  }
+  if (r.truncate_to > 0 && r.truncate_to < body.size()) body.resize(r.truncate_to);
+  return body;
+}
+
+HttpGetEx makeExHttp(std::map<std::string, FakeReply> replies) {
+  return [replies](const std::string& url,
+                    std::function<bool(const uint8_t*, size_t)> onData) -> FetchResult {
+    FetchResult res;
+    auto it = replies.find(url);
+    if (it == replies.end()) {
+      res.status = 404;
+      return res;  // complete=false, bytes=0: nothing was delivered
+    }
+    std::vector<uint8_t> body = replyBytes(it->second);
+    const size_t kChunk = 4096;
+    bool refused = false;
+    for (size_t i = 0; i < body.size(); i += kChunk) {
+      size_t n = std::min(kChunk, body.size() - i);
+      if (!onData(body.data() + i, n)) {
+        refused = true;
+        break;
+      }
+      res.bytes += n;
+    }
+    res.status = it->second.status;
+    res.aborted = refused;
+    res.complete = it->second.complete && !refused;
+    return res;
+  };
+}
+
+StopConfig busStop(const std::string& key, const std::string& route, const std::string& stop_id,
+                    const std::string& dir) {
+  StopConfig c;
+  c.key = key;
+  c.mode = Mode::Bus;
+  c.route = route;
+  c.stop_id = stop_id;
+  c.direction = dir;
+  return c;
+}
+
+}  // namespace
+
+// A 200 whose body stopped arriving halfway: the decoder used to see a valid short feed and every
+// bus stop came back "ok" with only its schedule rows, saying nothing about the missing half.
+void test_poll_bus_stops_truncated_tripupdates_is_reported() {
+  // Cut inside the feed header, so nothing at all was decoded: the stop has only its schedule.
+  std::map<std::string, FakeReply> replies = {
+      {septaTripUpdatesUrl(), {"septa_bus_tripupdates.pb", 200, false, 20}},
+      {septaTransitViewUrl("17"), {"transitview_17.json", 200, true, 0}},
+      {septaBusSchedulesUrl("21332"), {"busschedules_21332.json", 200, true, 0}},
+  };
+  FakeScheduleCache cache;
+  Snapshot snap = pollBusStops({busStop("17-21332", "17", "21332", "1")}, 1789352300,
+                                makeExHttp(replies), cache);
+
+  TEST_ASSERT_FALSE(snap.last_poll_ok);
+  TEST_ASSERT_TRUE(snap.last_error.find("TripUpdates") != std::string::npos);
+
+  const StopSnapshot* st = findStop(snap, "17-21332");
+  TEST_ASSERT_NOT_NULL(st);
+  TEST_ASSERT_FALSE(st->ok);
+  TEST_ASSERT_TRUE(st->error.find("live feed") != std::string::npos);
+  // The schedule still has something to say, so the panel is not blank - it is flagged.
+  TEST_ASSERT_TRUE(st->health == Health::ScheduleOnly);
+  TEST_ASSERT_TRUE(st->arrivals.size() > 0);
+  for (const auto& a : st->arrivals) {
+    TEST_ASSERT_TRUE(a.status == Status::Scheduled);
+  }
+
+  // A cut far enough in to have delivered some real predictions is still a failure: whatever
+  // arrived is shown, but the stop (and the poll) say the live feed did not finish. What the
+  // partial feed happened to contain does not change that, which is the point.
+  std::map<std::string, FakeReply> partial = replies;
+  partial[septaTripUpdatesUrl()] = {"septa_bus_tripupdates.pb", 200, false, 60000};
+  FakeScheduleCache cache2;
+  Snapshot snap2 = pollBusStops({busStop("17-21332", "17", "21332", "1")}, 1789352300,
+                                 makeExHttp(partial), cache2);
+  TEST_ASSERT_FALSE(snap2.last_poll_ok);
+  const StopSnapshot* st2 = findStop(snap2, "17-21332");
+  TEST_ASSERT_NOT_NULL(st2);
+  TEST_ASSERT_FALSE(st2->ok);
+  TEST_ASSERT_TRUE(st2->arrivals.size() > 0);
+}
+
+// HTTP 200 with a body that is not a protobuf FeedMessage at all.
+void test_poll_bus_stops_invalid_protobuf_is_reported() {
+  std::map<std::string, FakeReply> replies = {
+      // Wiretype 3 (deprecated groups) at the top level: unsupported framing, not a short feed.
+      {septaTripUpdatesUrl(), {"raw:\x0b\x0b\x0b\x0b", 200, true, 0}},
+      {septaTransitViewUrl("17"), {"transitview_17.json", 200, true, 0}},
+      {septaBusSchedulesUrl("21332"), {"busschedules_21332.json", 200, true, 0}},
+  };
+  FakeScheduleCache cache;
+  Snapshot snap = pollBusStops({busStop("17-21332", "17", "21332", "1")}, 1789352300,
+                                makeExHttp(replies), cache);
+  TEST_ASSERT_FALSE(snap.last_poll_ok);
+  const StopSnapshot* st = findStop(snap, "17-21332");
+  TEST_ASSERT_NOT_NULL(st);
+  TEST_ASSERT_FALSE(st->ok);
+}
+
+// A subway stop depends on BusSchedules and nothing else. Its failure must mark that stop and
+// leave the bus stop next to it alone - the old code used the TripUpdates status as the one
+// global success signal, so a subway-only failure read as "ok".
+void test_poll_bus_stops_subway_schedule_failure_is_local_to_that_stop() {
+  std::map<std::string, FakeReply> replies = {
+      {septaTripUpdatesUrl(), {"septa_bus_tripupdates.pb", 200, true, 0}},
+      {septaTransitViewUrl("17"), {"transitview_17.json", 200, true, 0}},
+      {septaBusSchedulesUrl("21332"), {"busschedules_21332.json", 200, true, 0}},
+      {septaBusSchedulesUrl("1286"), {"busschedules_error_400.json", 400, true, 0}},
+  };
+  StopConfig subway;
+  subway.key = "bsl-snyder";
+  subway.mode = Mode::Subway;
+  subway.route = "BSL";
+  subway.stop_id = "1286";
+  subway.direction = "0";
+
+  FakeScheduleCache cache;
+  Snapshot snap = pollBusStops({busStop("17-21332", "17", "21332", "1"), subway}, 1789352300,
+                                makeExHttp(replies), cache);
+
+  const StopSnapshot* bus = findStop(snap, "17-21332");
+  const StopSnapshot* sub = findStop(snap, "bsl-snyder");
+  TEST_ASSERT_NOT_NULL(bus);
+  TEST_ASSERT_NOT_NULL(sub);
+  TEST_ASSERT_TRUE(bus->ok);                            // untouched by the subway's failure
+  TEST_ASSERT_FALSE(sub->ok);
+  TEST_ASSERT_TRUE(sub->health == Health::Unavailable);
+  TEST_ASSERT_TRUE(sub->error.size() > 0);
+  TEST_ASSERT_FALSE(snap.last_poll_ok);                 // ...but the poll as a whole is not ok
+}
+
+// NOTES.md 1: SEPTA serves valid BusSchedules bodies under HTTP 501. That workaround has to
+// survive the new failure reporting - the body is what is validated, not the status line.
+void test_poll_bus_stops_501_with_a_valid_body_still_succeeds() {
+  std::map<std::string, FakeReply> replies = {
+      {septaTripUpdatesUrl(), {"septa_bus_tripupdates.pb", 200, true, 0}},
+      {septaTransitViewUrl("17"), {"transitview_17.json", 200, true, 0}},
+      {septaBusSchedulesUrl("21297"), {"busschedules_error_501.json", 501, true, 0}},
+  };
+  FakeScheduleCache cache;
+  Snapshot snap = pollBusStops({busStop("17-21297", "17", "21297", "0")}, 1789351200,
+                                makeExHttp(replies), cache);
+  const StopSnapshot* st = findStop(snap, "17-21297");
+  TEST_ASSERT_NOT_NULL(st);
+  TEST_ASSERT_TRUE(st->ok);
+  TEST_ASSERT_TRUE(st->arrivals.size() > 0);
+}
+
+// A valid feed that simply has nothing for us is a success, not a failure: only a header, no
+// entities, and no configured stop appears in it.
+void test_poll_bus_stops_valid_empty_feed_succeeds() {
+  // FeedMessage { header { gtfs_realtime_version: "2.0" } } - 9 bytes, valid and entity-free.
+  std::string empty_feed("\x0a\x07\x0a\x03\x32\x2e\x30\x18\x00", 9);
+  std::map<std::string, FakeReply> replies = {
+      {septaTripUpdatesUrl(), {"raw:" + empty_feed, 200, true, 0}},
+      {septaTransitViewUrl("17"), {"transitview_BSL.json", 200, true, 0}},  // a bare []
+      {septaBusSchedulesUrl("21332"), {"busschedules_21332.json", 200, true, 0}},
+  };
+  FakeScheduleCache cache;
+  Snapshot snap = pollBusStops({busStop("17-21332", "17", "21332", "1")}, 1789351200,
+                                makeExHttp(replies), cache);
+  TEST_ASSERT_TRUE(snap.last_poll_ok);
+  const StopSnapshot* st = findStop(snap, "17-21332");
+  TEST_ASSERT_NOT_NULL(st);
+  TEST_ASSERT_TRUE(st->ok);
+  TEST_ASSERT_TRUE(st->health == Health::ScheduleOnly);
+}
+
+// --- pollRailStops -----------------------------------------------------------------------------
+
+void test_poll_rail_stops_one_failed_station_is_local_to_that_station() {
+  std::map<std::string, FakeReply> replies = {
+      {septaArrivalsUrl("30th Street Station"), {"arrivals_30th.json", 200, true, 0}},
+      // The other station is simply not in the map: the fake answers 404 with no body.
+  };
+  StopConfig good;
+  good.key = "rail-30th";
+  good.mode = Mode::Rail;
+  good.station = "30th Street Station";
+  good.direction = "N";
+
+  StopConfig bad;
+  bad.key = "rail-suburban";
+  bad.mode = Mode::Rail;
+  bad.station = "Suburban Station";
+  bad.direction = "N";
+
+  Snapshot snap = pollRailStops({good, bad}, 1789352000, makeExHttp(replies));
+  const StopSnapshot* g = findStop(snap, "rail-30th");
+  const StopSnapshot* b = findStop(snap, "rail-suburban");
+  TEST_ASSERT_NOT_NULL(g);
+  TEST_ASSERT_NOT_NULL(b);
+  TEST_ASSERT_TRUE(g->ok);
+  TEST_ASSERT_EQUAL_UINT32(5, static_cast<uint32_t>(g->arrivals.size()));
+  TEST_ASSERT_FALSE(b->ok);
+  TEST_ASSERT_TRUE(b->health == Health::Unavailable);
+  TEST_ASSERT_FALSE(snap.last_poll_ok);
+}
+
+// HTTP 200 with a body that is not the Arrivals shape: used to become a successful empty station.
+void test_poll_rail_stops_malformed_json_is_a_failure() {
+  std::map<std::string, FakeReply> replies = {
+      {septaArrivalsUrl("30th Street Station"), {"raw:{\"oops\": ", 200, true, 0}},
+  };
+  StopConfig cfg;
+  cfg.key = "rail-30th";
+  cfg.mode = Mode::Rail;
+  cfg.station = "30th Street Station";
+
+  Snapshot snap = pollRailStops({cfg}, 1789352000, makeExHttp(replies));
+  TEST_ASSERT_FALSE(snap.last_poll_ok);
+  const StopSnapshot* st = findStop(snap, "rail-30th");
+  TEST_ASSERT_NOT_NULL(st);
+  TEST_ASSERT_FALSE(st->ok);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(st->arrivals.size()));
+}
