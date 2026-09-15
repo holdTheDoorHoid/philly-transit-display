@@ -54,20 +54,7 @@ int64_t nthSundayOfMonth(int64_t year, unsigned month, int n) {
 
 // UTC epoch -> local (year, month), America/New_York, current US DST rule.
 void localYearMonth(transit::Epoch utc, int &year, int &month) {
-  const int64_t days = floorDiv(utc, 86400);
-  int64_t y;
-  unsigned mo, da;
-  civilFromDays(days, y, mo, da);
-
-  const int64_t marchSecondSunday = nthSundayOfMonth(y, 3, 2);
-  const int64_t novFirstSunday = nthSundayOfMonth(y, 11, 1);
-  const transit::Epoch dstStartUtc = marchSecondSunday * 86400 + 7 * 3600;  // 02:00 EST = 07:00 UTC
-  const transit::Epoch dstEndUtc = novFirstSunday * 86400 + 6 * 3600;       // 02:00 EDT = 06:00 UTC
-  const bool isDst = (utc >= dstStartUtc) && (utc < dstEndUtc);
-  const int64_t offsetSeconds = isDst ? -4 * 3600 : -5 * 3600;
-
-  const int64_t localEpoch = static_cast<int64_t>(utc) + offsetSeconds;
-  const int64_t localDays = floorDiv(localEpoch, 86400);
+  const int64_t localDays = localServiceDayNewYork(utc);
   int64_t ly;
   unsigned lm, ld;
   civilFromDays(localDays, ly, lm, ld);
@@ -76,6 +63,24 @@ void localYearMonth(transit::Epoch utc, int &year, int &month) {
 }
 
 }  // namespace
+
+int64_t localServiceDayNewYork(transit::Epoch utc) {
+  const int64_t days = floorDiv(utc, 86400);
+  int64_t y;
+  unsigned mo, da;
+  civilFromDays(days, y, mo, da);
+  (void)mo;
+  (void)da;
+
+  const int64_t marchSecondSunday = nthSundayOfMonth(y, 3, 2);
+  const int64_t novFirstSunday = nthSundayOfMonth(y, 11, 1);
+  const transit::Epoch dstStartUtc = marchSecondSunday * 86400 + 7 * 3600;  // 02:00 EST = 07:00 UTC
+  const transit::Epoch dstEndUtc = novFirstSunday * 86400 + 6 * 3600;       // 02:00 EDT = 06:00 UTC
+  const bool isDst = (utc >= dstStartUtc) && (utc < dstEndUtc);
+  const int64_t offsetSeconds = isDst ? -4 * 3600 : -5 * 3600;
+
+  return floorDiv(static_cast<int64_t>(utc) + offsetSeconds, 86400);
+}
 
 std::vector<std::string> monthsInWindow(transit::Epoch window_start, transit::Epoch window_end) {
   std::vector<std::string> out;
