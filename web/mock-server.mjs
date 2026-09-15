@@ -299,6 +299,49 @@ function sendText(res, status, text, type) {
 }
 function notFound(res) { sendJSON(res, 404, { error: 'not found' }); }
 
+/* ------------------------------ admin PIN ------------------------------ */
+// Mirrors the firmware's PIN gate so the web UI's unlock flow can be exercised without
+// hardware: every call that changes the device, plus the CSV log downloads, wants an
+// `X-Pin` header. Missing or wrong is 401; five wrong tries in a row is 429 with the
+// seconds to wait. The starting PIN is 123456 (web/README.md says so).
+const MOCK_PIN_DEFAULT = '123456';
+const MOCK_PIN_MAX_FAILS = 5;
+const MOCK_PIN_LOCK_S = 60;
+let devicePin = MOCK_PIN_DEFAULT;
+let pinFails = 0;
+let pinLockUntilMs = 0;
+
+// New PIN rule, same as the firmware: 4-32 printable ASCII, no spaces.
+const PIN_RE = /^[\x21-\x7e]{4,32}$/;
+
+// Returns true when the request may proceed; otherwise it has already answered.
+function pinGate(req, res) {
+  const now = Date.now();
+  if (pinLockUntilMs > now) {
+    sendJSON(res, 429, { error: 'too many attempts', retry_s: Math.ceil((pinLockUntilMs - now) / 1000) });
+    return false;
+  }
+  const given = req.headers['x-pin'];
+  // No header at all is not a guess, so it does not count against the attempt budget.
+  if (given == null || given === '') {
+    sendJSON(res, 401, { error: 'pin required' });
+    return false;
+  }
+  if (String(given) !== devicePin) {
+    pinFails++;
+    if (pinFails >= MOCK_PIN_MAX_FAILS) {
+      pinFails = 0;
+      pinLockUntilMs = now + MOCK_PIN_LOCK_S * 1000;
+      sendJSON(res, 429, { error: 'too many attempts', retry_s: MOCK_PIN_LOCK_S });
+      return false;
+    }
+    sendJSON(res, 401, { error: 'wrong pin' });
+    return false;
+  }
+  pinFails = 0;
+  return true;
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -394,6 +437,11 @@ function buildState(query) {
       ? { ok: false, age_s: 420, error: 'SEPTA request timed out' }
       : { ok: true, age_s: 5 + (now % 20), error: '' },
     firmware_version: '0.1.0-mock',
+    // Fields the web UI reads for the PIN flow and the Settings page's device facts.
+    // ?recovered=1 shows the "restored its previous settings" notice.
+    auth: { pin_required: true },
+    board: 'cyd-3248S035R',
+    config_recovered: query.get('recovered') === '1',
     stops: stopsOut,
     alerts,
     weather: buildWeather(now),
@@ -492,10 +540,16 @@ function buildBusSnapshot(cfgStop, now) {
   if (vehicle) {
     const scheduled = now + 300;
     const predicted = scheduled + (vehicle.late || 0) * 60;
+    // Southbound keeps its lateness; northbound deliberately has a live prediction with
+    // NO lateness figure, which is the case the Now page used to mislabel "sched / no
+    // live tracking" (review F31). Both shapes come back from SEPTA in practice.
+    const lateKnown = isSouth;
     arrivals.push({
-      trip: vehicle.trip, vehicle: vehicle.VehicleID, destination: vehicle.destination,
+      trip: vehicle.trip, sched_trip: schedEntries[0]?.trip_id || '',
+      vehicle: vehicle.VehicleID, destination: vehicle.destination,
       predicted, scheduled, eta_s: predicted - now,
-      late_min: vehicle.late || 0, late_known: true, status: 'live', seats: vehicle.estimated_seat_availability || '',
+      late_min: lateKnown ? (vehicle.late || 0) : 0, late_known: lateKnown, status: 'live',
+      seats: vehicle.estimated_seat_availability || '',
     });
   }
   // Synthetic seats values on the scheduled/skipped slots (SEPTA doesn't send crowding
@@ -505,22 +559,38 @@ function buildBusSnapshot(cfgStop, now) {
   // FEW_SEATS_AVAILABLE northbound).
   const schedFallback = schedEntries[0] || {};
   arrivals.push({
-    trip: schedFallback.trip_id || '000000', vehicle: '', destination: schedFallback.DirectionDesc || cfgStop.headsign,
+    trip: schedFallback.trip_id || '000000', sched_trip: schedFallback.trip_id || '',
+    vehicle: '', destination: schedFallback.DirectionDesc || cfgStop.headsign,
     predicted: 0, scheduled: now + 1500, eta_s: 1500, late_min: 0, late_known: false, status: 'scheduled',
     seats: isSouth ? 'MANY_SEATS_AVAILABLE' : 'STANDING_ROOM_ONLY',
   });
+  // A skipped trip carries predicted 0; its time has to come from `scheduled`.
   const lastTrip = schedEntries[schedEntries.length - 1] || {};
   arrivals.push({
-    trip: lastTrip.trip_id || '000001', vehicle: '', destination: lastTrip.DirectionDesc || cfgStop.headsign,
+    trip: lastTrip.trip_id || '000001', sched_trip: lastTrip.trip_id || '',
+    vehicle: '', destination: lastTrip.DirectionDesc || cfgStop.headsign,
     predicted: 0, scheduled: now + 2200, eta_s: 2200, late_min: 0, late_known: false, status: 'skipped',
     seats: isSouth ? 'FULL' : 'CRUSHED_STANDING_ROOM_ONLY',
   });
   arrivals.sort((a, b) => (a.predicted || a.scheduled) - (b.predicted || b.scheduled));
 
+  // Per-stop feed health (live | schedule_only | stale | unavailable), when SEPTA produced
+  // the data, and how old that is. Southbound is healthy; northbound is deliberately stale
+  // so the Now page's "stale N min" chip is visible without waiting for a real outage.
+  // `ok` is false for stale as well as unavailable, and `error` is short human text — the
+  // Now page must still show a stale stop's (old) rows rather than a red banner.
+  const stale = !isSouth;
+  const source_age_s = stale ? 480 : 12;
   return {
     key: cfgStop.key, mode: cfgStop.mode, route: cfgStop.route, stop_id: cfgStop.stop_id,
     direction: cfgStop.direction, headsign: cfgStop.headsign, label: cfgStop.label,
-    stop_name: cfgStop.stop_name, show: cfgStop.show, ok: true, error: '', weather_note: weatherNoteFor(cfgStop), fetched: now, arrivals,
+    stop_name: cfgStop.stop_name, show: cfgStop.show,
+    ok: !stale,
+    error: stale ? 'SEPTA has not refreshed this route for 8 minutes' : '',
+    health: stale ? 'stale' : 'live',
+    source_ts: now - source_age_s,
+    source_age_s,
+    weather_note: weatherNoteFor(cfgStop), fetched: now, arrivals,
   };
 }
 
@@ -544,7 +614,7 @@ function buildRailSnapshot(cfgStop, now) {
     // first train and '' (blank) on the rest both map to "no crowding element" on the Now
     // page, but NOT_AVAILABLE also exercises that legacy/unknown-string code path.
     return {
-      trip: t.train_id, vehicle: t.train_id, destination: t.destination,
+      trip: t.train_id, sched_trip: t.train_id, vehicle: t.train_id, destination: t.destination,
       predicted, scheduled, eta_s: predicted - now,
       late_min: Math.round(delaySec / 60), late_known: true, status: 'live', seats: i === 0 ? 'NOT_AVAILABLE' : '',
     };
@@ -553,7 +623,11 @@ function buildRailSnapshot(cfgStop, now) {
   return {
     key: cfgStop.key, mode: 'rail', station: cfgStop.station, direction: cfgStop.direction,
     headsign: '', label: cfgStop.label, stop_name: cfgStop.station, show: cfgStop.show,
-    ok: true, error: '', weather_note: '', fetched: now, arrivals,
+    ok: true, error: '',
+    // Rail rides on the schedule feed in this mock, which is the third health value the
+    // Now page has to render. schedule_only is not an error, so `ok` stays true.
+    health: 'schedule_only', source_ts: now - 95, source_age_s: 95,
+    weather_note: '', fetched: now, arrivals,
   };
 }
 
@@ -634,13 +708,30 @@ function buildWaitByHour(rand, scale) {
   return out;
 }
 
-function buildStats(stop, days, empty) {
+// forecast_stability[] — the renamed prediction[]. One bucket per horizon, carrying how
+// far the forecast was revised (mean_abs_revision_s) and which way (mean_revision_s). It
+// replaces the old mae_s/bias_s, which claimed to measure error against a real arrival
+// time the device never has.
+function buildForecastStability(rand, samples) {
+  return [120, 300, 600, 900].map((horizon_s) => ({
+    horizon_s,
+    n: Math.round(samples * 0.7 * (0.8 + rand() * 0.4)),
+    mean_abs_revision_s: Math.round(30 + (horizon_s / 60) * (4 + rand() * 6)),
+    mean_revision_s: Math.round((rand() - 0.5) * (20 + horizon_s / 15)),
+  }));
+}
+
+function buildStats(stop, days, empty, noLate) {
   if (empty) {
+    // Nothing logged: every count is 0, but on_time_pct/mean_late_min are null rather than
+    // 0 — the UI must say "no data", not claim a stop was 0% on time.
     return {
-      stop, days, samples: 0, on_time_pct: 0, mean_late_min: 0,
+      stop, days, samples: 0, inferred: 0, unobserved: 0, late_known: 0,
+      on_time_pct: null, mean_late_min: null,
       by_hour: [], by_weekday: [], headway: { n: 0, bunched: 0, gapped: 0, ratio_hist: [] },
-      ghost: 0, noshow: 0, outage_min: 0, prediction: [],
-      crowding: { by_hour: [], by_weekday: [] }, wait_by_hour: [],
+      ghost: 0, noshow: 0, outage_min: 0, forecast_stability: [],
+      crowding: { by_hour: [], by_weekday: [] }, wait_by_hour: [], wait_basis: 'half_mean_gap',
+      coverage: 0,
     };
   }
   const rand = seedFrom(`${stop}|${days}`);
@@ -669,9 +760,12 @@ function buildStats(stop, days, empty) {
 
   const totalN = by_hour.reduce((a, b) => a + b.n, 0) || 1;
   const onTimeShare = 0.6 + rand() * 0.25;
+  // Every arrival is inferred from the bus vanishing out of the live feed; only some carry
+  // a lateness figure from SEPTA, and on_time_pct/mean_late_min are null when none do.
   const samples = totalN;
-  const on_time_pct = +(onTimeShare * 100).toFixed(1);
-  const mean_late_min = +(by_hour.reduce((a, b) => a + b.mean * b.n, 0) / totalN).toFixed(1);
+  const late_known = noLate ? 0 : Math.round(totalN * (0.7 + rand() * 0.2));
+  const on_time_pct = late_known === 0 ? null : +(onTimeShare * 100).toFixed(1);
+  const mean_late_min = late_known === 0 ? null : +(by_hour.reduce((a, b) => a + b.mean * b.n, 0) / totalN).toFixed(1);
 
   const headwayN = Math.round(samples * 0.9);
   const ratio_hist = [
@@ -684,22 +778,30 @@ function buildStats(stop, days, empty) {
   const bunched = ratio_hist[0].count;
   const gapped = ratio_hist[ratio_hist.length - 1].count;
 
-  const prediction = [120, 300, 600, 900].map((horizon_s) => ({
-    horizon_s,
-    n: Math.round(samples * 0.7 * (0.8 + rand() * 0.4)),
-    mae_s: Math.round(30 + (horizon_s / 60) * (4 + rand() * 6)),
-    bias_s: Math.round((rand() - 0.5) * (20 + horizon_s / 15)),
-  }));
-
+  const coverage = +(0.93 + rand() * 0.06).toFixed(3);
   return {
-    stop, days, samples, on_time_pct, mean_late_min, by_hour, by_weekday,
+    stop, days,
+    samples,
+    inferred: samples,
+    // Trips in the window the device was not polling for, so nothing is known about them.
+    // Tracks (1 - coverage) so the two numbers tell a consistent story.
+    unobserved: Math.round(samples * (1 - coverage)),
+    late_known,
+    on_time_pct,
+    mean_late_min,
+    by_hour, by_weekday,
     headway: { n: headwayN, bunched, gapped, ratio_hist },
     ghost: Math.round(3 * scale * rand() + 1),
     noshow: Math.round(2 * scale * rand()),
+    // Now includes ongoing/partial outages, not only closed ones.
     outage_min: Math.round(20 * scale * rand()),
-    prediction,
+    // Replaces the old prediction[] array; app.js still renders prediction[] when a
+    // firmware that predates the rename sends it.
+    forecast_stability: buildForecastStability(rand, samples),
     crowding: { by_hour: buildCrowdingByHour(rand, scale), by_weekday: buildCrowdingByWeekday(rand, scale) },
     wait_by_hour: buildWaitByHour(rand, scale),
+    wait_basis: 'half_mean_gap',
+    coverage,
   };
 }
 
@@ -729,28 +831,53 @@ function buildBikeByHour(stationId, days) {
 function buildBikesOverview(days) {
   const b = config.bike || {};
   if (!b.enabled || !b.stations || !b.stations.length) return [];
-  return b.stations.map((st) => ({ station: `indego-${st.id}`, name: st.name, by_hour: buildBikeByHour(st.id, days) }));
+  return b.stations.map((st) => {
+    const by_hour = buildBikeByHour(st.id, days);
+    return {
+      station: `indego-${st.id}`, name: st.name,
+      samples: by_hour.reduce((a, h) => a + h.n, 0),
+      by_hour,
+    };
+  });
 }
 
 // Reuses buildStats' own PRNG sequence for the summary numbers so a stop's overview row
 // always matches the tiles shown when you select it below, then adds a last_seen_ts the
 // per-stop endpoint has no reason to carry.
-function buildStatsOverview(days) {
+function buildStatsOverview(days, noLate) {
   const now = Math.floor(Date.now() / 1000);
   const stops = (config.stops || []).map((s) => {
-    const full = buildStats(s.key, days, false);
+    // Rail stops in this mock have no lateness data at all, which exercises the UI's
+    // null-percentage path in the comparison table.
+    const noLateHere = noLate || s.mode === 'rail';
+    const full = buildStats(s.key, days, false, noLateHere);
     const seenRand = seedFrom(`overview-seen|${s.key}|${days}`);
     return {
-      stop: s.key, samples: full.samples, on_time_pct: full.on_time_pct, mean_late_min: full.mean_late_min,
-      ghost: full.ghost, noshow: full.noshow, last_seen_ts: now - Math.round(seenRand() * 10800),
+      stop: s.key, samples: full.samples, inferred: full.inferred, late_known: full.late_known,
+      on_time_pct: full.on_time_pct, mean_late_min: full.mean_late_min,
+      ghost: full.ghost, noshow: full.noshow, outage_min: full.outage_min,
+      coverage: full.coverage, last_seen_ts: now - Math.round(seenRand() * 10800),
     };
   });
-  return { days, stops, bikes: buildBikesOverview(days) };
+  return {
+    days, stops, bikes: buildBikesOverview(days),
+    // Window totals across every stop.
+    samples: stops.reduce((a, s) => a + s.samples, 0),
+    inferred: stops.reduce((a, s) => a + s.inferred, 0),
+    // Keys still in the monthly logs that the fixed-size aggregator had no room for —
+    // typically stops the owner removed from the config a while ago. Two here so the web
+    // UI's "N older stops not shown" line is visible without hand-editing the log.
+    excluded_stops: 2,
+    excluded_bikes: 0,
+    coverage: 0.97,
+  };
 }
 
 /* ------------------------------ /api/log/* ------------------------------ */
 
-const CSV_HEADER = 'ts,event,stop_key,route,dir,trip,vehicle,scheduled_ts,predicted_ts,actual_ts,late_min,horizon_s,headway_s,note';
+// Log schema v3: `temp_c` (Celsius) is the temperature column; the UI converts to the
+// device's own unit setting for display.
+const CSV_HEADER = 'ts,event,stop_key,route,dir,trip,sched_trip,vehicle,scheduled_ts,predicted_ts,actual_ts,late_min,horizon_s,headway_s,seats,temp_c,note';
 
 function logIndex() {
   const now = new Date();
@@ -763,15 +890,17 @@ function logIndex() {
 function logCsv(file) {
   if (!/^\d{4}-\d{2}\.csv$/.test(file)) return null;
   const now = Math.floor(Date.now() / 1000);
+  // Columns: ts,event,stop_key,route,dir,trip,sched_trip,vehicle,scheduled_ts,predicted_ts,
+  //          actual_ts,late_min,horizon_s,headway_s,seats,temp_c,note
   const rows = [
-    `${now - 3600},pred,17-21332,17,1,3667,7477,${now - 3300},${now - 3200},,13,900,,`,
-    `${now - 3000},pred,17-21332,17,1,3667,7477,${now - 3300},${now - 2900},,11,600,,`,
-    `${now - 2600},arrive,17-21332,17,1,3667,7477,${now - 3300},${now - 2610},${now - 2600},12,,540,`,
-    `${now - 2000},pred,17-21297,17,0,3585,7300,${now - 1900},${now - 1850},,1,300,,`,
-    `${now - 1500},arrive,17-21297,17,0,3585,7300,${now - 1900},${now - 1510},${now - 1500},1,,600,`,
-    `${now - 900},ghost,17-21332,17,1,3654,7481,${now - 700},${now - 690},,,,,vanished before arriving`,
-    `${now - 400},noshow,17-21297,17,0,,,${now - 500},,,,,,` ,
-    `${now - 100},outage,17-21332,17,1,,,,,,,,,SEPTA API unreachable 6 min`,
+    `${now - 3600},pred,17-21332,17,1,3667,910234,7477,${now - 3300},${now - 3200},,13,900,,,18.5,`,
+    `${now - 3000},pred,17-21332,17,1,3667,910234,7477,${now - 3300},${now - 2900},,11,600,,,18.5,`,
+    `${now - 2600},arrive,17-21332,17,1,3667,910234,7477,${now - 3300},${now - 2610},${now - 2600},12,,540,FEW_SEATS_AVAILABLE,18.7,`,
+    `${now - 2000},pred,17-21297,17,0,3585,910588,7300,${now - 1900},${now - 1850},,1,300,,,19.1,`,
+    `${now - 1500},arrive,17-21297,17,0,3585,910588,7300,${now - 1900},${now - 1510},${now - 1500},1,,600,STANDING_ROOM_ONLY,19.1,`,
+    `${now - 900},ghost,17-21332,17,1,3654,910301,7481,${now - 700},${now - 690},,,,,,19.4,vanished before arriving`,
+    `${now - 400},noshow,17-21297,17,0,,910640,,${now - 500},,,,,,,19.4,`,
+    `${now - 100},outage,17-21332,17,1,,,,,,,,,,,19.6,SEPTA API unreachable 6 min`,
   ];
   return [CSV_HEADER, ...rows].join('\n') + '\n';
 }
@@ -787,6 +916,9 @@ const STATIC = {
 };
 
 /* ------------------------------ server ------------------------------ */
+
+// One OTA at a time, so a second upload can be answered with 409 like the firmware does.
+let otaInFlight = false;
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -808,6 +940,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/config' && req.method === 'GET') return sendJSON(res, 200, config);
     if (pathname === '/api/config' && req.method === 'PUT') {
       const { buf } = await readBody(req);
+      if (!pinGate(req, res)) return;
       let parsed;
       try { parsed = JSON.parse(buf.toString('utf8') || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'Invalid JSON body', path: '' }); }
       // Legacy clients send show_crowding (boolean) instead of crowding (string). Mirror
@@ -840,30 +973,65 @@ const server = http.createServer(async (req, res) => {
       if (!stop) return sendJSON(res, 400, { error: 'stop is required', path: 'stop' });
       let days = Number(q.get('days') || 30);
       if (![7, 30, 90].includes(days)) days = [7, 30, 90].reduce((a, b) => (Math.abs(b - days) < Math.abs(a - days) ? b : a));
-      return sendJSON(res, 200, buildStats(stop, days, q.get('empty') === '1'));
+      // ?nolate=1 returns on_time_pct: null so the "no lateness data" wording can be seen.
+      // Rail stops always take that path here (Regional Rail gives the device no lateness
+      // figure), so the detail view agrees with the overview table's "no data" row.
+      const isRail = (config.stops || []).some((s) => s.key === stop && s.mode === 'rail');
+      return sendJSON(res, 200, buildStats(stop, days, q.get('empty') === '1', q.get('nolate') === '1' || isRail));
     }
     if (pathname === '/api/stats/overview' && req.method === 'GET') {
       let days = Number(q.get('days') || 30);
       if (![7, 30, 90].includes(days)) days = [7, 30, 90].reduce((a, b) => (Math.abs(b - days) < Math.abs(a - days) ? b : a));
-      return sendJSON(res, 200, buildStatsOverview(days));
+      return sendJSON(res, 200, buildStatsOverview(days, q.get('nolate') === '1'));
     }
 
+    // The index is free; the CSV files themselves are behind the PIN, same as the firmware.
     if (pathname === '/api/log/index' && req.method === 'GET') return sendJSON(res, 200, logIndex());
     if (pathname.startsWith('/api/log/') && req.method === 'GET') {
+      if (!pinGate(req, res)) return;
       const file = decodeURIComponent(pathname.slice('/api/log/'.length));
       const csv = logCsv(file);
       if (!csv) return notFound(res);
       return sendText(res, 200, csv, 'text/csv; charset=utf-8');
     }
 
+    if (pathname === '/api/pin' && req.method === 'POST') {
+      const { buf } = await readBody(req);
+      if (!pinGate(req, res)) return;
+      let parsed;
+      try { parsed = JSON.parse(buf.toString('utf8') || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'Invalid JSON body', path: '' }); }
+      const next = parsed && parsed.pin;
+      if (typeof next !== 'string' || !PIN_RE.test(next)) {
+        return sendJSON(res, 400, { error: 'pin must be 4-32 printable characters with no spaces', path: 'pin' });
+      }
+      devicePin = next;
+      return sendJSON(res, 200, { ok: true });
+    }
+
     if (pathname === '/api/ota' && req.method === 'POST') {
-      const { len } = await readBody(req);
+      const { buf, len } = await readBody(req);
+      if (!pinGate(req, res)) return;
+      // 409 while an install is already running, and 400 for an image built for another
+      // board — the two OTA failures the web UI has to word for itself.
+      if (otaInFlight) return sendJSON(res, 409, { error: 'an update is already in progress' });
+      const nameMatch = /filename="([^"]*)"/.exec(buf.slice(0, 2048).toString('latin1'));
+      const filename = nameMatch ? nameMatch[1] : '';
+      if (/wrongboard/i.test(filename)) {
+        return sendJSON(res, 400, { error: 'firmware is built for board cyd-2432S028R, this device is cyd-3248S035R' });
+      }
+      otaInFlight = true;
       const delay = Math.min(1500, 300 + Math.round(len / 20000));
-      setTimeout(() => sendJSON(res, 200, { ok: true, bytes: len }), delay);
+      setTimeout(() => { otaInFlight = false; sendJSON(res, 200, { ok: true, bytes: len }); }, delay);
       return;
     }
-    if (pathname === '/api/reboot' && req.method === 'POST') return sendJSON(res, 200, { ok: true });
-    if (pathname === '/api/wifi/reset' && req.method === 'POST') return sendJSON(res, 200, { ok: true });
+    if (pathname === '/api/reboot' && req.method === 'POST') {
+      if (!pinGate(req, res)) return;
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (pathname === '/api/wifi/reset' && req.method === 'POST') {
+      if (!pinGate(req, res)) return;
+      return sendJSON(res, 200, { ok: true });
+    }
 
     notFound(res);
   } catch (e) {
@@ -873,4 +1041,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Philly Transit Display mock server listening on http://localhost:${PORT}`);
+  console.log(`  admin PIN: ${MOCK_PIN_DEFAULT} (X-Pin header; 5 wrong tries locks for ${MOCK_PIN_LOCK_S}s)`);
 });

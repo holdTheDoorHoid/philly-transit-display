@@ -714,17 +714,84 @@ accumulators, aiming under 2 KB.
 
 ## 10. Web UI (`web/`)
 
-Single page, vanilla JS, no framework, no build step other than `web/build.mjs`, which gzips
-`index.html`, `app.js`, `app.css`, `favicon.svg` into `firmware/src/generated/web_assets.h`.
+Single page, vanilla JS, no framework, no build step other than `web/build.mjs`, which strips
+whole-line comments from `app.js`/`app.css` and gzips `index.html`, `app.js`, `app.css`,
+`favicon.svg` into `firmware/src/generated/web_assets.h`. The stripping is a packaging step only —
+`web/` on disk and the mock server keep every comment — and it is deliberately conservative: only
+lines that are *entirely* a comment go, the source is refused if it ever grows a multi-line template
+literal, and the stripped JS is parse-checked before it is embedded. It buys back ~4.6 KB gzipped,
+which is what lets the files stay commented at the density the rest of the repo uses.
 `web/mock-server.mjs` implements §7 against the fixtures so the UI can be developed with
-`node web/mock-server.mjs` and no hardware.
+`node web/mock-server.mjs` and no hardware; its admin PIN is `123456`.
 
-Views: **Now** (live arrivals as the device sees them), **Stops** (list, reorder, add/edit/remove;
-add flow: mode → route → stop list from `/api/proxy/stops` with a Leaflet map loaded from a CDN when
-online → direction learned from `/api/proxy/schedule` → label), **Stats** (per stop, charts in
-inline SVG: by-hour bars, weekday bars, headway ratio histogram, prediction MAE by horizon, ghost/
-noshow tiles; CSV download), **Settings** (device, brightness, poll, logging, OTA upload,
-Wi-Fi reset, firmware version). Total gzipped assets must stay under 60 KB.
+Views: **Now** (live arrivals as the device sees them, with a per-stop feed-health chip from
+`health`/`source_age_s`), **Stops** (list, reorder, add/edit/remove;
+add flow: mode → route + a bus/trolley choice → stop list from `/api/proxy/stops` with a Leaflet map
+loaded from a CDN when online → direction learned from `/api/proxy/schedule` → label; Regional Rail
+picks its line from a dropdown of SEPTA line codes), **Stats** (per stop, charts in
+inline SVG: by-hour bars, weekday bars, headway ratio histogram, forecast-stability histogram,
+ghost/noshow tiles; CSV download), **Settings** (device, brightness, poll, logging, OTA upload,
+Wi-Fi reset, firmware version, board, Web PIN). Total gzipped assets must stay under 60 KB.
+
+Every control on Settings, and the Indego card and stop edit form on Stops, carries a
+`<p class="hint">` in plain language under it: the owner is not a programmer, and an unexplained
+setting is one nobody dares change.
+
+### 10.1 Admin PIN in the UI
+
+The calls that change the device — `PUT /api/config`, `POST /api/reboot`, `POST /api/wifi/reset`,
+`POST /api/ota`, `POST /api/pin` — and `GET /api/log/<file>.csv` carry an `X-Pin` header. The PIN
+lives in `localStorage` under `ptd_pin`. `fetchJSON(url, opts, true)` adds the header; a `401`
+("pin required" / "wrong pin") opens a modal — *"This device asks for its PIN before changing
+settings. Find it on the device: tap the top of the screen to open the device info page, or read it
+from the serial console."* — stores what is typed and replays the request **once**. A second `401`
+is reported as "That PIN was not accepted" rather than echoing the firmware's two words. A `429`
+(`{"error":"too many attempts","retry_s":N}`) reports the wait and is **not** retried.
+`uploadFirmware` carries the header on its `XMLHttpRequest` and words `409` as "already installing
+an update" and `400` with the firmware's own message (wrong board, bad image). The CSV links are
+buttons, not `<a href>`: a plain link cannot carry a header, so the bytes are fetched and handed
+over as a Blob + object URL + synthetic click.
+
+Settings gains a **Web PIN** card: change the PIN (new + confirm, 4–32 printable ASCII with no
+spaces, the current PIN supplied by the same header) and "Forget PIN on this browser", which clears
+only this browser's copy and says so. `/api/state`'s `auth.pin_required`, `board` and
+`config_recovered` are all surfaced there — the last as *"The device restored its previous settings
+after a bad save."*
+
+### 10.2 Honest numbers on the Stats page
+
+Two rules, because a statistic that overstates its own certainty is worse than no statistic:
+
+1. **A missing value is never drawn as 0.** `on_time_pct` can be `null` (SEPTA never said how late
+   anything ran); it renders as "no data", not a red 0 %.
+2. **A percentage always shows the count behind it** — "On time: 71 % of 143 with lateness data
+   (190 arrivals)".
+
+The page also states what the device can and cannot know. Arrivals are **inferred** from a bus
+disappearing from the live feed, not measured, and `unobserved` counts the trips that fell in a
+stretch when the device was not polling at all — distinct from ghosts and no-shows, which are
+failures it actually watched happen. What used to be "prediction accuracy by horizon" is now
+**forecast stability** (`forecast_stability[]`, the renamed `prediction[]`): how far the forecast was
+*revised* between first sighting and the inferred arrival, bar = `mean_abs_revision_s`, dot =
+`mean_revision_s`. `wait_basis` names the estimator ("half the average gap between buses") instead of
+the page asserting a method the firmware may have changed, `coverage` (0..1) is shown as "data
+coverage 97 %" per stop and for the window, and the overview's `excluded_stops`/`excluded_bikes` are
+reported as "N older stops not shown" so a missing row does not read as missing data. Keys are read
+defensively (`samples ?? arrivals`, `late_known ?? late_known_n`, `mean_abs_revision_s ?? mae_s`) so
+a rename on the firmware side degrades to a label rather than a blank page.
+
+On the Now page, `ok` is false for a **stale** stop as well as an unreachable one, but a stale stop
+still has usable — if old — times: it keeps its arrival rows with an amber "stale N min" chip and the
+short `error` text above them, and only a stop that is genuinely empty or unavailable gets the red
+banner in place of its rows.
+
+### 10.3 Untrusted text
+
+Agency and user text reaches the DOM only through the `h()` helper, which appends text nodes; the UI
+contains no `innerHTML`, `insertAdjacentHTML` or `outerHTML`. The one third-party sink that renders
+HTML is Leaflet's `bindTooltip`, which is therefore handed an element, never a string. Leaflet's CSS
+and JS are pinned to 1.9.4 and loaded with Subresource Integrity plus `crossorigin="anonymous"`; a
+hash mismatch simply drops the map and the wizard falls back to its list-only view.
 
 ## 11. Portability
 
