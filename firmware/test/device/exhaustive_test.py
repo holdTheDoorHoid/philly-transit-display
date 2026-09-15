@@ -4,6 +4,15 @@ Backs up the owner's config first and restores it at the end (with invert_colors
 import json, subprocess, sys, time, threading, re, copy, datetime, concurrent.futures, os
 B = 'http://192.168.1.181'
 S = os.path.dirname(os.path.abspath(__file__))
+
+# The admin PIN protects every state-changing endpoint (DESIGN.md SS7/SS12). It is per device and
+# never in the repo: read it off the serial console at boot ("[auth] web PIN: 123456") or the
+# device info screen, then run this script with CYD_PIN=123456.
+PIN = os.environ.get('CYD_PIN', '').strip()
+if not PIN:
+    sys.exit('CYD_PIN is not set. Read the PIN from the serial console at boot ("[auth] web PIN: ...")\n'
+             'or from the device info screen on the panel, then run:  CYD_PIN=123456 %s' % sys.argv[0])
+PINH = ['-H', 'X-Pin: ' + PIN]
 results = []
 serial_lines = []
 stop_serial = False
@@ -12,8 +21,8 @@ def curl(args, timeout=20):
     r = subprocess.run(['curl', '-s', '--max-time', str(timeout)] + args, capture_output=True)
     return r
 
-def get(path, timeout=15):
-    r = curl(['-w', '\n%{http_code}', B + path], timeout)
+def get(path, timeout=15, pin=False):
+    r = curl((PINH if pin else []) + ['-w', '\n%{http_code}', B + path], timeout)
     body, _, code = r.stdout.rpartition(b'\n')
     return int(code or 0), body
 
@@ -22,18 +31,24 @@ def get_json(path):
     try: return code, json.loads(body)
     except Exception: return code, None
 
-def put_cfg(cfg):
-    r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'PUT', '-H', 'Content-Type: application/json', '--data-binary', json.dumps(cfg), B + '/api/config'])
+def put_cfg(cfg, pin=PIN):
+    r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'PUT', '-H', 'X-Pin: ' + pin, '-H', 'Content-Type: application/json', '--data-binary', json.dumps(cfg), B + '/api/config'])
     return int(r.stdout or 0)
 
-def put_cfg_body(cfg):
+def put_cfg_nopin(cfg):
     r = curl(['-w', '\n%{http_code}', '-X', 'PUT', '-H', 'Content-Type: application/json', '--data-binary', json.dumps(cfg), B + '/api/config'])
     body, _, code = r.stdout.rpartition(b'\n')
     try: return int(code or 0), json.loads(body)
     except Exception: return int(code or 0), None
 
+def put_cfg_body(cfg):
+    r = curl(PINH + ['-w', '\n%{http_code}', '-X', 'PUT', '-H', 'Content-Type: application/json', '--data-binary', json.dumps(cfg), B + '/api/config'])
+    body, _, code = r.stdout.rpartition(b'\n')
+    try: return int(code or 0), json.loads(body)
+    except Exception: return int(code or 0), None
+
 def post(path):
-    r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', B + path])
+    r = curl(PINH + ['-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', B + path])
     return int(r.stdout or 0)
 
 def check(name, ok, detail=''):
@@ -99,7 +114,8 @@ code, d = get_json('/api/debug/ui'); check('A debug/ui', code == 200 and d.get('
 code, d = get_json('/api/stats?stop=%s&days=30' % backup['stops'][0]['key']); check('A stats', code == 200 and isinstance(d, dict), (code, str(d)[:80]))
 code, d = get_json('/api/log/index'); check('A log index', code == 200 and isinstance(d, list), (code, d))
 if isinstance(d, list) and d:
-    code, body = get('/api/log/' + d[0]['file']); check('A log download', code == 200 and body.startswith(b'ts,'), (code, body[:40]))
+    code, body = get('/api/log/' + d[0]['file'], pin=True); check('A log download', code == 200 and body.startswith(b'ts,'), (code, body[:40]))
+    code, _ = get('/api/log/' + d[0]['file']); check('A log download needs the PIN', code == 401, code)
 code, d = get_json('/api/rail/stations'); check('A rail stations', code == 200 and isinstance(d, list) and len(d) > 50, (code, type(d)))
 code, body = get('/api/proxy/stops?route=17', 40); check('A proxy stops 17', code == 200 and len(body) > 10000 and b'21332' in body, (code, len(body)))
 code, body = get('/api/proxy/schedule?stop_id=21332', 40); check('A proxy schedule', code == 200 and b'"17"' in body, (code, body[:60]))
@@ -119,7 +135,7 @@ try:
 except Exception:
     newest = None
 if newest:
-    r = curl([B + '/api/log/' + newest], 120); lines = [l for l in r.stdout.decode(errors='replace').split('\n') if l.strip()]
+    r = curl(PINH + [B + '/api/log/' + newest], 120); lines = [l for l in r.stdout.decode(errors='replace').split('\n') if l.strip()]
     v2 = [l for l in lines[-40:] if l.count(',') == 20]
     check('A log rows are v2 (21 columns)', len(v2) > 0, (newest, len(lines), lines[-1][:80] if lines else ''))
     check('A log has bike rows', any(',bike,indego-' in l for l in lines) or not base['bike'].get('enabled'), newest)
@@ -229,6 +245,64 @@ invalid('lat 91', lambda c: c['stops'][0].update(lat=91), 'stops[0].lat')
 r = curl(['-w', '%{http_code}', '-o', '/dev/null', '-X', 'PUT', '-H', 'Content-Type: application/json', '--data-binary', '{not json', B + '/api/config']); check('C malformed json rejected', r.stdout in (b'400', b'415'), r.stdout)
 check('C config unchanged after invalid PUTs', config()['device']['name'] == base['device']['name'])
 
+# ---------- C2. validation added by the hardening pass (review F07/F30) ----------
+invalid('brightness 256 (must not wrap to 0)', lambda c: c['device'].update(brightness=256), 'device.brightness')
+invalid('poll_seconds 65566 (must not wrap to 30)', lambda c: c['device'].update(poll_seconds=65566), 'device.poll_seconds')
+invalid('duplicate profile stop keys', lambda c: c.update(profiles=[{'name': 'Dup', 'days': [1], 'start': '01:00', 'end': '02:00',
+        'stops': [c['stops'][0]['key'], c['stops'][0]['key']]}]), 'profiles[0].stops')
+invalid('device name with a space', lambda c: c['device'].update(name='transit display'), 'device.name')
+invalid('control character in a label', lambda c: c['stops'][0].update(label='17\nSouthbound'), 'stops[0].label')
+
+def _rail_stop(line):
+    return {'key': 'rail-30th-N', 'mode': 'rail', 'station': '30th Street Station', 'direction': 'N',
+            'line': line, 'label': 'Regional Rail North', 'show': 2}
+
+cfg = copy.deepcopy(base); cfg['stops'] = cfg['stops'] + [_rail_stop('Paoli/Thorndale')]
+code = put_cfg(cfg); time.sleep(2.5)
+got = config()
+rail = [x for x in (got or {}).get('stops', []) if x['key'] == 'rail-30th-N']
+check('C2 rail display name normalised to a line code', code == 200 and rail and rail[0].get('line') == 'PAO', (code, rail))
+cfg['stops'][-1]['line'] = 'Not A Line'
+code, body = put_cfg_body(cfg)
+check('C2 unknown rail line rejected', code == 400 and body and body.get('path') == 'stops[2].route', (code, body))
+put_cfg(copy.deepcopy(base)); time.sleep(2.5)
+
+# ---------- C3. auth and cross-origin hardening (review F01/F05) ----------
+code, body = put_cfg_nopin(copy.deepcopy(base))
+check('C3 PUT /api/config without a PIN is 401', code == 401 and body and body.get('error') == 'pin required', (code, body))
+r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', B + '/api/reboot'])
+check('C3 POST /api/reboot without a PIN is 401', r.stdout == b'401', r.stdout)
+code, d = get_json('/api/state')
+check('C3 state advertises pin_required and board', code == 200 and d.get('auth', {}).get('pin_required') is True and isinstance(d.get('board'), str) and d['board'], (code, d.get('auth'), d.get('board')))
+check('C3 state reports config_recovered', 'config_recovered' in (d or {}), list(d or {})[:12])
+code, _ = get_json('/api/config')
+check('C3 GET /api/config stays open', code == 200, code)
+
+# Five wrong PINs in a row lock every protected route for 30 s, then it recovers on its own.
+bad = '000000' if PIN != '000000' else '999999'
+codes = [put_cfg(copy.deepcopy(base), pin=bad) for _ in range(4)]
+check('C3 a wrong PIN is 401', codes == [401, 401, 401, 401], codes)
+check('C3 the 5th wrong PIN locks out (429)', put_cfg(copy.deepcopy(base), pin=bad) == 429)
+locked = put_cfg(copy.deepcopy(base))
+check('C3 locked out even with the right PIN', locked == 429, locked)
+r = curl(['-w', '\n%{http_code}', '-X', 'PUT', '-H', 'X-Pin: ' + PIN, '-H', 'Content-Type: application/json',
+          '--data-binary', json.dumps(base), B + '/api/config'])
+lbody, _, lcode = r.stdout.rpartition(b'\n')
+try: lj = json.loads(lbody)
+except Exception: lj = {}
+check('C3 429 body carries retry_s', lcode == b'429' and isinstance(lj.get('retry_s'), int) and 0 < lj['retry_s'] <= 30, (lcode, lj))
+time.sleep(32)
+check('C3 recovers after the lockout expires', put_cfg(copy.deepcopy(base)) == 200)
+
+# Host-header check: a rebinding attacker's own domain must not be served (421).
+r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-H', 'Host: evil.example.com', B + '/api/state'])
+check('C3 wrong Host is 421', r.stdout == b'421', r.stdout)
+r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-H', 'Host: ' + B.replace('http://', '') + ':80', B + '/api/state'])
+check('C3 own IP with a port is accepted', r.stdout == b'200', r.stdout)
+r = curl(['-D', '-', '-o', '/dev/null', B + '/']); h = r.stdout.decode()
+check('C3 index sends frame + nosniff headers', 'X-Frame-Options: DENY' in h and "frame-ancestors 'none'" in h and 'X-Content-Type-Options: nosniff' in h, h[:300])
+time.sleep(2)
+
 # ---------- D. screen logic ----------
 k0, k1 = base['stops'][0]['key'], base['stops'][1]['key']
 # profiles
@@ -321,7 +395,20 @@ if os.path.exists(fw):
     # The OTA handler refuses uploads below 60 KB free heap, and right after section F's reboot the
     # first poll (Indego's 400 KB stream included) is still running: wait for it and for heap to settle.
     wait_for(lambda: state().get('last_poll', {}).get('ok') and state().get('heap', 0) > 70000, 120, 5)
-    r = curl(['-w', '\n%{http_code}', '-F', 'firmware=@' + fw, B + '/api/ota'], 180)
+    # An upload with no file at all, and one for a different board, must both be refused before
+    # anything is written (review F08).
+    r = curl(PINH + ['-w', '\n%{http_code}', '-X', 'POST', B + '/api/ota'], 30)
+    nbody, _, ncode = r.stdout.rpartition(b'\n')
+    check('G OTA with no file is 400', ncode == b'400' and b'no firmware file' in nbody, (ncode, nbody[:120]))
+    fake = os.path.join(S, 'test_wrong_board.bin')
+    with open(fake, 'wb') as fh:
+        fh.write(b'\xe9\x04\x02\x20' + bytes(range(256)) * 16)  # ESP32 image magic, then filler; no board marker
+    r = curl(PINH + ['-w', '\n%{http_code}', '-F', 'firmware=@' + fake, B + '/api/ota'], 60)
+    wbody, _, wcode = r.stdout.rpartition(b'\n')
+    check('G OTA rejects an image for a different board', wcode == b'400' and b'different board' in wbody, (wcode, wbody[:160]))
+    os.remove(fake)
+    check('G device still up after the rejected uploads', state().get('uptime', 0) > 0)
+    r = curl(PINH + ['-w', '\n%{http_code}', '-F', 'firmware=@' + fw, B + '/api/ota'], 180)
     body, _, code = r.stdout.rpartition(b'\n')
     check('G OTA upload accepted', code in (b'200', b'202'), (code, body[:120]))
     time.sleep(8)

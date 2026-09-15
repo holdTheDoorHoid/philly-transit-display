@@ -222,7 +222,7 @@ Memory rules: no full framebuffer; LVGL partial buffer is 1/10 of the screen in 
 TLS connection at a time; ArduinoJson documents sized from measured payloads (§4) with 25 %
 headroom; log free heap once per poll at `INFO`; refuse to start OTA if free heap < 60 KB.
 
-Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-14 the full feature set uses 97.8 % (41 KB headroom); `firmware/README.md` ranks what to cut if more is needed. Do not grow the app slots without dropping OTA.
+Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-15, with the §12 hardening, the full feature set uses 93.9 % on `cyd-3248S035R` and 93.7 % on the tightest board, `cyd-2432S024C` (~112 KB headroom); `firmware/README.md` ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
 
 Build/flash: `pio run -e cyd-3248S035R`, `pio run -e cyd-3248S035R -t upload --upload-port
 /dev/ttyUSB0`. Releases publish `bootloader.bin`, `partitions.bin`, `firmware.bin` per env plus an
@@ -352,15 +352,81 @@ entries). `weather` (§4.8): `enabled`, `per_stop` (the per-panel notes), `units
 unique and stable; it is the join key in the log. Maximum 8 stops. Validation errors return
 HTTP 400 with `{ "error": "...", "path": "stops[1].stop_id" }`.
 
+### 6.1 Validation limits
+
+`jsonToConfig()` in `config_store.cpp` is the only door configuration comes through, and it
+checks *before* it narrows: numbers are read as int64/double and range-checked against the ranges
+below, so `brightness: 256` and `poll_seconds: 65566` are 400s rather than silently wrapping to 0
+and 30 in their `uint8_t`/`uint16_t` fields. The first violation decides the response; its JSON
+path is returned.
+
+- Numbers: `poll_seconds` 5–600, `brightness` 0–100, `rotation` 0/90/180/270, `ticker_lines` 1–8,
+  `ticker_speed` 5–200, `quiet.brightness` 0–50, `quiet.wake_seconds` 5–300, `night.after_min`
+  15–240, `due.minutes` 1–15, `stops[].show` 1–4, `stops[].alt_after_min` 5–60 (when `alt_of` is
+  set), `bike.stations[].id` ≥ 1. `lat`/`lng` must be finite and within ±90 / ±180.
+- Strings: `device.name` ≤ 32 and, after lower-casing ("slugifying"), only `[a-z0-9-]` and no
+  leading or trailing `-` — it is the mDNS hostname, and a character DNS cannot carry is refused
+  rather than guessed at; `device.tz` ≤ 64; every per-stop string (`key`, `route`, `stop_id`,
+  `direction`, `headsign`, `label`, `stop_name`, `station`, `title_text`, `alt_of`) ≤ 64; profile
+  names ≤ 32; bike station names ≤ 48. No string may contain control characters.
+- Arrays, capped while being read rather than after: `stops` ≤ 8, `profiles` ≤ 4, a profile's
+  `stops` ≤ 8 with unique keys that all exist in `stops`, `bike.stations` ≤ 3.
+- Wrong JSON types are 400s, not silent fallbacks, for every string and number. Booleans are the
+  exception: a wrongly-typed boolean falls back to its documented default, which cannot wrap,
+  truncate or grow anything.
+
+**Regional Rail line normalisation.** A rail stop's line may be sent as the code (`"PAO"`) or as
+the display name SEPTA's own responses use (`"Paoli/Thorndale"`); only the code matches anything
+downstream, so a display name is converted to its code on the way in (case-insensitively, against
+`transit::kRailLines`). An unrecognised line is a 400 at `stops[i].route`: *"unknown Regional Rail
+line; use a line code such as PAO"*. Bus, trolley and subway route ids are SEPTA's own strings and
+are stored exactly as sent.
+
+### 6.2 Durable save
+
+A save never leaves the live file half-written. `saveConfig()` serializes to `/config.json.tmp`,
+checks the byte count written equals the serialized length (a short write is what a full LittleFS
+looks like from the File API), re-reads and re-validates that file, rotates the current
+`/config.json` to `/config.prev.json`, and only then renames the temp file into place. Config
+writes are serialized with a mutex — `PUT /api/config` runs on the web server's task while
+`main.cpp` may still be writing defaults. Any failure returns false, `PUT /api/config` answers 500
+and the running config is untouched.
+
+`loadConfig()` tries `/config.json`, then `/config.prev.json`, logs which one it used, and reports
+a fallback as `config_recovered: true` in `GET /api/state` so the owner learns a save did not
+survive instead of noticing a reverted setting days later.
+
 ## 7. Device HTTP API
 
-All JSON. No authentication in v1 (LAN device; same posture as printers and most smart-home
-gear). CORS not needed; the UI is same-origin. A later "settings PIN" is an opt-in addition.
+All JSON. **Viewing is open; changing needs the PIN.** Any client on the LAN can read state,
+config, stats, the log index and the proxies — the display behaves like an appliance and the web
+UI needs no login to show arrivals. Everything that changes the device carries the per-device
+admin PIN in an `X-Pin: <pin>` header (§12; the PIN is printed on the serial console at boot and
+shown on the device info screen). CORS is deliberately not enabled and the UI is same-origin, so a
+cross-origin page cannot attach that header without a preflight this server never answers.
+
+Protected: `PUT /api/config`, `POST /api/reboot`, `POST /api/wifi/reset`, `POST /api/ota`,
+`POST /api/pin`, `POST /api/debug/tap`, `GET /api/log/<file>.csv`.
+Open: everything else, including `GET /api/log/index` and `GET /api/debug/ui`.
+
+Status codes beyond the per-route ones below:
+
+| Code | Body | When |
+|---|---|---|
+| 401 | `{"error":"pin required"}` / `{"error":"wrong pin"}` | Protected route, `X-Pin` missing or wrong |
+| 429 | `{"error":"too many attempts","retry_s":N}` | Five consecutive wrong PINs; every protected route is locked for 30 s. A correct PIN resets the counter; a *missing* header never counts towards it |
+| 421 | `{"error":"this device is not reachable under that host name"}` | The `Host` header is not the device's IP, `<device name>` or `<device name>.local`, `192.168.4.1` or `localhost` (optional `:port`, case-insensitive). DNS-rebinding defence — checked before any handler runs, on every route |
+| 409 | `{"error":"another firmware upload is in progress"}` | A second `POST /api/ota` while one is streaming |
+| 500 | `{"error":"..."}` | `PUT /api/config` could not write the file (the live config is unchanged, §6) |
+
+`GET /` additionally answers with `X-Frame-Options: DENY`, `Content-Security-Policy:
+frame-ancestors 'none'` and `X-Content-Type-Options: nosniff`. There is no `script-src` directive:
+the Stops page loads Leaflet from a CDN (§10).
 
 | Method, path | Purpose |
 |---|---|
 | `GET /` , `/app.js`, `/app.css`, `/favicon.svg` | Web UI, served gzip with `Cache-Control: max-age=3600`, ETag = firmware build id |
-| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes}, last_poll {ok, age_s, error}, `stops[]` each with `arrivals[]` (§8 shape) and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8) |
+| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes}, last_poll {ok, age_s, error}, `stops[]` each with `arrivals[]` (§8 shape) and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8), plus `board` (the PlatformIO env this image was built for, e.g. `cyd-3248S035R`), `auth {pin_required}` and `config_recovered` (§6) |
 | `GET /api/config` | Current config (§6) |
 | `PUT /api/config` | Replace config; validates; persists; triggers immediate re-poll. 400 on error |
 | `GET /api/proxy/stops?route=17` | Streams SEPTA `Stops` for a route to the browser (setup only) |
@@ -370,10 +436,11 @@ gear). CORS not needed; the UI is same-origin. A later "settings PIN" is an opt-
 | `GET /api/stats/overview?days=7` | Every stop and Indego station in one pass (§9.3), for the Stats page's comparison table |
 | `GET /api/log/index` | `[ { "file": "2026-09.csv", "bytes": 123456 } ]` |
 | `GET /api/log/2026-09.csv` | Raw CSV download |
-| `POST /api/ota` | multipart `firmware` field; reboots on success |
+| `POST /api/ota` | multipart `firmware` field; reboots on success. One at a time. No file → 400 `no firmware file`; too little heap or a fragmented one → 503 naming which check failed; an image built for a different board → 400 `firmware is for a different board (expected <board>)`; larger than the OTA slot → 413. Answers 200 only after the final chunk arrived *and* `Update.end()` succeeded |
 | `POST /api/reboot`, `POST /api/wifi/reset` | Maintenance |
-| `GET /api/debug/ui` | Test hook: current page (main/night/stats/device), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, LVGL pool use, resolution, heap |
-| `POST /api/debug/tap` | Test hook: simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
+| `POST /api/pin` | Body `{"pin":"new"}`, authenticated with the **current** PIN in `X-Pin`. New PIN: 4–32 printable ASCII, no whitespace. → `{"ok":true}`, or 400 with the rule that was broken. No reset-by-network path: recovery is the serial console or the device info screen (§12) |
+| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, LVGL pool use, resolution, heap |
+| `POST /api/debug/tap` | Test hook (PIN-protected: it changes what the screen shows): simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
 
 Arrival object in `/api/state`:
 ```json
@@ -545,9 +612,55 @@ should be a new `*_source.cpp` and a config `agency` field, nothing else.
 
 ## 12. Security posture
 
-Default is open on the LAN, like a printer. Firmware never contacts anything except SEPTA and NTP.
-SEPTA is fetched over plain HTTP (see section 2; the HTTPS toggle was removed in v0.1.2). OTA accepts any image on the LAN in v1; a settings PIN is a documented
-follow-up. No telemetry. Wi-Fi credentials live only in the ESP32 NVS.
+**Reading is open, changing is not.** The device answers anyone on the LAN who asks what the
+arrivals are; it does not let them change the configuration, reboot it, wipe its Wi-Fi, flash it,
+or download the movement log. Firmware never contacts anything except SEPTA, Open-Meteo, Indego
+and NTP. No telemetry. Wi-Fi credentials live only in the ESP32 NVS.
+
+**Admin PIN.** A per-device six-digit PIN, generated with `esp_random()` on first boot and stored
+in NVS (namespace `ptd`, key `pin`) — *not* in `/config.json`, because `GET /api/config` is open.
+It goes in an `X-Pin` header on the protected routes listed in §7. Wrong or missing → 401; five
+consecutive wrong PINs lock every protected route for 30 s (429 with `retry_s`); the comparison is
+constant-time. `POST /api/pin` changes it (4–32 printable ASCII, no whitespace) and needs the
+current PIN. The owner learns the PIN from the serial console at boot (`[auth] web PIN: 123456`)
+or the device info screen — both require physical possession of the display, which is the
+deliberate recovery path: there is no way to reset it over the network.
+
+**Cross-site and rebinding.** The `Host` header is checked on every request before any handler
+runs and must name the device (its IP, `<device name>`, `<device name>.local`, `192.168.4.1` or
+`localhost`, optional port, case-insensitive); anything else is 421. That is what stops a page on
+the public internet from resolving its own domain to the device's LAN address and then talking to
+it with the attacker's origin. CORS is not enabled, so a cross-origin page cannot attach `X-Pin`
+without a preflight this server does not answer — a blind form POST therefore cannot carry the
+PIN. `GET /` sends `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'` and
+`X-Content-Type-Options: nosniff`.
+
+**First-time setup Wi-Fi.** The setup AP is WPA2 with a per-device ten-character password
+(NVS `ptd`/`ap_pass`, from an alphabet with no `0/O/1/l/I`), shown on the panel next to a QR code
+of the standard `WIFI:` join URI so nobody has to type it. An open setup AP would let anyone in
+range watch the owner's *home* Wi-Fi password being typed into the portal. A device that already
+has credentials never opens that AP by itself: it retries its stored network indefinitely (5 s →
+60 s backoff) showing "Connecting to …" and "Tap the screen to open Wi-Fi setup instead", so a
+router reboot cannot put a provisioning endpoint on the air. Once open, the portal closes itself
+(reboot) after ten minutes with no client joined.
+
+**OTA.** Still unsigned — signature verification is not in this version — but no longer
+unconditional: the upload needs the PIN (checked at the first chunk, before a byte is written, and
+the connection is closed rather than draining 1.7 MB from an unauthorised caller), only one
+upload runs at a time, a disconnect mid-image aborts the update, the image must fit the OTA slot,
+and the stream must contain this board's `PTD-BOARD:<env>;` marker or it is rejected with a 400.
+That last check is what stops a 2.4"-capacitive image from bricking a 3.5" resistive panel.
+
+**Residual risks, accepted for now.** HTTPS is deferred (§2 and `firmware/README.md`: a TLS
+session needs ~40 KB of heap with two 16 KB contiguous buffers this board cannot spare, and
+dropping mbedTLS freed ~100 KB of flash). So **the PIN travels over the LAN in clear text** — 
+anyone who can passively sniff the owner's own network, or who already controls a device on it,
+can read it and then do anything the owner can. The PIN raises the bar from "any script that finds
+the device" to "an attacker already inside the network with packet capture"; it is not a defence
+against that second attacker. Firmware is unsigned, so anyone who *has* the PIN can flash
+arbitrary code. SEPTA and the other feeds are fetched over plain HTTP, so their contents are
+spoofable by that same on-path attacker (arrival times are not a secret, and nothing in the
+response is executed).
 
 ### 12.1 Memory posture (2026-09-14)
 The classic ESP32 has ~320 KB of DRAM and no PSRAM; with LVGL, Wi-Fi, the async web server and the
