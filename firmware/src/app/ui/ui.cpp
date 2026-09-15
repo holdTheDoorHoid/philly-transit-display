@@ -360,7 +360,7 @@ void tick() {
       break;
     case Page::Stats:
       // Stats are a 30-day rollup (DESIGN.md SS8); no need to re-stream the SD card at the same
-      // ~1Hz cadence as the live arrivals screen. getStopSummary() itself is cached for 60s
+      // ~1Hz cadence as the live arrivals screen. getStopSummary() answers from a cache the poller refreshes (10 min, never blocking this task)
       // (net_poller.cpp), so this just re-reads that cache while the page is visible.
       refreshStatsScreen(g_stats_screen);
       break;

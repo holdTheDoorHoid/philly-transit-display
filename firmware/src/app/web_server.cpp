@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstring>
 #include <ctime>
+#include <memory>
 
 #include "auth.h"
 #include "config_store.h"
@@ -79,6 +80,22 @@ void serializeArrival(const Arrival &a, JsonObject o, transit::Epoch now) {
   o["late_known"] = a.late_known;
   o["status"] = statusToString(a.status);
   o["seats"] = a.seats;
+  o["sched_trip"] = a.sched_trip;  // matched static-schedule trip id, "" when unmatched (DESIGN.md SS7)
+}
+
+// transit::Health as the wire token GET /api/state uses (model.h, DESIGN.md SS4.7/SS7).
+const char *healthToString(transit::Health h) {
+  switch (h) {
+    case transit::Health::Live:
+      return "live";
+    case transit::Health::ScheduleOnly:
+      return "schedule_only";
+    case transit::Health::Stale:
+      return "stale";
+    case transit::Health::Unavailable:
+    default:
+      return "unavailable";
+  }
 }
 
 void serializeSnapshot(const Snapshot &snap, JsonObject out) {
@@ -104,6 +121,9 @@ void serializeSnapshot(const Snapshot &snap, JsonObject out) {
     }
     so["ok"] = s.ok;
     so["error"] = s.error;
+    so["health"] = healthToString(s.health);
+    so["source_ts"] = s.source_ts;  // when SEPTA produced the data; 0 = the feed carried no timestamp
+    so["source_age_s"] = s.source_ts > 0 ? (int64_t)(now - s.source_ts) : (int64_t)-1;
     so["weather_note"] = stopWeatherNote(s.key, s.arrivals.empty() ? 0 : s.arrivals.front().effective());
     JsonArray arrivals = so["arrivals"].to<JsonArray>();
     for (const Arrival &a : s.arrivals) {
@@ -115,7 +135,8 @@ void serializeSnapshot(const Snapshot &snap, JsonObject out) {
   JsonObject weather = out["weather"].to<JsonObject>();
   weather["enabled"] = cfg.weather.enabled;  // the config, not the last poll: a save applies at once
   weather["units"] = wv.fahrenheit ? "f" : "c";
-  weather["age_s"] = wv.fetched_epoch > 0 ? (int64_t)now - (int64_t)wv.fetched_epoch : -1;
+  weather["age_s"] = wv.age_s;  // main location's last SUCCESS, millis-based, -1 = never (F29)
+  weather["stale"] = wv.stale;  // over 60 min old: the device suppresses the header icon and notes
   if (cfg.weather.enabled && wv.main.valid()) {
     JsonObject m = weather["main"].to<JsonObject>();
     m["temp"] = wv.main.temp;
@@ -331,6 +352,9 @@ void handleGetState(AsyncWebServerRequest *request) {
   sdj["mounted"] = sd.mounted;
   sdj["free_mb"] = (double)sd.free_bytes / (1024.0 * 1024.0);
   sdj["log_bytes"] = logBytes();
+  sdj["dropped_rows"] = sd.dropped_rows;  // F26: rows that did not land on the card since boot
+  sdj["write_ok"] = sd.last_write_ok;
+  sdj["error"] = sd.error;
 
   PollStatus poll = getPollStatus();
   JsonObject last_poll = doc["last_poll"].to<JsonObject>();
@@ -748,12 +772,23 @@ bool handleLogDownload(AsyncWebServerRequest *request) {
     sendError(request, 400, "not a log filename");
     return true;
   }
-  File f = openLogFile(filename);
-  if (!f) {
+  // One download at a time (F26): the SD mount allows two open files and the poller's append
+  // needs one of them. The export re-emits every row in schema v3 (F24/F25) through a chunked
+  // response; the reader lease is released by the response's completion/disconnect callback.
+  if (!acquireLogReader()) {
+    sendError(request, 503, "a log download is already running, try again");
+    return true;
+  }
+  auto exp = std::make_shared<LogExport>(filename);
+  if (!exp->ok()) {
+    releaseLogReader();
     sendError(request, 404, "no log for that month");
     return true;
   }
-  AsyncWebServerResponse *response = request->beginResponse(f, filename.c_str(), "text/csv", true);
+  AsyncWebServerResponse *response = request->beginChunkedResponse(
+      "text/csv", [exp](uint8_t *buf, size_t maxLen, size_t /*index*/) -> size_t { return exp->fill(buf, maxLen); });
+  response->addHeader("Content-Disposition", (String("attachment; filename=\"") + filename.c_str() + "\"").c_str());
+  request->onDisconnect([]() { releaseLogReader(); });
   request->send(response);
   return true;
 }
