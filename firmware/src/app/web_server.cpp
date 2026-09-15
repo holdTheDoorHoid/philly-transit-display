@@ -11,12 +11,14 @@
 #include <cstring>
 #include <ctime>
 
+#include "auth.h"
 #include "config_store.h"
 #include "demo_data.h"
 #include "net_poller.h"
 #include "weather_service.h"
 #include "ui/ui.h"
 #include <esp_heap_caps.h>
+#include <esp_ota_ops.h>
 #include "bike_service.h"
 #include "profiles.h"
 #include "proxy_worker.h"
@@ -34,6 +36,9 @@
 
 #ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION "unknown"
+#endif
+#ifndef BOARD_NAME
+#define BOARD_NAME "unknown"
 #endif
 
 using transit::Alert;
@@ -195,6 +200,105 @@ void sendError(AsyncWebServerRequest *request, int code, const std::string &mess
   sendJson(request, code, doc);
 }
 
+// ---------------------------------------------------------------------------
+// Authentication and cross-origin defence (DESIGN.md SS12; review F01/F05)
+// ---------------------------------------------------------------------------
+
+// THE single place a protected handler asks "may this request change something?". Every
+// state-changing route calls requirePin() first and returns immediately if it answers false;
+// there are deliberately no ad-hoc PIN comparisons anywhere else in this file, so the policy
+// (which statuses, which bodies, the lockout) only ever has to be right once.
+//
+// The PIN travels in the custom header `X-Pin`, not a cookie and not a query parameter. That is
+// what makes a blind cross-site POST harmless: a form or <img> from a malicious page can reach
+// the device's LAN address, but the browser will not attach a custom header to a cross-origin
+// request without a CORS preflight, and this server answers no preflight and sends no
+// Access-Control-Allow-* header. A query parameter would land in browser history and server logs;
+// a cookie would be sent automatically and re-open exactly the hole this closes.
+constexpr const char *kPinHeader = "X-Pin";
+
+// The status and body a rejected request gets. Kept as a value because the OTA upload handler
+// decides at the first chunk (index == 0) but can only answer from its final handler.
+struct ApiFailure {
+  int status = 401;
+  std::string message = "pin required";
+  uint32_t retry_s = 0;  // 429 only
+};
+
+bool checkPin(AsyncWebServerRequest *request, ApiFailure &fail) {
+  const AsyncWebHeader *h = request->getHeader(kPinHeader);
+  auth::Check c = auth::check(h ? h->value().c_str() : nullptr);
+  switch (c.result) {
+    case auth::Result::Ok:
+      return true;
+    case auth::Result::Missing:
+      fail = {401, "pin required", 0};
+      return false;
+    case auth::Result::Wrong:
+      fail = {401, "wrong pin", 0};
+      return false;
+    case auth::Result::Locked:
+    default:
+      fail = {429, "too many attempts", c.retry_s};
+      return false;
+  }
+}
+
+void sendFailure(AsyncWebServerRequest *request, const ApiFailure &fail) {
+  if (fail.status == 429) {
+    JsonDocument doc;
+    doc["error"] = fail.message;
+    doc["retry_s"] = fail.retry_s;
+    sendJson(request, 429, doc);
+    return;
+  }
+  sendError(request, fail.status, fail.message);
+}
+
+// What every protected handler calls as its first statement: answers the request itself and
+// returns false when the caller may not proceed.
+bool requirePin(AsyncWebServerRequest *request) {
+  ApiFailure fail;
+  if (checkPin(request, fail)) return true;
+  sendFailure(request, fail);
+  return false;
+}
+
+// The device name, lower-cased. Kept here rather than read from getActiveConfig() on every
+// request: hostAllowed() runs before every handler, and copying the whole Config (eight stops of
+// std::strings) per request on a 75 KB heap is real churn for one field. Written only by
+// setHostName() - from startWebServer() and the PUT /api/config handler, both on the async web
+// server's own task, so no lock is needed.
+std::string g_host_name;
+
+void setHostName(const std::string &name) {
+  g_host_name = name;
+  for (char &c : g_host_name) c = (char)tolower((unsigned char)c);
+}
+
+// DNS rebinding defence (review F05). A page on the public internet can make the browser resolve
+// its own hostname to 192.168.1.x and then talk to this device with the *attacker's* origin -
+// which defeats same-origin policy entirely, because as far as the browser is concerned the
+// device is the attacker's site. The one thing the attacker cannot forge is the Host header: it
+// carries their domain, not ours. So every request must name the device by one of the ways the
+// owner can legitimately reach it, and anything else gets 421 (Misdirected Request) before a
+// handler runs.
+bool hostAllowed(const AsyncWebServerRequest *request) {
+  std::string host = request->host().c_str();
+  if (host.empty()) return false;  // HTTP/1.1 requires a Host header; a client without one is not the web UI
+  // Strip an optional ":port" (IPv6 literals are not a case this device can be reached by).
+  size_t colon = host.rfind(':');
+  if (colon != std::string::npos) host.resize(colon);
+  for (char &c : host) c = (char)tolower((unsigned char)c);
+  if (host.empty()) return false;
+
+  if (host == "localhost" || host == "192.168.4.1") return true;  // ssh tunnel / setup AP
+  if (host == std::string(WiFi.localIP().toString().c_str())) return true;
+
+  if (g_host_name.empty()) return false;
+  return host == g_host_name || host == g_host_name + ".local";
+}
+
 // Reboots shortly after the current request's response has had a chance to
 // go out - calling ESP.restart() directly inside the handler risks cutting
 // the HTTP response off mid-flight.
@@ -236,6 +340,15 @@ void handleGetState(AsyncWebServerRequest *request) {
   last_poll["error"] = poll.last_error;
 
   doc["firmware_version"] = FIRMWARE_VERSION;
+  // The board this image was built for (DESIGN.md SS7). Also what POST /api/ota refuses a
+  // mismatching upload against, so the web UI can name it in the error it shows.
+  doc["board"] = BOARD_NAME;
+  // SS7: so the web UI can say "this needs the PIN" before it makes the user fill in a form, and
+  // so a future build could report false if the owner ever turns the PIN off.
+  doc["auth"]["pin_required"] = true;
+  // SS6 safe-save: true when the last boot had to fall back to /config.prev.json because
+  // /config.json was missing or unreadable. The UI surfaces it; nothing else changes.
+  doc["config_recovered"] = configRecovered();
 
   // NB: doc.as<JsonObject>(), not .to<JsonObject>() - the latter clears the
   // document, which would wipe the time/uptime/heap/wifi/sd/last_poll
@@ -279,6 +392,7 @@ bool dataSettingsChanged(const Config &a, const Config &b) {
 }
 
 void handlePutConfig(AsyncWebServerRequest *request, JsonVariant &json, const std::function<void(bool)> &onConfigChanged) {
+  if (!requirePin(request)) return;
   Config cfg;
   ConfigError err;
   if (!jsonToConfig(json, cfg, err)) {
@@ -291,6 +405,7 @@ void handlePutConfig(AsyncWebServerRequest *request, JsonVariant &json, const st
   }
   bool data_changed = dataSettingsChanged(getActiveConfig(), cfg);
   setActiveConfig(cfg);
+  setHostName(cfg.device.name);  // a rename changes which Host headers are accepted (review F05)
   if (onConfigChanged) {
     onConfigChanged(data_changed);
   }
@@ -299,7 +414,29 @@ void handlePutConfig(AsyncWebServerRequest *request, JsonVariant &json, const st
   sendJson(request, 200, doc);
 }
 
+// DESIGN.md SS7: POST /api/pin, body {"pin":"new"}, authenticated with the CURRENT pin in X-Pin.
+// There is deliberately no "forgot my PIN" endpoint: the recovery path is physical (the serial
+// console at boot, or the device info screen), see auth.h.
+void handlePostPin(AsyncWebServerRequest *request, JsonVariant &json) {
+  if (!requirePin(request)) return;
+  JsonVariantConst body = json;
+  if (!body["pin"].is<const char *>()) {
+    sendError(request, 400, "body must be {\"pin\":\"...\"}", "pin");
+    return;
+  }
+  std::string next = std::string(body["pin"].as<const char *>());
+  std::string error;
+  if (!auth::setPin(next, error)) {
+    sendError(request, 400, error, "pin");
+    return;
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  sendJson(request, 200, doc);
+}
+
 void handlePostReboot(AsyncWebServerRequest *request) {
+  if (!requirePin(request)) return;
   JsonDocument doc;
   doc["ok"] = true;
   sendJson(request, 200, doc);
@@ -307,6 +444,7 @@ void handlePostReboot(AsyncWebServerRequest *request) {
 }
 
 void handlePostWifiReset(AsyncWebServerRequest *request) {
+  if (!requirePin(request)) return;
   JsonDocument doc;
   doc["ok"] = true;
   sendJson(request, 200, doc);
@@ -317,52 +455,212 @@ void handlePostWifiReset(AsyncWebServerRequest *request) {
   scheduleRestart();
 }
 
-// DESIGN.md SS7/SS12: "POST /api/ota; multipart `firmware` field; reboots on success." Refuses to
-// even start when free heap is below kMinOtaFreeHeap - flashing a new image needs a contiguous
-// scratch buffer plus everything else already running (LVGL, Wi-Fi/TLS, the poller), and starting
-// anyway just to fail partway through is worse than refusing up front. State is file-scope
-// (single AsyncWebServer, one OTA at a time in practice - a LAN device, not a fleet) rather than
-// per-request, since ArUploadHandlerFunction has no natural place to stash it across calls other
-// than the request object itself, and this is simpler.
+// DESIGN.md SS7/SS12: "POST /api/ota; multipart `firmware` field; reboots on success."
+//
+// The whole upload is one transaction with an explicit outcome (review F08). The old version
+// started from g_ota_ok = true, so a POST that never delivered a byte - no file part, a client
+// that vanished, an unauthorised caller - answered 200 and rebooted into whatever was in the OTA
+// slot. Now nothing is "ok" until the final chunk has been seen AND Update.end(true) has
+// succeeded AND the image proved it was built for this board.
+//
+// Admission checks happen at index == 0, before Update.begin(), because that is the last moment
+// at which refusing costs nothing: after it, ~1.7 MB is already on the wire.
 constexpr size_t kMinOtaFreeHeap = 60 * 1024;
-bool g_ota_ok = true;
-std::string g_ota_error;
+// Update.write() needs a contiguous scratch buffer; free heap alone can be healthy while the
+// largest block is fragmented down to a few KB, which is how a mid-flash failure used to happen
+// on a device that had been up for days (firmware/README.md, "Memory and flash budget").
+constexpr size_t kMinOtaLargestBlock = 16 * 1024;
 
-void handleOtaUpload(AsyncWebServerRequest * /*request*/, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
-  if (index == 0) {
-    g_ota_ok = true;
-    g_ota_error.clear();
-    log_w("web_server: OTA upload starting: %s", filename.c_str());
-    if (ESP.getFreeHeap() < kMinOtaFreeHeap) {
-      g_ota_ok = false;
-      g_ota_error = "refusing OTA: free heap below 60KB";
-    } else if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-      g_ota_ok = false;
-      g_ota_error = Update.errorString();
+// Board identity, stamped into .rodata of every build and therefore into every firmware.bin
+// (review F08: there is no firmware signing, but flashing a 2.4"-capacitive image onto a 3.5"
+// resistive board bricks the display until someone reaches it with a USB cable). The upload is
+// searched for the RUNNING device's own marker; the trailing ';' is part of the pattern so
+// "cyd-2432S028R;" cannot match inside "cyd-2432S028Rv3;". `used` keeps the compiler from
+// dropping it; it is referenced below anyway, which is what keeps the linker from doing so.
+const char kBoardMarker[] __attribute__((used, section(".rodata"))) = "PTD-BOARD:" BOARD_NAME ";";
+constexpr size_t kBoardMarkerLen = sizeof(kBoardMarker) - 1;
+
+struct OtaState {
+  const void *owner = nullptr;  // the request whose outcome this struct describes
+  bool busy = false;            // a flash-writing upload is in progress
+  bool writing = false;         // Update.begin() succeeded and Update.end() has not run yet
+  bool ok = false;              // F08: starts false, set only when everything has succeeded
+  bool final_seen = false;
+  int status = 500;
+  std::string error;
+  uint32_t retry_s = 0;  // set with status 429 (PIN lockout), so the final handler can repeat it
+  size_t written = 0;
+  size_t marker_match = 0;  // how many bytes of kBoardMarker the stream has matched so far
+  bool marker_found = false;
+};
+OtaState g_ota;
+
+// The OTA slot is the hard ceiling on the image: Update would fail late with "Not enough space",
+// after the whole upload has been drained. Knowing the size up front lets the transfer be cut off
+// as soon as it is provably too big.
+size_t otaSlotSize() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  return running != nullptr ? running->size : 0;
+}
+
+void otaFail(int status, const std::string &message) {
+  g_ota.ok = false;
+  g_ota.status = status;
+  g_ota.error = message;
+  if (g_ota.writing) {
+    Update.abort();
+    g_ota.writing = false;
+  }
+  g_ota.busy = false;
+}
+
+// Releases the transaction when the client goes away (review F08: without this a client that
+// disconnects mid-upload leaves `busy` set forever and Update holding the partition, so every
+// later OTA answers 409 until the device is rebooted).
+void otaRelease(const void *owner) {
+  if (g_ota.owner != owner) return;  // a newer upload already took over; leave its state alone
+  if (g_ota.writing) {
+    log_w("web_server: OTA client disconnected mid-image, aborting");
+    Update.abort();
+    g_ota.writing = false;
+    g_ota.ok = false;
+    g_ota.status = 400;
+    g_ota.error = "upload disconnected before the image was complete";
+  }
+  g_ota.busy = false;
+}
+
+// Streaming search for kBoardMarker. The marker can straddle any two chunks, so the match length
+// carries across calls; on a mismatch it backs off to the longest prefix of the marker that is
+// still a suffix of what was matched (a hand-rolled KMP step - the fallback loop only runs on the
+// rare mismatch-after-partial-match, so it costs nothing on the ~1.7 MB happy path).
+void otaScanForMarker(const uint8_t *data, size_t len) {
+  if (g_ota.marker_found) return;
+  size_t m = g_ota.marker_match;
+  for (size_t i = 0; i < len; ++i) {
+    uint8_t b = data[i];
+    while (m > 0 && (uint8_t)kBoardMarker[m] != b) {
+      size_t k = m - 1;
+      while (k > 0 && memcmp(kBoardMarker, kBoardMarker + m - k, k) != 0) --k;
+      m = k;
+    }
+    if ((uint8_t)kBoardMarker[m] == b) ++m;
+    if (m == kBoardMarkerLen) {
+      g_ota.marker_found = true;
+      g_ota.marker_match = 0;
+      return;
     }
   }
-  if (!g_ota_ok) return;  // still drains the rest of the upload; just ignores the bytes
+  g_ota.marker_match = m;
+}
 
-  if (Update.write(data, len) != len) {
-    g_ota_ok = false;
-    g_ota_error = Update.errorString();
-    return;
+void handleOtaUpload(AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
+  if (index == 0) {
+    if (g_ota.busy && g_ota.owner != request) {
+      // Someone else is already flashing. Do not touch their state; handlePostOta() answers 409
+      // for this request because it never becomes the owner.
+      return;
+    }
+    g_ota = OtaState{};
+    g_ota.owner = request;
+    g_ota.status = 500;
+    // Fires on client disconnect, including the normal end of the request, so the transaction is
+    // released on every path out of here.
+    request->onDisconnect([request]() { otaRelease(request); });
+
+    ApiFailure fail;
+    if (!checkPin(request, fail)) {
+      // Unauthorised: record the outcome, write nothing, and hang up rather than politely
+      // draining 1.7 MB of an attacker's upload through a device with 75 KB of heap. The final
+      // handler replays `fail` as the response if the close still lets one out.
+      g_ota.ok = false;
+      g_ota.status = fail.status;
+      g_ota.error = fail.message;
+      g_ota.retry_s = fail.retry_s;
+      g_ota.busy = false;
+      if (request->client() != nullptr) request->client()->close();
+      return;
+    }
+
+    log_w("web_server: OTA upload starting: %s", filename.c_str());
+    size_t free_heap = ESP.getFreeHeap();
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    if (free_heap < kMinOtaFreeHeap) {
+      otaFail(503, "refusing OTA: free heap " + std::to_string(free_heap / 1024) + " KB is below 60 KB");
+      return;
+    }
+    if (largest < kMinOtaLargestBlock) {
+      otaFail(503, "refusing OTA: largest free block " + std::to_string(largest / 1024) + " KB is below 16 KB");
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      otaFail(500, Update.errorString());
+      return;
+    }
+    g_ota.busy = true;
+    g_ota.writing = true;
+    g_ota.ok = true;
   }
-  if (final && !Update.end(true)) {
-    g_ota_ok = false;
-    g_ota_error = Update.errorString();
+
+  if (g_ota.owner != request || !g_ota.writing) return;  // rejected above; ignore the bytes
+
+  if (len > 0) {  // the final call can carry no bytes at all
+    size_t slot = otaSlotSize();
+    if (slot != 0 && g_ota.written + len > slot) {
+      otaFail(413, "firmware image is larger than the " + std::to_string(slot) + " byte OTA slot");
+      if (request->client() != nullptr) request->client()->close();
+      return;
+    }
+    if (Update.write(data, len) != len) {
+      otaFail(500, Update.errorString());
+      return;
+    }
+    g_ota.written += len;
+    otaScanForMarker(data, len);
+  }
+
+  if (final) {
+    g_ota.final_seen = true;
+    // The board check runs BEFORE Update.end(): an image for another board is a valid ESP32 image
+    // and would pass end()'s own checks, and once end() has run the partition is marked bootable.
+    if (!g_ota.marker_found) {
+      otaFail(400, std::string("firmware is for a different board (expected ") + BOARD_NAME + ")");
+      return;
+    }
+    if (!Update.end(true)) {
+      otaFail(500, Update.errorString());
+      return;
+    }
+    g_ota.writing = false;
+    g_ota.busy = false;
   }
 }
 
 void handlePostOta(AsyncWebServerRequest *request) {
-  if (!g_ota_ok) {
-    sendError(request, 500, g_ota_error.empty() ? "OTA failed" : g_ota_error);
+  if (g_ota.owner == request) {
+    if (!g_ota.ok) {
+      sendFailure(request, ApiFailure{g_ota.status, g_ota.error.empty() ? "OTA failed" : g_ota.error, g_ota.retry_s});
+      return;
+    }
+    if (!g_ota.final_seen) {
+      // Update.end() was never reached: the multipart body ended without a final chunk.
+      sendError(request, 400, "upload ended before the image was complete");
+      return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["bytes"] = g_ota.written;
+    doc["board"] = BOARD_NAME;
+    sendJson(request, 200, doc);
+    scheduleRestart();
     return;
   }
-  JsonDocument doc;
-  doc["ok"] = true;
-  sendJson(request, 200, doc);
-  scheduleRestart();
+  // Never became the owner: either no file part arrived at all, or another upload holds the flash.
+  if (!request->hasParam("firmware", true, true)) {
+    sendError(request, 400, "no firmware file");
+    return;
+  }
+  sendError(request, 409, "another firmware upload is in progress");
 }
 
 // DESIGN.md SS7 setup-wizard proxies: both just queue the job to proxy_worker.cpp's own task
@@ -442,6 +740,10 @@ bool handleLogDownload(AsyncWebServerRequest *request) {
   const std::string prefix = "/api/log/";
   if (url.rfind(prefix, 0) != 0) return false;
   std::string filename = url.substr(prefix.size());
+  // PIN-protected even though it only reads (DESIGN.md SS12): the CSV is a month of the owner's
+  // movements - when they leave the house and which stop they leave from - which is the most
+  // personal thing this device holds. `GET /api/log/index` (file names and sizes) stays open.
+  if (!requirePin(request)) return true;
   if (!isLogFilename(filename)) {
     sendError(request, 400, "not a log filename");
     return true;
@@ -480,6 +782,18 @@ void handleWebAsset(AsyncWebServerRequest *request, const transit_web::WebAsset 
   response->addHeader("Content-Encoding", "gzip");
   response->addHeader("ETag", transit_web::WEB_ASSETS_ETAG);
   response->addHeader("Cache-Control", is_index ? "no-cache" : "max-age=3600");
+  if (is_index) {
+    // Review F05, on the document that carries the app: a hostile page that frames this UI can
+    // read nothing across origins, but it can bait clicks onto controls the owner cannot see.
+    // Both headers say the same thing to old and new browsers. No script-src directive on
+    // purpose - the Stops page loads Leaflet from a CDN (DESIGN.md SS10) and a CSP that forbids it
+    // would break the map silently; the frame directives cost nothing and break nothing.
+    response->addHeader("X-Frame-Options", "DENY");
+    response->addHeader("Content-Security-Policy", "frame-ancestors 'none'");
+    // The UI is served gzipped from PROGMEM with fixed content types; nosniff stops a browser
+    // deciding for itself that one of them is something executable.
+    response->addHeader("X-Content-Type-Options", "nosniff");
+  }
   request->send(response);
 }
 
@@ -494,9 +808,22 @@ void registerWebAssets() {
 }  // namespace
 
 void startWebServer(std::function<void(bool)> onConfigChanged) {
+  setHostName(getActiveConfig().device.name);
+
+  // Runs before any handler, for every route including the static assets and the 404 (review
+  // F05). Registered first so nothing can be reached without passing it.
+  g_server.addMiddleware([](AsyncWebServerRequest *request, ArMiddlewareNext next) {
+    if (!hostAllowed(request)) {
+      sendError(request, 421, "this device is not reachable under that host name");
+      return;
+    }
+    next();
+  });
+
   g_server.on("/api/state", HTTP_GET, handleGetState);
   g_server.on("/api/config", HTTP_GET, handleGetConfig);
   g_server.on("/api/config", HTTP_PUT, [onConfigChanged](AsyncWebServerRequest *request, JsonVariant &json) { handlePutConfig(request, json, onConfigChanged); });
+  g_server.on("/api/pin", HTTP_POST, [](AsyncWebServerRequest *request, JsonVariant &json) { handlePostPin(request, json); });
   g_server.on("/api/reboot", HTTP_POST, handlePostReboot);
   // Test hooks (DESIGN.md SS7): what the screen is doing, and a simulated touch.
   g_server.on("/api/debug/ui", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -525,6 +852,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     sendJson(request, 200, doc);
   });
   g_server.on("/api/debug/tap", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!requirePin(request)) return;  // it changes what the screen shows, so it is state-changing
     ui::requestTap();
     request->send(200, "application/json", "{\"ok\":true}");
   });

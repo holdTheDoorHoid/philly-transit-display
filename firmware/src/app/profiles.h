@@ -30,11 +30,25 @@ inline int activeProfileIndex(const Config &cfg, time_t now) {
 }
 
 // The stops the main page should show, in order: the active profile's list, else every stop.
+//
+// De-duplicates defensively (review F07). jsonToConfig() rejects a profile that lists the same
+// key twice, but this runs against whatever is in memory - including a config written by an older
+// firmware that had no such check - and a repeated key would build two panels for one stop, each
+// with its own LVGL object tree, halving the room the other stops get for no reason the owner
+// could diagnose from the screen.
 inline std::vector<transit::StopConfig> visibleStops(const Config &cfg, time_t now) {
   int idx = activeProfileIndex(cfg, now);
   if (idx < 0) return cfg.stops;
   std::vector<transit::StopConfig> out;
   for (const std::string &key : cfg.profiles[(size_t)idx].stops) {
+    bool already = false;
+    for (const transit::StopConfig &o : out) {
+      if (o.key == key) {
+        already = true;
+        break;
+      }
+    }
+    if (already) continue;
     for (const transit::StopConfig &s : cfg.stops) {
       if (s.key == key) {
         out.push_back(s);
