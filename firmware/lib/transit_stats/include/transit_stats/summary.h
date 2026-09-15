@@ -9,12 +9,17 @@ namespace transit_stats {
 
 class StatsAggregator;
 
-// sizeof(StopSummary) is 16 bytes: cheap enough to keep one per configured stop (up to 8) in
+// sizeof(StopSummary) is 24 bytes: cheap enough to keep one per configured stop (up to 8) in
 // LVGL UI state with no meaningful memory cost.
 struct StopSummary {
   uint32_t samples = 0;       // total `arrive` events in the aggregator's window
-  float on_time_pct = 0.0f;   // 0..100, SEPTA on-time definition (see aggregate.h)
-  float mean_late_min = 0.0f; // mean over samples with known late_min
+  uint32_t late_known = 0;    // of those, how many carried a known late_min
+  // on_time_pct IS ONLY MEANINGFUL WHEN has_on_time IS TRUE. With no known-lateness sample there
+  // is no percentage to show, and 0.0f would read on the stats screen as "0% on time" -- the
+  // worst possible answer to a question we simply cannot answer (F21). Render a dash instead.
+  bool has_on_time = false;
+  float on_time_pct = 0.0f;   // 0..100 over late_known samples, SEPTA definition (aggregate.h)
+  float mean_late_min = 0.0f; // mean over samples with known late_min; 0 when late_known == 0
   int8_t worst_hour = -1;     // hour (0-23) with the highest mean lateness; -1 if no data
   uint32_t ghosts = 0;        // ghost count in the window
 };
