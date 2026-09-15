@@ -225,10 +225,15 @@ class GtfsRtStream {
 
   // Longest identifier (trip/route/vehicle/stop id) retained; longer values are truncated.
   static constexpr size_t kMaxIdentifierChars = 48;
-  // Defaults for retainUpdates(). 64 updates is ~8x what this device's 8-stop maximum
-  // (DESIGN.md 6) can display, and 12 per (stop, route) is 3x the 4-row panel maximum.
-  static constexpr size_t kDefaultMaxRetainedUpdates = 64;
-  static constexpr size_t kDefaultMaxPerStopRoute = 12;
+  // Defaults for retainUpdates(). 32 updates is 4x what this device's 8-stop maximum
+  // (DESIGN.md 6) can display, and 8 per (stop, route) is 2x the 4-row panel maximum. They were
+  // 64/12 for one day: reserve(64) is a ~10 KB contiguous block on the ESP32 (sizeof
+  // StopTimeUpdate is ~150 B there), and on the owner's board the largest free block between
+  // polls is 10-20 KB, so the reservation itself threw bad_alloc in the poller (2026-09-15,
+  // device suite). Halving it keeps the block under ~5 KB, the size the unbounded vector used to
+  // reach anyway on a normal day.
+  static constexpr size_t kDefaultMaxRetainedUpdates = 32;
+  static constexpr size_t kDefaultMaxPerStopRoute = 8;
 
  private:
   enum class State : uint8_t {

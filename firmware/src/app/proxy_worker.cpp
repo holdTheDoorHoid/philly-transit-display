@@ -339,12 +339,19 @@ void runOverviewJob(const ProxyJob &job) {
 
 void runJob(const ProxyJob &job) {
   if (!requestStillAlive(job)) return;  // client vanished before we even started
-  if (job.kind == ProxyKind::Stats) {
-    runStatsJob(job);
-  } else if (job.kind == ProxyKind::Overview) {
-    runOverviewJob(job);
-  } else {
-    runFetchJob(job);
+  // Same guard as net_poller.cpp's pollOnce(): a bad_alloc here used to be a reboot (exceptions
+  // are enabled in this SDK and nothing caught them). The browser gets a 503 and retries.
+  try {
+    if (job.kind == ProxyKind::Stats) {
+      runStatsJob(job);
+    } else if (job.kind == ProxyKind::Overview) {
+      runOverviewJob(job);
+    } else {
+      runFetchJob(job);
+    }
+  } catch (const std::bad_alloc &) {
+    Serial.printf("[proxy] out of memory running a queued job (free %u)\n", (unsigned)ESP.getFreeHeap());
+    if (auto r = lockRequest(job)) r->send(503, "application/json", "{\"error\":\"out of memory, try again\"}");
   }
 }
 

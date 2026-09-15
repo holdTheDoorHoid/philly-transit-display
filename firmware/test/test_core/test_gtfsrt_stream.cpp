@@ -312,7 +312,7 @@ void test_gtfsrt_retention_cap_holds_at_the_cap_with_500_matching_entities() {
   GtfsRtStream stream;
   stream.setRouteFilter({"17"});
   stream.setStopFilter({"21332"});
-  stream.retainUpdates();  // defaults: 64 total, 12 per (stop, route)
+  stream.retainUpdates();  // defaults: kDefaultMaxRetainedUpdates total, kDefaultMaxPerStopRoute per (stop, route)
   TEST_ASSERT_TRUE(stream.push(msg.data(), msg.size()));
   TEST_ASSERT_TRUE(stream.finish() == transit::FeedStatus::Complete);
 
@@ -320,17 +320,18 @@ void test_gtfsrt_retention_cap_holds_at_the_cap_with_500_matching_entities() {
   TEST_ASSERT_EQUAL_UINT32(500, stream.entitiesMatched());
   TEST_ASSERT_EQUAL_UINT32(500, stream.updatesMatched());
   // All 500 are the same (stop, route), so the per-pair cap is what binds here.
-  TEST_ASSERT_EQUAL_UINT32(12, static_cast<uint32_t>(stream.retained().size()));
-  TEST_ASSERT_EQUAL_UINT32(488, stream.updatesDroppedByCap());
+  TEST_ASSERT_EQUAL_UINT32(GtfsRtStream::kDefaultMaxPerStopRoute, static_cast<uint32_t>(stream.retained().size()));
+  TEST_ASSERT_EQUAL_UINT32(500 - GtfsRtStream::kDefaultMaxPerStopRoute, stream.updatesDroppedByCap());
 
-  // What survived is the 12 nearest, i.e. the last 12 entities in wire order.
+  // What survived is the N nearest (N = kDefaultMaxPerStopRoute), i.e. the last N in wire order.
+  const int64_t n = (int64_t)GtfsRtStream::kDefaultMaxPerStopRoute;
   int64_t worst = 0;
   for (const auto& u : stream.retained()) {
     TEST_ASSERT_TRUE(u.arrival_time >= kBase + 60);
-    TEST_ASSERT_TRUE(u.arrival_time <= kBase + 12 * 60);
+    TEST_ASSERT_TRUE(u.arrival_time <= kBase + n * 60);
     if (u.arrival_time > worst) worst = u.arrival_time;
   }
-  TEST_ASSERT_EQUAL_INT64(kBase + 12 * 60, worst);
+  TEST_ASSERT_EQUAL_INT64(kBase + n * 60, worst);
 }
 
 // With many distinct (stop, route) pairs it is the global cap that binds, and it binds hard.
@@ -350,10 +351,10 @@ void test_gtfsrt_retention_global_cap_across_many_stops() {
   TEST_ASSERT_TRUE(stream.push(msg.data(), msg.size()));
   stream.finish();
 
-  TEST_ASSERT_EQUAL_UINT32(64, static_cast<uint32_t>(stream.retained().size()));
-  TEST_ASSERT_EQUAL_UINT32(436, stream.updatesDroppedByCap());
+  TEST_ASSERT_EQUAL_UINT32(GtfsRtStream::kDefaultMaxRetainedUpdates, static_cast<uint32_t>(stream.retained().size()));
+  TEST_ASSERT_EQUAL_UINT32(500 - GtfsRtStream::kDefaultMaxRetainedUpdates, stream.updatesDroppedByCap());
   for (const auto& u : stream.retained()) {
-    TEST_ASSERT_TRUE(u.arrival_time <= kBase + 64 * 60);  // the nearest 64 kept
+    TEST_ASSERT_TRUE(u.arrival_time <= kBase + (int64_t)GtfsRtStream::kDefaultMaxRetainedUpdates * 60);  // the nearest N kept
   }
 }
 

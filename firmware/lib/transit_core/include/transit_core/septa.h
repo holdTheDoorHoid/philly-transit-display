@@ -54,7 +54,7 @@ struct ParseResult {
 // what a transit display actually needs (the soonest arrivals - a far-future row is worthless
 // next to the next bus). Real payloads are far under these numbers, so nothing is dropped in
 // normal operation; see ParseResult::dropped when it is.
-constexpr size_t kMaxTvVehicles = 48;     // one route's tracked vehicles (real: 5-25)
+constexpr size_t kMaxTvVehicles = 32;     // one route's tracked vehicles (real: 5-25)
 constexpr size_t kMaxSchedEntries = 24;   // BusSchedules entries per stop, nearest kept (real: 4-12)
 constexpr size_t kMaxRailArrivals = 24;   // Arrivals trains per station, nearest kept (real: 10)
 constexpr size_t kMaxAlerts = 16;         // alert objects per route (real: 0-2)

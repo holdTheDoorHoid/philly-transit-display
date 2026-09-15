@@ -343,8 +343,7 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
     bool ok = true;
   };
   std::vector<RouteVehicles> tv_ok_by_route;
-  std::vector<TvVehicle> tv_all;
-  tv_all.reserve(rt_routes.size() * kMaxTvVehicles);
+  std::vector<TvVehicle> tv_all;  // grows per route; a cap-sized reserve() was a ~10-20 KB block
   for (const auto& route : rt_routes) {
     std::vector<TvVehicle> tv;
     FetchOutcome o = src.fetchTransitViewEx(route, &tv, http);

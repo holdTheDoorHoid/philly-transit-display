@@ -139,7 +139,9 @@ if newest:
     v2 = [l for l in lines[-40:] if l.count(',') == 20]
     check('A log rows are v2 (21 columns)', len(v2) > 0, (newest, len(lines), lines[-1][:80] if lines else ''))
     check('A log export header is schema v3 (temp_c)', lines and lines[0].startswith('ts,event,') and ',temp_c,' in lines[0], lines[0][:120] if lines else '')
-    check('A log export rows all have 21 columns', all(l.count(',') == 20 for l in lines[1:]), [l[:60] for l in lines[1:] if l.count(',') != 20][:3])
+    import csv as _csv
+    widths = [len(row) for row in _csv.reader(lines[1:])]
+    check('A log export rows all have 21 columns', all(w == 21 for w in widths), [(w, l[:60]) for w, l in zip(widths, lines[1:]) if w != 21][:3])
     check('A log has bike rows', any(',bike,indego-' in l for l in lines) or not base['bike'].get('enabled'), newest)
 
 # ---------- B. config round-trips ----------

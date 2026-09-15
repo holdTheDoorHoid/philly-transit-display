@@ -779,8 +779,34 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   g_last_poll_unsynced = !clockIsSane();
   transit::ScheduleCache &sched_cache = g_last_poll_unsynced ? static_cast<transit::ScheduleCache &>(nostore)
                                                              : static_cast<transit::ScheduleCache &>(g_sched_cache);
-  Snapshot bus_snap = transit::pollBusStops(bus_like, now, http, sched_cache);
-  Snapshot rail_snap = transit::pollRailStops(rail_like, now, http);
+  // C++ exceptions are on in this SDK (-fexceptions), and with nothing catching them a failed
+  // std::vector growth inside the fetch/parse path ended in std::terminate -> abort -> reboot
+  // (seen twice in the 2026-09-15 device suite: bad_alloc in pollBusStops while the web server
+  // was busy and the largest free block was ~10 KB). A poll that cannot get memory is a failed
+  // poll, reported per stop like any other outage, not a reset.
+  Snapshot bus_snap, rail_snap;
+  bool out_of_memory = false;
+  try {
+    bus_snap = transit::pollBusStops(bus_like, now, http, sched_cache);
+    rail_snap = transit::pollRailStops(rail_like, now, http);
+  } catch (const std::bad_alloc &) {
+    out_of_memory = true;
+  }
+  if (out_of_memory) {
+    Serial.printf("[net_poller] out of memory during the fetch (free %u, largest %u); reporting the poll as failed\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    bus_snap = Snapshot{};
+    rail_snap = Snapshot{};
+    for (const auto &s : cfg.stops) {
+      StopSnapshot ss;
+      ss.key = s.key;
+      ss.fetched = now;
+      ss.ok = false;
+      ss.health = transit::Health::Unavailable;
+      ss.error = "out of memory during fetch";
+      bus_snap.stops.push_back(std::move(ss));
+    }
+  }
 
   Snapshot combined;
   combined.stops = std::move(bus_snap.stops);

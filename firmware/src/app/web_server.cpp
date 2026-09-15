@@ -11,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <memory>
+#include <new>
 
 #include "auth.h"
 #include "config_store.h"
@@ -415,8 +416,21 @@ bool dataSettingsChanged(const Config &a, const Config &b) {
   return false;
 }
 
+void handlePutConfigInner(AsyncWebServerRequest *request, JsonVariant &json, const std::function<void(bool)> &onConfigChanged);
+
 void handlePutConfig(AsyncWebServerRequest *request, JsonVariant &json, const std::function<void(bool)> &onConfigChanged) {
   if (!requirePin(request)) return;
+  // Runs on the AsyncTCP task with the poller possibly mid-fetch: building a Config (strings,
+  // vectors) can throw bad_alloc under that pressure, and an uncaught throw is a reboot (see
+  // net_poller.cpp pollOnce). A 503 lets the browser retry a moment later.
+  try {
+    handlePutConfigInner(request, json, onConfigChanged);
+  } catch (const std::bad_alloc &) {
+    request->send(503, "application/json", "{\"error\":\"out of memory, retry\"}");
+  }
+}
+
+void handlePutConfigInner(AsyncWebServerRequest *request, JsonVariant &json, const std::function<void(bool)> &onConfigChanged) {
   Config cfg;
   ConfigError err;
   if (!jsonToConfig(json, cfg, err)) {

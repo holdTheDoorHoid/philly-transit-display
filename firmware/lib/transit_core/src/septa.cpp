@@ -264,7 +264,11 @@ ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len) {
 
   // A vehicle list has no "nearest" ordering to prefer (these are positions, not arrival times),
   // so the cap keeps the first kMaxTvVehicles in wire order and counts the rest.
-  result.items.reserve(kMaxTvVehicles);
+  // Grows as vehicles arrive rather than reserving the cap: sizeof(TvVehicle) is ~200 B on the
+  // ESP32, and one 48-slot reservation was a 9.6 KB contiguous block that bad_alloc'd against a
+  // 10-20 KB largest free block (2026-09-15). A real route is 5-25 vehicles; doubling from 8
+  // never asks for more than ~6 KB at once.
+  result.items.reserve(8);
   for (JsonObjectConst v : arr) {
     if (result.items.size() >= kMaxTvVehicles) {
       ++result.dropped;
