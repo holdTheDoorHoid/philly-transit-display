@@ -35,6 +35,25 @@ function appendChildren(el, children) {
 function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 function $(sel, root) { return (root || document).querySelector(sel); }
 
+// One or two plain sentences under a control, saying what it actually does. The owner is
+// not a programmer; a setting with no explanation is a setting nobody dares touch.
+function hint(...text) { return h('p', { class: 'hint' }, ...text); }
+
+// Hints used in more than one place (the add wizard and the edit form show the same
+// fields), kept together so the wording cannot drift apart.
+const HINT_SHOW_ROWS = 'How many upcoming arrivals to list for this stop. The screen may '
+  + 'fit fewer than you ask for when several stops share it.';
+const HINT_TITLE_STYLE = 'How this stop is titled on the device’s screen. “Label → '
+  + 'destination” reads “17 Southbound → 20th-Johnston”; “Label only” reads “17 '
+  + 'Southbound”; “Route → destination • stop” reads “17 → 20th-Johnston • 19th St & '
+  + 'Mifflin St”; “Custom text” shows exactly what you type.';
+const HINT_ALT_OF = 'Normally every stop is always on screen. Pick another stop here and '
+  + 'this one hides itself until that stop has nothing coming within the minutes below — '
+  + 'useful for a backup route you only want to see when your usual one is a long way off.';
+const HINT_RAIL_LINE = 'Leave this on “Any line” to see every train at this station going '
+  + 'that way, or pick one line to show only its trains. SEPTA identifies lines by the '
+  + 'three-letter code shown here.';
+
 /* ======================== formatting helpers ======================== */
 
 function fmtClock(epochSec) {
@@ -94,10 +113,93 @@ function haversineMiles(lat1, lng1, lat2, lng2) {
 /* ======================== API layer (DESIGN.md §7) ======================== */
 
 class ApiError extends Error {
-  constructor(message, path, status) { super(message); this.path = path; this.status = status; }
+  constructor(message, path, status, retryS) {
+    super(message);
+    this.path = path;
+    this.status = status;
+    this.retry_s = retryS;
+  }
 }
 
-async function fetchJSON(url, opts) {
+/* ---- Admin PIN.
+   The device asks for a PIN before anything that changes it (PUT /api/config,
+   POST /api/reboot | /api/wifi/reset | /api/ota | /api/pin) and before handing out the
+   CSV logs. It travels in an `X-Pin` header; a missing or wrong PIN is 401, and five
+   wrong tries in a row is 429 with `retry_s`. The PIN is remembered per browser in
+   localStorage so the owner types it once, not on every save. */
+
+const PIN_KEY = 'ptd_pin';
+const PIN_HELP = 'This device asks for its PIN before changing settings. Find it on the '
+  + 'device: tap the top of the screen to open the device info page, or read it from the '
+  + 'serial console.';
+
+const pinStore = {
+  // Private-mode Safari throws on localStorage; treating that as "no PIN saved" just
+  // means the modal asks every time rather than the page failing outright.
+  get() { try { return localStorage.getItem(PIN_KEY) || ''; } catch (e) { return ''; } },
+  set(v) { try { localStorage.setItem(PIN_KEY, v); } catch (e) {} },
+  clear() { try { localStorage.removeItem(PIN_KEY); } catch (e) {} },
+  has() { return !!pinStore.get(); },
+};
+
+function withPin(opts) {
+  const next = { ...(opts || {}) };
+  next.headers = { ...(next.headers || {}) };
+  const pin = pinStore.get();
+  if (pin) next.headers['X-Pin'] = pin;
+  return next;
+}
+
+// "too many attempts" carries retry_s; say the wait in words rather than echoing a number
+// with no unit.
+function retryMessage(body) {
+  const s = Number(body && body.retry_s);
+  const wait = !s || !isFinite(s) ? 'a little while'
+    : s >= 60 ? `${Math.ceil(s / 60)} minute${Math.ceil(s / 60) === 1 ? '' : 's'}`
+    : `${Math.round(s)} seconds`;
+  return `Too many wrong PIN tries. The device is refusing new ones for ${wait}.`;
+}
+
+// Modal PIN prompt. Resolves with the PIN typed, or null when dismissed. Only one can be
+// open at a time; concurrent callers (two saves racing) share the same promise.
+let pinPromptOpen = null;
+function askForPin(message) {
+  if (pinPromptOpen) return pinPromptOpen;
+  pinPromptOpen = new Promise((resolve) => {
+    const input = h('input', { type: 'password', id: 'pin-input', autocomplete: 'current-password' });
+    const err = h('div', {});
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      document.removeEventListener('keydown', onKey);
+      backdrop.remove();
+      pinPromptOpen = null;
+      resolve(value);
+    };
+    const submit = () => {
+      const v = input.value.trim();
+      if (!v) { clear(err); err.append(h('div', { class: 'field-error' }, 'Enter the PIN.')); return; }
+      finish(v);
+    };
+    const onKey = (ev) => { if (ev.key === 'Escape') finish(null); };
+    const dialog = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'pin-modal-title' },
+      h('h2', { id: 'pin-modal-title' }, 'Device PIN'),
+      h('p', { class: 'small' }, message || PIN_HELP),
+      h('label', { for: 'pin-input' }, 'PIN'), input, err,
+      h('div', { class: 'row', style: 'margin-top:.8rem' },
+        h('button', { class: 'primary', onclick: submit }, 'Unlock'),
+        h('button', { onclick: () => finish(null) }, 'Cancel')));
+    input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); submit(); } });
+    const backdrop = h('div', { class: 'modal-backdrop', onclick: (ev) => { if (ev.target === backdrop) finish(null); } }, dialog);
+    document.addEventListener('keydown', onKey);
+    document.body.append(backdrop);
+    input.focus();
+  });
+  return pinPromptOpen;
+}
+
+async function rawFetchJSON(url, opts) {
   let res;
   try {
     res = await fetch(url, opts);
@@ -110,10 +212,37 @@ async function fetchJSON(url, opts) {
     try { body = await res.json(); } catch (e) { /* ignore parse failure */ }
   }
   if (!res.ok) {
-    const msg = (body && body.error) || `Request failed (HTTP ${res.status})`;
-    throw new ApiError(msg, body && body.path, res.status);
+    const msg = res.status === 429 ? retryMessage(body)
+      : (body && body.error) || `Request failed (HTTP ${res.status})`;
+    throw new ApiError(msg, body && body.path, res.status, body && body.retry_s);
   }
   return body;
+}
+
+// needsPin marks the protected calls: send the saved PIN, and on 401 ask for it and
+// replay the request once. A 429 is surfaced as-is — retrying would only extend the wait.
+async function fetchJSON(url, opts, needsPin) {
+  if (!needsPin) return rawFetchJSON(url, opts);
+  try {
+    return await rawFetchJSON(url, withPin(opts));
+  } catch (e) {
+    if (!(e instanceof ApiError) || e.status !== 401) throw e;
+    const wrong = /wrong pin/i.test(e.message || '');
+    const pin = await askForPin(wrong ? `That PIN was not accepted. ${PIN_HELP}` : PIN_HELP);
+    if (!pin) throw new ApiError('This device needs its PIN before it will accept that change.', null, 401);
+    pinStore.set(pin);
+    // Only one retry: a second 401 means the PIN itself is wrong, and saying so beats
+    // echoing the firmware's two-word "wrong pin".
+    return rawFetchJSON(url, withPin(opts)).catch((e2) => { throw asPinError(e2); });
+  }
+}
+
+// Turns a repeat 401 into something the owner can act on.
+function asPinError(e) {
+  if (e instanceof ApiError && e.status === 401) {
+    return new ApiError(`That PIN was not accepted. ${PIN_HELP}`, null, 401);
+  }
+  return e;
 }
 
 const api = {
@@ -121,38 +250,108 @@ const api = {
   config: () => fetchJSON('/api/config'),
   saveConfig: (cfg) => fetchJSON('/api/config', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg),
-  }),
+  }, true),
   proxyStops: (route) => fetchJSON(`/api/proxy/stops?route=${encodeURIComponent(route)}`),
   proxySchedule: (stopId) => fetchJSON(`/api/proxy/schedule?stop_id=${encodeURIComponent(stopId)}`),
   railStations: () => fetchJSON('/api/rail/stations'),
   stats: (stop, days) => fetchJSON(`/api/stats?stop=${encodeURIComponent(stop)}&days=${encodeURIComponent(days)}`),
   statsOverview: (days) => fetchJSON(`/api/stats/overview?days=${encodeURIComponent(days)}`),
   logIndex: () => fetchJSON('/api/log/index'),
-  reboot: () => fetchJSON('/api/reboot', { method: 'POST' }),
-  wifiReset: () => fetchJSON('/api/wifi/reset', { method: 'POST' }),
+  reboot: () => fetchJSON('/api/reboot', { method: 'POST' }, true),
+  wifiReset: () => fetchJSON('/api/wifi/reset', { method: 'POST' }, true),
+  setPin: (pin) => fetchJSON('/api/pin', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin }),
+  }, true),
 };
 
+// The CSV logs are PIN-protected, so a bare <a href> would land the owner on a 401 JSON
+// page. Fetch the bytes with the header instead and hand them to the browser through a
+// Blob + object URL + synthetic click, which is the only way to attach a header to a
+// download.
+async function downloadLog(file) {
+  const url = `/api/log/${encodeURIComponent(file)}`;
+  const once = async () => {
+    let res;
+    try { res = await fetch(url, withPin({})); }
+    catch (e) { throw new ApiError('Network error: could not reach the device.', null, 0); }
+    if (!res.ok) {
+      let body = null;
+      try { body = await res.json(); } catch (e) {}
+      const msg = res.status === 429 ? retryMessage(body)
+        : (body && body.error) || `Download failed (HTTP ${res.status})`;
+      throw new ApiError(msg, null, res.status, body && body.retry_s);
+    }
+    return res.blob();
+  };
+  let blob;
+  try {
+    blob = await once();
+  } catch (e) {
+    if (!(e instanceof ApiError) || e.status !== 401) throw e;
+    const pin = await askForPin(PIN_HELP);
+    if (!pin) throw new ApiError('This device needs its PIN before it will hand over the logs.', null, 401);
+    pinStore.set(pin);
+    blob = await once().catch((e2) => { throw asPinError(e2); });
+  }
+  const href = URL.createObjectURL(blob);
+  const a = h('a', { href, download: file });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 10000);
+}
+
 function uploadFirmware(file, onProgress) {
-  return new Promise((resolve, reject) => {
+  const send = (pin) => new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/api/ota');
+    if (pin) xhr.setRequestHeader('X-Pin', pin);
     xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) resolve();
-      else {
-        let msg = `OTA failed (HTTP ${xhr.status})`;
-        try { const b = JSON.parse(xhr.responseText); if (b && b.error) msg = b.error; } catch (e) {}
-        reject(new Error(msg));
-      }
+      if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
+      let body = null;
+      try { body = JSON.parse(xhr.responseText); } catch (e) {}
+      const detail = (body && body.error) || '';
+      let msg = detail || `Update failed (HTTP ${xhr.status})`;
+      if (xhr.status === 409) msg = 'The device is already installing an update. Wait for it to finish and reboot, then try again.';
+      else if (xhr.status === 429) msg = retryMessage(body);
+      else if (xhr.status === 400) msg = `The device would not take this file${detail ? `: ${detail}` : '.'}`;
+      reject(new ApiError(msg, null, xhr.status, body && body.retry_s));
     };
-    xhr.onerror = () => reject(new Error('Network error during upload.'));
+    xhr.onerror = () => reject(new ApiError('Network error during upload.', null, 0));
     const fd = new FormData();
     fd.append('firmware', file, file.name);
     xhr.send(fd);
   });
+  // A 401 costs a re-upload of the whole image; unavoidable, the header has to be on the
+  // request that carries the body.
+  return send(pinStore.get()).catch(async (e) => {
+    if (!(e instanceof ApiError) || e.status !== 401) throw e;
+    const pin = await askForPin(PIN_HELP);
+    if (!pin) throw new ApiError('This device needs its PIN before it will install firmware.', null, 401);
+    pinStore.set(pin);
+    return send(pin).catch((e2) => { throw asPinError(e2); });
+  });
 }
 
 /* ======================== Leaflet loader (CDN, graceful degrade) ======================== */
+
+// Pinned to 1.9.4 and checked with Subresource Integrity, so a compromised or
+// impersonated CDN cannot inject script into the page that holds the device's PIN.
+// A hash mismatch makes the browser refuse the file, the loader times out, and the
+// wizard falls back to its plain stop list — the same path as being offline.
+//
+// Hashes computed from the exact pinned files with:
+//   curl -sL https://unpkg.com/leaflet@1.9.4/dist/leaflet.css \
+//     | openssl dgst -sha384 -binary | openssl base64 -A
+//   curl -sL https://unpkg.com/leaflet@1.9.4/dist/leaflet.js \
+//     | openssl dgst -sha384 -binary | openssl base64 -A
+// (2026-09-15; leaflet.css 14806 B, leaflet.js 147552 B). crossorigin="anonymous" is
+// required or the browser cannot read the bytes to check them.
+const LEAFLET_CSS_URL = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+const LEAFLET_CSS_SRI = 'sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H';
+const LEAFLET_JS_URL = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+const LEAFLET_JS_SRI = 'sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH';
 
 let leafletPromise = null;
 function loadLeaflet() {
@@ -161,10 +360,14 @@ function loadLeaflet() {
     if (window.L) { resolve(window.L); return; }
     const link = document.createElement('link');
     link.rel = 'stylesheet';
-    link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    link.href = LEAFLET_CSS_URL;
+    link.integrity = LEAFLET_CSS_SRI;
+    link.crossOrigin = 'anonymous';
     document.head.appendChild(link);
     const script = document.createElement('script');
-    script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    script.src = LEAFLET_JS_URL;
+    script.integrity = LEAFLET_JS_SRI;
+    script.crossOrigin = 'anonymous';
     let done = false;
     const finish = (ok) => { if (done) return; done = true; resolve(ok ? window.L : null); };
     script.onload = () => finish(!!window.L);
@@ -367,13 +570,44 @@ function renderStatusStrip(strip, state) {
   }
 }
 
+// The badge answers two separate questions and must not conflate them: `status` says
+// whether the device has a live prediction for this trip, `late_known` says whether SEPTA
+// also told it how late the trip is running. A live trip with no lateness figure is still
+// live — labelling it "sched / no live tracking" was wrong (review F31).
 function badgeFor(a) {
-  if (a.status === 'skipped') return { cls: 'skip', text: 'skip', aria: 'Skipped — detour' };
-  if (a.status !== 'live' || !a.late_known) return { cls: 'sched', text: 'sched', aria: 'Scheduled, no live tracking' };
+  const status = a.status || (a.late_known ? 'live' : 'unknown');
+  if (status === 'skipped') return { cls: 'skip', text: 'skipped', aria: 'SEPTA says this trip skips this stop' };
+  if (status === 'scheduled') return { cls: 'sched', text: 'sched', aria: 'Scheduled time only — this trip is not being tracked live' };
+  if (status !== 'live') return { cls: 'sched', text: 'sched', aria: 'No live tracking for this trip' };
+  if (!a.late_known) return { cls: 'live', text: 'live', aria: 'live ETA, lateness unknown' };
   const late = a.late_min || 0;
   if (late > 5) return { cls: 'late', text: `+${late}`, aria: `${late} minutes late` };
   if (late < -1) return { cls: 'early', text: `−${Math.abs(late)}`, aria: `${Math.abs(late)} minutes early` };
   return { cls: 'on-time', text: 'on time', aria: 'On time' };
+}
+
+// Per-stop feed health. The firmware sends `health`, `source_ts` and `source_age_s` on each
+// /api/state stop; older builds send none of it, in which case nothing is drawn. `live` is
+// the normal case and needs no chip — a badge on every panel all the time would be noise.
+function stopHealthChip(s) {
+  const health = s.health;
+  if (!health || health === 'live') return null;
+  if (health === 'stale') {
+    // source_age_s is how old SEPTA's own data is; fall back to source_ts if only that came.
+    const ageS = s.source_age_s != null ? s.source_age_s
+      : s.source_ts ? Math.max(0, Math.floor(Date.now() / 1000) - s.source_ts) : null;
+    const mins = ageS == null ? null : Math.max(1, Math.round(ageS / 60));
+    const text = mins == null ? 'stale' : `stale ${mins} min`;
+    return h('span', { class: 'stop-health stale', title: 'The live feed for this stop has not refreshed recently; these times are the last ones SEPTA gave.' }, text);
+  }
+  if (health === 'unavailable') {
+    return h('span', { class: 'stop-health unavailable', title: 'The device could not reach the live feed for this stop.' },
+      s.error ? `unavailable: ${s.error}` : 'unavailable');
+  }
+  if (health === 'schedule_only') {
+    return h('span', { class: 'stop-health schedule-only', title: 'No live tracking here — these are timetable times.' }, 'schedule only');
+  }
+  return h('span', { class: 'stop-health schedule-only' }, String(health));
 }
 
 // ---- Crowding: device.crowding off/words/icons/both, device.crowding_icons seats/crowd.
@@ -435,13 +669,23 @@ function renderStopPanels(container, stopSnaps, crowdMode, crowdScheme) {
   for (const s of stopSnaps) {
     const title = `${s.route || (s.mode === 'rail' ? 'Rail' : '')}${s.headsign ? ' → ' + s.headsign : ''}${s.stop_name ? ' · ' + s.stop_name : ''}`.trim()
       || s.label || s.key;
-    const panel = h('div', { class: 'card stop-panel' }, h('div', { class: 'title' }, s.label ? `${s.label} — ${title}` : title));
+    const chip = stopHealthChip(s);
+    const panel = h('div', { class: 'card stop-panel' },
+      h('div', { class: 'title row between' },
+        h('span', {}, s.label ? `${s.label} — ${title}` : title), chip));
     if (s.weather_note) panel.append(h('div', { class: 'small', style: 'color:var(--early-fg)' }, s.weather_note));
-    if (!s.ok) {
+    // `ok` is false for a stale stop as well as an unreachable one, but stale still has
+    // usable (if old) times — hiding them behind a red banner would throw away the only
+    // information the panel has. Only a genuinely empty stop gets the banner; stale keeps
+    // its rows, with the amber chip in the title bar saying how old they are.
+    const stale = s.health === 'stale';
+    const hasRows = s.arrivals && s.arrivals.length;
+    if (!s.ok && !(stale && hasRows)) {
       panel.append(h('div', { class: 'banner danger' }, s.error || 'No data for this stop.'));
-    } else if (!s.arrivals || !s.arrivals.length) {
+    } else if (!hasRows) {
       panel.append(h('div', { class: 'muted small' }, 'No upcoming arrivals.'));
     } else {
+      if (stale && s.error) panel.append(h('div', { class: 'small muted' }, s.error));
       for (const a of s.arrivals.slice(0, s.show || 4)) {
         const badge = badgeFor(a);
         panel.append(h('div', { class: 'arrival-row' },
@@ -589,6 +833,69 @@ function stopTitle(s) {
   return `${s.label || s.route} — ${s.route} → ${s.headsign || '?'} · ${s.stop_name || s.stop_id}`;
 }
 
+/* ---- Regional Rail line filter (review F30).
+   The firmware filters rail arrivals by SEPTA's line *code* ("PAO"), not the public name
+   ("Paoli/Thorndale"), so the old free-text box quietly produced a filter that never
+   matched. The code is what gets stored; the name is only ever a label in this list. */
+const RAIL_LINES = [
+  ['AIR', 'Airport'],
+  ['CHE', 'Chestnut Hill East'],
+  ['CHW', 'Chestnut Hill West'],
+  ['CYN', 'Cynwyd'],
+  ['FOX', 'Fox Chase'],
+  ['LAN', 'Lansdale/Doylestown'],
+  ['MED', 'Media/Wawa'],
+  ['NOR', 'Manayunk/Norristown'],
+  ['PAO', 'Paoli/Thorndale'],
+  ['TRE', 'Trenton'],
+  ['WAR', 'Warminster'],
+  ['WIL', 'Wilmington/Newark'],
+  ['WTR', 'West Trenton'],
+];
+
+// Stops saved by an earlier version hold a display name (or nothing) where the code
+// belongs. Map whatever is there onto a code so the dropdown opens on the right entry;
+// anything unrecognised falls back to "Any line" rather than inventing a filter.
+function railLineCode(value) {
+  const v = String(value == null ? '' : value).trim();
+  if (!v) return '';
+  const upper = v.toUpperCase();
+  if (RAIL_LINES.some(([code]) => code === upper)) return upper;
+  const byName = RAIL_LINES.find(([, name]) => name.toLowerCase() === v.toLowerCase());
+  return byName ? byName[0] : '';
+}
+
+// A rail stop's line filter, wherever an older config happened to put it.
+function railLineOf(s) {
+  return railLineCode(s.route) || railLineCode(s.line);
+}
+
+function railLineSelect(id, current) {
+  const code = railLineCode(current);
+  return h('select', { id },
+    h('option', { value: '', selected: !code || undefined }, 'Any line'),
+    ...RAIL_LINES.map(([c, name]) => h('option', { value: c, selected: c === code || undefined }, `${c} — ${name}`)));
+}
+
+/* ---- Bus vs trolley (review F30).
+   SEPTA's own mode list has `trolley` as a separate mode and the firmware treats it as
+   one, but the wizard's single "Bus / Trolley" button always saved `bus`. The route id
+   is a good guess — City/subway-surface trolleys and the two Media/Sharon Hill lines
+   have known ids — but it is only a default the user can override. */
+const TROLLEY_ROUTE_RE = /^(T\d|G1|D\d|10|11|13|15|34|36|101|102)$/i;
+function looksLikeTrolley(route) {
+  return TROLLEY_ROUTE_RE.test(String(route || '').trim());
+}
+const SURFACE_MODE_HINT = 'SEPTA counts trolleys as their own mode, so the device asks for '
+  + 'them differently. Routes T1–T5, G1, D1, 10, 11, 13, 15, 34, 36, 101 and 102 are '
+  + 'trolleys; everything else on the street is a bus.';
+
+function surfaceModeSelect(id, current) {
+  return h('select', { id },
+    h('option', { value: 'bus', selected: current !== 'trolley' || undefined }, 'Bus'),
+    h('option', { value: 'trolley', selected: current === 'trolley' || undefined }, 'Trolley'));
+}
+
 // Options for stops[].title_style (DESIGN.md §6, "Fields added 2026-09-14").
 const TITLE_STYLES = [
   ['label_dest', 'Label → destination'],
@@ -608,7 +915,7 @@ function stopTitlePreview(s) {
   if (style === 'custom') return s.title_text || '';
   if (style === 'label') return s.label || (s.mode === 'rail' ? s.station : s.route) || s.key;
   if (s.mode === 'rail') {
-    if (style === 'route_dest_stop') return `${s.line || 'Regional Rail'} → ${directionWord(s)} • ${s.station || ''}`;
+    if (style === 'route_dest_stop') return `${railLineOf(s) || 'Regional Rail'} → ${directionWord(s)} • ${s.station || ''}`;
     return `${s.label || 'Regional Rail'} (${directionWord(s)})`;
   }
   if (style === 'route_dest_stop') return `${s.route || ''} → ${s.headsign || ''} • ${s.stop_name || ''}`;
@@ -671,9 +978,13 @@ function drawEditForm(s, i) {
 
   const fields = [
     h('label', { for: `edit-label-${i}` }, 'Label'), labelInput,
+    hint('Your own short name for this stop, used on screen and everywhere in this app.'),
     h('label', { for: `edit-show-${i}` }, 'Rows to show'), showInput,
+    hint(HINT_SHOW_ROWS),
     h('label', { for: `edit-title-style-${i}` }, 'Title on screen'), titleStyleSelect, titleTextWrap,
+    hint(HINT_TITLE_STYLE),
     h('label', { for: `edit-alt-of-${i}` }, 'Show only as an alternative to'), altOfSelect,
+    hint(HINT_ALT_OF),
     h('label', { for: `edit-alt-after-${i}` }, "when that stop's next bus is more than N minutes away"), altAfterInput,
   ];
   if (s.mode === 'rail') {
@@ -681,10 +992,17 @@ function drawEditForm(s, i) {
       h('option', { value: 'N', selected: s.direction === 'N' || undefined }, 'Northbound'),
       h('option', { value: 'S', selected: s.direction === 'S' || undefined }, 'Southbound'),
       h('option', { value: '', selected: !s.direction || undefined }, 'Both'));
-    const lineInput = h('input', { type: 'text', id: `edit-line-${i}`, value: s.line || '', placeholder: 'e.g. Paoli/Thorndale (optional)' });
-    fields.push(h('label', { for: `edit-dir-${i}` }, 'Direction'), dirSel);
-    fields.push(h('label', { for: `edit-line-${i}` }, 'Line filter'), lineInput);
-    fields._dirSel = dirSel; fields._lineInput = lineInput;
+    const lineSel = railLineSelect(`edit-line-${i}`, railLineOf(s));
+    fields.push(h('label', { for: `edit-dir-${i}` }, 'Direction'), dirSel,
+      hint('“Northbound” and “Southbound” are SEPTA’s own labels for the two halves of a through-running line, not compass directions.'));
+    fields.push(h('label', { for: `edit-line-${i}` }, 'Line filter'), lineSel, hint(HINT_RAIL_LINE));
+    fields._dirSel = dirSel; fields._lineSel = lineSel;
+  } else if (s.mode === 'bus' || s.mode === 'trolley') {
+    // Keeps an existing trolley a trolley on save, and lets a stop saved as `bus` by the
+    // old wizard be corrected without deleting and re-adding it (review F30).
+    const modeSel = surfaceModeSelect(`edit-mode-${i}`, s.mode);
+    fields.push(h('label', { for: `edit-mode-${i}` }, 'Service type'), modeSel, hint(SURFACE_MODE_HINT));
+    fields._modeSel = modeSel;
   }
   const form = h('div', { class: 'card' }, h('h3', {}, `Edit: ${s.label}`), ...fields,
     h('div', { class: 'row', style: 'margin-top:.6rem' },
@@ -698,7 +1016,16 @@ function drawEditForm(s, i) {
           alt_of: altOfSelect.value,
           alt_after_min: Number(altAfterInput.value),
         };
-        if (s.mode === 'rail') { updated.direction = fields._dirSel.value; updated.line = fields._lineInput.value.trim(); }
+        if (s.mode === 'rail') {
+          updated.direction = fields._dirSel.value;
+          // The code goes in both fields: DESIGN.md §6 documents rail `line` as mapping
+          // onto StopConfig::route, and the firmware contract for F30 asks for the code in
+          // `route`. Writing the same code to both leaves no stale display name behind.
+          updated.route = fields._lineSel.value;
+          updated.line = fields._lineSel.value;
+        } else if (fields._modeSel) {
+          updated.mode = fields._modeSel.value;
+        }
         const next = liveConfig.stops.slice();
         next[i] = updated;
         await persistConfig({ ...liveConfig, stops: next }, () => { editingIndex = -1; });
@@ -754,6 +1081,8 @@ function drawBikeCard() {
     persistConfig({ ...liveConfig, bike: { ...bike, enabled: enabledInput.checked } });
   });
   card.append(h('label', { class: 'inline' }, enabledInput, ' Show Indego bike/dock counts'));
+  card.append(hint('Adds a panel to the display showing how many bikes and free docks are '
+    + 'waiting at up to three Indego stations, refreshed alongside the arrivals.'));
 
   // bike.style: icons | words (default icons for old firmware/config that predates the field).
   const styleSelect = h('select', { id: 'bike-style' },
@@ -764,6 +1093,10 @@ function drawBikeCard() {
   });
   card.append(h('label', { for: 'bike-style' }, 'Indego style'));
   card.append(styleSelect);
+  card.append(hint('“Icons + numbers” draws a bicycle for classic bikes, a lightning bolt '
+    + 'for e-bikes and a P for free docks. “Words” spells it out instead: “5 bikes, 2 '
+    + 'e-bikes, 7 docks”. Either way a count turns red at zero and amber at one or two, so '
+    + 'you can see at a glance whether it is worth walking over.'));
 
   const listDiv = h('div', {});
   if (!stations.length) { listDiv.append(h('p', { class: 'small muted' }, 'No stations chosen yet.')); }
@@ -794,7 +1127,10 @@ function drawBikeCard() {
           nearbyResults.append(h('p', { class: 'muted small' }, 'None of your configured stops have coordinates yet — add some above first.'));
           return;
         }
-        const res = await fetch('http://bts-status.bicycletransit.workers.dev/phl');
+        // HTTPS: the feed answers over TLS with `Access-Control-Allow-Origin: *`
+        // (verified 2026-09-15), so this works whichever scheme this page was loaded
+        // over, and no longer leaks the lookup to anyone on the LAN in cleartext.
+        const res = await fetch('https://bts-status.bicycletransit.workers.dev/phl');
         if (!res.ok) throw new Error(`Indego feed returned HTTP ${res.status}`);
         const geo = await res.json();
         const scored = [];
@@ -835,7 +1171,7 @@ function drawBikeCard() {
       } catch (e) {
         clear(nearbyResults);
         nearbyResults.append(h('div', { class: 'banner warn' },
-          'Could not reach the Indego station feed from the browser. If this page was loaded over HTTPS, the browser blocks the plain-HTTP feed as mixed content — try loading the device UI over http:// instead. ' + (e && e.message ? `(${e.message})` : '')));
+          'Could not reach the Indego station feed. Your browser fetches it directly from Bicycle Transit, so this usually means no internet connection right now. You can still add a station by its id below. ' + (e && e.message ? `(${e.message})` : '')));
       } finally {
         ev.target.disabled = false;
       }
@@ -890,12 +1226,30 @@ function drawWizard() {
     card.append(h('label', { for: 'route-input' }, `${wizard.mode === 'subway' ? 'Subway ' : ''}Route ID`));
     card.append(input);
     card.append(h('p', { class: 'small muted' }, 'SEPTA route IDs are strings, not numbers (e.g. "T4", "G1").'));
+    // Bus/trolley is a real mode difference the old wizard hid (review F30). Guessed from
+    // the route id as you type, until you set it yourself — after that your choice sticks.
+    let modeSel = null;
+    if (wizard.mode !== 'subway') {
+      modeSel = surfaceModeSelect('route-mode', wizard.mode === 'trolley' ? 'trolley' : 'bus');
+      modeSel.addEventListener('change', () => {
+        wizard.modeTouched = true;
+        wizard.mode = modeSel.value;
+      });
+      input.addEventListener('input', () => {
+        if (wizard.modeTouched) return;
+        const guess = looksLikeTrolley(input.value) ? 'trolley' : 'bus';
+        modeSel.value = guess;
+        wizard.mode = guess;
+      });
+      card.append(h('label', { for: 'route-mode' }, 'Service type'), modeSel, hint(SURFACE_MODE_HINT));
+    }
     const err = h('div', {});
     card.append(err);
     card.append(h('div', { class: 'row', style: 'margin-top:.6rem' }, h('button', {
       class: 'primary',
       onclick: async () => {
         const route = input.value.trim();
+        if (modeSel) wizard.mode = modeSel.value;
         if (!route) { clear(err); err.append(h('div', { class: 'field-error' }, 'Enter a route id.')); return; }
         clear(err); err.append(h('p', { class: 'muted small' }, 'Looking up stops…'));
         try {
@@ -992,13 +1346,18 @@ function drawWizard() {
       const avgLat = pts.reduce((a, p) => a + p[0], 0) / pts.length;
       const avgLng = pts.reduce((a, p) => a + p[1], 0) / pts.length;
       currentMap = L.map(mapDiv).setView([avgLat, avgLng], 13);
+      // The attribution string is rendered as HTML by Leaflet, but it is a fixed literal
+      // written here — no agency or user data reaches it.
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '&copy; OpenStreetMap contributors', maxZoom: 19,
       }).addTo(currentMap);
       for (const entry of wizard.stopResults) {
         const lat = +entry.lat, lng = +entry.lng;
         if (isNaN(lat) || isNaN(lng)) continue;
-        const marker = L.marker([lat, lng]).addTo(currentMap).bindTooltip(entry.stopname);
+        // bindTooltip() renders a string through innerHTML. entry.stopname is agency data,
+        // so hand Leaflet a node built with h() (text nodes only) instead (review F03).
+        const marker = L.marker([lat, lng]).addTo(currentMap)
+          .bindTooltip(h('span', {}, entry.stopname || ''));
         marker.on('click', () => selectStop(entry));
         mapMarkers.push({ entry, marker });
       }
@@ -1061,8 +1420,12 @@ function drawWizard() {
     const showInput = h('select', { id: 'detail-show' }, ...[1, 2, 3, 4].map((n) => h('option', { value: n, selected: n === 3 || undefined }, `${n} row${n === 1 ? '' : 's'}`)));
     const nameInput = h('input', { type: 'text', id: 'detail-stopname', value: wizard.stopName });
     card.append(h('label', { for: 'detail-label' }, 'Label'), labelInput);
+    card.append(hint('Your own short name for this stop — “Home, towards Center City”, say.'));
     card.append(h('label', { for: 'detail-stopname' }, 'Stop name (shown on display)'), nameInput);
+    card.append(hint('SEPTA’s name for the stop itself. Shorten it if it is too long for the screen.'));
     card.append(h('label', { for: 'detail-show' }, 'Rows to show'), showInput);
+    card.append(hint(HINT_SHOW_ROWS));
+    card.append(hint(`Saving as a ${wizard.mode === 'trolley' ? 'trolley' : wizard.mode === 'subway' ? 'subway' : 'bus'} stop. You can change that later from the stop list.`));
     if (dup) card.append(h('div', { class: 'banner warn' }, 'This exact stop and direction is already configured.'));
     const err = h('div', {});
     card.append(err);
@@ -1157,11 +1520,14 @@ function drawWizard() {
     const key = `rail-${slugify(wizard.station)}-${wizard.dirToken}`;
     const dup = liveConfig.stops.some((s) => s.key === key);
     const labelInput = h('input', { type: 'text', id: 'rail-label', value: `${wizard.station} (${dirLabel})` });
-    const lineInput = h('input', { type: 'text', id: 'rail-line', placeholder: 'e.g. Paoli/Thorndale (optional)' });
+    const lineSel = railLineSelect('rail-line', wizard.line || '');
     const showInput = h('select', { id: 'rail-show' }, ...[1, 2, 3, 4].map((n) => h('option', { value: n, selected: n === 2 || undefined }, `${n} row${n === 1 ? '' : 's'}`)));
     card.append(h('label', { for: 'rail-label' }, 'Label'), labelInput);
-    card.append(h('label', { for: 'rail-line' }, 'Line filter (optional)'), lineInput);
+    card.append(hint('Your own short name for this station, used on screen and in this app.'));
+    card.append(h('label', { for: 'rail-line' }, 'Line filter (optional)'), lineSel);
+    card.append(hint(HINT_RAIL_LINE));
     card.append(h('label', { for: 'rail-show' }, 'Rows to show'), showInput);
+    card.append(hint(HINT_SHOW_ROWS));
     if (dup) card.append(h('div', { class: 'banner warn' }, 'This station and direction is already configured.'));
     const err = h('div', {});
     card.append(err);
@@ -1170,9 +1536,11 @@ function drawWizard() {
       h('button', {
         class: 'primary', disabled: dup,
         onclick: async () => {
+          // Line code in both fields — see the edit form for why.
+          const lineCode = lineSel.value;
           const stop = {
-            key, mode: 'rail', route: '', stop_id: '', station: wizard.station,
-            direction: wizard.direction, line: lineInput.value.trim(), headsign: '',
+            key, mode: 'rail', route: lineCode, stop_id: '', station: wizard.station,
+            direction: wizard.direction, line: lineCode, headsign: '',
             label: labelInput.value.trim() || key, stop_name: wizard.station,
             show: Number(showInput.value),
           };
@@ -1229,7 +1597,10 @@ async function renderStats(root) {
     h('label', { for: 'stats-days', class: 'inline' }, 'Window'), daysSelect);
   const overview = h('div', { class: 'stack' }, h('div', { class: 'card muted' }, 'Loading overview…'));
   const body = h('div', { class: 'stack' }, h('p', { class: 'muted' }, 'Loading statistics…'));
-  const csvCard = h('div', { class: 'card' }, h('h3', {}, 'Download logs'), h('div', { id: 'csv-list' }, 'Loading…'));
+  const csvCard = h('div', { class: 'card' }, h('h3', {}, 'Download logs'),
+    hint('One CSV file per month, straight off the SD card — every arrival, ghost, no-show '
+      + 'and outage the device recorded. The device asks for its PIN before handing them over.'),
+    h('div', { id: 'csv-list' }, 'Loading…'));
   root.append(controls, overview, body, csvCard);
 
   // Row click in the overview table selects that stop in the detail picker below.
@@ -1288,9 +1659,21 @@ async function renderStats(root) {
     if (!box) return;
     clear(box);
     if (!files || !files.length) { box.append(h('p', { class: 'muted small' }, 'No log files yet.')); return; }
+    const err = h('div', {});
     const ul = h('ul', {});
-    for (const f of files) ul.append(h('li', {}, h('a', { href: `/api/log/${encodeURIComponent(f.file)}` }, f.file), ` — ${humanBytes(f.bytes)}`));
-    box.append(ul);
+    for (const f of files) {
+      // A plain <a href> cannot carry the X-Pin header, so fetch the bytes and hand them
+      // over as a Blob instead (see downloadLog).
+      const btn = h('button', { class: 'linklike', onclick: async (ev) => {
+        ev.target.disabled = true;
+        clear(err);
+        try { await downloadLog(f.file); }
+        catch (e) { err.append(h('div', { class: 'field-error' }, e.message)); }
+        finally { ev.target.disabled = false; }
+      } }, f.file);
+      ul.append(h('li', {}, btn, ` — ${humanBytes(f.bytes)}`));
+    }
+    box.append(ul, err);
   }).catch(() => {
     if (!statsActive) return;
     const box = $('#csv-list');
@@ -1298,19 +1681,141 @@ async function renderStats(root) {
   });
 }
 
+/* ---- Reading numbers out loud.
+   The firmware distinguishes "zero" from "never found out", and the UI has to as well: a
+   stop with no lateness data is not a stop that was 0% on time. Any value that can be
+   absent goes through these, and every percentage is shown with the count it came from. */
+
+function fmtCount(v) { return v == null ? 'no data' : String(v); }
+function fmtPct(v, digits) { return v == null ? 'no data' : `${Number(v).toFixed(digits == null ? 1 : digits)}%`; }
+function fmtMinutes(v) { return v == null ? 'no data' : `${v} min`; }
+
+// Total arrivals in the window. `samples` is the firmware's name; `arrivals` was floated
+// during the rename, so accept either rather than blanking the page over a spelling.
+function arrivalCount(d) { return d.samples ?? d.arrivals ?? null; }
+// How many of those arrivals SEPTA also gave a lateness figure for.
+function lateKnownCount(d) { return d.late_known ?? d.late_known_n ?? null; }
+
+// "On time: 92% of 48 with lateness data (61 arrivals)".
+function onTimeSentence(d) {
+  const arrivals = arrivalCount(d);
+  const known = lateKnownCount(d);
+  if (d.on_time_pct == null) {
+    return arrivals == null
+      ? 'No lateness data for this stop yet, so there is nothing to be on time against.'
+      : `No lateness data — SEPTA never said how late any of the ${arrivals} arrivals ran.`;
+  }
+  const pct = `${Number(d.on_time_pct).toFixed(0)}%`;
+  const of = known == null ? '' : ` of ${known} with lateness data`;
+  const total = arrivals == null ? '' : ` (${arrivals} arrival${arrivals === 1 ? '' : 's'})`;
+  return `On time: ${pct}${of}${total}.`;
+}
+
+// Coverage arrives as a fraction of the window, but tolerate a firmware that sends 0-100.
+function coverageSentence(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  if (!isFinite(n)) return null;
+  return `Data coverage ${(n <= 1 ? n * 100 : n).toFixed(0)}% — the share of the window the device managed to poll SEPTA successfully.`;
+}
+
+const INFERRED_NOTE = 'Arrivals are inferred from the bus disappearing from the live feed, '
+  + 'not measured. Nothing on the device watches the kerb, so treat these as close '
+  + 'estimates rather than exact times.';
+
+function inferredSentence(d) {
+  const n = d.inferred ?? null;
+  const arrivals = arrivalCount(d);
+  let s = INFERRED_NOTE;
+  if (n != null) {
+    const of = arrivals == null ? '' : ` of ${arrivals}`;
+    s += ` ${n}${of} arrival${n === 1 ? '' : 's'} in this window were worked out that way.`;
+  }
+  if (d.unobserved) {
+    s += ` A further ${d.unobserved} fell in a stretch when the device was not polling, so nothing is known about ${d.unobserved === 1 ? 'it' : 'them'}.`;
+  }
+  return s;
+}
+
+// `wait_basis` names the estimator the firmware used, so the page can say what the number
+// means instead of asserting a method the device may have changed.
+const WAIT_BASIS_WORDS = {
+  half_mean_gap: 'half the average gap between buses',
+  half_mean_headway: 'half the average gap between buses',
+  mean_gap: 'the average gap between buses',
+};
+function waitBasisSentence(basis) {
+  const words = basis ? (WAIT_BASIS_WORDS[basis] || String(basis).replace(/_/g, ' ')) : null;
+  return words
+    ? `Typical wait is estimated as ${words}, which is what you get if you turn up without checking.`
+    : 'If you turn up without checking, your typical wait is about half the average gap between buses.';
+}
+
+/* ---- Forecast stability (was "prediction accuracy by horizon").
+   The old card claimed to measure prediction *error* against a real arrival time. The
+   device has no real arrival time — see INFERRED_NOTE — so what it honestly reports is how
+   far the forecast was revised while the bus was in sight: `forecast_stability[]`, one
+   bucket per horizon, carrying `mean_abs_revision_s` (how much it moved) and
+   `mean_revision_s` (which way). Same bar-and-dot rendering as before, honest labels.
+
+   Read defensively: the array form is what the firmware sends, but an object carrying a
+   histogram, and the pre-rename `prediction[]` with `mae_s`/`bias_s`, both still draw. */
+function forecastStabilityCard(data) {
+  const blurb = 'How much the forecast moved between first sighting and the inferred arrival.';
+  const card = h('div', { class: 'card' }, h('h3', {}, 'Forecast stability'), hint(blurb));
+  const fs = data.forecast_stability;
+  const buckets = Array.isArray(fs) ? fs : (fs ? (fs.by_horizon || fs.buckets || []) : (data.prediction || []));
+  if (buckets.length) {
+    card.append(chartWrap(buildRevisionChart(buckets)));
+    card.append(h('p', { class: 'small muted' },
+      'Bar = how far the forecast moved on average, in seconds, for buses first seen that far out. '
+      + 'Dot = which way it usually moved (red = the bus kept slipping later, blue = it arrived sooner than first forecast).'));
+    return card;
+  }
+  // Object form with a histogram of per-trip movement.
+  const histBins = (fs && (fs.hist || fs.histogram || fs.bins)) || [];
+  if (!histBins.length) {
+    card.append(h('p', { class: 'muted small' }, 'No data yet.'));
+    return card;
+  }
+  const n = fs.n ?? fs.samples ?? null;
+  const typical = fs.median_s ?? fs.p50_s ?? null;
+  const worst = fs.p90_s ?? fs.max_s ?? null;
+  card.append(h('div', { class: 'tiles', style: 'margin-bottom:.6rem' },
+    statTile('Trips', fmtCount(n), n == null ? null : 'with a forecast to compare'),
+    statTile('Typical move', typical == null ? 'no data' : `${Math.round(typical)} s`),
+    statTile('Worst 10%', worst == null ? 'no data' : `${Math.round(worst)} s`)));
+  card.append(chartWrap(buildHistChart(histBins)));
+  card.append(h('p', { class: 'small muted' },
+    'Each bar counts trips; the label underneath is how far that trip’s forecast moved.'));
+  return card;
+}
+
 function buildStatsBody(data) {
   const wrap = h('div', { class: 'stack' });
-  if (!data || !data.samples) {
+  const arrivals = data ? arrivalCount(data) : null;
+  if (!data || !arrivals) {
     wrap.append(h('div', { class: 'card muted' }, 'No data yet for this stop and window. Statistics build up once the device has been logging arrivals for a while.'));
     return wrap;
   }
-  const tiles = h('div', { class: 'card tiles' },
-    statTile('On time', `${data.on_time_pct?.toFixed?.(1) ?? data.on_time_pct}%`),
-    statTile('Mean late', `${data.mean_late_min} min`),
-    statTile('Samples', data.samples),
-    statTile('Ghosts', data.ghost ?? 0),
-    statTile('No-shows', data.noshow ?? 0),
-    statTile('Outage min', data.outage_min ?? 0));
+  const known = lateKnownCount(data);
+  const tiles = h('div', { class: 'card' },
+    h('div', { class: 'tiles' },
+      // No denominator under a "no data" value — "of 0 with lateness data" reads like a
+      // measurement when it is the absence of one.
+      statTile('On time', fmtPct(data.on_time_pct, 0),
+        data.on_time_pct == null || known == null ? null : `of ${known} with lateness data`),
+      statTile('Mean late', fmtMinutes(data.mean_late_min)),
+      statTile('Arrivals', fmtCount(arrivals), data.inferred == null ? null : `${data.inferred} inferred`),
+      // `unobserved` sits beside `coverage`: trips the device simply was not watching for.
+      // Counted separately from ghosts and no-shows, which are things it *did* watch fail.
+      data.unobserved == null ? null : statTile('Unobserved', fmtCount(data.unobserved), 'device was not polling'),
+      statTile('Ghosts', fmtCount(data.ghost)),
+      statTile('No-shows', fmtCount(data.noshow)),
+      statTile('Outage', data.outage_min == null ? 'no data' : `${data.outage_min} min`)),
+    hint(onTimeSentence(data)),
+    hint(inferredSentence(data)),
+    coverageSentence(data.coverage) ? hint(coverageSentence(data.coverage)) : null);
   wrap.append(tiles);
 
   wrap.append(h('div', { class: 'card' }, h('h3', {}, 'Lateness by hour'), chartWrap(buildBarChart(fillHours(data.by_hour), (s, i) => (i % 3 === 0 ? s.h : ''))), chartLegendMinutes()));
@@ -1326,8 +1831,7 @@ function buildStatsBody(data) {
       h('span', {}, h('span', { class: 'swatch', style: 'background:var(--chip-normal)' }), 'Normal'),
       h('span', {}, h('span', { class: 'swatch', style: 'background:var(--chip-gapped)' }), 'Gapped (>175%)'))));
 
-  wrap.append(h('div', { class: 'card' }, h('h3', {}, 'Prediction accuracy by horizon'), chartWrap(buildPredictionChart(data.prediction || [])),
-    h('p', { class: 'small muted' }, 'Bar = mean absolute error in seconds. Dot above/below = bias (red = predictions ran late, blue = predictions ran early).')));
+  wrap.append(forecastStabilityCard(data));
 
   const crowding = data.crowding || {};
   wrap.append(h('div', { class: 'card' }, h('h3', {}, 'Crowding by hour'),
@@ -1338,7 +1842,8 @@ function buildStatsBody(data) {
     crowdLegend()));
 
   wrap.append(h('div', { class: 'card' }, h('h3', {}, 'Expected wait by hour'), chartWrap(buildWaitChart(fillWaitHours(data.wait_by_hour))),
-    h('p', { class: 'small muted' }, 'Bar = mean gap between buses, in minutes. Tick = worst gap seen. If you arrive at random, the typical wait is about half the mean gap; the marker is the worst gap seen.')));
+    h('p', { class: 'small muted' }, 'Bar = average gap between buses, in minutes. Tick = worst gap seen.'),
+    hint(waitBasisSentence(data.wait_basis))));
 
   wrap.append(h('div', { class: 'card' }, h('h3', {}, 'Reliability by hour'), chartWrap(buildReliabilityChart(fillWaitHours(data.wait_by_hour))),
     h('div', { class: 'chart-legend' },
@@ -1348,7 +1853,12 @@ function buildStatsBody(data) {
   return wrap;
 }
 
-function statTile(k, v) { return h('div', { class: 'tile' }, h('div', { class: 'k' }, k), h('div', { class: 'v' }, v)); }
+// `note` carries the sample count a percentage came from, so a number is never shown
+// without the evidence behind it.
+function statTile(k, v, note) {
+  return h('div', { class: 'tile' }, h('div', { class: 'k' }, k), h('div', { class: 'v' }, v),
+    note ? h('div', { class: 'tile-note' }, note) : null);
+}
 function chartWrap(svg) { return h('div', { class: 'chart-wrap' }, svg); }
 function chartLegendMinutes() {
   return h('div', { class: 'chart-legend' },
@@ -1437,28 +1947,35 @@ function buildHistChart(hist) {
   return svg;
 }
 
-function buildPredictionChart(pred) {
-  if (!pred.length) return h('p', { class: 'muted small' }, 'No prediction samples yet.');
+// forecast_stability[] buckets: mean_abs_revision_s (bar, how far the forecast moved) and
+// mean_revision_s (dot, which way). `mae_s`/`bias_s` are the pre-rename spellings and are
+// still accepted so an older device does not draw an empty chart.
+function revisionSize(p) { return p.mean_abs_revision_s ?? p.mae_s ?? 0; }
+function revisionBias(p) { return p.mean_revision_s ?? p.bias_s ?? 0; }
+
+function buildRevisionChart(pred) {
+  if (!pred.length) return h('p', { class: 'muted small' }, 'No forecast samples yet.');
   const w = Math.max(280, pred.length * 90);
   const hgt = 160, padT = 30, padB = 24;
   const chartH = hgt - padT - padB;
-  const maxMae = Math.max(1, ...pred.map((p) => p.mae_s || 0));
-  const maxBias = Math.max(1, ...pred.map((p) => Math.abs(p.bias_s || 0)));
+  const maxSize = Math.max(1, ...pred.map((p) => revisionSize(p)));
+  const maxBias = Math.max(1, ...pred.map((p) => Math.abs(revisionBias(p))));
   const barW = w / pred.length;
-  const svg = hs('svg', { viewBox: `0 0 ${w} ${hgt}`, width: w, height: hgt, role: 'img', 'aria-label': 'Prediction accuracy by horizon' });
+  const svg = hs('svg', { viewBox: `0 0 ${w} ${hgt}`, width: w, height: hgt, role: 'img', 'aria-label': 'Forecast stability by horizon' });
   const mid = padT + chartH / 2;
   svg.append(hs('line', { x1: 0, x2: w, y1: mid, y2: mid, stroke: 'var(--border)' }));
   pred.forEach((p, i) => {
     const x = i * barW + 8;
     const bw = Math.max(10, barW - 16);
-    const barH = (p.mae_s / maxMae) * (chartH / 2);
+    const size = revisionSize(p);
+    const barH = (size / maxSize) * (chartH / 2);
     svg.append(hs('rect', { x, y: mid - barH, width: bw, height: barH, fill: 'var(--accent)' }));
-    const bias = p.bias_s || 0;
+    const bias = revisionBias(p);
     const by = mid - barH - 8 - (bias / maxBias) * (chartH / 2 - 10);
     svg.append(hs('circle', { cx: x + bw / 2, cy: Math.max(padT, Math.min(hgt - padB, by)), r: 4, fill: bias >= 0 ? 'var(--chip-bunched)' : 'var(--chip-normal)' }));
-    const mins = Math.round(p.horizon_s / 60);
-    svg.append(hs('text', { x: x + bw / 2, y: hgt - 6, 'font-size': 9, fill: 'var(--text-muted)', 'text-anchor': 'middle' }, `${mins}m (n=${p.n})`));
-    svg.append(hs('text', { x: x + bw / 2, y: mid - barH - 14, 'font-size': 9, fill: 'var(--text-muted)', 'text-anchor': 'middle' }, `${p.mae_s}s`));
+    const mins = Math.round((p.horizon_s || 0) / 60);
+    svg.append(hs('text', { x: x + bw / 2, y: hgt - 6, 'font-size': 9, fill: 'var(--text-muted)', 'text-anchor': 'middle' }, `${mins}m (n=${p.n ?? 0})`));
+    svg.append(hs('text', { x: x + bw / 2, y: mid - barH - 14, 'font-size': 9, fill: 'var(--text-muted)', 'text-anchor': 'middle' }, `${Math.round(size)}s`));
   });
   return svg;
 }
@@ -1492,7 +2009,8 @@ function buildOverviewTable(data, stopsCfg, selectedStop, onSelect) {
     return h('div', { class: 'card' }, h('h3', {}, 'All stops'), h('p', { class: 'muted small' }, 'No arrivals logged yet.'));
   }
   const rows = stops.map((s) => {
-    const pct = s.on_time_pct ?? 0;
+    const pct = s.on_time_pct;
+    const known = lateKnownCount(s);
     const selectThis = () => onSelect(s.stop);
     return h('tr', {
       class: `overview-row${s.stop === selectedStop ? ' selected' : ''}`,
@@ -1501,21 +2019,51 @@ function buildOverviewTable(data, stopsCfg, selectedStop, onSelect) {
       onkeydown: (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectThis(); } },
     },
       h('td', {}, stopLabelFor(stopsCfg, s.stop)),
-      h('td', { class: 'num' }, String(s.samples ?? 0)),
-      h('td', { class: 'num' }, h('span', { class: `pct-chip ${pctTone(pct)}` }, `${pct?.toFixed?.(1) ?? pct}%`)),
-      h('td', { class: 'num' }, `${s.mean_late_min ?? 0} min`),
-      h('td', { class: 'num' }, String(s.ghost ?? 0)),
-      h('td', { class: 'num' }, String(s.noshow ?? 0)),
+      h('td', { class: 'num' }, fmtCount(arrivalCount(s))),
+      // A missing percentage is "no data", never a red 0% — see fmtPct.
+      h('td', { class: 'num' }, pct == null
+        ? h('span', { class: 'muted small' }, 'no data')
+        : [h('span', { class: `pct-chip ${pctTone(pct)}` }, fmtPct(pct)),
+           known == null ? null : h('span', { class: 'muted small' }, ` of ${known}`)]),
+      h('td', { class: 'num' }, fmtMinutes(s.mean_late_min)),
+      h('td', { class: 'num' }, fmtCount(s.ghost)),
+      h('td', { class: 'num' }, fmtCount(s.noshow)),
+      h('td', { class: 'num' }, s.outage_min == null ? 'no data' : `${s.outage_min} min`),
+      // Coverage qualifies every other number in the row, so it belongs in the row.
+      h('td', { class: 'num' }, s.coverage == null ? 'no data' : `${(Number(s.coverage) <= 1 ? Number(s.coverage) * 100 : Number(s.coverage)).toFixed(0)}%`),
       h('td', {}, fmtRelativeTs(s.last_seen_ts)));
   });
   const table = h('table', { class: 'overview-table' },
     h('thead', {}, h('tr', {},
-      h('th', {}, 'Stop'), h('th', { class: 'num' }, 'Samples'), h('th', { class: 'num' }, 'On time %'),
+      h('th', {}, 'Stop'), h('th', { class: 'num' }, 'Arrivals'), h('th', { class: 'num' }, 'On time'),
       h('th', { class: 'num' }, 'Mean late'), h('th', { class: 'num' }, 'Ghosts'), h('th', { class: 'num' }, 'No-shows'),
+      h('th', { class: 'num' }, 'Outage'), h('th', { class: 'num' }, 'Coverage'),
       h('th', {}, 'Last seen'))),
     h('tbody', {}, ...rows));
-  return h('div', { class: 'card' }, h('h3', {}, 'All stops'), h('div', { class: 'table-wrap' }, table),
+  const card = h('div', { class: 'card' }, h('h3', {}, 'All stops'), h('div', { class: 'table-wrap' }, table),
     h('p', { class: 'small muted' }, 'Click a row to see that stop’s detail charts below.'));
+  // Window totals across every stop, with the same "inferred, not measured" caveat.
+  const totalSamples = arrivalCount(data);
+  if (totalSamples != null) {
+    const inf = data.inferred == null ? '' : ` ${data.inferred} of them inferred from a bus leaving the live feed.`;
+    card.append(hint(`${totalSamples} arrival${totalSamples === 1 ? '' : 's'} across all stops in this window.${inf}`));
+  }
+  // The log keeps rows for stops that are no longer configured; the aggregator has fixed
+  // room for 8 stops and 3 stations and drops the rest rather than evicting a live one.
+  // Say so, so a missing row does not read as missing data.
+  const exStops = Number(data.excluded_stops) || 0;
+  const exBikes = Number(data.excluded_bikes) || 0;
+  if (exStops > 0) {
+    card.append(h('p', { class: 'small muted' },
+      `${exStops} older stop${exStops === 1 ? '' : 's'} not shown — ${exStops === 1 ? 'it appears' : 'they appear'} in the logs but ${exStops === 1 ? 'is' : 'are'} no longer on the device.`));
+  }
+  if (exBikes > 0) {
+    card.append(h('p', { class: 'small muted' },
+      `${exBikes} older Indego station${exBikes === 1 ? '' : 's'} not shown, for the same reason.`));
+  }
+  const cov = coverageSentence(data.coverage);
+  if (cov) card.append(hint(cov));
+  return card;
 }
 
 /* ---- Crowding charts (data.crowding.by_hour / by_weekday, 0-5 levels) ---- */
@@ -1699,6 +2247,88 @@ function buildBikeOverviewCards(bikes) {
 
 /* ======================== Settings view ======================== */
 
+/* ---- Web PIN card.
+   The PIN the device asks for before any change. Changing it needs the current one, which
+   the X-Pin header on POST /api/pin supplies (and the 401 flow collects if this browser
+   has not been told it yet). "Forget" only clears this browser's copy — it does not
+   disable the PIN on the device, and the card says so. */
+
+// Firmware rule: 4-32 printable ASCII, no spaces. Checked here too so a typo is caught
+// before it costs a round trip, but the device remains the authority.
+const PIN_RE = /^[\x21-\x7e]{4,32}$/;
+
+function buildPinCard(state) {
+  const card = h('div', { class: 'card settings-grid' }, h('h2', {}, 'Web PIN'));
+  const auth = state.auth || {};
+  const msg = h('div', {});
+
+  card.append(hint('The PIN protects everything that changes this device: saving settings, '
+    + 'rebooting, resetting Wi-Fi, installing firmware and downloading the logs. Viewing '
+    + 'arrivals and statistics never asks for it.'));
+  if (auth.pin_required === false) {
+    card.append(h('p', { class: 'small muted' }, 'This device is not asking for a PIN at the moment.'));
+  }
+
+  const newInput = h('input', { type: 'password', id: 'pin-new', autocomplete: 'new-password' });
+  const confirmInput = h('input', { type: 'password', id: 'pin-confirm', autocomplete: 'new-password' });
+  const saveBtn = h('button', { class: 'primary', onclick: async (ev) => {
+    clear(msg);
+    const next = newInput.value;
+    if (next !== confirmInput.value) {
+      msg.append(h('div', { class: 'field-error' }, 'The two PINs do not match.'));
+      return;
+    }
+    if (!PIN_RE.test(next)) {
+      msg.append(h('div', { class: 'field-error' },
+        'A PIN is 4 to 32 characters, with no spaces. Letters, digits and punctuation are all fine.'));
+      return;
+    }
+    ev.target.disabled = true;
+    try {
+      await api.setPin(next);
+      // The device is now expecting the new PIN, so this browser must remember that one.
+      pinStore.set(next);
+      newInput.value = '';
+      confirmInput.value = '';
+      refreshForgetState();
+      msg.append(h('div', { class: 'banner ok', role: 'status' }, 'PIN changed, and remembered on this browser.'));
+    } catch (e) {
+      msg.append(h('div', { class: 'banner danger', role: 'alert' }, e.message));
+    } finally {
+      ev.target.disabled = false;
+    }
+  } }, 'Change PIN');
+
+  card.append(
+    h('label', { for: 'pin-new' }, 'New PIN'), newInput,
+    hint('4 to 32 characters, no spaces. Write it down somewhere — the device also shows it '
+      + 'on its own screen if you tap the top of the display.'),
+    h('label', { for: 'pin-confirm' }, 'Confirm new PIN'), confirmInput,
+    h('div', { class: 'row', style: 'margin-top:.6rem' }, saveBtn),
+    msg);
+
+  const forgetState = h('p', { class: 'small muted' }, '');
+  function refreshForgetState() {
+    forgetState.textContent = pinStore.has()
+      ? 'The PIN is saved on this browser.'
+      : 'No PIN is saved on this browser.';
+  }
+  refreshForgetState();
+  card.append(h('h3', { style: 'margin-top:1rem' }, 'This browser'), forgetState,
+    hint('Forgetting the PIN here does not turn it off on the device — it only clears the '
+      + 'saved copy in this browser, so you will be asked for it again the next time you '
+      + 'change something. Do this on a shared or borrowed computer.'),
+    h('div', { class: 'row' }, h('button', {
+      onclick: () => {
+        pinStore.clear();
+        clear(msg);
+        refreshForgetState();
+        msg.append(h('div', { class: 'banner ok', role: 'status' }, 'Forgotten. You will be asked for the PIN next time.'));
+      },
+    }, 'Forget PIN on this browser')));
+  return card;
+}
+
 let settingsActive = false;
 
 async function renderSettings(root) {
@@ -1714,6 +2344,14 @@ async function renderSettings(root) {
 
   const banner = h('div', {});
   root.append(banner);
+
+  // The firmware sets config_recovered when it had to fall back to the last known-good
+  // config after a bad save — silence here would let the owner wonder why a setting
+  // reverted itself.
+  if (state.config_recovered) {
+    root.append(h('div', { class: 'banner warn', role: 'status' },
+      'The device restored its previous settings after a bad save. Check the settings below still say what you want, then save again.'));
+  }
 
   const d = cfg.device;
   const nameInput = h('input', { type: 'text', id: 'set-name', value: d.name });
@@ -1898,59 +2536,84 @@ async function renderSettings(root) {
   const form = h('div', { class: 'card settings-grid' },
     h('h2', {}, 'Device'),
     h('label', { for: 'set-name' }, 'Device name'), h('div', { class: 'row' }, nameInput, mdnsPreview),
+    hint('What the device calls itself. It is also the web address of this page on your network: name.local in any browser at home.'),
     h('label', { for: 'set-tz' }, 'Timezone'), tzSelect, tzCustom,
+    hint('Every clock time the device shows is in this zone. Eastern is the right one for Philadelphia, and it changes for daylight saving on its own.'),
     h('label', { for: 'set-poll' }, 'Poll interval (seconds)'), pollInput,
+    hint('How often the device asks SEPTA for fresh times. It speeds up to every 15 seconds by itself whenever a bus is less than 3 minutes away, so this setting only affects the quiet stretches.'),
     h('label', { for: 'set-rotation' }, 'Screen rotation'), rotSelect,
+    hint('Which way up the display is mounted. 0° is the tall portrait orientation the layout was designed around; 90° turns it on its side.'),
     h('label', { for: 'set-bright' }, 'Screen brightness'), h('div', { class: 'row' }, brightInput, brightVal),
+    hint('How bright the backlight is during the day. Quiet hours below can dim it further at night.'),
     h('label', { for: 'set-theme' }, 'Screen theme'), themeSelect,
+    hint('Light or dark colours on the device’s own screen. This web page follows your browser instead.'),
     h('label', { class: 'inline' }, invertInput, ' Invert panel colors'),
-    h('p', { class: 'small muted' }, 'Some panels need this on to show colors correctly. If the light theme looks dark, the route badge looks orange instead of blue, or the screen flashes white at boot, flip it.'),
+    hint('Only turn this on if colours look wrong on your panel — the light theme looking dark, the route badge orange instead of blue, or a white flash at boot. Otherwise leave it alone.'),
     h('h2', {}, 'Alert ticker'),
+    hint('Service alerts and detours for your routes scroll along the bottom of the screen.'),
     h('label', { for: 'set-ticker-lines' }, 'Height'), tickerLinesSelect,
+    hint('One line scrolls sideways like a news ticker. Two or more lines wrap the text and scroll it upward instead, which is easier to read but takes room from the arrivals.'),
     h('label', { for: 'set-ticker-speed' }, 'Scroll speed'), h('div', { class: 'row' }, tickerSpeedInput, tickerSpeedVal),
+    hint('How fast the text moves, in pixels a second. Slower is easier to read from across the room.'),
     h('label', { for: 'set-ticker-show' }, 'Show'), tickerShowSelect,
-    h('p', { class: 'small muted' }, '"Show service alerts" below controls whether alerts are fetched at all; this picks what the ticker shows.'),
-    h('p', { class: 'small muted' }, 'Service alerts and detours for your routes appear along the bottom of the main screen. A taller ticker wraps the text and scrolls it upward; lower speeds are easier to read.'),
+    hint('Which messages the ticker carries. “Show service alerts” further down decides whether they are fetched from SEPTA at all.'),
 
     h('h2', {}, 'Display extras'),
     h('label', { class: 'inline' }, largeTextInput, ' Large text (two rows per stop, big numbers)'),
+    hint('Two rows per stop with the minutes in large digits, readable from across a room. Fewer arrivals fit on the screen this way.'),
     h('label', { for: 'set-crowding' }, 'Crowding'), crowdingSelect,
+    hint('SEPTA reports how full each bus is, and the display can show it next to the destination as: empty, open (many seats), few seats, standing (standing room only), packed (crushed standing) or full (not boarding). Not every bus reports crowding — when one doesn’t, nothing is shown for it.'),
     h('label', { for: 'set-crowding-icons' }, 'Crowding icons'), crowdingIconsSelect,
-    h('p', { class: 'small muted' },
-      '"Seats then people" shows chairs while there’s room to sit and switches to person icons once it’s standing room only; "Crowd meter" always shows people, with more filled-in icons meaning more crowded. In words: open, few seats, standing, packed, full.'),
+    hint('“Seats then people” is three chairs that empty out as the seats fill: 3 green chairs for empty, 2 green for open, 1 amber chair for few seats, then 1 amber person for standing, 2 red people for packed and 3 red people for full. “Crowd meter” is just one to three people: 1 green for empty or open, 2 amber for few seats or standing, 3 red for packed or full. Picking “Icons + word” above shows both.'),
 
     h('h2', {}, 'Quiet hours'),
     h('label', { class: 'inline' }, quietEnabled, ' Enable quiet hours'),
+    hint('Dims or blanks the screen overnight so it is not glowing at you in bed. A tap on the screen wakes it briefly.'),
     h('label', { for: 'set-quiet-start' }, 'Start'), quietStart,
     h('label', { for: 'set-quiet-end' }, 'End'), quietEnd,
+    hint('Quiet hours run from the first time to the second, and may cross midnight.'),
     h('label', { for: 'set-quiet-bright' }, 'Brightness during quiet hours'), h('div', { class: 'row' }, quietBrightness, quietBrightVal),
+    hint('How dim the screen goes. Zero turns the backlight off completely.'),
     h('label', { for: 'set-quiet-wake' }, 'Wake for N seconds on touch'), quietWake,
+    hint('A tap brings the screen back to normal brightness for this long, then it dims again. It stays on the page you were looking at.'),
 
     h('h2', {}, 'Night clock'),
     h('label', { class: 'inline' }, nightEnabled, ' Enable night clock'),
+    hint('When nothing is due for a while the screen becomes a big clock with the date, the weather and each stop’s next departure — so it is useful the rest of the time too.'),
     h('label', { for: 'set-night-after' }, 'Show the clock when nothing is due within N minutes'), nightAfter,
+    hint('How quiet it has to get first. A lower number switches to the clock sooner.'),
 
     h('h2', {}, 'Time to leave'),
     h('label', { class: 'inline' }, dueEnabled, ' Enable'),
+    hint('Nudges you the moment an arrival first comes within the minutes below, so you can leave without watching the screen.'),
     h('label', { for: 'set-due-minutes' }, 'Minutes before arrival'), dueMinutes,
+    hint('Roughly how long it takes you to walk to the stop.'),
     h('label', { class: 'inline' }, dueLed, ' Blink the LED'),
+    hint('Blinks the small coloured LED on the board green — easy to catch from the corner of your eye.'),
     h('label', { class: 'inline' }, dueScreen, ' Blink the row on screen'),
+    hint('Flashes that arrival’s minutes on the display.'),
     h('label', { class: 'inline' }, dueChime, ' Two short beeps (board speaker)'),
-    h('p', { class: 'small muted' }, 'Beeps are silenced during quiet hours.'),
+    hint('Two short beeps, once per bus. Needs a board with a speaker fitted, and stays silent during quiet hours.'),
 
     h('h2', {}, 'Profiles'),
+    hint('Profiles decide which stops appear at which times of the week — the outbound stop on weekday mornings, the inbound one in the evening. Outside every profile’s days and hours, all your stops are shown. Every stop keeps polling and logging either way.'),
     profilesCard,
 
     h('h2', {}, 'Header'),
-    h('p', { class: 'small muted' }, 'The strip along the top of the main screen is narrow; pick what it shows.'),
+    hint('The strip along the top of the device’s screen is narrow, so pick what it shows. Anything unticked is simply not drawn.'),
     ...headerRows,
     h('h2', {}, 'Weather'),
     h('label', { class: 'inline' }, wxEnabled, ' Show weather'),
+    hint('Puts the current temperature and a condition icon in the top strip of the screen.'),
     h('label', { class: 'inline' }, wxPerStop, ' Note the forecast at each stop\u2019s next arrival when it differs (rain, snow, fog)'),
+    hint('Adds a short line to a stop’s panel when the weather around its next arrival is worth knowing about — rain, snow or fog. Nothing is shown on ordinary days.'),
     h('label', { for: 'set-wx-units' }, 'Units'), wxUnits,
+    hint('Fahrenheit or Celsius, for every temperature the device shows.'),
     h('p', { class: 'small muted' }, 'Forecasts come from Open-Meteo.com (free, no account) for each stop\u2019s coordinates; stops within about a mile share one forecast. Stops added before this version may need coordinates - see the Stops page.'),
     h('label', { class: 'inline', style: 'margin-top:1rem' }, loggingInput, ' Log arrivals to SD card'),
+    hint('Writes every arrival to the SD card so the Stats page has something to work from. Turn it off and the Stats page stays empty.'),
     h('label', { class: 'inline' }, alertsInput, ' Show service alerts'),
+    hint('Fetches SEPTA’s alerts and detours for your routes. The ticker settings above pick which of them are displayed.'),
     h('div', { style: 'margin-top:1rem' }, h('button', { class: 'primary', onclick: async () => {
       const tz = tzSelect.value === '__custom__' ? tzCustom.value.trim() : tzSelect.value;
       // Drop legacy fields the current UI never sets: show_crowding (folded into
@@ -2002,8 +2665,13 @@ async function renderSettings(root) {
     } }, 'Save settings')));
   root.append(form);
 
+  root.append(buildPinCard(state));
+
   root.append(h('div', { class: 'card' }, h('h2', {}, 'Firmware'),
     h('p', {}, 'Version: ', h('strong', {}, state.firmware_version || 'unknown')),
+    h('p', {}, 'Board: ', h('strong', {}, state.board || 'unknown')),
+    hint('The board name matters when you update: a firmware image built for a different '
+      + 'board is refused, and the device says so rather than bricking itself.'),
     h('label', { for: 'ota-file' }, 'Upload new firmware (.bin)'),
     h('input', { type: 'file', id: 'ota-file', accept: '.bin' }),
     h('div', { id: 'progress-wrap' }, h('div', { id: 'progress-bar' })),
