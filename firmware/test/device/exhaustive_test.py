@@ -138,6 +138,8 @@ if newest:
     r = curl(PINH + [B + '/api/log/' + newest], 120); lines = [l for l in r.stdout.decode(errors='replace').split('\n') if l.strip()]
     v2 = [l for l in lines[-40:] if l.count(',') == 20]
     check('A log rows are v2 (21 columns)', len(v2) > 0, (newest, len(lines), lines[-1][:80] if lines else ''))
+    check('A log export header is schema v3 (temp_c)', lines and lines[0].startswith('ts,event,') and ',temp_c,' in lines[0], lines[0][:120] if lines else '')
+    check('A log export rows all have 21 columns', all(l.count(',') == 20 for l in lines[1:]), [l[:60] for l in lines[1:] if l.count(',') != 20][:3])
     check('A log has bike rows', any(',bike,indego-' in l for l in lines) or not base['bike'].get('enabled'), newest)
 
 # ---------- B. config round-trips ----------
@@ -361,6 +363,18 @@ check('D tap device->main', post('/api/debug/tap') == 200 and (time.sleep(2) or 
 st = state(); seats = [a.get('seats') for x in st['stops'] for a in x['arrivals'] if a.get('status') == 'live']
 check('D live rows carry seat data', any(seats) or not seats, seats[:3])
 check('D weather_note field present on stops', all('weather_note' in x for x in st['stops']))
+# Review F13/F15/F26/F29 fields (DESIGN.md SS7): per-stop health, data age, matched schedule trip,
+# SD write health and weather staleness must all be present and well-formed.
+check('D stop health is one of the four tokens', all(x.get('health') in ('live', 'schedule_only', 'stale', 'unavailable') for x in st['stops']), [(x['key'], x.get('health')) for x in st['stops']])
+check('D stop source_age_s present', all(isinstance(x.get('source_age_s'), int) for x in st['stops']), [x.get('source_age_s') for x in st['stops']])
+check('D arrivals carry sched_trip', all('sched_trip' in a for x in st['stops'] for a in x['arrivals']))
+check('D live stops are not stale right after a poll', all(x.get('health') != 'stale' for x in st['stops'] if x.get('ok')), [(x['key'], x.get('health'), x.get('source_age_s')) for x in st['stops']])
+sdj = st.get('sd', {})
+check('D sd write health fields', isinstance(sdj.get('dropped_rows'), int) and isinstance(sdj.get('write_ok'), bool) and 'error' in sdj, sdj)
+check('D sd dropped no rows', sdj.get('dropped_rows') == 0 or not sdj.get('mounted'), sdj)
+wxj = st.get('weather', {})
+check('D weather age/stale fields', isinstance(wxj.get('age_s'), int) and isinstance(wxj.get('stale'), bool), wxj.get('age_s'))
+check('D state reports board and auth', st.get('board') == 'cyd-3248S035R' and st.get('auth', {}).get('pin_required') is True and 'config_recovered' in st, (st.get('board'), st.get('auth')))
 d = ui(); check('D LVGL pool has headroom', d.get('lv_free', 0) > 3000, (d.get('lv_used'), d.get('lv_free'), d.get('lv_max_used')))
 
 # ---------- E. concurrency ----------
