@@ -92,13 +92,85 @@ void sendError(AsyncWebServerRequest *request, int code, const std::string &mess
 // and after Wi-Fi + web server the largest free block is ~15 KB (boot loop observed 2026-09-14).
 constexpr size_t kProxyFileCap = 64 * 1024;
 const char *kProxyFiles[2] = {"/proxy0.json", "/proxy1.json"};
-uint8_t g_proxy_file_idx = 0;
+
+// ---- temp-file leases (F11) -------------------------------------------------------------------
+//
+// The two files used to be handed out by a plain alternating index, on the theory that "a
+// response still being streamed is not overwritten". That is only true for exactly two requests
+// in flight and no more: a third job wraps back to file 0 and rewrites it UNDER an
+// AsyncWebServer response that is still reading it, so a setup-wizard client gets half a stop
+// list spliced onto half a schedule, with a 200 and valid-looking JSON framing. Nothing in the
+// old code could detect it; the browser just showed the wrong stops.
+//
+// So a file is LEASED for the whole life of the response that serves it, and released by the
+// request's disconnect callback - which ESPAsyncWebServer fires on both endings (WebRequest.cpp:
+// when the response finishes, _onAck closes the client, and closing is what triggers
+// _onDisconnect; an aborted client reaches the same callback). With both leased, a new job is
+// refused with 503 rather than corrupting one.
+constexpr uint32_t kLeaseMaxMs = 60 * 1000;
+
+struct ProxyFileLease {
+  std::atomic<bool> held{false};
+  uint32_t taken_ms = 0;
+};
+ProxyFileLease g_proxy_leases[2];
+
+// Acquire runs only on the poller task (runQueuedProxyJob), release on the AsyncTCP task - hence
+// the atomics. Returns the file index, or -1 when both are busy.
+int acquireProxyFile() {
+  for (int i = 0; i < 2; ++i) {
+    bool expected = false;
+    if (g_proxy_leases[i].held.compare_exchange_strong(expected, true)) {
+      g_proxy_leases[i].taken_ms = millis();
+      return i;
+    }
+  }
+  // Last resort: a lease this old cannot belong to a live response - a 64 KB file served off
+  // LittleFS over the LAN is a second or two - so it is one whose disconnect callback never ran
+  // (the client vanished in the window between locking the request and registering the callback).
+  // Without this, one such miss would wedge the setup wizard until the next reboot.
+  for (int i = 0; i < 2; ++i) {
+    if ((millis() - g_proxy_leases[i].taken_ms) > kLeaseMaxMs) {
+      Serial.printf("[proxy] reclaiming abandoned lease on %s after %u ms\n", kProxyFiles[i],
+                    (unsigned)(millis() - g_proxy_leases[i].taken_ms));
+      g_proxy_leases[i].taken_ms = millis();
+      return i;
+    }
+  }
+  return -1;
+}
+
+void releaseProxyFile(int idx) {
+  if (idx < 0 || idx > 1) return;
+  g_proxy_leases[idx].held.store(false);
+}
+
+// Releases the lease unless it was handed over to the response's disconnect callback.
+struct LeaseGuard {
+  explicit LeaseGuard(int i) : idx(i) {}
+  ~LeaseGuard() {
+    if (idx >= 0) releaseProxyFile(idx);
+  }
+  int handOver() {
+    int i = idx;
+    idx = -1;
+    return i;
+  }
+  int idx;
+};
 
 void runFetchJob(const ProxyJob &job) {
   std::string url = job.kind == ProxyKind::Stops ? septaStopsUrl(job.param) : transit::septaBusSchedulesUrl(job.param);
 
-  const char *path = kProxyFiles[g_proxy_file_idx];
-  g_proxy_file_idx ^= 1;  // alternate so a response still being streamed is not overwritten
+  int lease = acquireProxyFile();
+  if (lease < 0) {
+    // Both files are being streamed to other clients. Telling the caller to try again is the only
+    // honest answer; the alternative is overwriting a file someone is reading (F11).
+    if (auto r = lockRequest(job)) sendError(r.get(), 503, "busy, try again");
+    return;
+  }
+  LeaseGuard guard(lease);
+  const char *path = kProxyFiles[lease];
 
   int status = -1;
   size_t written = 0;
@@ -180,7 +252,11 @@ void runFetchJob(const ProxyJob &job) {
     return;
   }
 
-  // DESIGN.md SS7: "Return SEPTA's JSON as-is" - streamed from the temp file in small chunks.
+  // DESIGN.md SS7: "Return SEPTA's JSON as-is" - streamed from the temp file in small chunks. The
+  // lease now belongs to the response: registered BEFORE send() so a response that completes
+  // inside send() (a body small enough for one _send) still finds the callback in place.
+  int held = guard.handOver();
+  req->onDisconnect([held]() { releaseProxyFile(held); });
   req->send(LittleFS, path, "application/json");
 }
 
@@ -224,7 +300,23 @@ void runOverviewJob(const ProxyJob &job) {
   transit::Epoch now = (transit::Epoch)time(nullptr);
   transit::Epoch window_end = now;
   transit::Epoch window_start = now - (transit::Epoch)job.days * 86400;
-  std::unique_ptr<transit_stats::OverviewAggregator> agg(new (std::nothrow) transit_stats::OverviewAggregator(window_start, window_end));
+
+  // F28 / DESIGN.md SS9.3: the aggregator has 8 stop slots and 3 bike slots, and a 30-day log can
+  // easily hold more distinct keys than that because the user is allowed to change stops. Under
+  // the old first-seen-wins rule those slots went to the stops they USED to watch and the ones on
+  // the screen right now were silently dropped - exactly backwards for a page whose job is to
+  // describe the current configuration. So the CURRENT keys are reserved up front, in config
+  // order, and appear even with zero rows ("just added, no data yet" is a real answer).
+  Config cfg = getActiveConfig();
+  std::vector<std::string> stop_keys;
+  stop_keys.reserve(cfg.stops.size());
+  for (const transit::StopConfig &s : cfg.stops) stop_keys.push_back(s.key);
+  std::vector<std::string> bike_keys;
+  bike_keys.reserve(cfg.bike.stations.size());
+  for (const BikeStation &b : cfg.bike.stations) bike_keys.push_back("indego-" + std::to_string(b.id));
+
+  std::unique_ptr<transit_stats::OverviewAggregator> agg(
+      new (std::nothrow) transit_stats::OverviewAggregator(window_start, window_end, stop_keys, bike_keys));
   if (!agg) {
     if (auto r = lockRequest(job)) r->send(503, "application/json", "{\"error\":\"out of memory, try again\"}");
     return;
