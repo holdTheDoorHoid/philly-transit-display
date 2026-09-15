@@ -7,6 +7,8 @@ namespace transit_stats {
 StopSummary summarize(const StatsAggregator& agg) {
   StopSummary s;
   s.samples = agg.samples();
+  s.late_known = agg.lateKnown();
+  s.has_on_time = agg.hasOnTime();
   s.on_time_pct = static_cast<float>(agg.onTimePct());
   s.mean_late_min = static_cast<float>(agg.meanLateMin());
   s.worst_hour = static_cast<int8_t>(agg.findWorstHour());

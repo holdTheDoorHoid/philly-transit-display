@@ -64,6 +64,9 @@ int horizonBucketIndex(int32_t horizon_s) {
 }
 
 double round1(double v) { return std::round(v * 10.0) / 10.0; }
+// Coverage needs finer resolution than the 1-decimal display numbers: a 15-minute outage in a
+// 30-day window is a real, reportable gap and must not round away to a flat 1.0.
+double round4(double v) { return std::round(v * 10000.0) / 10000.0; }
 
 int percentileFromHist(const LatenessBucket& b, double pct) {
   if (b.n == 0) return 0;
@@ -127,6 +130,14 @@ void StatsAggregator::feedLine(const char* line, size_t len) {
   LogEvent ev;
   if (!fromCsv(line, len, ev)) return;
   if (ev.stop_key != stop_key_) return;
+
+  // Outage rows are paired first and clipped to the window afterwards (see feedLine's contract in
+  // aggregate.h): an interval that started before the window, or has not ended yet, still costs
+  // this window minutes.
+  if (ev.event == EventType::Outage) {
+    handleOutage(ev);
+    return;
+  }
   if (ev.ts < window_start_ || ev.ts >= window_end_) return;
 
   switch (ev.event) {
@@ -134,33 +145,39 @@ void StatsAggregator::feedLine(const char* line, size_t len) {
     case EventType::Arrive: handleArrive(ev); break;
     case EventType::Ghost: handleGhost(ev); break;
     case EventType::NoShow: handleNoShow(ev); break;
-    case EventType::Outage: handleOutage(ev); break;
+    case EventType::Outage: break;  // handled above, window filter deliberately bypassed
     case EventType::Bike: break;  // per-stop only; OverviewAggregator handles Bike rows
   }
 }
 
-PendingPred* StatsAggregator::findPending(const std::string& trip) {
+int64_t StatsAggregator::overlapWithWindow(transit::Epoch a, transit::Epoch b) const {
+  const transit::Epoch lo = a > window_start_ ? a : window_start_;
+  const transit::Epoch hi = b < window_end_ ? b : window_end_;
+  return hi > lo ? static_cast<int64_t>(hi - lo) : 0;
+}
+
+PendingForecast* StatsAggregator::findPending(const std::string& trip) {
   for (auto& p : pending_) {
     if (p.in_use && tripMatches(p.trip, trip)) return &p;
   }
   return nullptr;
 }
 
-PendingPred& StatsAggregator::allocPending(const std::string& trip) {
+PendingForecast& StatsAggregator::allocPending(const std::string& trip) {
   for (auto& p : pending_) {
     if (!p.in_use) {
-      p = PendingPred{};
+      p = PendingForecast{};
       p.in_use = true;
       copyTripTruncated(trip, p.trip);
       p.seq = ++pending_seq_;
       return p;
     }
   }
-  PendingPred* victim = &pending_[0];
+  PendingForecast* victim = &pending_[0];
   for (auto& p : pending_) {
     if (p.seq < victim->seq) victim = &p;
   }
-  *victim = PendingPred{};
+  *victim = PendingForecast{};
   victim->in_use = true;
   copyTripTruncated(trip, victim->trip);
   victim->seq = ++pending_seq_;
@@ -172,7 +189,7 @@ void StatsAggregator::handlePred(const LogEvent& ev) {
   const int idx = horizonBucketIndex(*ev.horizon_s);
   if (idx < 0) return;  // e.g. the first-sighting row, far from any of the 4 tracked buckets
 
-  PendingPred* p = findPending(ev.trip);
+  PendingForecast* p = findPending(ev.trip);
   if (!p) p = &allocPending(ev.trip);
   p->seq = ++pending_seq_;
   p->predicted_offset_s[idx] = static_cast<int32_t>(*ev.predicted_ts - window_start_);
@@ -181,6 +198,12 @@ void StatsAggregator::handlePred(const LogEvent& ev) {
 
 void StatsAggregator::handleArrive(const LogEvent& ev) {
   samples_++;
+  // Which inference produced this row (F22). Rows written before 2026-09-15 carry no marker and
+  // so are not counted here even though they were inferred too -- `inferred` is "rows that say
+  // how", which is why the UI wording must be "N of M arrivals are marked inferred", not "M - N
+  // were measured". Nothing in this log is measured.
+  if (isInferenceNote(ev.note)) inferred_++;
+  if (ev.note == kNoteUnobserved) unobserved_++;
 
   if (!ev.seats.empty()) {
     const int level = seatsLevel(ev.seats);
@@ -203,7 +226,12 @@ void StatsAggregator::handleArrive(const LogEvent& ev) {
     }
   }
 
-  if (ev.headway_s.has_value() && *ev.headway_s > 0) {
+  // A gap is a wait sample only if it is positive (a negative headway is corrupt or from a
+  // pre-F20 log and must never reach the statistics) and shorter than kMaxWaitGapS.
+  const bool usable_gap = ev.headway_s.has_value() && *ev.headway_s > 0 &&
+                           *ev.headway_s <= kMaxWaitGapS;
+
+  if (usable_gap) {
     int hour = 0, wd = 0;
     tz_fn_(ev.ts, hour, wd);  // wait_by_hour buckets by the row's own ts, per DESIGN §9.3
     WaitBucket& wb = wait_by_hour_[hour];
@@ -239,7 +267,7 @@ void StatsAggregator::handleArrive(const LogEvent& ev) {
     wb.hist[bin]++;
   }
 
-  if (ev.headway_s.has_value()) {
+  if (usable_gap) {
     headway_.n++;
     if (has_prev_scheduled_ && ev.scheduled_ts.has_value()) {
       const int64_t sched_gap = *ev.scheduled_ts - prev_scheduled_ts_;
@@ -259,18 +287,20 @@ void StatsAggregator::handleArrive(const LogEvent& ev) {
     has_prev_scheduled_ = true;
   }
 
-  if (PendingPred* p = findPending(ev.trip)) {
-    const transit::Epoch actual_ts = ev.actual_ts.value_or(ev.ts);
+  if (PendingForecast* p = findPending(ev.trip)) {
+    const transit::Epoch final_ts = ev.actual_ts.value_or(ev.ts);
     for (int i = 0; i < 4; i++) {
       if (!(p->bucket_has & (1u << i))) continue;
       const transit::Epoch predicted_ts = window_start_ + p->predicted_offset_s[i];
-      const int32_t err = static_cast<int32_t>(predicted_ts - actual_ts);
-      PredictionBucket& pb = prediction_[i];
-      pb.n++;
-      pb.sum_abs_err_s += (err < 0 ? -err : err);
-      pb.sum_err_s += err;
+      // How far the forecast moved between that horizon and the final inferred time -- NOT error
+      // against a measured arrival, which this project does not have (F22).
+      const int32_t revision = static_cast<int32_t>(predicted_ts - final_ts);
+      ForecastStabilityBucket& fb = forecast_stability_[i];
+      fb.n++;
+      fb.sum_abs_revision_s += (revision < 0 ? -revision : revision);
+      fb.sum_revision_s += revision;
     }
-    p->in_use = false;  // consumed: forget it, matching a pred row to at most one arrive
+    p->in_use = false;  // consumed: matching a pred row to at most one arrive
   }
 }
 
@@ -289,23 +319,52 @@ void StatsAggregator::handleNoShow(const LogEvent& ev) {
 }
 
 void StatsAggregator::handleOutage(const LogEvent& ev) {
-  if (ev.note == "end") {
-    if (outage_pending_) {
-      outage_seconds_ += static_cast<int64_t>(ev.ts - outage_pending_start_);
-      outage_pending_ = false;
+  if (ev.note == kNoteOutageEnd) {
+    if (outage_open_) {
+      // Only the part of the interval inside the window counts -- an outage that began three
+      // days before a 1-day window contributes just the slice that overlaps it (F23).
+      outage_seconds_ += overlapWithWindow(outage_open_start_, ev.ts);
+      outage_open_ = false;
     }
-  } else if (ev.note.empty()) {
-    outage_pending_ = true;
-    outage_pending_start_ = ev.ts;
+    // An `end` with no start (its start row is in a month the caller did not stream) is ignored:
+    // we know an outage happened but not when it began, and guessing would inflate the total.
+    return;
+  }
+  if (ev.note.empty()) {
+    // A second start row while one is already open means we lost the `end` (e.g. a reboot during
+    // the outage). Keep the earlier start: it is the one that bounds the real blind interval.
+    if (!outage_open_) {
+      outage_open_ = true;
+      outage_open_start_ = ev.ts;
+    }
   }
   // note == "no_live_vehicles" (the noshow-vs-outage fallback from ArrivalTracker) is a single
   // informational row, not one end of a start/end pair; it deliberately does not affect
   // outage_min. See tracker.cpp's reapVanishedAndExpired() for why it is tagged that way.
 }
 
+int64_t StatsAggregator::outageSecondsInWindow() const {
+  int64_t total = outage_seconds_;
+  // An outage with no `end` row was still running when the log was written (or when the query was
+  // made). It runs to the end of the window; treating it as zero-length was the other half of
+  // F23 -- the device would report "0 min offline" precisely while it was offline.
+  if (outage_open_) total += overlapWithWindow(outage_open_start_, window_end_);
+  return total;
+}
+
+double StatsAggregator::coverage() const {
+  const int64_t span = static_cast<int64_t>(window_end_) - static_cast<int64_t>(window_start_);
+  if (span <= 0) return 0.0;
+  double c = 1.0 - static_cast<double>(outageSecondsInWindow()) / static_cast<double>(span);
+  if (c < 0.0) c = 0.0;
+  if (c > 1.0) c = 1.0;
+  return c;
+}
+
 double StatsAggregator::onTimePct() const {
-  if (samples_ == 0) return 0.0;
-  return 100.0 * static_cast<double>(on_time_count_) / static_cast<double>(samples_);
+  // Denominator is known-lateness samples, not all arrivals (F21, and see lateKnown()).
+  if (late_known_count_ == 0) return 0.0;
+  return 100.0 * static_cast<double>(on_time_count_) / static_cast<double>(late_known_count_);
 }
 
 double StatsAggregator::meanLateMin() const {
@@ -331,8 +390,20 @@ void StatsAggregator::toJson(ArduinoJson::JsonDocument& doc) const {
   doc["stop"] = stop_key_;
   doc["days"] = static_cast<int32_t>((window_end_ - window_start_) / 86400);
   doc["samples"] = samples_;
-  doc["on_time_pct"] = round1(onTimePct());
-  doc["mean_late_min"] = round1(meanLateMin());
+  doc["late_known"] = late_known_count_;
+  // JSON null, never 0: "no bus told us how late it was" and "every bus was 0% on time" are
+  // opposite answers, and a UI that renders a missing measurement as a number is lying for us
+  // (F21). Same for mean_late_min.
+  if (hasOnTime()) {
+    doc["on_time_pct"] = round1(onTimePct());
+    doc["mean_late_min"] = round1(meanLateMin());
+  } else {
+    doc["on_time_pct"] = nullptr;
+    doc["mean_late_min"] = nullptr;
+  }
+  doc["inferred"] = inferred_;
+  doc["unobserved"] = unobserved_;
+  doc["coverage"] = round4(coverage());
 
   ArduinoJson::JsonArray by_hour = doc["by_hour"].to<ArduinoJson::JsonArray>();
   for (int h = 0; h < 24; h++) {
@@ -365,16 +436,18 @@ void StatsAggregator::toJson(ArduinoJson::JsonDocument& doc) const {
 
   doc["ghost"] = ghost_;
   doc["noshow"] = noshow_;
-  doc["outage_min"] = static_cast<int32_t>(outage_seconds_ / 60);
+  doc["outage_min"] = static_cast<int32_t>(outageSecondsInWindow() / 60);
 
-  ArduinoJson::JsonArray prediction = doc["prediction"].to<ArduinoJson::JsonArray>();
+  ArduinoJson::JsonArray stability = doc["forecast_stability"].to<ArduinoJson::JsonArray>();
   for (int i = 0; i < 4; i++) {
-    const PredictionBucket& pb = prediction_[i];
-    ArduinoJson::JsonObject o = prediction.add<ArduinoJson::JsonObject>();
+    const ForecastStabilityBucket& fb = forecast_stability_[i];
+    ArduinoJson::JsonObject o = stability.add<ArduinoJson::JsonObject>();
     o["horizon_s"] = kHorizonBuckets[i];
-    o["n"] = pb.n;
-    o["mae_s"] = pb.n ? static_cast<int32_t>(std::lround(static_cast<double>(pb.sum_abs_err_s) / pb.n)) : 0;
-    o["bias_s"] = pb.n ? static_cast<int32_t>(std::lround(static_cast<double>(pb.sum_err_s) / pb.n)) : 0;
+    o["n"] = fb.n;
+    o["mean_abs_revision_s"] =
+        fb.n ? static_cast<int32_t>(std::lround(static_cast<double>(fb.sum_abs_revision_s) / fb.n)) : 0;
+    o["mean_revision_s"] =
+        fb.n ? static_cast<int32_t>(std::lround(static_cast<double>(fb.sum_revision_s) / fb.n)) : 0;
   }
 
   ArduinoJson::JsonObject crowding = doc["crowding"].to<ArduinoJson::JsonObject>();
@@ -410,6 +483,11 @@ void StatsAggregator::toJson(ArduinoJson::JsonDocument& doc) const {
     o["ghost"] = b.ghost;
     o["noshow"] = b.noshow;
   }
+
+  // Says out loud what "typical wait" means wherever the UI derives one from mean_gap_s: half the
+  // mean OBSERVED gap, which is the random-arrival expectation only if buses are evenly spaced --
+  // and only over gaps that survived the kMaxWaitGapS / outage filters above (DESIGN §9.2).
+  doc["wait_basis"] = "half_mean_gap";
 }
 
 }  // namespace transit_stats

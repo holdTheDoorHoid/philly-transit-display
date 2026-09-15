@@ -284,7 +284,11 @@ static void test_tracker_pred_horizons_and_arrive_with_headway(void) {
   tracker.registerStop("S1", "17", "0");
   std::vector<LogEvent> out;
 
-  const transit::Epoch t0 = 2000000000;
+  // 2033-05-17 19:33:20 America/New_York. Deliberately mid-evening, not near midnight: this test
+  // asserts a headway between bus A and bus B, and the tracker refuses to join a headway across a
+  // local service-day boundary (tracker.h / DESIGN §9.2), which the old t0 of 2000000000
+  // (23:33 local) would have straddled.
+  const transit::Epoch t0 = 1999985600;
 
   // Bus A: sighted right as it arrives, then vanishes -> establishes the previous `arrive`.
   {
@@ -302,9 +306,12 @@ static void test_tracker_pred_horizons_and_arrive_with_headway(void) {
     tracker.observe(snap, t0, true, true, out);
   }
   {
+    // Two consecutive SUCCESSFUL observations without A are what it takes to conclude it passed
+    // (kMissesBeforeInference, tracker.h): one missing observation is routinely a partial feed.
     transit::StopSnapshot snap;
     snap.key = "S1";  // A no longer present
     tracker.observe(snap, t0 + 30, true, true, out);
+    tracker.observe(snap, t0 + 60, true, true, out);
   }
 
   size_t a_arrives = 0;
@@ -335,6 +342,7 @@ static void test_tracker_pred_horizons_and_arrive_with_headway(void) {
     transit::StopSnapshot snap;
     snap.key = "S1";  // B has passed
     tracker.observe(snap, predicted_B + 30, true, true, out);
+    tracker.observe(snap, predicted_B + 60, true, true, out);
   }
 
   std::vector<int32_t> b_pred_horizons;
@@ -395,6 +403,7 @@ static void test_tracker_ghost(void) {
     transit::StopSnapshot snap;
     snap.key = "S1";  // G vanished while still 370s out (> 180s threshold)
     tracker.observe(snap, t0 + 30, true, true, out);
+    tracker.observe(snap, t0 + 60, true, true, out);  // second successful miss confirms it
   }
 
   size_t ghosts = 0, arrives = 0;
@@ -472,7 +481,9 @@ static void test_tracker_noshow_vs_outage(void) {
 }
 
 // (d) outage start/end: one row when poll_ok has been false for > 300s, one more (note="end")
-// when polling recovers; no duplicate start while still failing.
+// when polling recovers; no duplicate start while still failing. The start row is timestamped
+// with the FIRST failed poll, not with the moment the 5-minute threshold was crossed (F23) --
+// otherwise every outage in the log is short by the detection delay.
 static void test_tracker_outage_start_end(void) {
   ArrivalTracker tracker;
   tracker.registerStop("S3", "17", "0");
@@ -493,14 +504,21 @@ static void test_tracker_outage_start_end(void) {
   }
   TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(outages.size()));
   TEST_ASSERT_EQUAL_STRING("", outages[0].note.c_str());
-  TEST_ASSERT_EQUAL_INT64(t0 + 310, outages[0].ts);
+  TEST_ASSERT_EQUAL_INT64(t0, outages[0].ts);  // first failure, NOT t0 + 310 (F23)
+  TEST_ASSERT_TRUE(outages[0].horizon_s.has_value());
+  TEST_ASSERT_EQUAL_INT32(310, *outages[0].horizon_s);  // detection delay is kept, not lost
   TEST_ASSERT_EQUAL_STRING("end", outages[1].note.c_str());
   TEST_ASSERT_EQUAL_INT64(t0 + 400, outages[1].ts);
+
+  // The pair the aggregator will read therefore spans the whole 400 s, not 90 s.
+  TEST_ASSERT_EQUAL_INT64(400, outages[1].ts - outages[0].ts);
 }
 
-// (e) Memory bound eviction: more than kMaxTrackedTripsPerStop distinct trips at one stop, and
-// more than kMaxTrackedStops distinct stops, both evict the least-recently-touched entry and
-// increment the exposed counters rather than growing without bound.
+// (e) Memory bound: more than kMaxTrackedTripsPerStop distinct trips at one stop, and more than
+// kMaxTrackedStops distinct stops, both stay inside the fixed arrays and report what they did
+// rather than growing without bound. The per-stop overflow is now a DROP, not an eviction: the
+// 13th trip is the farthest out of the thirteen, and evicting a sooner trip to make room for it
+// would be exactly the churn F19 is about.
 static void test_tracker_memory_bound_eviction(void) {
   {
     ArrivalTracker tracker;
@@ -520,7 +538,16 @@ static void test_tracker_memory_bound_eviction(void) {
 
     StopCounters ctr;
     TEST_ASSERT_TRUE(tracker.getStopCounters("S4", ctr));
-    TEST_ASSERT_EQUAL_UINT32(1, ctr.evicted_trips);
+    TEST_ASSERT_EQUAL_UINT32(0, ctr.evicted_trips);
+    TEST_ASSERT_EQUAL_UINT32(1, ctr.dropped_observations);
+
+    // The trips that kept their slots are the soonest ones, and the dropped one produced no row.
+    size_t preds_for_last = 0;
+    const std::string last_trip = "T" + std::to_string((int)transit_stats::kMaxTrackedTripsPerStop + 1);
+    for (const auto& ev : out) {
+      if (ev.event == EventType::Pred && ev.trip == last_trip) preds_for_last++;
+    }
+    TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(preds_for_last));
   }
   {
     ArrivalTracker tracker;
@@ -580,6 +607,7 @@ static void test_tracker_seats_on_pred_and_arrive(void) {
     transit::StopSnapshot snap;
     snap.key = "S5";
     tracker.observe(snap, predicted + 10, true, true, out);
+    tracker.observe(snap, predicted + 40, true, true, out);  // confirming second miss
   }
 
   std::vector<LogEvent> preds;
@@ -852,9 +880,16 @@ static void test_aggregator_synthetic_month(void) {
   for (const auto& line : m.lines) agg.feedLine(line.c_str(), line.size());
 
   TEST_ASSERT_EQUAL_UINT32(m.expected_samples, agg.samples());
+  TEST_ASSERT_EQUAL_UINT32(m.expected_late_known_count, agg.lateKnown());
+  TEST_ASSERT_TRUE(agg.hasOnTime());
 
+  // On-time % is over KNOWN-lateness samples only (F21). The month deliberately contains
+  // arrivals with no late_min at all (the forecast-stability pairs below); counting those in the
+  // denominator would quietly drag the figure down by ~1.4 points here, and to 50% on the
+  // one-on-time-one-unknown case the dedicated test covers.
   const double expected_on_time_pct =
-      m.expected_samples ? 100.0 * m.expected_on_time / m.expected_samples : 0.0;
+      m.expected_late_known_count ? 100.0 * m.expected_on_time / m.expected_late_known_count : 0.0;
+  TEST_ASSERT_TRUE(m.expected_samples > m.expected_late_known_count);  // the distinction is exercised
   const double expected_mean_late =
       m.expected_late_known_count
           ? static_cast<double>(m.expected_sum_late_known) / m.expected_late_known_count
@@ -902,28 +937,39 @@ static void test_aggregator_synthetic_month(void) {
   TEST_ASSERT_EQUAL_UINT32(2, doc["noshow"].as<uint32_t>());
   TEST_ASSERT_EQUAL_INT32(15, doc["outage_min"].as<int32_t>());  // only the paired start/end
 
-  ArduinoJson::JsonArray prediction = doc["prediction"];
-  TEST_ASSERT_EQUAL_INT(4, static_cast<int>(prediction.size()));
+  // F22: the feature is "forecast stability" (how much the forecast MOVED between a horizon and
+  // the final inferred time), not "prediction accuracy". Same arithmetic, honest name and keys.
+  TEST_ASSERT_TRUE(doc["prediction"].isNull());  // the misleading old key is gone, not aliased
+  ArduinoJson::JsonArray stability = doc["forecast_stability"];
+  TEST_ASSERT_EQUAL_INT(4, static_cast<int>(stability.size()));
 
-  TEST_ASSERT_EQUAL_INT32(120, prediction[0]["horizon_s"].as<int32_t>());
-  TEST_ASSERT_EQUAL_UINT16(8, prediction[0]["n"].as<uint16_t>());
-  TEST_ASSERT_EQUAL_INT32(30, prediction[0]["mae_s"].as<int32_t>());
-  TEST_ASSERT_EQUAL_INT32(30, prediction[0]["bias_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_INT32(120, stability[0]["horizon_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_UINT16(8, stability[0]["n"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_INT32(30, stability[0]["mean_abs_revision_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_INT32(30, stability[0]["mean_revision_s"].as<int32_t>());
 
-  TEST_ASSERT_EQUAL_INT32(300, prediction[1]["horizon_s"].as<int32_t>());
-  TEST_ASSERT_EQUAL_UINT16(6, prediction[1]["n"].as<uint16_t>());
-  TEST_ASSERT_EQUAL_INT32(20, prediction[1]["mae_s"].as<int32_t>());
-  TEST_ASSERT_EQUAL_INT32(-20, prediction[1]["bias_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_INT32(300, stability[1]["horizon_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_UINT16(6, stability[1]["n"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_INT32(20, stability[1]["mean_abs_revision_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_INT32(-20, stability[1]["mean_revision_s"].as<int32_t>());
 
-  TEST_ASSERT_EQUAL_INT32(600, prediction[2]["horizon_s"].as<int32_t>());
-  TEST_ASSERT_EQUAL_UINT16(4, prediction[2]["n"].as<uint16_t>());
-  TEST_ASSERT_EQUAL_INT32(30, prediction[2]["mae_s"].as<int32_t>());
-  TEST_ASSERT_EQUAL_INT32(20, prediction[2]["bias_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_INT32(600, stability[2]["horizon_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_UINT16(4, stability[2]["n"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_INT32(30, stability[2]["mean_abs_revision_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_INT32(20, stability[2]["mean_revision_s"].as<int32_t>());
 
-  TEST_ASSERT_EQUAL_INT32(900, prediction[3]["horizon_s"].as<int32_t>());
-  TEST_ASSERT_EQUAL_UINT16(2, prediction[3]["n"].as<uint16_t>());
-  TEST_ASSERT_EQUAL_INT32(15, prediction[3]["mae_s"].as<int32_t>());
-  TEST_ASSERT_EQUAL_INT32(15, prediction[3]["bias_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_INT32(900, stability[3]["horizon_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_UINT16(2, stability[3]["n"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_INT32(15, stability[3]["mean_abs_revision_s"].as<int32_t>());
+  TEST_ASSERT_EQUAL_INT32(15, stability[3]["mean_revision_s"].as<int32_t>());
+
+  // Every response says how much of the window it could actually see, and how many of its
+  // arrivals are marked as inferred, so the UI never has to guess (F22/F23).
+  TEST_ASSERT_EQUAL_UINT32(m.expected_late_known_count, doc["late_known"].as<uint32_t>());
+  TEST_ASSERT_EQUAL_STRING("half_mean_gap", doc["wait_basis"].as<const char*>());
+  TEST_ASSERT_EQUAL_UINT32(0, doc["inferred"].as<uint32_t>());  // synthetic rows carry no marker
+  // 15 minutes of outage in a 30-day window: coverage is ~0.9997, and certainly not 0 or 1.
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.9997f, doc["coverage"].as<float>());
 }
 
 static void test_summary_from_aggregator(void) {
@@ -939,9 +985,18 @@ static void test_summary_from_aggregator(void) {
 
   StopSummary s = transit_stats::summarize(agg);
   TEST_ASSERT_EQUAL_UINT32(1, s.samples);
+  TEST_ASSERT_EQUAL_UINT32(1, s.late_known);
+  TEST_ASSERT_TRUE(s.has_on_time);
   TEST_ASSERT_FLOAT_WITHIN(0.01f, 100.0f, s.on_time_pct);
   TEST_ASSERT_FLOAT_WITHIN(0.01f, 2.0f, s.mean_late_min);
   TEST_ASSERT_EQUAL_UINT32(0, s.ghosts);
+
+  // A window with no known-lateness sample at all must say so, not report 0% on time (F21).
+  StatsAggregator empty("SUM2", 0, 1000000);
+  StopSummary e = transit_stats::summarize(empty);
+  TEST_ASSERT_EQUAL_UINT32(0, e.samples);
+  TEST_ASSERT_EQUAL_UINT32(0, e.late_known);
+  TEST_ASSERT_FALSE(e.has_on_time);
 }
 
 // =============================================================================================
@@ -1177,6 +1232,11 @@ static void test_overview_aggregator_capacity_ignores_overflow(void) {
   TEST_ASSERT_EQUAL_INT(3, static_cast<int>(bikes.size()));
   TEST_ASSERT_EQUAL_STRING("indego-1", bikes[0]["station"].as<const char*>());
   TEST_ASSERT_EQUAL_STRING("indego-3", bikes[2]["station"].as<const char*>());
+
+  // What did not fit is REPORTED, not silently dropped, so the page can say "1 stop not shown"
+  // instead of implying the list is everything (F28).
+  TEST_ASSERT_EQUAL_UINT32(1, doc["excluded_stops"].as<uint32_t>());
+  TEST_ASSERT_EQUAL_UINT32(1, doc["excluded_bikes"].as<uint32_t>());
 }
 
 // =============================================================================================
@@ -1192,6 +1252,10 @@ static void test_stats_aggregator_size_budget(void) {
   // DESIGN §9.3 aims for < 2 KB; asserted here with headroom rather than the exact target, since
   // std::string SSO thresholds differ between the 64-bit host and the 32-bit ESP32 target.
   TEST_ASSERT_TRUE(sizeof(OverviewAggregator) < 4096);
+  // F19 raised kMaxTrackedTripsPerStop from 8 to 12 to stop an ordinary feed churning its slots.
+  // The budget that buys is ~20 KB on the 32-bit target; the 64-bit host build is the larger of
+  // the two (std::string is 32 B there, 24 B on ESP32), so asserting it here is the strict case.
+  TEST_ASSERT_TRUE(sizeof(ArrivalTracker) < 20480);
 }
 
 // =============================================================================================
@@ -1260,6 +1324,960 @@ static void test_months_in_window_across_dst_spring_forward(void) {
   TEST_ASSERT_EQUAL_STRING("2026-03", months[0].c_str());
 }
 
+// =============================================================================================
+// Regression tests for the 2026-09-15 measurement-defect review (F17-F25, F28). Each one asserts
+// the CORRECT behaviour for a defect the review reproduced; the comment on each says what the
+// device used to report and why that was wrong.
+// =============================================================================================
+
+namespace {
+
+// 2026-01-01 12:00:00 America/New_York. Midday on purpose: several of these tests assert a
+// headway, and headway continuity deliberately stops at a local service-day boundary.
+constexpr transit::Epoch kT = 1767286800;
+
+transit::Arrival liveArrival(const std::string& trip, transit::Epoch predicted,
+                              transit::Epoch scheduled = 0) {
+  transit::Arrival a;
+  a.trip = trip;
+  a.vehicle = "V" + trip;
+  a.predicted = predicted;
+  a.scheduled = scheduled;
+  a.status = transit::Status::Live;
+  return a;
+}
+
+transit::Arrival schedArrival(const std::string& trip, transit::Epoch scheduled) {
+  transit::Arrival a;
+  a.trip = trip;
+  a.scheduled = scheduled;
+  a.status = transit::Status::Scheduled;
+  return a;
+}
+
+transit::StopSnapshot snapOf(const char* key, const std::vector<transit::Arrival>& arrivals) {
+  transit::StopSnapshot s;
+  s.key = key;
+  s.arrivals = arrivals;
+  return s;
+}
+
+size_t countOf(const std::vector<LogEvent>& out, EventType type) {
+  size_t n = 0;
+  for (const auto& ev : out) {
+    if (ev.event == type) n++;
+  }
+  return n;
+}
+
+size_t countOfTrip(const std::vector<LogEvent>& out, EventType type, const std::string& trip) {
+  size_t n = 0;
+  for (const auto& ev : out) {
+    if (ev.event == type && ev.trip == trip) n++;
+  }
+  return n;
+}
+
+// No event anywhere may carry a negative (or zero-as-if-real) headway: the aggregator would count
+// it as a gap and could classify it as bunching (F20).
+void assertNoNegativeHeadways(const std::vector<LogEvent>& out) {
+  for (const auto& ev : out) {
+    if (ev.headway_s.has_value()) TEST_ASSERT_TRUE(*ev.headway_s > 0);
+  }
+}
+
+}  // namespace
+
+// ---- F17: a failed poll is not evidence --------------------------------------------------
+
+// The review's reproduction: a live trip predicted for T+60, then an EMPTY snapshot at T+30 with
+// poll_ok=false. The tracker used to reap the trip anyway and emit an `arrive` -- a network
+// timeout inventing a bus arrival. Nothing here may produce arrive/ghost/noshow/headway.
+static void test_tracker_failed_poll_creates_no_arrival(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F17", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F17", {liveArrival("L", kT + 60), schedArrival("S", kT + 60)}), kT, true,
+                   true, out);
+  out.clear();  // the first-sighting pred row is not what this test is about
+
+  // Eleven minutes of failed polls: long enough to cross the 5-minute outage threshold AND to
+  // pass the live trip's prediction and the scheduled trip's 10-minute no-show deadline.
+  for (transit::Epoch t = kT + 30; t <= kT + 690; t += 30) {
+    tracker.observe(snapOf("F17", {}), t, true, /*poll_ok=*/false, out);
+  }
+
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(out, EventType::Arrive)));
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(out, EventType::Ghost)));
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(out, EventType::NoShow)));
+  assertNoNegativeHeadways(out);
+  for (const auto& ev : out) TEST_ASSERT_FALSE(ev.headway_s.has_value());
+
+  // The one thing a failed poll IS evidence of: an outage, dated from the first failure (F23).
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(countOf(out, EventType::Outage)));
+  TEST_ASSERT_EQUAL_INT64(kT + 30, out[0].ts);
+}
+
+// On recovery, a trip whose predicted time passed while we were blind is closed exactly once, as
+// an explicitly "unobserved" passage -- not fabricated as an ordinary arrival, and not left to
+// rot until it looks like a ghost.
+static void test_tracker_outage_recovery_closes_unobserved_once(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F17b", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F17b", {liveArrival("U", kT + 300)}), kT, true, true, out);
+  for (transit::Epoch t = kT + 30; t <= kT + 630; t += 30) {
+    tracker.observe(snapOf("F17b", {}), t, true, /*poll_ok=*/false, out);
+  }
+  out.clear();
+
+  tracker.observe(snapOf("F17b", {}), kT + 660, true, /*poll_ok=*/true, out);  // recovery
+  const size_t arrives_after_recovery = countOf(out, EventType::Arrive);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(arrives_after_recovery));
+
+  LogEvent closed;
+  for (const auto& ev : out) {
+    if (ev.event == EventType::Arrive) closed = ev;
+  }
+  TEST_ASSERT_EQUAL_STRING("unobserved", closed.note.c_str());
+  TEST_ASSERT_TRUE(closed.actual_ts.has_value());
+  TEST_ASSERT_EQUAL_INT64(kT + 300, *closed.actual_ts);  // its last prediction; the note says so
+  TEST_ASSERT_FALSE(closed.headway_s.has_value());       // we do not know it was the next bus
+
+  // And it is gone: further successful polls must not re-close it.
+  tracker.observe(snapOf("F17b", {}), kT + 690, true, true, out);
+  tracker.observe(snapOf("F17b", {}), kT + 720, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(countOf(out, EventType::Arrive)));
+
+  StopCounters ctr;
+  TEST_ASSERT_TRUE(tracker.getStopCounters("F17b", ctr));
+  TEST_ASSERT_EQUAL_UINT32(1, ctr.unobserved_arrivals);
+}
+
+// The other half of "do not double count": if the trip is STILL being predicted when polling
+// recovers, it was not an unobserved passage at all. It keeps being tracked and produces exactly
+// one arrival later, when it genuinely disappears.
+static void test_tracker_outage_recovery_no_double_count(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F17c", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F17c", {liveArrival("R", kT + 300)}), kT, true, true, out);
+  for (transit::Epoch t = kT + 30; t <= kT + 630; t += 30) {
+    tracker.observe(snapOf("F17c", {}), t, true, /*poll_ok=*/false, out);
+  }
+  // Recovery, and the bus is still there, running late.
+  tracker.observe(snapOf("F17c", {liveArrival("R", kT + 700)}), kT + 660, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(out, EventType::Arrive)));
+
+  tracker.observe(snapOf("F17c", {}), kT + 690, true, true, out);
+  tracker.observe(snapOf("F17c", {}), kT + 720, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(countOfTrip(out, EventType::Arrive, "R")));
+
+  for (const auto& ev : out) {
+    if (ev.event == EventType::Arrive) {
+      TEST_ASSERT_EQUAL_STRING("inferred", ev.note.c_str());  // not "unobserved"
+      TEST_ASSERT_EQUAL_INT64(kT + 700, *ev.actual_ts);
+    }
+  }
+}
+
+// Genuine disappearance in fresh, successful data still follows the documented heuristic -- it
+// just needs kMissesBeforeInference consecutive successful polls to agree.
+static void test_tracker_inference_needs_two_successful_misses(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F17d", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F17d", {liveArrival("D", kT + 60)}), kT, true, true, out);
+  tracker.observe(snapOf("F17d", {}), kT + 90, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(out, EventType::Arrive)));
+
+  tracker.observe(snapOf("F17d", {}), kT + 120, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(countOf(out, EventType::Arrive)));
+
+  // A trip that merely blinked out of one feed and came back is NOT an arrival.
+  ArrivalTracker blink;
+  blink.registerStop("F17e", "17", "0");
+  std::vector<LogEvent> bout;
+  blink.observe(snapOf("F17e", {liveArrival("B", kT + 600)}), kT, true, true, bout);
+  blink.observe(snapOf("F17e", {}), kT + 30, true, true, bout);                       // partial feed
+  blink.observe(snapOf("F17e", {liveArrival("B", kT + 600)}), kT + 60, true, true, bout);
+  blink.observe(snapOf("F17e", {}), kT + 90, true, true, bout);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(bout, EventType::Arrive)));
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(bout, EventType::Ghost)));
+}
+
+// ---- F18: a scheduled trip that turns up live is not also a no-show ----------------------
+
+// The review's reproduction: schedule row for trip "same" at T+30, the live vehicle for the same
+// trip at T+10, then disappearance. The tracker keyed its lookups by (trip id, kind), so the
+// pending schedule entry was never retired and the one bus produced an `arrive` AND a `noshow`.
+static void test_tracker_scheduled_then_live_same_id_no_noshow(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F18a", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F18a", {schedArrival("same", kT + 30)}), kT, true, true, out);
+  tracker.observe(snapOf("F18a", {liveArrival("same", kT + 30, kT + 30)}), kT + 10, true, true, out);
+  tracker.observe(snapOf("F18a", {}), kT + 40, true, true, out);
+  tracker.observe(snapOf("F18a", {}), kT + 70, true, true, out);
+  tracker.observe(snapOf("F18a", {}), kT + 931, true, true, out);  // well past the no-show deadline
+
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(countOf(out, EventType::Arrive)));
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(out, EventType::NoShow)));
+}
+
+// The realistic SEPTA shape: BusSchedules' static trip id and GTFS-RT's realtime trip id are
+// different strings for the same bus (DESIGN §4.4), so the join has to fall back to the matching
+// scheduled time. (transit_core is adding Arrival::sched_trip for a precise join; this must work
+// without it.)
+static void test_tracker_scheduled_then_live_different_ids_same_scheduled_time(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F18b", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F18b", {schedArrival("SCHED-88431", kT + 30)}), kT, true, true, out);
+  tracker.observe(snapOf("F18b", {liveArrival("3667", kT + 30, kT + 30)}), kT + 10, true, true, out);
+  tracker.observe(snapOf("F18b", {}), kT + 40, true, true, out);
+  tracker.observe(snapOf("F18b", {}), kT + 70, true, true, out);
+  tracker.observe(snapOf("F18b", {}), kT + 931, true, true, out);
+
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(countOfTrip(out, EventType::Arrive, "3667")));
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(out, EventType::NoShow)));
+
+  // The reverse order (live vehicle first, schedule row after) must not open a pending record
+  // either -- it is the same bus seen twice.
+  ArrivalTracker rev;
+  rev.registerStop("F18c", "17", "0");
+  std::vector<LogEvent> rout;
+  rev.observe(snapOf("F18c", {liveArrival("3668", kT + 30, kT + 30)}), kT, true, true, rout);
+  rev.observe(snapOf("F18c", {liveArrival("3668", kT + 30, kT + 30), schedArrival("SCHED-2", kT + 30)}),
+               kT + 10, true, true, rout);
+  rev.observe(snapOf("F18c", {}), kT + 40, true, true, rout);
+  rev.observe(snapOf("F18c", {}), kT + 70, true, true, rout);
+  rev.observe(snapOf("F18c", {}), kT + 931, true, true, rout);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(rout, EventType::NoShow)));
+}
+
+// A scheduled trip that never shows up live, with the route running normally throughout, is still
+// a no-show. Fixing F18 must not silence the real signal.
+static void test_tracker_never_observed_scheduled_still_noshow(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F18d", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F18d", {schedArrival("ghosted", kT + 30)}), kT, true, true, out);
+  tracker.observe(snapOf("F18d", {}), kT + 700, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(countOf(out, EventType::NoShow)));
+}
+
+// ...but a pending schedule row whose deadline passed during an OUTAGE is dropped, not called a
+// no-show: we were not watching, so "the bus never came" is not something we know (F18/F17).
+static void test_tracker_pending_scheduled_dropped_on_outage_not_noshow(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F18e", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F18e", {schedArrival("uncertain", kT + 60)}), kT, true, true, out);
+  for (transit::Epoch t = kT + 30; t <= kT + 700; t += 30) {
+    tracker.observe(snapOf("F18e", {}), t, true, /*poll_ok=*/false, out);
+  }
+  tracker.observe(snapOf("F18e", {}), kT + 730, true, /*poll_ok=*/true, out);
+  tracker.observe(snapOf("F18e", {}), kT + 760, true, /*poll_ok=*/true, out);
+
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(countOf(out, EventType::NoShow)));
+}
+
+// ---- F19: the working set must not churn -------------------------------------------------
+
+// The review's reproduction: nine trips, the same nine every poll, eight slots -- every poll
+// evicted the entry it was about to need and re-emitted nine first-sighting `pred` rows, ten
+// evictions deep. An unchanged feed must produce no rows at all after the first poll.
+static void test_tracker_nine_trip_feed_does_not_churn(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F19a", "17", "0");
+  std::vector<LogEvent> out;
+
+  std::vector<transit::Arrival> feed;
+  for (int i = 0; i < 9; i++) {
+    // Far enough out that no horizon milestone is crossed between the two polls, so anything that
+    // shows up in round two is churn and nothing else.
+    feed.push_back(liveArrival("T" + std::to_string(i), kT + 1000 + i * 120));
+  }
+
+  tracker.observe(snapOf("F19a", feed), kT, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(9, static_cast<uint32_t>(countOf(out, EventType::Pred)));
+
+  out.clear();
+  tracker.observe(snapOf("F19a", feed), kT + 30, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(out.size()));
+
+  StopCounters ctr;
+  TEST_ASSERT_TRUE(tracker.getStopCounters("F19a", ctr));
+  TEST_ASSERT_EQUAL_UINT32(0, ctr.evicted_trips);
+  TEST_ASSERT_EQUAL_UINT32(0, ctr.dropped_observations);
+  TEST_ASSERT_EQUAL_UINT32(0, ctr.arrivals_seen);
+  TEST_ASSERT_EQUAL_UINT32(0, ctr.ghosts_seen);
+}
+
+// Twenty trips into twelve slots: the twelve SOONEST are kept, the rest are counted as dropped
+// observations, and the set is stable -- no first sighting ever repeats, and the soonest arrivals
+// are never the ones lost.
+static void test_tracker_twenty_trip_feed_keeps_the_soonest(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F19b", "17", "0");
+  std::vector<LogEvent> out;
+
+  std::vector<transit::Arrival> feed;
+  for (int i = 0; i < 20; i++) {
+    feed.push_back(liveArrival("T" + std::to_string(i), kT + 1000 + i * 60));
+  }
+
+  tracker.observe(snapOf("F19b", feed), kT, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(transit_stats::kMaxTrackedTripsPerStop),
+                            static_cast<uint32_t>(countOf(out, EventType::Pred)));
+  for (int i = 0; i < 20; i++) {
+    const std::string trip = "T" + std::to_string(i);
+    const size_t preds = countOfTrip(out, EventType::Pred, trip);
+    if (i < (int)transit_stats::kMaxTrackedTripsPerStop) {
+      TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(preds));  // soonest twelve: admitted
+    } else {
+      TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(preds));  // farthest eight: ignored
+    }
+  }
+
+  out.clear();
+  tracker.observe(snapOf("F19b", feed), kT + 30, true, true, out);
+  tracker.observe(snapOf("F19b", feed), kT + 60, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(out.size()));  // no churn, no re-sightings
+
+  StopCounters ctr;
+  TEST_ASSERT_TRUE(tracker.getStopCounters("F19b", ctr));
+  TEST_ASSERT_EQUAL_UINT32(0, ctr.evicted_trips);
+  TEST_ASSERT_EQUAL_UINT32(24, ctr.dropped_observations);  // 8 per poll, 3 polls
+}
+
+// A trip beyond the admission horizon is ignored rather than admitted-then-evicted, and is picked
+// up normally once it is close enough to matter.
+static void test_tracker_far_future_arrival_is_ignored_until_close(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F19c", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F19c", {liveArrival("FAR", kT + 5000)}), kT, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(out.size()));
+
+  tracker.observe(snapOf("F19c", {liveArrival("FAR", kT + 5000)}), kT + 3000, true, true, out);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(countOfTrip(out, EventType::Pred, "FAR")));
+}
+
+// ---- F20: headways are computed in passage order, never slot order -----------------------
+
+// The review's reproduction: two trips vanish in the same observation, the one predicted LATER
+// sitting in the earlier slot. Emitting in slot order walked last_arrive_actual backwards and
+// produced a -50 s headway, which the aggregator then counted (and could call bunching).
+static void test_tracker_simultaneous_disappearances_sorted_by_passage_time(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F20a", "17", "0");
+  std::vector<LogEvent> out;
+
+  // Slot order A, B; passage order B (T+50), A (T+100).
+  tracker.observe(snapOf("F20a", {liveArrival("A", kT + 100), liveArrival("B", kT + 50)}), kT, true,
+                   true, out);
+  out.clear();
+  tracker.observe(snapOf("F20a", {}), kT + 150, true, true, out);
+  tracker.observe(snapOf("F20a", {}), kT + 180, true, true, out);
+
+  std::vector<LogEvent> arrives;
+  for (const auto& ev : out) {
+    if (ev.event == EventType::Arrive) arrives.push_back(ev);
+  }
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(arrives.size()));
+  TEST_ASSERT_EQUAL_STRING("B", arrives[0].trip.c_str());  // earlier inferred passage comes first
+  TEST_ASSERT_EQUAL_INT64(kT + 50, *arrives[0].actual_ts);
+  TEST_ASSERT_FALSE(arrives[0].headway_s.has_value());     // nothing before it at this stop
+  TEST_ASSERT_EQUAL_STRING("A", arrives[1].trip.c_str());
+  TEST_ASSERT_TRUE(arrives[1].headway_s.has_value());
+  TEST_ASSERT_EQUAL_INT32(50, *arrives[1].headway_s);      // +50, never -50
+  assertNoNegativeHeadways(out);
+}
+
+// Two trips whose inferred times coincide: the gap between them is not knowable, so no headway is
+// written at all. A 0 would be averaged in downstream as a real, perfectly bunched pair.
+static void test_tracker_equal_passage_times_write_no_headway(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F20b", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F20b", {liveArrival("X", kT + 100), liveArrival("Y", kT + 100)}), kT, true,
+                   true, out);
+  out.clear();
+  tracker.observe(snapOf("F20b", {}), kT + 150, true, true, out);
+  tracker.observe(snapOf("F20b", {}), kT + 180, true, true, out);
+
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(countOf(out, EventType::Arrive)));
+  for (const auto& ev : out) {
+    if (ev.event == EventType::Arrive) TEST_ASSERT_FALSE(ev.headway_s.has_value());
+  }
+  assertNoNegativeHeadways(out);
+}
+
+// Headway continuity does not survive an outage: the bus after the gap is not known to be the
+// next one. The control case (same timings, no outage) shows the headway would otherwise be
+// written, so this is the outage doing it and not some other filter.
+static void test_tracker_headway_continuity_breaks_across_outage(void) {
+  auto run = [](bool with_outage) {
+    ArrivalTracker tracker;
+    tracker.registerStop("F20c", "17", "0");
+    std::vector<LogEvent> out;
+
+    tracker.observe(snapOf("F20c", {liveArrival("X", kT)}), kT, true, true, out);
+    tracker.observe(snapOf("F20c", {}), kT + 30, true, true, out);
+    tracker.observe(snapOf("F20c", {}), kT + 60, true, true, out);  // X arrives, chain starts
+
+    for (transit::Epoch t = kT + 90; t <= kT + 500; t += 30) {
+      tracker.observe(snapOf("F20c", {}), t, true, /*poll_ok=*/!with_outage, out);
+    }
+    tracker.observe(snapOf("F20c", {liveArrival("Y", kT + 560)}), kT + 530, true, true, out);
+    tracker.observe(snapOf("F20c", {}), kT + 590, true, true, out);
+    tracker.observe(snapOf("F20c", {}), kT + 620, true, true, out);
+
+    std::optional<int32_t> y_headway;
+    for (const auto& ev : out) {
+      if (ev.event == EventType::Arrive && ev.trip == "Y") y_headway = ev.headway_s;
+    }
+    assertNoNegativeHeadways(out);
+    return y_headway;
+  };
+
+  TEST_ASSERT_TRUE(run(false).has_value());   // control: consecutive buses, headway written
+  TEST_ASSERT_EQUAL_INT32(560, *run(false));
+  TEST_ASSERT_FALSE(run(true).has_value());   // across an outage: no claim made
+}
+
+// An arrival on the far side of a local service-day boundary does not inherit the previous day's
+// last arrival as its predecessor.
+static void test_tracker_headway_continuity_breaks_at_service_day(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F20d", "17", "0");
+  std::vector<LogEvent> out;
+
+  // 2026-01-01 23:50 EST and 2026-01-02 00:05 EST: 15 minutes apart, different service days.
+  const transit::Epoch late_night = 1767243600 + 23 * 3600 + 50 * 60;
+  tracker.observe(snapOf("F20d", {liveArrival("N1", late_night)}), late_night, true, true, out);
+  tracker.observe(snapOf("F20d", {}), late_night + 30, true, true, out);
+  tracker.observe(snapOf("F20d", {}), late_night + 60, true, true, out);
+
+  const transit::Epoch after_midnight = late_night + 900;
+  tracker.observe(snapOf("F20d", {liveArrival("N2", after_midnight)}), after_midnight, true, true, out);
+  tracker.observe(snapOf("F20d", {}), after_midnight + 30, true, true, out);
+  tracker.observe(snapOf("F20d", {}), after_midnight + 60, true, true, out);
+
+  for (const auto& ev : out) {
+    if (ev.event == EventType::Arrive && ev.trip == "N2") TEST_ASSERT_FALSE(ev.headway_s.has_value());
+  }
+  assertNoNegativeHeadways(out);
+}
+
+// Re-registering a stop onto a different route/direction is a new service: nothing tracked for
+// the old one carries over, headway included.
+static void test_tracker_reregistration_breaks_continuity(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F20e", "17", "0");
+  std::vector<LogEvent> out;
+
+  tracker.observe(snapOf("F20e", {liveArrival("P", kT)}), kT, true, true, out);
+  tracker.observe(snapOf("F20e", {}), kT + 30, true, true, out);
+  tracker.observe(snapOf("F20e", {}), kT + 60, true, true, out);
+
+  tracker.registerStop("F20e", "T4", "1");  // user pointed this stop at another route
+
+  tracker.observe(snapOf("F20e", {liveArrival("Q", kT + 300)}), kT + 200, true, true, out);
+  tracker.observe(snapOf("F20e", {}), kT + 330, true, true, out);
+  tracker.observe(snapOf("F20e", {}), kT + 360, true, true, out);
+
+  for (const auto& ev : out) {
+    if (ev.event == EventType::Arrive && ev.trip == "Q") TEST_ASSERT_FALSE(ev.headway_s.has_value());
+  }
+}
+
+// The aggregator defends itself too: a negative headway in an old log row (or a corrupt one) is
+// ignored rather than averaged in or counted as bunching.
+static void test_aggregator_ignores_negative_and_overlong_headways(void) {
+  StatsAggregator agg("NEG", 0, 100000, &trivialHourWeekday);
+  auto feed = [&](transit::Epoch ts, const std::string& trip, transit::Epoch scheduled,
+                   std::optional<int32_t> headway_s) {
+    LogEvent ev;
+    ev.ts = ts;
+    ev.event = EventType::Arrive;
+    ev.stop_key = "NEG";
+    ev.trip = trip;
+    ev.actual_ts = ts;
+    ev.scheduled_ts = scheduled;
+    ev.headway_s = headway_s;
+    const std::string line = transit_stats::toCsv(ev);
+    agg.feedLine(line.c_str(), line.size());
+  };
+
+  feed(28800, "S0", 28800, std::nullopt);  // seed, establishes prev_scheduled
+  feed(28810, "S1", 29400, -50);           // the F20 defect's signature value
+  feed(28820, "S2", 30000, 0);             // ambiguous, not a real gap
+  feed(28830, "S3", 30600, 4 * 3600);      // an overnight hole, not a wait
+
+  ArduinoJson::JsonDocument doc;
+  agg.toJson(doc);
+  TEST_ASSERT_EQUAL_UINT16(0, doc["headway"]["n"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_UINT16(0, doc["headway"]["bunched"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_UINT16(0, doc["wait_by_hour"][8]["n"].as<uint16_t>());
+  TEST_ASSERT_EQUAL_UINT32(4, doc["samples"].as<uint32_t>());  // still counted as arrivals
+}
+
+// ---- F21: unknown lateness is not a late bus ---------------------------------------------
+
+// The review's reproduction: one on-time arrival plus one arrival with no lateness reading read
+// as "50% on time". The unknown sample belongs in neither the numerator nor the denominator.
+static void test_aggregator_on_time_pct_over_known_lateness_only(void) {
+  // Mixed: one known on-time + one unknown is 100% of what we know, not 50% of everything.
+  {
+    StatsAggregator agg("OT", 0, 100000, &trivialHourWeekday);
+    LogEvent k;
+    k.ts = 28800; k.event = EventType::Arrive; k.stop_key = "OT"; k.trip = "K";
+    k.actual_ts = 28800; k.late_min = 2;
+    LogEvent u;
+    u.ts = 28900; u.event = EventType::Arrive; u.stop_key = "OT"; u.trip = "U"; u.actual_ts = 28900;
+    for (const LogEvent* ev : {&k, &u}) {
+      const std::string line = transit_stats::toCsv(*ev);
+      agg.feedLine(line.c_str(), line.size());
+    }
+    ArduinoJson::JsonDocument doc;
+    agg.toJson(doc);
+    TEST_ASSERT_EQUAL_UINT32(2, doc["samples"].as<uint32_t>());
+    TEST_ASSERT_EQUAL_UINT32(1, doc["late_known"].as<uint32_t>());
+    TEST_ASSERT_FALSE(doc["on_time_pct"].isNull());
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, 100.0f, doc["on_time_pct"].as<float>());
+    TEST_ASSERT_TRUE(agg.hasOnTime());
+  }
+
+  // All-unknown: two arrivals, nothing known about lateness -> null, not 0.
+  {
+    StatsAggregator agg("OT", 0, 100000, &trivialHourWeekday);
+    for (int i = 0; i < 2; i++) {
+      LogEvent ev;
+      ev.ts = 28800 + i; ev.event = EventType::Arrive; ev.stop_key = "OT";
+      ev.trip = "U" + std::to_string(i); ev.actual_ts = ev.ts;
+      const std::string line = transit_stats::toCsv(ev);
+      agg.feedLine(line.c_str(), line.size());
+    }
+    ArduinoJson::JsonDocument doc;
+    agg.toJson(doc);
+    TEST_ASSERT_EQUAL_UINT32(2, doc["samples"].as<uint32_t>());
+    TEST_ASSERT_EQUAL_UINT32(0, doc["late_known"].as<uint32_t>());
+    TEST_ASSERT_TRUE(doc["on_time_pct"].isNull());
+    TEST_ASSERT_TRUE(doc["mean_late_min"].isNull());
+    TEST_ASSERT_FALSE(agg.hasOnTime());
+  }
+
+  // Empty window: distinct again -- zero samples, and still no percentage to report.
+  {
+    StatsAggregator agg("OT", 0, 100000, &trivialHourWeekday);
+    ArduinoJson::JsonDocument doc;
+    agg.toJson(doc);
+    TEST_ASSERT_EQUAL_UINT32(0, doc["samples"].as<uint32_t>());
+    TEST_ASSERT_EQUAL_UINT32(0, doc["late_known"].as<uint32_t>());
+    TEST_ASSERT_TRUE(doc["on_time_pct"].isNull());
+  }
+
+}
+
+// ---- F22: inferred arrivals say so --------------------------------------------------------
+
+static void test_tracker_arrive_rows_carry_inference_method(void) {
+  ArrivalTracker tracker;
+  tracker.registerStop("F22", "17", "0");
+  std::vector<LogEvent> out;
+
+  // Vanishes near its prediction -> "inferred".
+  tracker.observe(snapOf("F22", {liveArrival("I", kT + 60)}), kT, true, true, out);
+  tracker.observe(snapOf("F22", {}), kT + 90, true, true, out);
+  tracker.observe(snapOf("F22", {}), kT + 120, true, true, out);
+
+  // Still being predicted long after it should have arrived, then vanishes -> "late-vanish".
+  tracker.observe(snapOf("F22", {liveArrival("LV", kT + 200)}), kT + 200, true, true, out);
+  tracker.observe(snapOf("F22", {liveArrival("LV", kT + 200)}), kT + 600, true, true, out);
+  tracker.observe(snapOf("F22", {}), kT + 630, true, true, out);
+  tracker.observe(snapOf("F22", {}), kT + 660, true, true, out);
+
+  bool saw_inferred = false, saw_late_vanish = false;
+  for (const auto& ev : out) {
+    if (ev.event != EventType::Arrive) continue;
+    if (ev.trip == "I") {
+      saw_inferred = ev.note == transit_stats::kNoteInferred;
+      TEST_ASSERT_TRUE(ev.horizon_s.has_value());   // horizon left when we lost sight of it
+      TEST_ASSERT_EQUAL_INT32(-30, *ev.horizon_s);
+    }
+    if (ev.trip == "LV") saw_late_vanish = ev.note == transit_stats::kNoteLateVanish;
+    TEST_ASSERT_TRUE(transit_stats::isInferenceNote(ev.note));  // never a bare, unexplained arrive
+  }
+  TEST_ASSERT_TRUE(saw_inferred);
+  TEST_ASSERT_TRUE(saw_late_vanish);
+}
+
+static void test_aggregator_counts_inferred_arrivals(void) {
+  StatsAggregator agg("INF", 0, 100000, &trivialHourWeekday);
+  auto arrive = [&](transit::Epoch ts, const std::string& trip, const char* note) {
+    LogEvent ev;
+    ev.ts = ts;
+    ev.event = EventType::Arrive;
+    ev.stop_key = "INF";
+    ev.trip = trip;
+    ev.actual_ts = ts;
+    ev.note = note;
+    const std::string line = transit_stats::toCsv(ev);
+    agg.feedLine(line.c_str(), line.size());
+  };
+  arrive(1000, "A", transit_stats::kNoteInferred);
+  arrive(2000, "B", transit_stats::kNoteUnobserved);
+  arrive(3000, "C", transit_stats::kNoteLateVanish);
+  arrive(4000, "D", "");  // a pre-2026-09-15 row: inferred too, but does not say so
+
+  ArduinoJson::JsonDocument doc;
+  agg.toJson(doc);
+  TEST_ASSERT_EQUAL_UINT32(4, doc["samples"].as<uint32_t>());
+  TEST_ASSERT_EQUAL_UINT32(3, doc["inferred"].as<uint32_t>());
+  TEST_ASSERT_EQUAL_UINT32(1, doc["unobserved"].as<uint32_t>());
+}
+
+// ---- F23: outage totals include the detection delay and unfinished intervals --------------
+
+// Each case is one outage interval placed differently relative to a one-day window; the reported
+// figure must be the OVERLAP with that window. The old code counted only start/end pairs whose
+// rows both fell inside the window, and timestamped the start at detection time, so a 600 s
+// outage was logged as 299 s and an ongoing one as nothing at all.
+static void test_aggregator_outage_overlap_variants(void) {
+  const transit::Epoch w0 = 1767243600;               // 2026-01-01 00:00 EST
+  const transit::Epoch w1 = w0 + 86400;
+
+  auto outageMinutes = [&](transit::Epoch start, std::optional<transit::Epoch> end) {
+    StatsAggregator agg("OUT", w0, w1, &trivialHourWeekday);
+    auto feed = [&](transit::Epoch ts, const char* note) {
+      LogEvent ev;
+      ev.ts = ts;
+      ev.event = EventType::Outage;
+      ev.stop_key = "OUT";
+      ev.note = note;
+      const std::string line = transit_stats::toCsv(ev);
+      agg.feedLine(line.c_str(), line.size());
+    };
+    feed(start, "");
+    if (end) feed(*end, "end");
+    ArduinoJson::JsonDocument doc;
+    agg.toJson(doc);
+    return doc["outage_min"].as<int32_t>();
+  };
+
+  // Closed, entirely inside the window: the full 10 minutes, detection delay included.
+  TEST_ASSERT_EQUAL_INT32(10, outageMinutes(w0 + 3600, w0 + 3600 + 600));
+  // Ongoing (no `end` row at all): runs to the end of the window, not zero.
+  TEST_ASSERT_EQUAL_INT32(100, outageMinutes(w1 - 6000, std::nullopt));
+  // Started before the window: only the part inside it counts.
+  TEST_ASSERT_EQUAL_INT32(10, outageMinutes(w0 - 3600, w0 + 600));
+  // Ends after the window: likewise.
+  TEST_ASSERT_EQUAL_INT32(10, outageMinutes(w1 - 600, w1 + 3600));
+  // Spans the whole window (a month-crossing outage): the whole window is lost.
+  TEST_ASSERT_EQUAL_INT32(1440, outageMinutes(w0 - 100000, w1 + 100000));
+  // Entirely before the window: nothing.
+  TEST_ASSERT_EQUAL_INT32(0, outageMinutes(w0 - 7200, w0 - 3600));
+
+  // Coverage follows from the same arithmetic and is reported alongside it.
+  {
+    StatsAggregator agg("OUT", w0, w1, &trivialHourWeekday);
+    LogEvent ev;
+    ev.ts = w0 + 3600;
+    ev.event = EventType::Outage;
+    ev.stop_key = "OUT";
+    std::string line = transit_stats::toCsv(ev);
+    agg.feedLine(line.c_str(), line.size());
+    ev.ts = w0 + 3600 + 8640;  // 10% of a day
+    ev.note = "end";
+    line = transit_stats::toCsv(ev);
+    agg.feedLine(line.c_str(), line.size());
+
+    ArduinoJson::JsonDocument doc;
+    agg.toJson(doc);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.9f, doc["coverage"].as<float>());
+  }
+}
+
+// ---- F24/F25: one header, one bounded record shape ---------------------------------------
+
+static void test_csv_schema_version_and_single_header(void) {
+  TEST_ASSERT_EQUAL_INT(3, transit_stats::csvSchemaVersion());
+
+  const std::string header = transit_stats::csvHeader();
+  TEST_ASSERT_TRUE(header.find("temp_c") != std::string::npos);  // v3 renames temp -> temp_c
+  TEST_ASSERT_TRUE(header.find(",temp,") == std::string::npos);
+
+  // 21 columns in the header, matching what toCsv() writes -- this is what the SD logger used to
+  // get wrong, writing a 14-column v1 header above 21-column rows (F24).
+  size_t header_commas = 0;
+  for (char c : header) header_commas += (c == ',');
+  LogEvent ev;
+  ev.ts = 1;
+  ev.stop_key = "S";
+  const std::string row = transit_stats::toCsv(ev);
+  size_t row_commas = 0;
+  for (char c : row) row_commas += (c == ',');
+  TEST_ASSERT_EQUAL_UINT32(20, static_cast<uint32_t>(header_commas));
+  TEST_ASSERT_EQUAL_UINT32(header_commas, static_cast<uint32_t>(row_commas));
+
+  // Both the v1 and the current header row are unparsable, so a mixed-schema file's header lines
+  // are skipped by the ordinary "skip what does not parse" rule.
+  LogEvent parsed;
+  TEST_ASSERT_FALSE(transit_stats::fromCsv(header.c_str(), header.size(), parsed));
+  const std::string v1h = transit_stats::csvHeaderV1();
+  TEST_ASSERT_FALSE(transit_stats::fromCsv(v1h.c_str(), v1h.size(), parsed));
+}
+
+static void test_normalize_csv_line_to_v3(void) {
+  // A v1 (14-column) row gains the seven missing columns as empty fields.
+  const char* v1 = "1757800000,arrive,17-21332,17,0,3667,7477,,1757800010,1757800012,-3,,900,";
+  std::string out;
+  TEST_ASSERT_TRUE(transit_stats::normalizeCsvLine(v1, std::string(v1).size(), out));
+  size_t commas = 0;
+  for (char c : out) commas += (c == ',');
+  TEST_ASSERT_EQUAL_UINT32(20, static_cast<uint32_t>(commas));
+
+  LogEvent parsed;
+  TEST_ASSERT_TRUE(transit_stats::fromCsv(out.c_str(), out.size(), parsed));
+  TEST_ASSERT_TRUE(parsed.event == EventType::Arrive);
+  TEST_ASSERT_EQUAL_STRING("17-21332", parsed.stop_key.c_str());
+  // A negative NUMBER must stay a number: neutralising formulas must not touch numeric columns.
+  TEST_ASSERT_TRUE(parsed.late_min.has_value());
+  TEST_ASSERT_EQUAL_INT32(-3, *parsed.late_min);
+
+  // A 21-column row passes through with its columns intact.
+  LogEvent ev;
+  ev.ts = 1757900000;
+  ev.event = EventType::Bike;
+  ev.stop_key = "indego-3468";
+  ev.note = "Snyder & Dorrance";
+  ev.bikes = 4;
+  const std::string v3 = transit_stats::toCsv(ev);
+  TEST_ASSERT_TRUE(transit_stats::normalizeCsvLine(v3.c_str(), v3.size(), out));
+  TEST_ASSERT_TRUE(transit_stats::fromCsv(out.c_str(), out.size(), parsed));
+  TEST_ASSERT_EQUAL_STRING("Snyder & Dorrance", parsed.note.c_str());
+  TEST_ASSERT_EQUAL_INT32(4, *parsed.bikes);
+
+  // Spreadsheet safety: a text field that would be read as a formula is prefixed with a quote in
+  // the EXPORT only. The stored row keeps the exact bytes the device wrote.
+  LogEvent nasty;
+  nasty.ts = 100;
+  nasty.event = EventType::Arrive;
+  nasty.stop_key = "S";
+  nasty.trip = "=HYPERLINK(\"http://x\")";
+  nasty.note = "@SUM(A1:A9)";
+  const std::string stored = transit_stats::toCsv(nasty);
+  TEST_ASSERT_TRUE(stored.find("'") == std::string::npos);  // never in the log file itself
+  TEST_ASSERT_TRUE(transit_stats::normalizeCsvLine(stored.c_str(), stored.size(), out));
+  TEST_ASSERT_TRUE(transit_stats::fromCsv(out.c_str(), out.size(), parsed));
+  TEST_ASSERT_EQUAL_CHAR('\'', parsed.trip[0]);
+  TEST_ASSERT_EQUAL_CHAR('\'', parsed.note[0]);
+
+  // Header rows, blank lines and garbage are skipped, not turned into rows.
+  const std::string header = transit_stats::csvHeader();
+  TEST_ASSERT_FALSE(transit_stats::normalizeCsvLine(header.c_str(), header.size(), out));
+  TEST_ASSERT_FALSE(transit_stats::normalizeCsvLine("", 0, out));
+  TEST_ASSERT_FALSE(transit_stats::normalizeCsvLine("nonsense", 8, out));
+}
+
+// F25: whatever goes into a LogEvent, the record that comes out is one line, no CR/LF inside a
+// field, and never longer than kMaxCsvLineBytes -- which is what makes the app's fixed 512-byte,
+// split-on-newline SD reader correct instead of merely usually-correct.
+static void test_csv_records_are_bounded_and_single_line(void) {
+  LogEvent ev;
+  ev.ts = 1757900000;
+  ev.event = EventType::Arrive;
+  ev.stop_key = std::string(80, 'S');            // absurd, but must not overflow the record
+  ev.trip = std::string(200, '9');
+  ev.vehicle = std::string(200, '7');
+  ev.note = "line one\r\nline two\ttabbed" + std::string(400, 'x');
+
+  const std::string line = transit_stats::toCsv(ev);
+  TEST_ASSERT_TRUE(line.size() <= transit_stats::kMaxCsvLineBytes);
+  TEST_ASSERT_TRUE(line.find('\n') == std::string::npos);
+  TEST_ASSERT_TRUE(line.find('\r') == std::string::npos);
+
+  LogEvent parsed;
+  TEST_ASSERT_TRUE(transit_stats::fromCsv(line.c_str(), line.size(), parsed));
+  TEST_ASSERT_TRUE(parsed.trip.size() <= transit_stats::kMaxCsvTextChars);
+  TEST_ASSERT_TRUE(parsed.stop_key.size() <= transit_stats::kMaxCsvIdChars);
+  TEST_ASSERT_EQUAL_STRING("line one  line two tabbed", parsed.note.substr(0, 25).c_str());
+
+  // Commas and quotes still round-trip exactly (they are quoted, not mangled).
+  LogEvent q;
+  q.ts = 1;
+  q.event = EventType::Arrive;
+  q.stop_key = "S";
+  q.note = "operator said, \"late, sorry\"";
+  const std::string qline = transit_stats::toCsv(q);
+  TEST_ASSERT_TRUE(transit_stats::fromCsv(qline.c_str(), qline.size(), parsed));
+  TEST_ASSERT_EQUAL_STRING(q.note.c_str(), parsed.note.c_str());
+}
+
+// A blank line or a corrupt/over-long record in the middle of a month's log must cost exactly
+// that record -- never the rest of the file.
+static void test_reader_skips_blank_and_overlong_records(void) {
+  StatsAggregator agg("SKIP", 0, 100000, &trivialHourWeekday);
+  auto arriveLine = [](transit::Epoch ts, const std::string& trip) {
+    LogEvent ev;
+    ev.ts = ts;
+    ev.event = EventType::Arrive;
+    ev.stop_key = "SKIP";
+    ev.trip = trip;
+    ev.actual_ts = ts;
+    ev.late_min = 1;
+    return transit_stats::toCsv(ev);
+  };
+
+  const std::vector<std::string> file = {
+      arriveLine(1000, "A"),
+      "",                                     // blank line mid-file
+      "   ",                                  // whitespace-only line
+      std::string(700, 'x'),                  // over-long garbage, past kMaxCsvLineBytes
+      "1,arrive,SKIP,17,0,T,,,,,,,,",         // v1 shape but truncated payload: still parses
+      arriveLine(2000, "B"),
+  };
+  for (const auto& l : file) agg.feedLine(l.c_str(), l.size());
+
+  LogEvent probe;
+  TEST_ASSERT_FALSE(transit_stats::fromCsv("", 0, probe));
+  TEST_ASSERT_FALSE(transit_stats::fromCsv(file[3].c_str(), file[3].size(), probe));
+
+  // A (v1) row at ts=1 plus the two real arrivals: the records after the damage survived.
+  TEST_ASSERT_EQUAL_UINT32(3, agg.samples());
+  TEST_ASSERT_EQUAL_UINT32(2, agg.lateKnown());
+}
+
+// ---- F28: the stops you have configured now own the overview slots -----------------------
+
+// The review's reproduction: eight historical stop_keys fill the eight first-seen slots, so the
+// two stops the user actually has configured are silently missing from the overview page.
+static void test_overview_reserved_stops_survive_a_history_of_others(void) {
+  const std::vector<std::string> current = {"17-21332", "17-21297"};
+  OverviewAggregator agg(0, 200000, current, {}, &trivialHourWeekday);
+
+  auto arrive = [&](const std::string& stop, transit::Epoch ts, int32_t late_min) {
+    LogEvent ev;
+    ev.ts = ts;
+    ev.event = EventType::Arrive;
+    ev.stop_key = stop;
+    ev.trip = "T";
+    ev.actual_ts = ts;
+    ev.late_min = late_min;
+    const std::string line = transit_stats::toCsv(ev);
+    agg.feedLine(line.c_str(), line.size());
+  };
+
+  // Eight older stops, all seen BEFORE the current ones, exactly as a month of history would be.
+  for (int i = 1; i <= 8; i++) arrive("OLD" + std::to_string(i), 1000 + i, 4);
+  arrive("17-21332", 9000, 2);
+  arrive("17-21297", 9100, 9);
+
+  ArduinoJson::JsonDocument doc;
+  agg.toJson(doc);
+
+  ArduinoJson::JsonArray stops = doc["stops"];
+  TEST_ASSERT_EQUAL_INT(8, static_cast<int>(stops.size()));
+  // The configured stops come first and carry their own numbers, not someone else's.
+  TEST_ASSERT_EQUAL_STRING("17-21332", stops[0]["stop"].as<const char*>());
+  TEST_ASSERT_EQUAL_UINT32(1, stops[0]["samples"].as<uint32_t>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 100.0f, stops[0]["on_time_pct"].as<float>());
+  TEST_ASSERT_EQUAL_STRING("17-21297", stops[1]["stop"].as<const char*>());
+  TEST_ASSERT_FLOAT_WITHIN(0.05f, 0.0f, stops[1]["on_time_pct"].as<float>());  // 9 min late
+  // Six of the eight older stops fit in the remaining slots; the other two are disclosed.
+  TEST_ASSERT_EQUAL_STRING("OLD1", stops[2]["stop"].as<const char*>());
+  TEST_ASSERT_EQUAL_UINT32(2, doc["excluded_stops"].as<uint32_t>());
+  // Top-level `samples` is the total across the stops actually LISTED (8 of the 10 arrivals);
+  // the two rows belonging to excluded stops are accounted for by excluded_stops, not silently
+  // folded into a total that would not match the rows above it.
+  TEST_ASSERT_EQUAL_UINT32(8, doc["samples"].as<uint32_t>());
+}
+
+// A reserved stop with no rows at all in the window still appears -- "just added, no data yet" is
+// a real answer, and dropping the row would make a new stop look like it does not exist.
+static void test_overview_reserved_stop_with_no_rows_still_appears(void) {
+  OverviewAggregator agg(0, 200000, {"17-NEW"}, {}, &trivialHourWeekday);
+  ArduinoJson::JsonDocument doc;
+  agg.toJson(doc);
+  ArduinoJson::JsonArray stops = doc["stops"];
+  TEST_ASSERT_EQUAL_INT(1, static_cast<int>(stops.size()));
+  TEST_ASSERT_EQUAL_STRING("17-NEW", stops[0]["stop"].as<const char*>());
+  TEST_ASSERT_EQUAL_UINT32(0, stops[0]["samples"].as<uint32_t>());
+  TEST_ASSERT_TRUE(stops[0]["on_time_pct"].isNull());  // no data, not "0% on time"
+}
+
+// The 3-to-4 bike-station transition: the user swaps one of three configured Indego stations for
+// a different one, so the window contains four. The three configured now win the slots.
+static void test_overview_bike_station_three_to_four_transition(void) {
+  const std::vector<std::string> current = {"indego-3468", "indego-3101", "indego-3999"};
+  OverviewAggregator agg(0, 200000, {}, current, &trivialHourWeekday);
+
+  auto bike = [&](const std::string& station, transit::Epoch ts, int32_t bikes) {
+    LogEvent ev;
+    ev.ts = ts;
+    ev.event = EventType::Bike;
+    ev.stop_key = station;
+    ev.note = station + " name";
+    ev.bikes = bikes;
+    const std::string line = transit_stats::toCsv(ev);
+    agg.feedLine(line.c_str(), line.size());
+  };
+
+  bike("indego-3007", 28800, 1);  // the station the user removed, seen first in the window
+  bike("indego-3468", 28810, 4);
+  bike("indego-3101", 28820, 5);
+  bike("indego-3999", 28830, 6);
+
+  ArduinoJson::JsonDocument doc;
+  agg.toJson(doc);
+  ArduinoJson::JsonArray bikes = doc["bikes"];
+  TEST_ASSERT_EQUAL_INT(3, static_cast<int>(bikes.size()));
+  TEST_ASSERT_EQUAL_STRING("indego-3468", bikes[0]["station"].as<const char*>());
+  TEST_ASSERT_EQUAL_STRING("indego-3101", bikes[1]["station"].as<const char*>());
+  TEST_ASSERT_EQUAL_STRING("indego-3999", bikes[2]["station"].as<const char*>());
+  TEST_ASSERT_EQUAL_UINT32(1, doc["bikes"][0]["samples"].as<uint32_t>());
+  TEST_ASSERT_EQUAL_UINT32(1, doc["excluded_bikes"].as<uint32_t>());
+}
+
+// Per-stop outage accounting in the overview follows the same overlap rule as the per-stop
+// endpoint, including an outage that is still open at the end of the window (F23).
+static void test_overview_outage_and_coverage_per_stop(void) {
+  const transit::Epoch w0 = 0, w1 = 86400;
+  OverviewAggregator agg(w0, w1, {"S"}, {}, &trivialHourWeekday);
+  auto outage = [&](transit::Epoch ts, const char* note) {
+    LogEvent ev;
+    ev.ts = ts;
+    ev.event = EventType::Outage;
+    ev.stop_key = "S";
+    ev.note = note;
+    const std::string line = transit_stats::toCsv(ev);
+    agg.feedLine(line.c_str(), line.size());
+  };
+
+  outage(-3600, "");        // started before the window
+  outage(600, "end");       // 600 s of overlap
+  outage(w1 - 8640, "");    // still open at the end of the window: 8640 s more
+
+  ArduinoJson::JsonDocument doc;
+  agg.toJson(doc);
+  TEST_ASSERT_EQUAL_INT32((600 + 8640) / 60, doc["stops"][0]["outage_min"].as<int32_t>());
+  TEST_ASSERT_FLOAT_WITHIN(0.005f, 1.0f - 9240.0f / 86400.0f,
+                            doc["stops"][0]["coverage"].as<float>());
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -1299,6 +2317,45 @@ int main(int argc, char** argv) {
   RUN_TEST(test_months_in_window_many_months);
   RUN_TEST(test_months_in_window_empty_when_end_not_after_start);
   RUN_TEST(test_months_in_window_across_dst_spring_forward);
+
+  // 2026-09-15 measurement-defect review (F17-F25, F28).
+  RUN_TEST(test_tracker_failed_poll_creates_no_arrival);
+  RUN_TEST(test_tracker_outage_recovery_closes_unobserved_once);
+  RUN_TEST(test_tracker_outage_recovery_no_double_count);
+  RUN_TEST(test_tracker_inference_needs_two_successful_misses);
+
+  RUN_TEST(test_tracker_scheduled_then_live_same_id_no_noshow);
+  RUN_TEST(test_tracker_scheduled_then_live_different_ids_same_scheduled_time);
+  RUN_TEST(test_tracker_never_observed_scheduled_still_noshow);
+  RUN_TEST(test_tracker_pending_scheduled_dropped_on_outage_not_noshow);
+
+  RUN_TEST(test_tracker_nine_trip_feed_does_not_churn);
+  RUN_TEST(test_tracker_twenty_trip_feed_keeps_the_soonest);
+  RUN_TEST(test_tracker_far_future_arrival_is_ignored_until_close);
+
+  RUN_TEST(test_tracker_simultaneous_disappearances_sorted_by_passage_time);
+  RUN_TEST(test_tracker_equal_passage_times_write_no_headway);
+  RUN_TEST(test_tracker_headway_continuity_breaks_across_outage);
+  RUN_TEST(test_tracker_headway_continuity_breaks_at_service_day);
+  RUN_TEST(test_tracker_reregistration_breaks_continuity);
+  RUN_TEST(test_aggregator_ignores_negative_and_overlong_headways);
+
+  RUN_TEST(test_aggregator_on_time_pct_over_known_lateness_only);
+
+  RUN_TEST(test_tracker_arrive_rows_carry_inference_method);
+  RUN_TEST(test_aggregator_counts_inferred_arrivals);
+
+  RUN_TEST(test_aggregator_outage_overlap_variants);
+
+  RUN_TEST(test_csv_schema_version_and_single_header);
+  RUN_TEST(test_normalize_csv_line_to_v3);
+  RUN_TEST(test_csv_records_are_bounded_and_single_line);
+  RUN_TEST(test_reader_skips_blank_and_overlong_records);
+
+  RUN_TEST(test_overview_reserved_stops_survive_a_history_of_others);
+  RUN_TEST(test_overview_reserved_stop_with_no_rows_still_appears);
+  RUN_TEST(test_overview_bike_station_three_to_four_transition);
+  RUN_TEST(test_overview_outage_and_coverage_per_stop);
 
   return UNITY_END();
 }

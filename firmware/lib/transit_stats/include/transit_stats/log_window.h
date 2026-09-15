@@ -22,4 +22,12 @@ namespace transit_stats {
 // device, or one with logging just turned on, won't have earlier months at all.
 std::vector<std::string> monthsInWindow(transit::Epoch window_start, transit::Epoch window_end);
 
+// Local (America/New_York) day number for `utc` -- days since 1970-01-01 local, so two epochs
+// compare equal exactly when they fall on the same local calendar day. Lives here rather than in
+// aggregate.h because ArrivalTracker needs it (headway continuity must not carry across a service
+// day boundary, DESIGN.md §9.2) and tracker.h deliberately does not depend on ArduinoJson, which
+// aggregate.h pulls in. Uses the same deterministic DST rule as everything else in this library,
+// never the host's tz database.
+int64_t localServiceDayNewYork(transit::Epoch utc);
+
 }  // namespace transit_stats
