@@ -217,10 +217,17 @@ cannot measure the heap through `/api/state` at these moments - it refuses exact
 you want is lowest - so use the `[net_poller]` serial heartbeat for an unperturbed reading.
 
 Every heap gate in the firmware reads `MALLOC_CAP_8BIT` as of 2026-09-16, with thresholds re-derived
-from what each path actually allocates (DESIGN.md §2.1): OTA needs 16 KB free and a 6 KB block,
+from what each path actually allocates (DESIGN.md §2.1): OTA needs 16 KB free and a 5,876 B block,
 because `Update.begin()` allocates exactly one 4,096 B sector buffer; `/api/state` and `/api/config`
-need 12 KB free and an 8 KB block, against one 2,872 B send buffer and ArduinoJson's 1 KB pools; the
-poller's idle slice needs 16 KB free and a 12 KB block for its ~8 KB `StatsAggregator`. Before that
+need 12 KB free and a 7,924 B block, against one 2,872 B send buffer and ArduinoJson's 1 KB pools;
+the poller's idle slice needs 16 KB free and a 12,020 B block for its ~8 KB `StatsAggregator`.
+
+**The block figures look arbitrary on purpose.** `heap_caps_get_largest_free_block()` returns values
+on a 512-byte lattice at offset 500 (`500 + 512k` - all 24 distinct values measured here fit it
+exactly), so a threshold written as a round `m * 1024` lands 12 B above a lattice point: a device
+resting there is refused by a hair while the next value up clears by 1,012 B. That is exactly how
+the old 16,384 B OTA gate locked out a board resting at 16,372. 5,876 / 7,924 / 12,020 are
+`756 + 512k`, i.e. mid-gap, 256 B from either neighbour. Do not "tidy" them to round kilobytes. Before that
 they compared INTERNAL free against thresholds that only meant something in 8-bit terms, and two of
 the three could not fire at all: INTERNAL free never drops below the 33,708 B of IRAM, so a 24 KB
 `/api/state` floor and a 40 KB idle-work floor were unreachable, and those gates were running on

@@ -322,11 +322,45 @@ poll, their steady state - both measured on the owner's two-stop config on 2026-
 | `3707f54` | 11,764 B | 4,620 B short | 5 over 10 min, all refused |
 | released **v0.2.0** | 16,372 B | **12 B short** | 3, all refused |
 
-The v0.2.0 row is the alarming one. It misses by twelve bytes - 0.07% - which is not a build that
-sits safely under the threshold but one that happens to land on the wrong side of it. That cuts
-both ways and neither direction should be over-read: it is not evidence that shipped devices are
-generally lockable (a different stop list or feed selection moves resting fragmentation either way),
-and it is not evidence that they are safe. It is one configuration, measured.
+The v0.2.0 row misses by twelve bytes, and that number is not a coincidence - it is the signature of
+a threshold placed on a lattice boundary.
+
+**`heap_caps_get_largest_free_block()` returns values on a 512-byte lattice at offset 500.** Every
+one of 24 distinct values measured here fits `500 + 512k` exactly, and two other agents confirmed
+the same structure independently across four images on separate captures. A threshold written as a
+round `m * 1024` therefore lands **exactly 12 B above a lattice point** - the worst placement
+available. A build resting on that point is refused by a hair, while the next lattice value up
+clears by 1,012 B. So a "narrow miss" against a round-KB gate is *always* a 12-byte miss; it is
+never a comfortable margin, because the nearest failing value below is 1,036 B short. Nothing about
+v0.2.0's twelve bytes is accidental, and calling it a coin toss (as an earlier draft of this section
+did) gets the mechanism backwards.
+
+All four round thresholds in play had it, with the bottom two observed at rest on real devices:
+
+| Threshold | Lattice point below | Short by | Next value up | Observed resting there |
+|---|---:|---:|---:|---|
+| 16,384 old OTA block | 16,372 | 12 | 17,396 | yes, v0.2.0, 8 minutes |
+| 12,288 idle-work block | 12,276 | 12 | 13,300 | yes |
+| 8,192 `/api/state` block | 8,180 | 12 | 9,204 | yes |
+| 6,144 new OTA block | 6,132 | 12 | 7,156 | - |
+
+Fixed by moving all three block thresholds mid-gap: **5,876** (OTA), **7,924** (`/api/state`) and
+**12,020** (idle slice), which are `756 + 512k` and therefore 256 B from either neighbour. A device
+resting on any lattice point is now admitted or refused with real margin, and a small change in
+allocation cannot flip admission. The derivations did not need redoing - each is still comfortably
+above what its path allocates (1.43x, 2.76x and 1.47x respectively); they needed moving off the
+boundary.
+
+Note that `m * 1024 - 512` does **not** fix this, which is worth stating because it is the obvious
+correction and it was the first one proposed: 5,632 sits 12 B above 5,620, reproducing the pathology
+one residue over. Seen through a 1024-byte window the lattice looks like two families at `+1012` and
+`+500`; it is one 512-byte lattice, and only a mid-gap value escapes both.
+
+The free-size thresholds are unaffected: `free8` is a sum over every free block and does not lattice.
+
+None of this should be over-read as "shipped devices are lockable". It is one configuration,
+measured. What it does establish is that a *different* configuration resting one lattice point lower
+would have been locked out just as precisely.
 
 The new 6 KB threshold admits both boards with real headroom, because it comes from the single
 4,096 B buffer the update path allocates rather than from a round number. But a sufficiently
