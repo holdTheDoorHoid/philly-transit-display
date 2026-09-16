@@ -170,7 +170,7 @@ heap region that only 32-bit word access can reach, and `malloc()` never hands t
 | web server, mDNS, SNTP | 67 KB | 100 KB | 61 KB |
 | SD card mounted | 36 KB | 69 KB | 32 KB |
 | UI screens built | 35 KB | 68 KB | 31 KB |
-| steady state while polling | ~53 KB | ~86 KB | ~43 KB |
+| steady state while polling (re-measured 2026-09-16) | ~39 KB | ~73 KB | ~20 KB |
 
 The gap between the two columns is **exactly 33,708 B at every stage** - not approximately. It was
 read directly from five paired measurements on the owner's cyd-3248S035R, spanning two firmware
@@ -178,6 +178,12 @@ builds and every point from `display` to a poll in flight, and the difference wa
 five. That region is sized once when the app's IRAM code is placed and is never allocated from, so
 the `free8` column above is the `free` column minus that constant, which is an exact restatement and
 not an estimate. The largest-block column was always `MALLOC_CAP_8BIT` and is unchanged.
+
+The boot rows are the historical `[heap]` readings restated; only the last row was re-measured on
+2026-09-16, and it moved - it had said ~86 KB `free` with a ~43 KB block, which is higher than the
+`UI screens built` row above it and did not match anything the board reports today. If the boot rows
+are ever re-taken, take them from a single boot's `[heap]` lines, which now print `free8` directly
+and need no arithmetic.
 
 Measured on the owner's board at steady state on 2026-09-16: **39.8 KB of `free8` against 73.5 KB of
 `free`**. Across 114 samples of ordinary polling (two stops, the owner's own config), `free8` ran
