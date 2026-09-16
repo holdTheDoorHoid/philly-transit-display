@@ -134,6 +134,21 @@ print('== start: uptime', uptime0, 'heap', heap0, 'stops', [x['key'] for x in ba
 code, sd_ = get_json('/api/state'); check('A state 200 json', code == 200 and isinstance(sd_, dict) and 'time' in sd_, (code, list(sd_ or {})[:5]))
 code, d = get_json('/api/config'); check('A config has all sections', code == 200 and all(k in d for k in ('device', 'stops', 'alerts', 'weather', 'due', 'profiles', 'bike')), d and list(d.keys()))
 code, d = get_json('/api/debug/ui'); check('A debug/ui', code == 200 and d.get('page') in ('main', 'night', 'stats', 'device'), d)
+# DESIGN.md SS12.1: the C++ emergency exception pool. POST /api/debug/oom exhausts the heap on the
+# device, forces a std::bad_alloc with nothing left for the exception object, frees everything and
+# reports whether the catch ran; without the pool that request reboots the device (the Z serial
+# check would then also count the rst line). 'largest' under ~100 B at the throw proves the
+# exception object could only have come from the pool. A 404 is a firmware from before the endpoint.
+r = curl(PINH + ['-w', '\n%{http_code}', '-X', 'POST', B + '/api/debug/oom'], 30)
+obody, _, ocode = r.stdout.rpartition(b'\n')
+if ocode == b'404':
+    print('SKIP A debug/oom: this firmware has no /api/debug/oom')
+else:
+    try: oj = json.loads(obody)
+    except Exception: oj = {}
+    check('A debug/oom bad_alloc caught with the heap exhausted', ocode == b'200' and oj.get('caught') is True, (ocode, obody[:120]))
+    print('     debug/oom: largest block at the throw %s B, %s blocks taken, heap %s -> %s' % (oj.get('largest'), oj.get('blocks'), oj.get('free_before'), oj.get('free_after')))
+    time.sleep(2)  # let the poller / display loop finish whatever the momentary starvation interrupted
 code, d = get_json('/api/stats?stop=%s&days=30' % backup['stops'][0]['key']); check('A stats', code == 200 and isinstance(d, dict), (code, str(d)[:80]))
 code, d = get_json('/api/log/index'); check('A log index', code == 200 and isinstance(d, list), (code, d))
 if isinstance(d, list) and d:

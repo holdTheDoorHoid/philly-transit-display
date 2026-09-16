@@ -761,6 +761,46 @@ void handleProxySchedule(AsyncWebServerRequest *request) {
   queueScheduleProxy(request, request->getParam("stop_id")->value().c_str());
 }
 
+// DESIGN.md SS12.1: the deterministic on-device proof of the C++ emergency exception pool
+// (cxx_exception_pool.cpp). Takes the heap away in shrinking blocks until even a 16-byte allocation
+// fails, then forces a std::bad_alloc: with no pool, __cxa_allocate_exception cannot get the ~100
+// bytes for the exception object and calls std::terminate - a reboot - before any catch block runs;
+// with the pool it lands in the catch below. Every block is freed before the response is built, and
+// the body is snprintf'd into a stack buffer so answering needs no heap of its own. "largest" is the
+// largest free block at the moment of the throw: under ~100 bytes proves the exception object came
+// from the pool and not from a hole another task opened meanwhile. PIN-gated because it starves
+// every other task for the sub-millisecond it holds the blocks (the poller and the display loop
+// catch their own bad_alloc and carry on; lwIP tolerates a NULL pbuf; LVGL draws from its own pool).
+void handleDebugOom(AsyncWebServerRequest *request) {
+  if (!requirePin(request)) return;
+  constexpr size_t kMaxBlocks = 200;
+  static const size_t kBlockSizes[] = {1024, 256, 64, 16};
+  void *blocks[kMaxBlocks];
+  size_t n = 0;
+  const uint32_t free_before = ESP.getFreeHeap();
+  for (size_t size : kBlockSizes) {
+    while (n < kMaxBlocks) {
+      void *p = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+      if (!p) break;
+      blocks[n++] = p;
+    }
+  }
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  bool caught = false;
+  char *volatile probe = nullptr;  // volatile: the compiler may otherwise elide an unused new/delete pair
+  try {
+    probe = new char[4096];
+    delete[] probe;
+  } catch (const std::bad_alloc &) {
+    caught = true;
+  }
+  for (size_t i = 0; i < n; ++i) heap_caps_free(blocks[i]);
+  char body[128];
+  snprintf(body, sizeof body, "{\"caught\":%s,\"blocks\":%u,\"largest\":%u,\"free_before\":%u,\"free_after\":%u}",
+           caught ? "true" : "false", (unsigned)n, (unsigned)largest, (unsigned)free_before, (unsigned)ESP.getFreeHeap());
+  request->send(200, "application/json", body);
+}
+
 // Static list embedded in firmware (transit_core/rail_stations.h) - no network needed, so this
 // runs directly on the web server's own task.
 void handleRailStations(AsyncWebServerRequest *request) {
@@ -974,6 +1014,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     ui::requestTap();
     request->send(200, "application/json", "{\"ok\":true}");
   });
+  g_server.on("/api/debug/oom", HTTP_POST, handleDebugOom);  // SS12.1 exception-pool proof; PIN-gated
   g_server.on("/api/wifi/reset", HTTP_POST, handlePostWifiReset);
 
   g_server.on("/api/proxy/stops", HTTP_GET, handleProxyStops);

@@ -462,7 +462,7 @@ shown on the device info screen). CORS is deliberately not enabled and the UI is
 cross-origin page cannot attach that header without a preflight this server never answers.
 
 Protected: `PUT /api/config`, `POST /api/reboot`, `POST /api/wifi/reset`, `POST /api/ota`,
-`POST /api/pin`, `POST /api/debug/tap`, `GET /api/log/<file>.csv`.
+`POST /api/pin`, `POST /api/debug/tap`, `POST /api/debug/oom`, `GET /api/log/<file>.csv`.
 Open: everything else, including `GET /api/log/index` and `GET /api/debug/ui`.
 
 Status codes beyond the per-route ones below:
@@ -497,6 +497,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | `POST /api/pin` | Body `{"pin":"new"}`, authenticated with the **current** PIN in `X-Pin`. New PIN: 4–32 printable ASCII, no whitespace. → `{"ok":true}`, or 400 with the rule that was broken. No reset-by-network path: recovery is the serial console or the device info screen (§12) |
 | `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, LVGL pool use, resolution, heap |
 | `POST /api/debug/tap` | Test hook (PIN-protected: it changes what the screen shows): simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
+| `POST /api/debug/oom` | Test hook (PIN-protected: it starves every other task for under a millisecond): exhausts the heap on purpose, forces a `std::bad_alloc`, frees everything and answers `{"caught":true,"blocks":N,"largest":B,"free_before":X,"free_after":Y}` - the deterministic proof of the emergency exception pool (§12.1). `largest` under ~100 means the exception object could only have come from the pool; without the pool the request reboots the device |
 
 Arrival object in `/api/state`:
 ```json

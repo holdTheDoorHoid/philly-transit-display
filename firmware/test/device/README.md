@@ -16,6 +16,9 @@ header (DESIGN.md §7/§12). Read it off the serial console at boot — `[auth] 
 from the device info screen on the panel. The script fails immediately with that instruction if it
 is unset. It also exercises the hardening itself: 401 without a PIN, the 429 lockout and its
 recovery, the 421 `Host` check, an OTA with no file, and an OTA image built for a different board.
+On firmware that has it, `POST /api/debug/oom` (DESIGN.md §12.1) is run too: the heap is exhausted
+on purpose and the resulting `std::bad_alloc` must be caught instead of rebooting the device; older
+builds that answer 404 get a `SKIP` line.
 
 It is not part of `pio test` (it needs the hardware and about 15 minutes). PlatformIO ignores this
 directory because it has no `test_main`. 2026-09-14: 119/122 with the three remaining items being
