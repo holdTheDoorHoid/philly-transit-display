@@ -1,5 +1,7 @@
-// Device info page: IP, mDNS, SSID, RSSI, SD status, free heap, firmware
-// version, and a "hold 5s to reset Wi-Fi" gesture. DESIGN.md SS8.
+// Device info page (DESIGN.md SS8): the header strip with the firmware version, a Network panel
+// (Wi-Fi bars, SSID, mDNS URL, IP, RSSI, last SEPTA poll), a panel named after the device (web
+// PIN in the big font, SD status and write health, free heap, uptime) and the "hold 5 s to reset
+// Wi-Fi" button along the bottom. Built when tapped to and deleted when tapped away from (ui.cpp).
 #pragma once
 #include <lvgl.h>
 
