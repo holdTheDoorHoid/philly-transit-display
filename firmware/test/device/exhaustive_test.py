@@ -35,12 +35,21 @@ def get_json(path):
     # DESIGN.md SS12.1: /api/state can answer an empty 200 (or 503) under memory pressure and the
     # client must retry - the data is there, the async send buffer momentarily was not. Retry a
     # handful of times before giving up so a state()-based assertion does not flake on that.
+    #
+    # BACKING OFF, not a flat interval (2026-09-16). A 503 here is the largest-block gate, i.e.
+    # fragmentation, and fragmentation is relieved by TIME WITH NOTHING RUNNING - a retry every
+    # 1.5 s is itself load, and ten of them spent fifteen seconds making the condition they were
+    # waiting out slightly worse. put_cfg() already learned this for writes ("retrying too eagerly
+    # amplifies the very memory pressure that caused the 503"); this is the same lesson for reads.
+    # Eight tries over about a minute, widening.
     code, body = 0, b''
-    for attempt in range(10):
+    delay = 1.5
+    for attempt in range(8):
         code, body = get(path)
         if not (code == 503 or (code == 200 and not body)):
             break
-        time.sleep(1.5)
+        time.sleep(delay)
+        delay = min(delay * 1.7, 12.0)
     try: return code, json.loads(body)
     except Exception: return code, None
 
@@ -116,6 +125,28 @@ def serial_thread():
         s.close()
     except Exception as e:
         serial_lines.append('SERIAL THREAD ERROR ' + repr(e))
+
+def settle_heap(why, floor=8000, timeout=150):
+    """Wait for the byte-addressable heap to defragment enough that the gated read handlers will
+    answer again (DESIGN.md SS12.1: /api/state and /api/config refuse below a 7,924 B largest
+    block).
+
+    The heavy reads in section A - a month of CSV, the 400 KB stop-list proxy, two 30-day scans -
+    leave the largest block in the low thousands, and the section after them then reads /api/config
+    after every write and reports "GET refused after every retry". That is the documented gate
+    doing its job against a suite that gave it no room, not a firmware fault, so the suite is what
+    changes: measure the thing, wait for it, say so. /api/debug/ui is deliberately not gated
+    (web_server.cpp) and reports largest_block, so this can be asked without adding to the pressure
+    it is waiting out."""
+    got = wait_for(lambda: ui().get('largest_block', 0) >= floor, timeout, 5)
+    # Reported as its OWN check, not waited out in silence. The pacing exists so that a wedged heap
+    # is one named failure instead of thirty-five unrelated ones blaming themselves - it must not
+    # make the wedge invisible. If this check fails, the device could not defragment enough to
+    # answer a gated read within a couple of minutes of being left alone, and every failure under it is downstream
+    # of that.
+    check('heap recovered enough for the gated reads before %s' % why, got,
+          'largest_block %s after %ds idle, floor %d' % (ui().get('largest_block'), timeout, floor))
+    return got
 
 def wait_for(pred, timeout=60, every=3):
     deadline = time.time() + timeout
@@ -279,6 +310,10 @@ if newest:
     check('A log has bike rows', any(',bike,indego-' in l for l in lines) or not base['bike'].get('enabled'), newest)
 
 # ---------- B. config round-trips ----------
+# Section A's heavy reads fragment the heap; every check below reads /api/config, which is gated on
+# the largest block. Give it back before starting, rather than reporting the gate as 35 failures.
+settle_heap('B (every check here reads the gated /api/config)')
+
 def refused(d):
     """True for a gate refusal body - {"error": "low memory, retry"} - which parses as a perfectly
     good dict and so slips past an `is not None` guard. DESIGN.md SS12.1: any heavy read can answer
@@ -469,6 +504,12 @@ check('C3 index sends frame + nosniff headers', 'X-Frame-Options: DENY' in h and
 time.sleep(2)
 
 # ---------- D. screen logic ----------
+# Like B: every step here saves a config and then reads the gated /api/state and /api/config to see
+# what the screen did, with wait_for() budgets of 15-90 s that a refusing read eats whole. Same
+# named check, same reason - so a refusal is reported once, here, instead of as a dozen screen-logic
+# failures that had nothing to do with screen logic.
+settle_heap('D (its wait_for budgets are spent on gated reads)')
+
 k0, k1 = base['stops'][0]['key'], base['stops'][1]['key']
 # profiles
 cfg = copy.deepcopy(base); cfg['profiles'] = [{'name': 'Test window', 'days': [today_dow()], 'start': now_hhmm(-5), 'end': now_hhmm(30), 'stops': [k1]}]
@@ -719,10 +760,25 @@ for rnd in range(3):
     with concurrent.futures.ThreadPoolExecutor(7) as ex:
         outcomes.append(list(ex.map(hit, ['/api/state'] * 4 + ['/api/proxy/stops?route=17', '/api/stats?stop=%s&days=30' % k0, '/app.js'])))
     time.sleep(5)
+# A refused /api/state right after seven concurrent requests is the memory gate, not a reboot, and
+# reading uptime as 0 from it used to fail this check for the wrong reason. Wait for a real answer.
+wait_for(lambda: state().get('uptime', 0) > 0, 90, 5)
 u_after = state().get('uptime', 0)
 check('E no reboot under 3x7 concurrent requests', u_after > u_before, (u_before, u_after, outcomes))
+# Two shapes of the same refusal, counted together against one budget (DESIGN.md SS12.1):
+#   "200 0"   the handler built the answer and the send buffer was not there - the documented
+#             empty-200 the README tells scripted clients to retry;
+#   "000 0"   curl never got a reply at all, because AsyncTCP's accept path does
+#             `new (std::nothrow) AsyncClient` and `new (std::nothrow) lwip_tcp_event_packet_t` and
+#             aborts the pcb when either returns null (AsyncTCP.cpp tcp_accept). Under
+#             MEMP_MEM_MALLOC every lwIP allocation is a plain malloc, so this is the SAME
+#             fragmentation one layer lower down - too little heap to build a connection object, so
+#             there is no handler to answer 503 politely. Not connection-count exhaustion: nothing
+#             here caps concurrent clients.
 empties = sum(1 for r in outcomes for o in r if o.startswith('200 0'))
-check('E at most 2 empty responses per round (known limit, firmware/README.md)', empties <= 6, (empties, outcomes))
+aborted = sum(1 for r in outcomes for o in r if o.startswith('000'))
+check('E at most 2 refusals per round (empty 200 or aborted connection; known limit, firmware/README.md)',
+      empties + aborted <= 6, ('empty200=%d aborted=%d' % (empties, aborted), outcomes))
 
 # ---------- F. reboot ----------
 check('F reboot endpoint', post('/api/reboot') == 200)
@@ -783,12 +839,23 @@ else:
         # number main.cpp restarts on - that is the later of this stamp and the per-fetch one, and
         # is not exposed - so a device mid-cycle on a dead network may exceed 300 s here without
         # restarting. On the bench, with SEPTA reachable, it should never come close.)
-        samples = []
+        # Sample uptime WITH since_s. Read alone, since_s cannot tell three different things apart:
+        # a poller that has stopped (what this section is for), a read the memory gate refused
+        # (None), and a device that rebooted mid-sample (-1 again, because before_first_cycle is
+        # true after every boot). The 2026-09-16 run reported [None, -1, 6, 1, 12, 3] and the
+        # None/-1 pair was the board rebooting from the getBikes() panic, not anything about
+        # since_s - which is a documented -1 until the first cycle of a boot finishes. Carrying
+        # uptime makes the three say which they are.
+        samples, uptimes = [], []
         for _ in range(6):
             time.sleep(10)
-            samples.append((state().get('last_poll') or {}).get('since_s'))
+            st_i = state()
+            samples.append((st_i.get('last_poll') or {}).get('since_s'))
+            uptimes.append(st_i.get('uptime'))
         numeric = [s for s in samples if isinstance(s, int)]
-        check('F2 since_s stays sampled over a minute', len(numeric) == len(samples), samples)
+        rebooted = any(isinstance(a, int) and isinstance(b, int) and b < a for a, b in zip(uptimes, uptimes[1:]))
+        check('F2 device did not reboot while since_s was being sampled', not rebooted, list(zip(uptimes, samples)))
+        check('F2 since_s stays sampled over a minute', len(numeric) == len(samples), list(zip(uptimes, samples)))
         check('F2 since_s never approaches the stall window (300 s) on a healthy network',
               bool(numeric) and max(numeric) < 240, samples)
         # It has to come back DOWN at least once over the minute. On a healthy network a since_s
@@ -865,6 +932,26 @@ if restore_ok:
     restored = True  # only now has the atexit safety net nothing left to do
 else:
     print('     !! restore NOT verified - leaving the atexit safety net armed')
+# DESIGN.md SS5/SS12.1: the display task's lock policy, checked rather than asserted. These two
+# numbers are what a future screen that reintroduced a blocking read would move, and they are read
+# last so they cover the whole run - including section I's page cycling and section E's burst.
+uz = ui(); sz = state()
+misses, tick_max, up = uz.get('lock_misses'), uz.get('tick_ms_max'), sz.get('uptime')
+if misses is None or tick_max is None:
+    print('== Z skipped: /api/debug/ui carries no lock_misses/tick_ms_max (firmware predates the policy)', flush=True)
+else:
+    # Fewer than one miss per second of uptime, i.e. under one per 1 Hz refresh on average. The
+    # display task takes these locks without waiting, so misses are expected and cheap - each costs
+    # one frame of staleness on one field - but a count that tracks the tick rate would mean a lock
+    # that is genuinely always held, which is a different bug and this is what would show it.
+    check('Z display task: lock misses stayed well under one per refresh', isinstance(misses, int) and isinstance(up, int) and misses < up,
+          (misses, 'uptime', up))
+    # A refresh is single-digit ms; a page rebuild after a config save is ~200. Half a second is
+    # comfortably above both and far below any of the waits this task used to be allowed (200 ms to
+    # 1 s), so this fails if anything ever waits on a lock from here again. NOTE: with due.chime on,
+    # dueAlertTick()'s two beeps (tone() + delay(160)) legitimately land in this measurement.
+    check('Z display task: no refresh ever blocked (worst tick under 500 ms)', isinstance(tick_max, int) and tick_max < 500, tick_max)
+
 stop_serial = True; time.sleep(1.5)
 crashes = [l for l in serial_lines if re.search(r'Guru|abort\(\)|Backtrace|rst:0x', l)]
 warns = sum(1 for l in serial_lines if '[Warn]' in l)
@@ -874,6 +961,11 @@ errs = [l for l in serial_lines if re.search(r'\bE \(|error', l, re.I)][:5]
 check('Z serial: no crash lines except the three requested reboots (A0, F, OTA)', len([l for l in crashes if 'rst:0x' in l]) <= 3 and not [l for l in crashes if 'Guru' in l or 'Backtrace' in l or 'abort' in l], crashes[:5])
 check('Z serial: no LVGL warnings', warns == 0, warns)
 print('== serial lines captured', len(serial_lines), 'errors sample', errs)
+# Keep the capture. A crash line is only half an answer - the other half is the addresses after it,
+# which need `xtensa-esp32-elf-addr2line -pfiaC -e <elf>` and therefore need the raw text to still
+# exist after the run. Overwritten each run, like exhaustive_results.json beside it.
+with open(os.path.join(S, 'exhaustive_serial.log'), 'w') as fh:
+    fh.write('\n'.join(serial_lines) + '\n')
 passed = sum(1 for r in results if r[1]); print('\n== %d/%d checks passed' % (passed, len(results)))
 for name, ok, detail in results:
     if not ok: print('   FAILED:', name, '--', str(detail)[:300])

@@ -17,6 +17,7 @@
 #include <string>
 
 #include "transit_stats/events.h"
+#include "ui_lock.h"
 
 namespace transit_app {
 
@@ -39,10 +40,16 @@ SemaphoreHandle_t statusMutex() {
   return g_status_mutex;
 }
 
+// 200 ms for the poller and the web task; zero for the LVGL display task, which reads this on
+// every tick the device-info page is up and must never block on another task's lock (ui_lock.h,
+// DESIGN.md SS5). The hold is short either way - struct copies, never an SD operation - but "short"
+// is not "never", and the panic this pass fixes came from an accessor whose hold was also short.
+constexpr uint32_t kSdStatusWaitMs = 200;
+
 struct StatusLock {
-  StatusLock() : held(xSemaphoreTake(statusMutex(), pdMS_TO_TICKS(200)) == pdTRUE) {}
+  StatusLock() : held(takeShared(statusMutex(), kSdStatusWaitMs)) {}
   ~StatusLock() {
-    if (held) xSemaphoreGive(statusMutex());
+    if (held) giveShared(statusMutex());
   }
   bool held;
 };
@@ -147,9 +154,27 @@ SdStatus mountSd() {
 }
 
 SdStatus getSdStatus() {
-  StatusLock lock;
-  if (!lock.held) return SdStatus{};
-  return g_status;
+  static LastGood<SdStatus> ui_last;  // display task only (ui_lock.h)
+  const bool ui = onDisplayTask();
+  SdStatus copy;
+  {
+    StatusLock lock;
+    if (!lock.held) {
+      if (ui) {
+        ui_last.miss();
+        // Last frame's line, not a default SdStatus - which says "not mounted" and would flash the
+        // device page's SD row to a fault the card never had.
+        return ui_last.value();
+      }
+      return copy;
+    }
+    copy = g_status;
+  }
+  if (ui) {
+    ui_last.slot() = copy;
+    ui_last.hit();
+  }
+  return copy;
 }
 
 uint64_t logBytes() {

@@ -859,6 +859,8 @@ firmware/
     config_store.{h,cpp}         LittleFS <-> Config struct, validation, defaults, migration
     web_server.{h,cpp}           routes in §7, serves gzipped assets from src/generated/
     ui/                          LVGL screens: main, stats, device info; uses only Snapshot data
+    ui_lock.{h,cpp}              who may wait on whom: the display task's zero-wait lock policy and
+                                 the last-good fallback every shared accessor uses (this §)
     sd_logger.{h,cpp}            SD mount, monthly CSV append, disk-full handling
     status_led.{h,cpp}
   src/generated/web_assets.h     produced by web/build.mjs (committed; CI verifies freshness)
@@ -891,13 +893,73 @@ stop per slice, at most every 10 minutes per stop or on request, evicting stops 
 configured. It used to stream a month of CSV per stop synchronously on whichever task asked, so
 opening the stats page froze touch and the clock for as long as the card took.
 
-**Nor may it wait on the poller's mutex.** Every accessor the LVGL task uses takes that lock for at
-most 50 ms and gives up rather than waiting: `getStopSummary()`, and since the RC review
-`tryGetPollStatus()`, which the device page calls on every tick it is shown (it had been calling
-the blocking `getPollStatus()`, a 1 s wait, on the display task). The blocking form is for the web
-task only. §12.1 records the `vTaskPriorityDisinheritAfterTimeout` assert that exactly a 1 s wait
-from this task produced. On a miss the caller redraws the value it last read, which costs one tick
-of staleness on a line that already shows an age - never a blank "no poll yet".
+**Nor may it wait on ANY other task's mutex. Not briefly: NOT AT ALL** (2026-09-16). The display
+task's budget for waiting on a lock another task can hold is zero ticks, and "a short cap" is not a
+weaker form of that rule - it is a different rule, and the wrong one (below). This had been kept at
+each call site, which is not a mechanism: a pass in the RC review capped
+`getStopSummary()` and `tryGetPollStatus()` at 50 ms and left every other accessor on its original
+500-1000 ms wait, and one of those - `getBikes()`, 500 ms, called from `refreshMainScreen()` on
+every tick the arrivals page is up - panicked a device in `vTaskPriorityDisinheritAfterTimeout`
+(§12.1, second occurrence). The decision now lives in one place, `src/app/ui_lock.h`: every shared
+accessor takes its lock through `takeShared()`, which picks the wait from **who is asking** rather
+than from what the call site remembered to pass - a zero-tick try on the display task, the
+accessor's own wait on every other.
+
+**The two accessors that already looked fixed were not the pattern to copy** - they were a narrower
+version of the same bug, and both are now zero-budget like everything else. Zero and not "short",
+because a short wait does not close the hole. That assert is reachable on
+exactly one path: a take that blocks, times out, and donated priority on the way in. A shorter
+timeout makes a blocked take time out *more* often, not less - it narrows the window instead of
+closing it. With `xTicksToWait == 0` the take returns without ever blocking, so it never donates
+priority and FreeRTOS says so itself on that branch (`configASSERT( xInheritanceOccurred ==
+pdFALSE )`): the assert is unreachable rather than unlikely. The same fact removes the rest of the
+problem for free - a task that never blocks on a lock cannot be priority-inverted behind whoever
+holds it.
+
+A miss costs one frame, never a blank panel. Each accessor keeps a `LastGood<T>` of the value it
+last handed *this* task and returns that when the lock was busy: `snapshotPtr()`, `getBikes()`,
+`getWeather()`, `headerWeatherText()`/`Temp()`/`Icon()`, `stopWeatherNote()` and `getStopSummary()`
+(both keyed per stop), `getSdStatus()`, `tryGetPollStatus()` and `tryGetActiveConfig()`. Those
+holders are only ever touched when the caller is the display task, so they are per-task state that
+happens to be spelled `static`, and they need no lock of their own. Every other task keeps its
+blocking wait, which is right: the web task is answering one request, a few milliseconds cost it
+nothing, and a stale field would be a worse answer than a short pause.
+
+**The writers were the other half**, and fixing them is what keeps misses rare rather than routine.
+A reader's wait is only as long as a writer's hold. `publishSnapshot()` used to copy the whole
+Snapshot - vectors of arrivals, a string per field - *with the mutex held*, so a reader was not
+waiting for a pointer, it was waiting out somebody else's allocation. The Snapshot is now published
+as a `shared_ptr<const Snapshot>` built outside the lock and swapped in, weather and bike publish by
+swap so the outgoing value is freed outside too, and what happens under any of these mutexes on the
+display path is a refcount bump or a pointer exchange. Two things fall out of that beyond the
+latency: the display task no longer copies the Snapshot at all - it holds a reference to the
+poller's own, which is one whole Snapshot less live heap and one less allocate/free cycle per second
+fragmenting it - and `GET /api/state` borrows it the same way instead of copying it, which is a
+whole Snapshot less peak heap per request on a device whose largest free block sits at 5-25 KB
+(§12.1).
+
+**And it is observable, not just asserted.** `GET /api/debug/ui` reports `lock_misses` (reads that
+found a lock busy and redrew last frame's value) and `tick_ms`/`tick_ms_max` (how long a refresh
+took, worst since boot). A tick is single-digit milliseconds; a reading in the hundreds is what a
+display task that waited for something looks like, and the only things it can wait for are the locks
+it is not allowed to wait for. That is the check a future screen would fail.
+
+**What the audit found and deliberately did NOT change**, so the next reader does not have to
+rediscover it: the display path still calls into the Wi-Fi driver. `WiFi.status()`, `WiFi.RSSI()`,
+`WiFi.SSID()` and `WiFi.localIP()` are read from `refreshDeviceInfoScreen()`, and
+`refreshMainScreen()` reads `status()`/`RSSI()` for the header's signal bars on every 1 Hz refresh
+(`main_screen.cpp`, twice each - a free cleanup for whoever is next in that function). `RSSI()`
+reaches `esp_wifi_sta_get_ap_info()` and takes the SDK's Wi-Fi API lock, so this is, strictly, the
+display task waiting on a lock another task can hold.
+
+It is left alone on purpose, and the reason is the same fact that makes the rest of this section
+work: that lock is taken with `portMAX_DELAY`. A take that never times out can never reach
+`vTaskPriorityDisinheritAfterTimeout()` - the assert needs a *timeout* - so these calls cannot
+produce the panic in §12.1, first or second occurrence. What they can cost is latency, and that is
+measured rather than assumed: `tick_ms_max` sat at 168 ms across a full device-suite run whose page
+rebuilds are the expensive part, so they are not costing anything now. Caching RSSI off the poller
+would remove the theoretical stall and add a staleness question to a number that is already only a
+four-bar icon; if it is ever done, do it for a measurement, not for this paragraph.
 
 **The idle loop runs one deferred job per slice** and re-checks the poll deadline afterwards.
 Draining the whole queue back to back (a 400 KB stop-list proxy and a 30-day stats scan are each
@@ -919,7 +981,7 @@ TLS connection at a time; ArduinoJson documents sized from measured payloads (§
 headroom; log free heap once per poll at `INFO`; refuse to start OTA below 16 KB of `MALLOC_CAP_8BIT`
 free with a 5,876 B largest block (§2.1 - the byte-addressable heap, not `ESP.getFreeHeap()`).
 
-Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-16, with the §12 hardening, the screen pass, the LVGL pool safety work and the release-candidate fixes, the full feature set uses **1,859,434 B (97.8 %)** on `cyd-3248S035R` — 41,110 B of headroom — and 1,855,226 B (97.6 %) on `cyd-2432S024C`; the tightest env of all is the HTTPS prototype `cyd-3248S035R-https` (§2.1), which ships in no image. (This line read "93.9 % / 93.7 %, ~112 KB headroom" until 2026-09-16, which was the 2026-09-15 measurement left behind by three later passes — the same failure §2.1's threshold note describes, so the figures here are now absolute bytes with the date they were taken.) `firmware/README.md` carries the per-env table and ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
+Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-16, with the §12 hardening, the screen pass, the LVGL pool safety work, the release-candidate fixes and the display task's lock policy (this §), the full feature set uses **1,862,942 B (98.0 %)** on `cyd-3248S035R` — 37,602 B of headroom — and 1,858,614 B (97.8 %) on `cyd-2432S024C`; the tightest env of all is the HTTPS prototype `cyd-3248S035R-https` (§2.1), which ships in no image. (This line read "93.9 % / 93.7 %, ~112 KB headroom" until 2026-09-16, which was the 2026-09-15 measurement left behind by three later passes — the same failure §2.1's threshold note describes, so the figures here are now absolute bytes with the date they were taken.) `firmware/README.md` carries the per-env table and ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
 
 Build/flash: `pio run -e cyd-3248S035R`, `pio run -e cyd-3248S035R -t upload --upload-port
 /dev/ttyUSB0`. Releases publish `bootloader.bin`, `partitions.bin`, `firmware.bin` per env plus an
@@ -1878,6 +1940,48 @@ read is the fix that avoids both.) Idle-slice work
 (stats summaries, queued proxy jobs) additionally waits for 40 KB free heap and a 12 KB largest
 block so it never collides with a config save on the web task.
 
+**`vTaskPriorityDisinheritAfterTimeout` came back (2026-09-16), and the rule now has enforcement
+rather than convention.** The paragraph above records the first occurrence and treats it as cured by
+the poller's priority plus "the capped read". It was not: what that pass capped was `getSnapshot()`,
+and it capped it at the one call site that had just crashed. Running the release candidate's device
+suite panicked a board again, from a different accessor on the same task:
+
+```
+panic_abort <- esp_system_abort <- __assert_func
+  <- vTaskPriorityDisinheritAfterTimeout (tasks.c:5261)
+  <- xQueueSemaphoreTake (queue.c:1842)
+  <- transit_app::getBikes()                  bike_service.cpp:83   (a 500 ms wait)
+  <- transit_app::ui::refreshMainScreen(...)  main_screen.cpp:764
+  <- transit_app::ui::tick()                  ui.cpp:628
+  <- loop()                                   main.cpp:308
+```
+
+Six accessors reachable from `ui::tick()` were still on 500-1000 ms waits - `getBikes()` twice,
+`getWeather()`, `headerWeatherText()`/`Temp()`/`Icon()`, `stopWeatherNote()`, `getSdStatus()`,
+`getActiveConfig()` - so this was a class with one instance fixed, not a fixed bug. §5 has the
+mechanism that replaces the convention (`src/app/ui_lock.h`, one policy, decided by which task is
+asking) and the last-good fallback that makes a refused read cost one frame.
+
+The part worth writing down for the next person, because it is counter-intuitive: **a shorter
+timeout is not a smaller version of this bug.** `xQueueSemaphoreTake()` reaches
+`vTaskPriorityDisinheritAfterTimeout()` only on a take that actually blocked, then timed out, having
+donated priority on the way in - so capping a wait at 50 ms makes a contended take time out *more*
+often than 1000 ms would, not less. The 50 ms caps were a latency fix that read like a safety fix.
+Only a **zero** wait is immune, and it is immune by construction: FreeRTOS's zero-tick branch
+returns before blocking and asserts `configASSERT( xInheritanceOccurred == pdFALSE )` on the way
+past, so the disinherit path cannot be reached from it at all. That is why the display task's budget
+is zero rather than small.
+
+The other half of the same finding is that the contention was mostly self-inflicted. `getBikes()`
+was blamed on "the poller holds this mutex across a 400 KB Indego feed" - it does not, and never
+did: `refreshBikes()` scans the feed with nothing held and takes the lock only to publish. What WAS
+held across an allocation was `publishSnapshot()`, which copied the whole Snapshot under the poller's
+mutex, and `getSnapshot()`, which copied it back out under the same one, once a second on the
+display task and once per `/api/state` on the web task. The Snapshot is now published as a
+`shared_ptr<const Snapshot>` prepared outside the lock and swapped in; readers take a refcount, not a
+copy. `GET /api/debug/ui` reports `lock_misses` and `tick_ms_max` so the result is measured rather
+than assumed - on the owner's board a tick is 5 ms.
+
 Heap-wedge self-heal (2026-09-15): a long burst of rapid config saves (each rebuilds the whole
 LVGL screen) interleaved with active polling can fragment the heap to ~2 KB largest block while
 ~50 KB is still free - too small for any fetch buffer, so every poll fails with a caught
@@ -1888,6 +1992,76 @@ healthy, so it keeps its normal backoff and never reboots; only a genuine wedge,
 would fix by power-cycling anyway, triggers the reboot. Config is durably saved (this §), so the
 reboot loses nothing. Observed cause was the on-device regression suite's stress section; normal
 use holds the heap stable (~74 KB free, ~22 KB largest).
+
+**That last sentence is wrong, and was measured wrong on 2026-09-16.** The owner's board, on the
+release-candidate image, with no suite running and nothing but a handful of hand-issued `curl`s
+against it, reached 812 s of uptime with `ESP.getFreeHeap()` at 50,924 and the **largest block at
+5,108 B** - under `kMinHeavyResponseBlock` (7,924 B), so `GET /api/config` and `GET /api/state`
+answered `{"error":"low memory, retry"}` twelve times in a row over fifty seconds. A reboot cleared
+it instantly and it began decaying again. So the wedge is not a property of the stress section; the
+stress section only gets there sooner. Free heap is fine and stays fine - it is the largest block
+that decays with uptime, which is why a reading of `ESP.getFreeHeap()` makes this look healthy
+right up until a read is refused.
+
+**The self-heal cannot see this state**, and not for the reason the paragraph above gives: polls
+keep *succeeding* (their buffers are small enough to fit the gaps), so the consecutive-failure tally
+never climbs and the reboot never fires. What is refusing is the heavy read handlers, which are not
+what the tally counts.
+
+**It is a band, not a latch - but the recovery time is not bounded by anything we know.** This is the
+part that is easy to get wrong in both directions.
+The largest block oscillates around the 7,924 B gate under load, and an eager client holds it below:
+both observations above came from clients retrying every 1.5-4 s, which is itself the allocation
+pressure they were waiting out. It recovers WITHOUT a reboot once that eases - measured in the same
+run, 2,932 B during the config round-trips to 8,692 B a section later, no restart in between. So
+"unreadable until you reboot it" would be an overstatement, and the earlier reboot that appeared to
+cure it was never tested against simply waiting.
+
+Equally, do not read "it recovers" as "it recovers promptly". In the 2026-09-16 paced run the suite
+deliberately idled for **150 s** before the config round-trips and the largest block was still
+5,108 B - the same figure as the session's first observation, and under the gate - so that settle
+check failed. It had come back by the next section. Nothing here defragments on demand: the
+recovery is real, its timing is not predictable, and any future fix has to be judged against that
+rather than against a single lucky sample.
+
+**A resting largest-block figure is meaningless without the client's request rate beside it**, and
+this is the correction that makes the two measurements of this comparable at all. Same board, same
+day, same firmware family:
+
+| largest block | uptime | request rate | build |
+|---:|---:|---|---|
+| 25,588 B | 629 s | one read every 20 s | this §'s lock work (Snapshot published by pointer) |
+| 16,372 B | 603 s | one read every 45-60 s | release candidate |
+| 5,108 B | 812 s | one read every 4 s | release candidate |
+
+A fivefold difference between the bottom two rows at comparable uptimes, where the variable is how
+often something asked. So "the resting value drifts down with uptime" is the wrong shape for this
+claim: the resting value is dominated by *request rate*, with uptime a much weaker second term, and
+any figure quoted in this file, in an issue or in a commit message has to carry its rate or it
+cannot be compared with another one. The 5,108 B reading is not evidence about an idle device; it is
+evidence about a device being asked four times a minute.
+
+The top row is a **third** variable and is quoted with its build for the same reason: 25,588 B held
+flat over five minutes at a 20 s rate, on the build this section describes, is *higher* than the
+release candidate managed at a gentler 45-60 s rate. That is consistent with removing one
+whole-Snapshot allocate/free per second from the display task and a second per `/api/state`, and it
+is the only evidence here that the lock work moved this number at all - but it is one board on one
+afternoon, with rate and build changing together, so read it as encouraging rather than as a
+measurement of the effect. A rate sweep on a single build is what would actually settle it.
+
+What survives is that at a high enough request rate the resting value sits under the gate before any
+burst at all. And the shipping web UI is, by design, the *gentle* client here - `resilientRead()`
+backs off with jitter and shares one in-flight request per endpoint (§10.2) precisely so tabs cannot
+amplify this - so a browser sees "busy, try again" and then its page, which is the designed
+behaviour rather than a break. The device suite was harsher than the product, which is why it
+reported the condition as thirty-five unrelated failures.
+
+This is open, and it is **not** claimed as cured by §5's lock work - which removes real churn from
+it (one whole-Snapshot allocate/free per second is gone, and `/api/state` no longer copies one per
+request) without curing it. Nothing defragments a running heap. The device suite now states the
+condition as **one named check** - "heap recovered enough for the gated reads" - rather than letting
+each config round-trip report it as its own failure: the pacing there exists to stop the noise, not
+to hide the condition, and if the heap does not come back that check is what fails.
 
 **What that self-heal does NOT cover, corrected 2026-09-16.** The paragraph above used to read as
 though it covered "the poller stops being useful". It does not, and the difference is the whole of

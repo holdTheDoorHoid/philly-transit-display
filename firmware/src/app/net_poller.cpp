@@ -29,6 +29,7 @@
 #include "transit_stats/events.h"
 #include "transit_stats/log_window.h"
 #include "transit_stats/tracker.h"
+#include "ui_lock.h"
 #include "weather_service.h"
 #include "bike_service.h"
 #include "web_server.h"  // otaBusy(): the wedge counter stands down during a firmware upload
@@ -117,7 +118,16 @@ class NoStoreScheduleCache : public transit::ScheduleCache {
   void put(const std::string &, const std::vector<SchedEntry> &) override {}
   void putSuspect(const std::string &, const std::vector<SchedEntry> &) override {}
 };
-transit::Snapshot g_snapshot;
+// Published as a shared, immutable pointer rather than as a value (2026-09-16). A reader used to
+// copy the whole Snapshot - vectors of arrivals, a string per field - with g_mutex held, so the
+// cost of every /api/state and every 1 Hz redraw was charged to everyone else waiting for the
+// lock, and the display task's copy was also the allocation that aborted the board on 2026-09-15
+// (main.cpp loop()'s comment names it: bad_alloc in Snapshot::operator= <- getSnapshot()
+// <- ui::tick()). Now the poller builds the new Snapshot outside the lock and swaps the pointer in,
+// and a reader's work under the lock is one refcount bump. The display task no longer copies the
+// Snapshot at all - it holds a reference to the poller's own - which is one whole Snapshot less
+// live heap, and one less per-second allocate/free cycle fragmenting it.
+std::shared_ptr<const transit::Snapshot> g_snapshot;
 PollStatus g_status;
 uint32_t g_poll_seconds = 30;
 volatile bool g_invalidate_sched_cache = false;
@@ -141,9 +151,13 @@ volatile uint32_t g_cycle_interval_ms = 30000;
 // One 32-bit store, on the poller task, no allocation, cannot throw.
 inline void notePollerProgress() { g_progress_ms = millis(); }
 
-// How long the LVGL task may wait for g_mutex. DESIGN.md SS5: it must never block on the poller,
-// and SS12.1 records a vTaskPriorityDisinheritAfterTimeout assert caused by a 1 s wait from it.
-constexpr uint32_t kUiLockWaitMs = 50;
+// How long a NON-DISPLAY task may wait for g_mutex, and nothing else. None of these is the display
+// task's budget: that one is zero, it is applied by takeShared() (ui_lock.h) rather than by any
+// call site, and no number here can change it. Do not read kSummaryWaitMs as "the UI waits 50 ms" -
+// that reading is the bug DESIGN.md SS12.1's second entry is about.
+constexpr uint32_t kSnapshotWaitMs = 1000;
+constexpr uint32_t kStatusWaitMs = 1000;
+constexpr uint32_t kSummaryWaitMs = 50;
 
 // ---- Self-heal restart note (DESIGN.md SS12.1) ------------------------------------------------
 // RTC slow memory: kept across ESP.restart() (and across a panic), not across a power cycle, which
@@ -762,21 +776,30 @@ inline void tracePoll(const char *) {}
 // than once per cycle (F12): the arrivals go out the moment they exist, and again when the alerts
 // that belong to the same Snapshot arrive.
 void publishSnapshot(const Snapshot &snap) {
+  // Everything that allocates happens HERE, with nothing held: the Snapshot copy and the error
+  // string. This used to run with g_mutex held, which is what made a reader's wait long enough to
+  // matter in the first place - the display task was not waiting for a pointer, it was waiting out
+  // somebody else's allocation of a few kilobytes of arrivals. A bad_alloc now escapes before the
+  // lock is ever taken and is caught by pollOnce()/pollerTask() exactly as before, leaving the
+  // published Snapshot untouched.
+  std::shared_ptr<const Snapshot> next = std::make_shared<const Snapshot>(snap);
+  PollStatus status;
+  status.has_polled = true;
+  status.ok = snap.last_poll_ok;
+  status.last_http_status = snap.last_poll_ok ? 200 : 0;
+  status.last_poll_epoch = (uint32_t)snap.generated;
+  status.last_error = snap.last_error;
+
+  // `previous` takes the outgoing Snapshot out of the critical section so its destructor - freeing
+  // those same vectors and strings - also runs with the lock released.
+  std::shared_ptr<const Snapshot> previous;
   if (xSemaphoreTake(g_mutex, portMAX_DELAY) == pdTRUE) {
-    // try/give: g_snapshot = snap copies vectors (allocates); a bad_alloc here must not leave the
-    // mutex held, or every getSnapshot() on the display task would block forever (the loop guard
-    // in main.cpp turns a UI-side throw into a skipped frame, but only if it is not deadlocked).
-    try {
-      g_status.has_polled = true;
-      g_status.ok = snap.last_poll_ok;
-      g_status.last_http_status = snap.last_poll_ok ? 200 : 0;
-      g_status.last_poll_epoch = (uint32_t)snap.generated;
-      g_status.last_error = snap.last_error;
-      g_snapshot = snap;
-    } catch (const std::bad_alloc &) {
-      xSemaphoreGive(g_mutex);
-      throw;  // caught by pollOnce's / pollerTask's bad_alloc handler; snapshot keeps its old value
-    }
+    // Two pointer swaps and a struct swap whose only non-trivial member is a string being moved
+    // between two objects. Nothing here allocates, frees or can throw, so there is no try/catch
+    // around it any more: the old one existed only because the copy above used to be inside.
+    previous.swap(g_snapshot);
+    g_snapshot.swap(next);
+    std::swap(g_status, status);
     xSemaphoreGive(g_mutex);
   }
 
@@ -1279,45 +1302,66 @@ void requestRepoll(bool data_changed) {
   }
 }
 
-transit::Snapshot getSnapshot() {
-  transit::Snapshot copy;
-  if (g_mutex != nullptr && xSemaphoreTake(g_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-    // try/give as in publishSnapshot: the copy allocates, and a bad_alloc must release the mutex
-    // (the caller - ui::tick on the display task - has its own bad_alloc guard in loop()).
-    try {
-      copy = g_snapshot;
-    } catch (const std::bad_alloc &) {
-      xSemaphoreGive(g_mutex);
-      throw;
+std::shared_ptr<const transit::Snapshot> snapshotPtr() {
+  // The display task's own last-good pointer (ui_lock.h). Touched only when onDisplayTask() is
+  // true, so it is per-task state and needs no lock; on a miss the display keeps rendering the
+  // Snapshot it rendered last frame, which is a second of staleness on a page that already prints
+  // "updated 12 s ago" - not a blank one.
+  static LastGood<std::shared_ptr<const transit::Snapshot>> ui_last;
+  if (onDisplayTask()) {
+    // `outgoing` matters. Overwriting ui_last in place would drop its reference to the PREVIOUS
+    // Snapshot inside the critical section, and when that reference is the last one - the poller has
+    // already published past it - dropping it runs the whole Snapshot's destructor there. Moving it
+    // out first makes the store a bare refcount bump and leaves the free until after the give.
+    std::shared_ptr<const transit::Snapshot> outgoing;
+    if (takeShared(g_mutex, kSnapshotWaitMs)) {
+      outgoing = std::move(ui_last.slot());
+      ui_last.slot() = g_snapshot;  // a refcount bump: no allocation, no free, cannot throw
+      ui_last.hit();
+      giveShared(g_mutex);
+    } else {
+      ui_last.miss();
     }
-    xSemaphoreGive(g_mutex);
+    return ui_last.value();  // `outgoing` is released here, with the lock long gone
+  }
+  std::shared_ptr<const transit::Snapshot> copy;
+  if (takeShared(g_mutex, kSnapshotWaitMs)) {
+    copy = g_snapshot;
+    giveShared(g_mutex);
   }
   return copy;
 }
 
+transit::Snapshot getSnapshot() {
+  // The copy is made from the shared pointer, OUTSIDE the lock. Kept for callers that genuinely
+  // want a private value; the display task and /api/state both take the pointer instead.
+  std::shared_ptr<const transit::Snapshot> p = snapshotPtr();
+  return p ? *p : transit::Snapshot{};
+}
+
 PollStatus getPollStatus() {
   PollStatus copy;
-  if (g_mutex != nullptr && xSemaphoreTake(g_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+  if (takeShared(g_mutex, kStatusWaitMs)) {
     copy = g_status;
-    xSemaphoreGive(g_mutex);
+    giveShared(g_mutex);
   }
   return copy;
 }
 
 bool tryGetPollStatus(PollStatus *out) {
-  // Short wait, and give up rather than block: the caller is the LVGL task, which must never wait
-  // on another task's lock (DESIGN.md SS5; SS12.1 records the priority-disinherit assert a 1 s wait
-  // from here produced). Leaving *out alone on a miss is the point - the device page then redraws
-  // the value it last read instead of blanking to "no poll yet" for one tick.
-  if (out == nullptr || g_mutex == nullptr) return false;
-  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(kUiLockWaitMs)) != pdTRUE) return false;
+  // The display task gets a zero wait from takeShared() and therefore cannot block here at all
+  // (ui_lock.h); other tasks get kStatusWaitMs. Leaving *out alone on a miss is the point - the
+  // device page then redraws the value it last read instead of blanking to "no poll yet" for one
+  // tick - so this keeps its out-parameter shape rather than growing a LastGood of its own.
+  if (out == nullptr) return false;
+  if (!takeShared(g_mutex, kStatusWaitMs)) return false;
   try {
     *out = g_status;  // copies a std::string, so it can throw; the mutex must not be lost with it
   } catch (const std::bad_alloc &) {
-    xSemaphoreGive(g_mutex);
+    giveShared(g_mutex);
     throw;  // loop()'s guard in main.cpp skips the frame
   }
-  xSemaphoreGive(g_mutex);
+  giveShared(g_mutex);
   return true;
 }
 
@@ -1332,11 +1376,23 @@ AlertsStatus getAlertsStatus() {
 }
 
 StopSummaryView getStopSummary(const std::string &stop_key) {
+  // Per-stop last-good, for the display task only (ui_lock.h). Without it a miss returned
+  // has_value = false, which stats_screen.cpp renders as "loading..." with the numbers and the
+  // meter hidden - so a single busy lock replaced a whole panel of statistics with a caption and
+  // then put it back a second later. StopSummaryView is 40-odd bytes plus the key, and DESIGN.md
+  // SS6 caps the stop list at 8, so this is a few hundred bytes for the display task.
+  static std::vector<std::pair<std::string, StopSummaryView>> ui_last;
+  const bool ui = onDisplayTask();
+
   StopSummaryView view;
-  if (g_mutex == nullptr) return view;
-  // Short wait, and give up rather than block: this runs on the LVGL task, which must never wait
-  // on another task's lock (DESIGN.md SS5). A missed refresh costs one screen update.
-  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(kUiLockWaitMs)) != pdTRUE) return view;
+  if (!takeShared(g_mutex, kSummaryWaitMs)) {
+    if (ui) {
+      for (const auto &e : ui_last) {
+        if (e.first == stop_key) return e.second;
+      }
+    }
+    return view;
+  }
   uint32_t now_ms = millis();
   SummaryCacheEntry *entry = nullptr;
   for (auto &e : g_summary_cache) {
@@ -1360,7 +1416,20 @@ StopSummaryView getStopSummary(const std::string &stop_key) {
   view.age_s = entry->has_value ? (now_ms - entry->computed_ms) / 1000u : 0;
   view.inferred = entry->inferred;
   view.summary = entry->summary;
-  xSemaphoreGive(g_mutex);
+  giveShared(g_mutex);
+
+  if (ui) {
+    bool stored = false;
+    for (auto &e : ui_last) {
+      if (e.first != stop_key) continue;
+      e.second = view;
+      stored = true;
+      break;
+    }
+    // Only ever grows to the stop list's own size; evictUnconfiguredSummaries() drops stops from
+    // the poller's cache, and a stop that is gone simply stops being asked for here.
+    if (!stored && ui_last.size() < kMaxStops) ui_last.emplace_back(stop_key, view);
+  }
   return view;
 }
 

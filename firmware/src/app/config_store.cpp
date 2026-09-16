@@ -7,9 +7,11 @@
 
 #include <cctype>
 #include <cmath>
+#include <new>
 #include <set>
 
 #include "transit_core/septa.h"
+#include "ui_lock.h"
 #ifdef TRANSIT_HTTPS
 #include "http_fetch.h"  // Transport policy handoff from setActiveConfig() (DESIGN.md SS2.1)
 #endif
@@ -966,13 +968,30 @@ SemaphoreHandle_t activeMutex() {
 }
 }  // namespace
 
-Config getActiveConfig() {
-  Config copy;
+bool tryGetActiveConfig(Config *out) {
+  if (out == nullptr) return false;
   SemaphoreHandle_t mutex = activeMutex();
-  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-    copy = g_active_config;
-    xSemaphoreGive(mutex);
+  // 1 s for the poller and the web task, zero for the LVGL display task (ui_lock.h). A Config copy
+  // is the largest thing any of these accessors does under a lock - eight stops, their profiles and
+  // every string in them - so the display task waiting on it was never acceptable.
+  if (!takeShared(mutex, 1000)) return false;
+  try {
+    *out = g_active_config;
+  } catch (const std::bad_alloc &) {
+    giveShared(mutex);
+    throw;
   }
+  giveShared(mutex);
+  return true;
+}
+
+Config getActiveConfig() {
+  // An empty Config on a miss, which is what this has always returned when the wait ran out. That
+  // is fine for a caller that only reads a field or two, and wrong for one that ACTS on the result
+  // - main.cpp's applyNetworkSettings() would rename mDNS to "" - so that caller uses
+  // tryGetActiveConfig() and tries again on the next pass through loop() instead.
+  Config copy;
+  tryGetActiveConfig(&copy);
   return copy;
 }
 

@@ -92,6 +92,23 @@ struct UiDebug {
                                 // bigger stop list on this board would not
   uint32_t page_cost[4] = {0, 0, 0, 0};  // measured build cost: main, night, stats, device
   int32_t hor_res = 0, ver_res = 0;
+  // Reads this task made on another task's shared state that found the lock busy and fell back on
+  // the value it last read (ui_lock.h). The display task never waits for a lock, so this is the
+  // price of that: each one is a second of staleness on a single field. Small and slowly growing is
+  // normal; a number climbing with every tick means a lock that is genuinely always held, which is
+  // a bug this figure exists to make visible.
+  uint32_t lock_misses = 0;
+  // How long the last ui::tick() took, and the worst since boot, in ms. The display task is not
+  // allowed to wait on another task's lock, and a tick in the hundreds of ms is what it would look
+  // like if something did - so this is the observable that says the rule is holding, rather than a
+  // comment saying it should.
+  //
+  // ONE legitimate exception, so a reading is not misread: with `due.chime` on, the two beeps
+  // dueAlertTick() plays sit in this measurement (due_alert.cpp uses tone() and delay(160) on this
+  // task), which puts one tick near 300 ms per due trip. Everything else is tens of ms - a page
+  // build being the expensive one.
+  uint32_t tick_ms = 0;
+  uint32_t tick_ms_max = 0;
 };
 UiDebug debugSnapshot();
 void requestTap();

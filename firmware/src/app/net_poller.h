@@ -10,6 +10,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "transit_core/model.h"
@@ -54,17 +55,28 @@ void initNetPoller();
 // bike feed.
 void requestRepoll(bool data_changed = true);
 
-// Returns a copy of the latest Snapshot, safe to call from any task.
+// The latest Snapshot as a shared, immutable pointer - the form it is published in (net_poller.cpp
+// g_snapshot). Safe from any task, and the right call for a reader that only wants to LOOK at the
+// data: taking it is one refcount bump under the lock instead of a whole-Snapshot copy, so it
+// neither allocates nor makes anyone else wait out an allocation. Null only before the first
+// publish, or when the read was refused and the caller has never had one.
+//
+// On the LVGL task it cannot block (ui_lock.h takeShared()), and on a refusal it returns the
+// pointer that task last held, so the screen redraws last frame's arrivals rather than blanking.
+std::shared_ptr<const transit::Snapshot> snapshotPtr();
+
+// A private COPY of the latest Snapshot. Prefer snapshotPtr() unless the caller really needs to own
+// or modify one: this allocates the whole thing. The copy is made outside the lock.
 transit::Snapshot getSnapshot();
 
 // Returns a copy of the latest poll diagnostics, safe to call from any task. Waits up to 1 s for
-// the poller's mutex. NOT for the LVGL task - see tryGetPollStatus().
+// the poller's mutex on a non-display task. NOT for the LVGL task - see tryGetPollStatus().
 PollStatus getPollStatus();
 
 // The same diagnostics for callers that must never wait on the poller's lock: the LVGL task
 // (DESIGN.md SS5, and SS12.1's vTaskPriorityDisinheritAfterTimeout assert, which was caused by
-// exactly a 1 s wait from this task). Waits the same 50 ms as getStopSummary() and then gives up,
-// returning false and leaving *out untouched so the caller can keep showing the value it last read
+// exactly a 1 s wait from this task). On that task the take does not wait at all; on a miss it
+// returns false and leaves *out untouched, so the caller keeps showing the value it last read
 // rather than blanking the line. `out` must not be null.
 bool tryGetPollStatus(PollStatus *out);
 
@@ -161,6 +173,10 @@ struct StopSummaryView {
 // cached at all, and registers a refresh; the poller task does the scanning in its idle slices,
 // one stop per slice, at most every 10 minutes per stop. Safe to call from any task, as often as
 // the UI likes.
+//
+// On the LVGL task the lock is taken without waiting (ui_lock.h) and a refusal returns the last
+// view this task read for THIS STOP, so a busy lock costs a second of staleness rather than
+// replacing a panel of statistics with "loading..." and putting it back on the next tick.
 StopSummaryView getStopSummary(const std::string &stop_key);
 
 }  // namespace transit_app
