@@ -1976,6 +1976,29 @@ would fix by power-cycling anyway, triggers the reboot. Config is durably saved 
 reboot loses nothing. Observed cause was the on-device regression suite's stress section; normal
 use holds the heap stable (~74 KB free, ~22 KB largest).
 
+**That last sentence is wrong, and was measured wrong on 2026-09-16.** The owner's board, on the
+release-candidate image, with no suite running and nothing but a handful of hand-issued `curl`s
+against it, reached 812 s of uptime with `ESP.getFreeHeap()` at 50,924 and the **largest block at
+5,108 B** - under `kMinHeavyResponseBlock` (7,924 B), so `GET /api/config` and `GET /api/state`
+answered `{"error":"low memory, retry"}` twelve times in a row over fifty seconds. A reboot cleared
+it instantly and it began decaying again. So the wedge is not a property of the stress section; the
+stress section only gets there sooner. Free heap is fine and stays fine - it is the largest block
+that decays with uptime, which is why a reading of `ESP.getFreeHeap()` makes this look healthy
+right up until a read is refused.
+
+Two things follow. **The self-heal cannot see this state**, and not for the reason the paragraph
+above gives: polls keep *succeeding* (their buffers are small enough to fit the gaps), so the
+consecutive-failure tally never climbs and the reboot never fires. What is wedged is the heavy read
+handlers, which are not what the tally counts. And **a browser is not a paced client**: the web UI
+retries (§10.2) so it degrades to "busy, try again" rather than breaking, but after some hours of
+uptime the Stats and Settings pages can be unreadable until the device is rebooted. That is a real,
+open, user-visible defect, distinct from the display-task lock work in §5 - which reduces the churn
+that feeds it (one whole-Snapshot allocate/free per second is gone, and `/api/state` no longer
+copies one per request) but does not claim to cure it. Nothing defragments a running heap. The
+device suite now states this as **one named check** - "heap recovered enough for the gated reads" -
+rather than letting thirty-five config round-trips each report the same wedge as their own failure;
+the pacing there exists to stop the noise, not to hide the condition.
+
 **What that self-heal does NOT cover, corrected 2026-09-16.** The paragraph above used to read as
 though it covered "the poller stops being useful". It does not, and the difference is the whole of
 the next paragraph. It counts cycles that **complete and report failure**: the check sits in
