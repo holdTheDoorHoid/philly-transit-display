@@ -57,8 +57,16 @@ void requestRepoll(bool data_changed = true);
 // Returns a copy of the latest Snapshot, safe to call from any task.
 transit::Snapshot getSnapshot();
 
-// Returns a copy of the latest poll diagnostics, safe to call from any task.
+// Returns a copy of the latest poll diagnostics, safe to call from any task. Waits up to 1 s for
+// the poller's mutex. NOT for the LVGL task - see tryGetPollStatus().
 PollStatus getPollStatus();
+
+// The same diagnostics for callers that must never wait on the poller's lock: the LVGL task
+// (DESIGN.md SS5, and SS12.1's vTaskPriorityDisinheritAfterTimeout assert, which was caused by
+// exactly a 1 s wait from this task). Waits the same 50 ms as getStopSummary() and then gives up,
+// returning false and leaving *out untouched so the caller can keep showing the value it last read
+// rather than blanking the line. `out` must not be null.
+bool tryGetPollStatus(PollStatus *out);
 
 // ---------------------------------------------------------------------------------------------
 // Liveness: has the poller completed a cycle lately? (DESIGN.md SS12.1)

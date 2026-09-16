@@ -140,6 +140,10 @@ volatile uint32_t g_cycle_interval_ms = 30000;
 // One 32-bit store, on the poller task, no allocation, cannot throw.
 inline void notePollerProgress() { g_progress_ms = millis(); }
 
+// How long the LVGL task may wait for g_mutex. DESIGN.md SS5: it must never block on the poller,
+// and SS12.1 records a vTaskPriorityDisinheritAfterTimeout assert caused by a 1 s wait from it.
+constexpr uint32_t kUiLockWaitMs = 50;
+
 // ---- Self-heal restart note (DESIGN.md SS12.1) ------------------------------------------------
 // RTC slow memory: kept across ESP.restart() (and across a panic), not across a power cycle, which
 // is exactly the lifetime wanted - "the last boot rebooted itself, here is why". The magic word is
@@ -1287,6 +1291,23 @@ PollStatus getPollStatus() {
   return copy;
 }
 
+bool tryGetPollStatus(PollStatus *out) {
+  // Short wait, and give up rather than block: the caller is the LVGL task, which must never wait
+  // on another task's lock (DESIGN.md SS5; SS12.1 records the priority-disinherit assert a 1 s wait
+  // from here produced). Leaving *out alone on a miss is the point - the device page then redraws
+  // the value it last read instead of blanking to "no poll yet" for one tick.
+  if (out == nullptr || g_mutex == nullptr) return false;
+  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(kUiLockWaitMs)) != pdTRUE) return false;
+  try {
+    *out = g_status;  // copies a std::string, so it can throw; the mutex must not be lost with it
+  } catch (const std::bad_alloc &) {
+    xSemaphoreGive(g_mutex);
+    throw;  // loop()'s guard in main.cpp skips the frame
+  }
+  xSemaphoreGive(g_mutex);
+  return true;
+}
+
 AlertsStatus getAlertsStatus() {
   AlertsStatus s;
   uint32_t t = g_alerts_fetched_ms;
@@ -1302,7 +1323,7 @@ StopSummaryView getStopSummary(const std::string &stop_key) {
   if (g_mutex == nullptr) return view;
   // Short wait, and give up rather than block: this runs on the LVGL task, which must never wait
   // on another task's lock (DESIGN.md SS5). A missed refresh costs one screen update.
-  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return view;
+  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(kUiLockWaitMs)) != pdTRUE) return view;
   uint32_t now_ms = millis();
   SummaryCacheEntry *entry = nullptr;
   for (auto &e : g_summary_cache) {

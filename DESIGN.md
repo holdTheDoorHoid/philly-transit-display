@@ -885,6 +885,14 @@ stop per slice, at most every 10 minutes per stop or on request, evicting stops 
 configured. It used to stream a month of CSV per stop synchronously on whichever task asked, so
 opening the stats page froze touch and the clock for as long as the card took.
 
+**Nor may it wait on the poller's mutex.** Every accessor the LVGL task uses takes that lock for at
+most 50 ms and gives up rather than waiting: `getStopSummary()`, and since the RC review
+`tryGetPollStatus()`, which the device page calls on every tick it is shown (it had been calling
+the blocking `getPollStatus()`, a 1 s wait, on the display task). The blocking form is for the web
+task only. §12.1 records the `vTaskPriorityDisinheritAfterTimeout` assert that exactly a 1 s wait
+from this task produced. On a miss the caller redraws the value it last read, which costs one tick
+of staleness on a line that already shows an age - never a blank "no poll yet".
+
 **The idle loop runs one deferred job per slice** and re-checks the poll deadline afterwards.
 Draining the whole queue back to back (a 400 KB stop-list proxy and a 30-day stats scan are each
 seconds of work) pushed the next transit poll well past its deadline with nothing noticing.

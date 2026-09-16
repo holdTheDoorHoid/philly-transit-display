@@ -373,7 +373,16 @@ void refreshDeviceInfoScreen(lv_obj_t *screen) {
   // poller has stopped getting through even though nothing has reported a failure yet. The age
   // is left off until the clock has been set.
   {
-    PollStatus ps = getPollStatus();
+    // tryGetPollStatus(), not getPollStatus(): this runs on the LVGL task on every tick the device
+    // page is shown, and getPollStatus() waits up to a second on the poller's mutex. DESIGN.md SS5
+    // says the display task must never block on the poller, and SS12.1 records the
+    // vTaskPriorityDisinheritAfterTimeout assert that exactly this 1 s wait produced. The 50 ms cap
+    // is getStopSummary()'s. `last` is function-static and touched only from this task: on a miss
+    // the line redraws with the value it last read - one tick of staleness on a page that is
+    // already showing an age in seconds - rather than blanking to "no poll yet".
+    static PollStatus last;
+    tryGetPollStatus(&last);
+    const PollStatus &ps = last;
     int32_t age = ps.has_polled && clock_set && now >= ps.last_poll_epoch ? (int32_t)(now - ps.last_poll_epoch) : -1;
     const char *cap = ctx->septa_inline ? "SEPTA" : nullptr;
     if (!ps.has_polled) {

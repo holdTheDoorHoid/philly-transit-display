@@ -100,6 +100,13 @@ PollStatus getPollStatus() {
   p.last_error = sim::poll_error;
   return p;
 }
+// The non-blocking form the device page uses (net_poller.h). No poller task here, so it always
+// succeeds - the simulator's job is the layout, not the lock.
+bool tryGetPollStatus(PollStatus *out) {
+  if (out == nullptr) return false;
+  *out = getPollStatus();
+  return true;
+}
 AlertsStatus getAlertsStatus() {
   AlertsStatus s;
   if (sim::alerts_age_s >= 0) {
