@@ -1584,7 +1584,25 @@ only this browser's copy and says so. `/api/state`'s `auth.pin_required`, `board
 `config_recovered` are all surfaced there — the last as *"The device restored its previous settings
 after a bad save."*
 
-### 10.2 Honest numbers on the Stats page
+### 10.2 Reads that retry, and reads that give up
+
+`GET /api/state` and `GET /api/config` are the two heap-gated reads (§12.1): during a poll cycle
+they legitimately answer 503, and `/api/state` can come back as a 200 with a zero-length body.
+`resilientRead()` folds 503, an empty 200, an unparseable body, a network error and a timeout into
+one "busy" outcome and retries with capped, jittered backoff, sharing one in-flight request per
+endpoint so several open tabs cannot amplify the pressure they are retrying against. A top-bar line
+says so and clears itself.
+
+It does **not** retry forever. A 4xx other than 429 is the device answering definitively, and
+retrying one is how the blank page this mechanism exists to prevent comes back through a different
+door: `renderNow` awaits `api.config()` before it fetches state, so a permanent 421 — browsing an
+old `<name>.local` after the display was renamed — left the Now page on "Connecting to the
+display…" for as long as the tab stayed open, with no error anywhere. Those reject, the view shows
+the message, and the top-bar line switches from "retrying…" to what happened; 421 is worded for the
+owner ("it has probably been renamed — open it at its current name or IP address") rather than
+echoing the header. 429 stays retryable: it carries `retry_s` and means "later", not "no".
+
+### 10.3 Honest numbers on the Stats page
 
 Two rules, because a statistic that overstates its own certainty is worse than no statistic:
 
@@ -1611,7 +1629,7 @@ still has usable — if old — times: it keeps its arrival rows with an amber "
 short `error` text above them, and only a stop that is genuinely empty or unavailable gets the red
 banner in place of its rows.
 
-### 10.3 Untrusted text
+### 10.4 Untrusted text
 
 Agency and user text reaches the DOM only through the `h()` helper, which appends text nodes; the UI
 contains no `innerHTML`, `insertAdjacentHTML` or `outerHTML`. The one third-party sink that renders

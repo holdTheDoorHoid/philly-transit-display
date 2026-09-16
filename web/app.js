@@ -285,16 +285,25 @@ function writeErrorMessage(e) {
    that is a real error: it clears in a second or two, and the documented contract is
    "retry." A 503, an empty 200, a body that fails to parse, a network error and a
    timeout are folded into the exact same "busy" outcome here, so every caller (the Now
-   page's poll, Settings' load) sees one simple thing: the promise resolves a bit late
-   sometimes, and never rejects for a reason the owner needs to see.
+   page's poll, Settings' load) sees one simple thing: for those, the promise resolves a
+   bit late sometimes and never rejects. It CAN reject — see the give-up rule below — and
+   every caller handles that, because the alternative is a page that waits for ever.
 
-   The retry loop is deliberately open-ended (capped, jittered backoff, no give-up) —
-   the device is healthy and this clears on its own, so stopping would just bring back
+   The retry loop is open-ended (capped, jittered backoff) for that family of outcomes —
+   the device is healthy and they clear on their own, so stopping would just bring back
    the blank/stuck page this exists to prevent. `inflightReads` keeps at most one
    request per endpoint in flight app-wide: a second caller (the next poll tick, or a
    different view wanting the same data) joins the retry already running instead of
    starting its own, which matters because eager retries are exactly what amplifies the
-   memory pressure they're retrying against. */
+   memory pressure they're retrying against.
+
+   It is NOT open-ended for a 4xx. Those are the device answering definitively, and
+   retrying one forever reintroduces the exact blank page this was written to remove,
+   through a different door: renderNow awaits api.config() before it fetches state, so a
+   permanent 421 — the DNS-rebinding host check refusing an old `<name>.local` after the
+   display was renamed — left the Now page on “Connecting to the display…” for as long as
+   the tab stayed open, with no error anywhere. 429 is the exception: it carries retry_s
+   and means "later", not "no". */
 const HEAVY_TIMEOUT_MS = 8000;
 const RETRY_BASE_MS = 1000;
 const RETRY_MAX_MS = 8000;
@@ -312,14 +321,32 @@ function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 // `connListeners` gets a call after every change so the top-bar indicator (see the
 // bottom of this file) can repaint without each view wiring up its own polling.
 const connStatus = {
-  state: { busy: false, attempt: 0, lastGoodAt: null },
-  config: { busy: false, attempt: 0, lastGoodAt: null },
+  state: { busy: false, attempt: 0, lastGoodAt: null, failed: null },
+  config: { busy: false, attempt: 0, lastGoodAt: null, failed: null },
 };
 const connListeners = new Set();
 function watchConn(fn) { connListeners.add(fn); fn(); return () => connListeners.delete(fn); }
 function notifyConn() { for (const fn of connListeners) fn(); }
 function markBusy(key, attempt) { connStatus[key].busy = true; connStatus[key].attempt = attempt; notifyConn(); }
-function markGood(key) { connStatus[key].busy = false; connStatus[key].attempt = 0; connStatus[key].lastGoodAt = Date.now(); notifyConn(); }
+function markGood(key) { connStatus[key].busy = false; connStatus[key].attempt = 0; connStatus[key].failed = null; connStatus[key].lastGoodAt = Date.now(); notifyConn(); }
+function markFailed(key, message) { connStatus[key].busy = false; connStatus[key].attempt = 0; connStatus[key].failed = message; notifyConn(); }
+
+// Which failures are worth asking again for. Anything that isn't an ApiError (a thrown
+// TypeError from our own code, say) is not the device's answer and is treated as
+// terminal too — retrying a bug forever hides it.
+const RETRYABLE_STATUSES = new Set([0, 429, 500, 502, 503, 504]);
+function terminalReadError(e) {
+  if (!(e instanceof ApiError)) return e;
+  if (RETRYABLE_STATUSES.has(e.status)) return null;
+  if (e.status >= 500) return null; // an unlisted 5xx is still "the device is struggling"
+  if (e.status < 400) return null;  // shouldn't happen; if it does, behave as before
+  if (e.status === 421) {
+    // The one a real owner hits. Say what to do about it, not what the header said.
+    return new ApiError('This display does not answer to the address you used — it has probably'
+      + ' been renamed. Open it at its current name or IP address.', e.path, 421);
+  }
+  return e;
+}
 
 const inflightReads = new Map();
 function resilientRead(key, url) {
@@ -336,6 +363,11 @@ function resilientRead(key, url) {
         markGood(key);
         return body;
       } catch (e) {
+        const fatal = terminalReadError(e);
+        if (fatal) {
+          markFailed(key, fatal.message);
+          throw fatal;
+        }
         attempt++;
         markBusy(key, attempt);
         await sleep(jitteredDelay(attempt));
@@ -511,6 +543,10 @@ window.addEventListener('DOMContentLoaded', router);
   watchConn(() => {
     const busyState = connStatus.state.busy;
     const busyConfig = connStatus.config.busy;
+    // A terminal failure outranks "busy": it will not clear on its own, so the line has to
+    // stop saying "retrying…" and say what happened instead.
+    const failed = connStatus.state.failed || connStatus.config.failed;
+    if (failed) { bar.textContent = failed; bar.classList.add('show'); return; }
     if (!busyState && !busyConfig) { bar.classList.remove('show'); bar.textContent = ''; return; }
     const parts = [];
     if (busyState) {
