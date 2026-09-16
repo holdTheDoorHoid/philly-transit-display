@@ -2028,17 +2028,26 @@ rather than against a single lucky sample.
 this is the correction that makes the two measurements of this comparable at all. Same board, same
 day, same firmware family:
 
-| largest block | uptime | what the client was doing |
-|---:|---:|---|
-| 16,372 B | 603 s | sampling every 45-60 s |
-| 5,108 B | 812 s | probing every 4 s |
+| largest block | uptime | request rate | build |
+|---:|---:|---|---|
+| 25,588 B | 629 s | one read every 20 s | this §'s lock work (Snapshot published by pointer) |
+| 16,372 B | 603 s | one read every 45-60 s | release candidate |
+| 5,108 B | 812 s | one read every 4 s | release candidate |
 
-A tenfold difference, and the variable is not uptime and not the build - it is how often something
-asked. So "the resting value drifts down with uptime" is the wrong shape for this claim: the resting
-value is a function of *request rate*, with uptime a much weaker second term, and any figure quoted
-in this file, in an issue or in a commit message has to carry its polling rate or it cannot be
-compared with another one. The 5,108 B reading is not evidence about an idle device; it is evidence
-about a device being asked four times a minute.
+A fivefold difference between the bottom two rows at comparable uptimes, where the variable is how
+often something asked. So "the resting value drifts down with uptime" is the wrong shape for this
+claim: the resting value is dominated by *request rate*, with uptime a much weaker second term, and
+any figure quoted in this file, in an issue or in a commit message has to carry its rate or it
+cannot be compared with another one. The 5,108 B reading is not evidence about an idle device; it is
+evidence about a device being asked four times a minute.
+
+The top row is a **third** variable and is quoted with its build for the same reason: 25,588 B held
+flat over five minutes at a 20 s rate, on the build this section describes, is *higher* than the
+release candidate managed at a gentler 45-60 s rate. That is consistent with removing one
+whole-Snapshot allocate/free per second from the display task and a second per `/api/state`, and it
+is the only evidence here that the lock work moved this number at all - but it is one board on one
+afternoon, with rate and build changing together, so read it as encouraging rather than as a
+measurement of the effect. A rate sweep on a single build is what would actually settle it.
 
 What survives is that at a high enough request rate the resting value sits under the gate before any
 burst at all. And the shipping web UI is, by design, the *gentle* client here - `resilientRead()`
