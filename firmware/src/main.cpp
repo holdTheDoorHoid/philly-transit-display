@@ -96,7 +96,10 @@ std::string wifiApName() {
 // Always-on heap trace at each setup stage (CORE_DEBUG_LEVEL=2 hides log_i), so a fragmented
 // heap is visible over serial before it turns into a failed allocation.
 void heapStage(const char *stage) {
-  Serial.printf("[heap] %-10s free=%u largest=%u\n", stage, (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  // free = MALLOC_CAP_INTERNAL (includes ~34 KB of 32-bit-only IRAM heap malloc never uses for
+  // data); free8 = MALLOC_CAP_8BIT, the number an allocation can really get (net_poller.cpp).
+  Serial.printf("[heap] %-10s free=%u free8=%u largest=%u\n", stage, (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
 void setup() {
