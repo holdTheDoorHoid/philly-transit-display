@@ -40,14 +40,16 @@ def get_json(path):
     except Exception: return code, None
 
 def put_cfg(cfg, pin=PIN):
-    # Retry the documented 503 (SS12.1: PUT can bad_alloc-parse its 16 KB body under the heap
-    # fragmentation that rapid saves leave behind) up to several times so a save reliably lands.
+    # Retry the documented 503 (SS12.1) a FEW times with a real settle between tries. Each PUT parses
+    # a 16 KB body into a JsonDocument, so retrying too eagerly amplifies the very memory pressure
+    # that caused the 503 (learned 2026-09-16: an 8x retry pushed the device into the uncatchable
+    # OOM-while-throwing reboot). Three tries, 3 s apart, lets the heap recover between attempts.
     code = 0
-    for attempt in range(8):
+    for attempt in range(3):
         r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'PUT', '-H', 'X-Pin: ' + pin, '-H', 'Content-Type: application/json', '--data-binary', json.dumps(cfg), B + '/api/config'])
         code = int(r.stdout or 0)
         if code not in (0, 503): return code
-        time.sleep(1.5)
+        time.sleep(3.0)
     return code
 
 def put_cfg_nopin(cfg):
