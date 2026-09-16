@@ -28,12 +28,18 @@ def get(path, timeout=15, pin=False):
 
 def get_json(path):
     code, body = get(path)
+    if code == 503 or (code == 200 and not body):  # DESIGN.md SS12.1: the device answers 503/empty under memory pressure; clients retry
+        time.sleep(1.5); code, body = get(path)
     try: return code, json.loads(body)
     except Exception: return code, None
 
 def put_cfg(cfg, pin=PIN):
-    r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'PUT', '-H', 'X-Pin: ' + pin, '-H', 'Content-Type: application/json', '--data-binary', json.dumps(cfg), B + '/api/config'])
-    return int(r.stdout or 0)
+    for attempt in range(2):
+        r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'PUT', '-H', 'X-Pin: ' + pin, '-H', 'Content-Type: application/json', '--data-binary', json.dumps(cfg), B + '/api/config'])
+        code = int(r.stdout or 0)
+        if code != 503: return code
+        time.sleep(1.5)  # designed answer under memory pressure (DESIGN.md SS12.1); retry once
+    return code
 
 def put_cfg_nopin(cfg):
     r = curl(['-w', '\n%{http_code}', '-X', 'PUT', '-H', 'Content-Type: application/json', '--data-binary', json.dumps(cfg), B + '/api/config'])
@@ -378,7 +384,7 @@ check('D tap main->stats', post('/api/debug/tap') == 200 and (time.sleep(2) or u
 check('D tap stats->device', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'device'), ui().get('page'))
 check('D tap device->main', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'main'), ui().get('page'))
 # weather notes + crowding presence in state
-st = state(); seats = [a.get('seats') for x in st['stops'] for a in x['arrivals'] if a.get('status') == 'live']
+st = state(); seats = [a.get('seats') for x in st.get('stops', []) for a in x.get('arrivals', []) if a.get('status') == 'live']
 check('D live rows carry seat data', any(seats) or not seats, seats[:3])
 check('D weather_note field present on stops', all('weather_note' in x for x in st['stops']))
 # Review F13/F15/F26/F29 fields (DESIGN.md SS7): per-stop health, data age, matched schedule trip,

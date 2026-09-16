@@ -268,14 +268,17 @@ bool checkPin(AsyncWebServerRequest *request, ApiFailure &fail) {
 }
 
 void sendFailure(AsyncWebServerRequest *request, const ApiFailure &fail) {
+  // Formatted on the stack, not through a JsonDocument + String: a 401/429 must still go out
+  // when the heap is momentarily exhausted (the device suite saw a 401 turn into a 503 "out of
+  // memory building the response" while the poller was mid-fetch). The message is one of this
+  // file's own literals, never user input, so no escaping is needed.
+  char body[96];
   if (fail.status == 429) {
-    JsonDocument doc;
-    doc["error"] = fail.message;
-    doc["retry_s"] = fail.retry_s;
-    sendJson(request, 429, doc);
-    return;
+    snprintf(body, sizeof body, "{\"error\":\"%s\",\"retry_s\":%u}", fail.message.c_str(), (unsigned)fail.retry_s);
+  } else {
+    snprintf(body, sizeof body, "{\"error\":\"%s\"}", fail.message.c_str());
   }
-  sendError(request, fail.status, fail.message);
+  request->send(fail.status, "application/json", body);
 }
 
 // What every protected handler calls as its first statement: answers the request itself and
@@ -861,6 +864,20 @@ void registerWebAssets() {
 
 }  // namespace
 
+// Every handler runs on the AsyncTCP task and copies a Config (strings, vectors) or builds a
+// JsonDocument; with -fexceptions on, a bad_alloc there that nothing catches is std::terminate and
+// a reboot. Under the 2026-09-15 device suite's request storms that happened while the poller held
+// the heap. Wrapped, the request gets a 503 and the browser retries on its next tick.
+ArRequestHandlerFunction guarded(ArRequestHandlerFunction fn) {
+  return [fn](AsyncWebServerRequest *request) {
+    try {
+      fn(request);
+    } catch (const std::bad_alloc &) {
+      request->send(503, "application/json", "{\"error\":\"out of memory, retry\"}");
+    }
+  };
+}
+
 void startWebServer(std::function<void(bool)> onConfigChanged) {
   setHostName(getActiveConfig().device.name);
 
@@ -874,13 +891,19 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     next();
   });
 
-  g_server.on("/api/state", HTTP_GET, handleGetState);
-  g_server.on("/api/config", HTTP_GET, handleGetConfig);
+  g_server.on("/api/state", HTTP_GET, guarded(handleGetState));
+  g_server.on("/api/config", HTTP_GET, guarded(handleGetConfig));
   g_server.on("/api/config", HTTP_PUT, [onConfigChanged](AsyncWebServerRequest *request, JsonVariant &json) { handlePutConfig(request, json, onConfigChanged); });
-  g_server.on("/api/pin", HTTP_POST, [](AsyncWebServerRequest *request, JsonVariant &json) { handlePostPin(request, json); });
+  g_server.on("/api/pin", HTTP_POST, [](AsyncWebServerRequest *request, JsonVariant &json) {
+    try {
+      handlePostPin(request, json);
+    } catch (const std::bad_alloc &) {
+      request->send(503, "application/json", "{\"error\":\"out of memory, retry\"}");
+    }
+  });
   g_server.on("/api/reboot", HTTP_POST, handlePostReboot);
   // Test hooks (DESIGN.md SS7): what the screen is doing, and a simulated touch.
-  g_server.on("/api/debug/ui", HTTP_GET, [](AsyncWebServerRequest *request) {
+  g_server.on("/api/debug/ui", HTTP_GET, guarded([](AsyncWebServerRequest *request) {
     ui::UiDebug d = ui::debugSnapshot();
     JsonDocument doc;
     doc["page"] = d.page;
@@ -904,7 +927,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["heap"] = ESP.getFreeHeap();
     doc["largest_block"] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     sendJson(request, 200, doc);
-  });
+  }));
   g_server.on("/api/debug/tap", HTTP_POST, [](AsyncWebServerRequest *request) {
     if (!requirePin(request)) return;  // it changes what the screen shows, so it is state-changing
     ui::requestTap();
