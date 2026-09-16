@@ -2247,27 +2247,52 @@ function buildBikeOverviewCards(bikes) {
 
 /* ======================== Settings view ======================== */
 
-/* ---- Web PIN card.
+/* ---- Page structure.
+   The settings are grouped into blocks of things that affect each other: Screen,
+   Schedules, Alerts, Data, Device, PIN, Firmware. A setting that only matters while
+   another one is on sits in a `deps()` box under it, dimmed and disabled while the parent
+   is off, so the relationship is visible instead of something to discover by trial. A
+   sticky strip at the top jumps between blocks and filters the fields by their label and
+   hint text; a sticky bar at the bottom carries the one Save button and says whether
+   there is anything to save. Everything the firmware validates (DESIGN.md §6.1) is sent
+   exactly as before — this is a re-arrangement of the page, not of the config. */
+
+// One label + control + hint, wrapped so the filter can show or hide it as a unit.
+function field(...parts) { return h('div', { class: 'field' }, ...parts); }
+
+// A titled sub-group inside a block; consecutive groups get a divider from the CSS.
+function group(...parts) { return h('div', { class: 'group' }, ...parts); }
+
+// Settings that only matter while a parent setting is on. setDeps() dims and disables
+// the whole box. The values inside are still collected on save, so switching the parent
+// off and on again loses nothing.
+function deps(...children) { return h('div', { class: 'dependents' }, ...children); }
+function setDeps(box, on) {
+  box.classList.toggle('is-off', !on);
+  for (const el of box.querySelectorAll('input, select, button')) el.disabled = !on;
+}
+
+// A block: a card with a heading, a one-line intro, and the fields. `short` is the label
+// on its pill in the sticky nav.
+function block(id, short, title, intro, ...children) {
+  return h('section', { class: 'card settings-block', id, 'data-short': short },
+    h('h2', {}, title), intro ? h('p', { class: 'block-intro' }, intro) : null, ...children);
+}
+
+/* ---- Web PIN block.
    The PIN the device asks for before any change. Changing it needs the current one, which
    the X-Pin header on POST /api/pin supplies (and the 401 flow collects if this browser
    has not been told it yet). "Forget" only clears this browser's copy — it does not
-   disable the PIN on the device, and the card says so. */
+   disable the PIN on the device, and the block says so. It is not part of the config
+   form: it talks to its own endpoint, so it keeps its own button. */
 
 // Firmware rule: 4-32 printable ASCII, no spaces. Checked here too so a typo is caught
 // before it costs a round trip, but the device remains the authority.
 const PIN_RE = /^[\x21-\x7e]{4,32}$/;
 
-function buildPinCard(state) {
-  const card = h('div', { class: 'card settings-grid' }, h('h2', {}, 'Web PIN'));
+function buildPinBlock(state) {
   const auth = state.auth || {};
   const msg = h('div', {});
-
-  card.append(hint('The PIN protects everything that changes this device: saving settings, '
-    + 'rebooting, resetting Wi-Fi, installing firmware and downloading the logs. Viewing '
-    + 'arrivals and statistics never asks for it.'));
-  if (auth.pin_required === false) {
-    card.append(h('p', { class: 'small muted' }, 'This device is not asking for a PIN at the moment.'));
-  }
 
   const newInput = h('input', { type: 'password', id: 'pin-new', autocomplete: 'new-password' });
   const confirmInput = h('input', { type: 'password', id: 'pin-confirm', autocomplete: 'new-password' });
@@ -2299,14 +2324,6 @@ function buildPinCard(state) {
     }
   } }, 'Change PIN');
 
-  card.append(
-    h('label', { for: 'pin-new' }, 'New PIN'), newInput,
-    hint('4 to 32 characters, no spaces. Write it down somewhere — the device also shows it '
-      + 'on its own screen if you tap the top of the display.'),
-    h('label', { for: 'pin-confirm' }, 'Confirm new PIN'), confirmInput,
-    h('div', { class: 'row', style: 'margin-top:.6rem' }, saveBtn),
-    msg);
-
   const forgetState = h('p', { class: 'small muted' }, '');
   function refreshForgetState() {
     forgetState.textContent = pinStore.has()
@@ -2314,46 +2331,90 @@ function buildPinCard(state) {
       : 'No PIN is saved on this browser.';
   }
   refreshForgetState();
-  card.append(h('h3', { style: 'margin-top:1rem' }, 'This browser'), forgetState,
-    hint('Forgetting the PIN here does not turn it off on the device — it only clears the '
-      + 'saved copy in this browser, so you will be asked for it again the next time you '
-      + 'change something. Do this on a shared or borrowed computer.'),
-    h('div', { class: 'row' }, h('button', {
-      onclick: () => {
-        pinStore.clear();
-        clear(msg);
-        refreshForgetState();
-        msg.append(h('div', { class: 'banner ok', role: 'status' }, 'Forgotten. You will be asked for the PIN next time.'));
-      },
-    }, 'Forget PIN on this browser')));
-  return card;
+
+  return block('s-pin', 'PIN', 'Web PIN',
+    'The PIN protects everything that changes this device: saving settings, rebooting, '
+      + 'resetting Wi-Fi, installing firmware and downloading the logs. Viewing arrivals and '
+      + 'statistics never asks for it.',
+    auth.pin_required === false
+      ? h('p', { class: 'small muted' }, 'This device is not asking for a PIN at the moment.') : null,
+    field(h('label', { for: 'pin-new' }, 'New PIN'), newInput,
+      hint('4 to 32 characters, no spaces. Write it down somewhere — the device also shows it '
+        + 'on its own Device page (tap the screen twice to get there).')),
+    field(h('label', { for: 'pin-confirm' }, 'Confirm new PIN'), confirmInput,
+      h('div', { class: 'row', style: 'margin-top:.6rem' }, saveBtn), msg),
+    group(field(h('h3', {}, 'This browser'), forgetState,
+      hint('Forgetting the PIN here does not turn it off on the device — it only clears the '
+        + 'saved copy in this browser, so you will be asked for it again the next time you '
+        + 'change something. Do this on a shared or borrowed computer.'),
+      h('div', { class: 'row' }, h('button', {
+        onclick: () => {
+          pinStore.clear();
+          clear(msg);
+          refreshForgetState();
+          msg.append(h('div', { class: 'banner ok', role: 'status' }, 'Forgotten. You will be asked for the PIN next time.'));
+        },
+      }, 'Forget PIN on this browser')))));
 }
 
-let settingsActive = false;
+/* ---- Firmware & maintenance block.
+   OTA upload, then the two actions that take the device off the network for a while,
+   boxed off in their own danger area so they are never mistaken for ordinary settings. */
 
-async function renderSettings(root) {
-  settingsActive = true;
-  activeCleanup = () => { settingsActive = false; };
-  root.append(h('p', { class: 'muted' }, 'Loading…'));
-  let cfg, state;
-  try {
-    [cfg, state] = await Promise.all([api.config(), api.state().catch(() => ({}))]);
-  } catch (e) { if (!settingsActive) return; clear(root); root.append(h('div', { class: 'banner danger' }, e.message)); return; }
-  if (!settingsActive) return;
-  clear(root);
+function buildFirmwareBlock(state) {
+  return block('s-firmware', 'Firmware', 'Firmware & maintenance',
+    'Update the software on the device, restart it, or make it forget its Wi-Fi. None of these need Save.',
+    field(h('p', {}, 'Version: ', h('strong', {}, state.firmware_version || 'unknown')),
+      h('p', {}, 'Board: ', h('strong', {}, state.board || 'unknown')),
+      hint('The board name matters when you update: a firmware image built for a different '
+        + 'board is refused, and the device says so rather than bricking itself.')),
+    field(h('label', { for: 'ota-file' }, 'Upload new firmware (.bin)'),
+      h('input', { type: 'file', id: 'ota-file', accept: '.bin' }),
+      h('div', { id: 'progress-wrap' }, h('div', { id: 'progress-bar' })),
+      h('div', { id: 'ota-status', class: 'small muted' }),
+      h('button', { class: 'primary', style: 'margin-top:.6rem', onclick: async (ev) => {
+        const fileInput = $('#ota-file');
+        const status = $('#ota-status');
+        const bar = $('#progress-bar');
+        if (!fileInput.files.length) { status.textContent = 'Choose a .bin file first.'; return; }
+        if (!confirm('Upload and install this firmware? The device will reboot when done.')) return;
+        ev.target.disabled = true;
+        status.textContent = 'Uploading…';
+        try {
+          await uploadFirmware(fileInput.files[0], (frac) => { bar.style.width = `${Math.round(frac * 100)}%`; });
+          status.textContent = 'Upload complete. Device is installing and will reboot.';
+        } catch (e) {
+          status.textContent = e.message;
+        } finally {
+          ev.target.disabled = false;
+        }
+      } }, 'Upload')),
+    h('div', { class: 'danger-zone' },
+      h('h3', {}, 'Restart and reset'),
+      field(h('div', { class: 'row' }, h('button', { class: 'danger', onclick: async () => {
+        if (!confirm('Reboot the device now?')) return;
+        try { await api.reboot(); alert('Reboot requested.'); } catch (e) { alert(e.message); }
+      } }, 'Reboot device')),
+      hint('Restarts the device. It is back on the network within about half a minute, and '
+        + 'nothing you have saved is lost.')),
+      field(h('div', { class: 'row' }, h('button', { class: 'danger', onclick: async () => {
+        if (!confirm('Reset Wi-Fi credentials? The device will start its setup access point again.')) return;
+        try { await api.wifiReset(); alert('Wi-Fi reset requested.'); } catch (e) { alert(e.message); }
+      } }, 'Reset Wi-Fi')),
+      hint('Forgets the saved Wi-Fi network and restarts into the setup hotspot, so you join '
+        + 'the device from a phone and enter the Wi-Fi password again, as on the first day. '
+        + 'Your stops and settings stay as they are.'))));
+}
 
-  const banner = h('div', {});
-  root.append(banner);
+/* ---- The config form.
+   Builds every control from `cfg`, arranges them into blocks, and returns the blocks plus
+   a collect() that reads the controls back into a whole config object — the same object
+   PUT /api/config has always received. */
 
-  // The firmware sets config_recovered when it had to fall back to the last known-good
-  // config after a bad save — silence here would let the owner wonder why a setting
-  // reverted itself.
-  if (state.config_recovered) {
-    root.append(h('div', { class: 'banner warn', role: 'status' },
-      'The device restored its previous settings after a bad save. Check the settings below still say what you want, then save again.'));
-  }
-
+function buildSettingsForm(cfg, state) {
   const d = cfg.device;
+
+  // ---- Device & network ----
   const nameInput = h('input', { type: 'text', id: 'set-name', value: d.name });
   const mdnsPreview = h('span', { class: 'muted small' }, `${slugify(d.name)}.local`);
   nameInput.addEventListener('input', () => { mdnsPreview.textContent = `${slugify(nameInput.value)}.local`; });
@@ -2365,7 +2426,12 @@ async function renderSettings(root) {
   tzCustom.classList.toggle('hidden', tzSelect.value !== '__custom__');
   tzSelect.addEventListener('change', () => tzCustom.classList.toggle('hidden', tzSelect.value !== '__custom__'));
 
+  // ---- Data ----
   const pollInput = h('input', { type: 'number', id: 'set-poll', min: 15, max: 120, value: d.poll_seconds });
+  const loggingInput = h('input', { type: 'checkbox', id: 'set-logging' });
+  loggingInput.checked = d.logging;
+
+  // ---- Screen ----
   const ROTATIONS = [[0, 'Portrait (0°)'], [90, 'Landscape (90°)'], [180, 'Portrait, flipped (180°)'], [270, 'Landscape, flipped (270°)']];
   const rotSelect = h('select', { id: 'set-rotation' },
     ...ROTATIONS.map(([deg, label]) => h('option', { value: String(deg), selected: deg === (d.rotation ?? 0) || undefined }, label)));
@@ -2377,6 +2443,36 @@ async function renderSettings(root) {
     ...THEMES.map(([v, label]) => h('option', { value: v, selected: v === (d.theme || 'light') || undefined }, label)));
   const invertInput = h('input', { type: 'checkbox', id: 'set-invert' });
   invertInput.checked = !!d.invert_colors;
+  const largeTextInput = h('input', { type: 'checkbox', id: 'set-large-text' });
+  largeTextInput.checked = !!d.large_text;
+  const crowdingMode = d.crowding || (d.show_crowding === false ? 'off' : 'words');
+  const CROWDING_MODES = [['off', 'Off'], ['words', 'Words'], ['icons', 'Icons'], ['both', 'Icons + word']];
+  const crowdingSelect = h('select', { id: 'set-crowding' },
+    ...CROWDING_MODES.map(([v, label]) => h('option', { value: v, selected: v === crowdingMode || undefined }, label)));
+  const CROWDING_ICON_SCHEMES = [['seats', 'Seats then people'], ['crowd', 'Crowd meter (people only)']];
+  const crowdingIconsSelect = h('select', { id: 'set-crowding-icons' },
+    ...CROWDING_ICON_SCHEMES.map(([v, label]) => h('option', { value: v, selected: v === (d.crowding_icons || 'seats') || undefined }, label)));
+  // The icon scheme only matters while icons are shown at all.
+  const crowdIconDeps = deps(
+    field(h('label', { for: 'set-crowding-icons' }, 'Crowding icons'), crowdingIconsSelect,
+      hint('“Seats then people” is three chairs that empty out as the seats fill: 3 green chairs for empty, 2 green for open, 1 amber chair for few seats, then 1 amber person for standing, 2 red people for packed and 3 red people for full. “Crowd meter” is just one to three people: 1 green for empty or open, 2 amber for few seats or standing, 3 red for packed or full. Picking “Icons + word” above shows both.')));
+  const refreshCrowd = () => setDeps(crowdIconDeps, crowdingSelect.value === 'icons' || crowdingSelect.value === 'both');
+  crowdingSelect.addEventListener('change', refreshCrowd);
+  refreshCrowd();
+
+  const hdr = d.header || {};
+  const HEADER_ITEMS = [['name', 'Device name', false], ['clock', 'Clock', true], ['weather', 'Current weather', true], ['wifi', 'Wi-Fi signal', true], ['updated', '"updated N s ago"', true]];
+  const headerInputs = {};
+  const headerRows = HEADER_ITEMS.map(([k, label, dflt]) => {
+    const cb = h('input', { type: 'checkbox', id: `set-hdr-${k}` });
+    cb.checked = hdr[k] ?? dflt;
+    headerInputs[k] = cb;
+    return h('label', { class: 'inline' }, cb, ` ${label}`);
+  });
+
+  // ---- Alerts: fetch switch -> ticker contents -> ticker size/speed ----
+  const alertsInput = h('input', { type: 'checkbox', id: 'set-alerts' });
+  alertsInput.checked = cfg.alerts;
   const tickerLines = d.ticker_lines ?? 3;
   const tickerLinesSelect = h('select', { id: 'set-ticker-lines' },
     ...[1, 2, 3, 4, 5, 6, 7, 8].map((n) => h('option', { value: String(n), selected: n === tickerLines || undefined },
@@ -2389,66 +2485,24 @@ async function renderSettings(root) {
   const tickerShow = d.ticker_show || 'both';
   const tickerShowSelect = h('select', { id: 'set-ticker-show' },
     ...TICKER_SHOW.map(([v, label]) => h('option', { value: v, selected: v === tickerShow || undefined }, label)));
-  tickerLinesSelect.disabled = tickerShow === 'off';
-  tickerSpeedInput.disabled = tickerShow === 'off';
-  tickerShowSelect.addEventListener('change', () => {
-    const off = tickerShowSelect.value === 'off';
-    tickerLinesSelect.disabled = off;
-    tickerSpeedInput.disabled = off;
-  });
-  const loggingInput = h('input', { type: 'checkbox', id: 'set-logging' });
-  loggingInput.checked = d.logging;
-  const alertsInput = h('input', { type: 'checkbox', id: 'set-alerts' });
-  alertsInput.checked = cfg.alerts;
-  const hdr = d.header || {};
-  const HEADER_ITEMS = [['name', 'Device name', false], ['clock', 'Clock', true], ['weather', 'Current weather', true], ['wifi', 'Wi-Fi signal', true], ['updated', '"updated N s ago"', true]];
-  const headerInputs = {};
-  const headerRows = HEADER_ITEMS.map(([k, label, dflt]) => {
-    const cb = h('input', { type: 'checkbox', id: `set-hdr-${k}` });
-    cb.checked = hdr[k] ?? dflt;
-    headerInputs[k] = cb;
-    return h('label', { class: 'inline' }, cb, ` ${label}`);
-  });
-  const wx = cfg.weather || {};
-  const wxEnabled = h('input', { type: 'checkbox', id: 'set-wx' });
-  wxEnabled.checked = wx.enabled ?? true;
-  const wxPerStop = h('input', { type: 'checkbox', id: 'set-wx-stop' });
-  wxPerStop.checked = wx.per_stop ?? true;
-  const wxUnits = h('select', { id: 'set-wx-units' },
-    h('option', { value: 'f', selected: (wx.units || 'f') === 'f' || undefined }, '°F'),
-    h('option', { value: 'c', selected: wx.units === 'c' || undefined }, '°C'));
-
-  // ---- Display extras ----
-  const largeTextInput = h('input', { type: 'checkbox', id: 'set-large-text' });
-  largeTextInput.checked = !!d.large_text;
-  const crowdingMode = d.crowding || (d.show_crowding === false ? 'off' : 'words');
-  const CROWDING_MODES = [['off', 'Off'], ['words', 'Words'], ['icons', 'Icons'], ['both', 'Icons + word']];
-  const crowdingSelect = h('select', { id: 'set-crowding' },
-    ...CROWDING_MODES.map(([v, label]) => h('option', { value: v, selected: v === crowdingMode || undefined }, label)));
-  const CROWDING_ICON_SCHEMES = [['seats', 'Seats then people'], ['crowd', 'Crowd meter (people only)']];
-  const crowdingIconsSelect = h('select', { id: 'set-crowding-icons' },
-    ...CROWDING_ICON_SCHEMES.map(([v, label]) => h('option', { value: v, selected: v === (d.crowding_icons || 'seats') || undefined }, label)));
-  crowdingIconsSelect.disabled = !(crowdingMode === 'icons' || crowdingMode === 'both');
-  crowdingSelect.addEventListener('change', () => {
-    crowdingIconsSelect.disabled = !(crowdingSelect.value === 'icons' || crowdingSelect.value === 'both');
-  });
-
-  // ---- Quiet hours (device.quiet) ----
-  const quiet = d.quiet || {};
-  const quietEnabled = h('input', { type: 'checkbox', id: 'set-quiet-enabled' });
-  quietEnabled.checked = !!quiet.enabled;
-  const quietStart = h('input', { type: 'time', id: 'set-quiet-start', value: quiet.start || '23:00' });
-  const quietEnd = h('input', { type: 'time', id: 'set-quiet-end', value: quiet.end || '06:00' });
-  const quietBrightness = h('input', { type: 'range', id: 'set-quiet-bright', min: 0, max: 50, value: quiet.brightness ?? 0 });
-  const quietBrightVal = h('span', { class: 'small muted' }, `${quiet.brightness ?? 0}% (0 = screen off)`);
-  quietBrightness.addEventListener('input', () => { quietBrightVal.textContent = `${quietBrightness.value}% (0 = screen off)`; });
-  const quietWake = h('input', { type: 'number', id: 'set-quiet-wake', min: 5, max: 300, value: quiet.wake_seconds ?? 30 });
-
-  // ---- Night clock (device.night) ----
-  const night = d.night || {};
-  const nightEnabled = h('input', { type: 'checkbox', id: 'set-night-enabled' });
-  nightEnabled.checked = night.enabled ?? true;
-  const nightAfter = h('input', { type: 'number', id: 'set-night-after', min: 15, max: 240, value: night.after_min ?? 60 });
+  const tickerSizeDeps = deps(
+    field(h('label', { for: 'set-ticker-lines' }, 'Height'), tickerLinesSelect,
+      hint('One line scrolls sideways like a news ticker. Two or more lines wrap the text and scroll it upward instead, which is easier to read but takes room from the arrivals.')),
+    field(h('label', { for: 'set-ticker-speed' }, 'Scroll speed'), h('div', { class: 'row' }, tickerSpeedInput, tickerSpeedVal),
+      hint('How fast the text moves, in pixels a second. Slower is easier to read from across the room.')));
+  const tickerDeps = deps(
+    field(hint('Service alerts and detours for your routes scroll along the bottom of the screen.')),
+    field(h('label', { for: 'set-ticker-show' }, 'Show'), tickerShowSelect,
+      hint('Which messages the ticker carries. The “Show service alerts” switch above decides whether they are fetched from SEPTA at all.')),
+    tickerSizeDeps);
+  // Outer box first, then the inner one: enabling the outer re-enables everything in it.
+  const refreshTicker = () => {
+    setDeps(tickerDeps, alertsInput.checked);
+    setDeps(tickerSizeDeps, alertsInput.checked && tickerShowSelect.value !== 'off');
+  };
+  alertsInput.addEventListener('change', refreshTicker);
+  tickerShowSelect.addEventListener('change', refreshTicker);
+  refreshTicker();
 
   // ---- Time to leave (top-level due) ----
   const due = cfg.due || {};
@@ -2461,6 +2515,68 @@ async function renderSettings(root) {
   dueScreen.checked = due.screen ?? true;
   const dueChime = h('input', { type: 'checkbox', id: 'set-due-chime' });
   dueChime.checked = !!due.chime;
+  const dueDeps = deps(
+    field(h('label', { for: 'set-due-minutes' }, 'Minutes before arrival'), dueMinutes,
+      hint('Roughly how long it takes you to walk to the stop.')),
+    field(h('label', { class: 'inline' }, dueLed, ' Blink the LED'),
+      hint('Blinks the small coloured LED on the board green — easy to catch from the corner of your eye.')),
+    field(h('label', { class: 'inline' }, dueScreen, ' Blink the row on screen'),
+      hint('Flashes that arrival’s minutes on the display.')),
+    field(h('label', { class: 'inline' }, dueChime, ' Two short beeps (board speaker)'),
+      hint('Two short beeps, once per bus. Needs a board with a speaker fitted, and stays silent during quiet hours.')));
+  dueEnabled.addEventListener('change', () => setDeps(dueDeps, dueEnabled.checked));
+  setDeps(dueDeps, dueEnabled.checked);
+
+  // ---- Quiet hours (device.quiet) ----
+  const quiet = d.quiet || {};
+  const quietEnabled = h('input', { type: 'checkbox', id: 'set-quiet-enabled' });
+  quietEnabled.checked = !!quiet.enabled;
+  const quietStart = h('input', { type: 'time', id: 'set-quiet-start', value: quiet.start || '23:00' });
+  const quietEnd = h('input', { type: 'time', id: 'set-quiet-end', value: quiet.end || '06:00' });
+  const quietBrightness = h('input', { type: 'range', id: 'set-quiet-bright', min: 0, max: 50, value: quiet.brightness ?? 0 });
+  const quietBrightVal = h('span', { class: 'small muted' }, `${quiet.brightness ?? 0}% (0 = screen off)`);
+  quietBrightness.addEventListener('input', () => { quietBrightVal.textContent = `${quietBrightness.value}% (0 = screen off)`; });
+  const quietWake = h('input', { type: 'number', id: 'set-quiet-wake', min: 5, max: 300, value: quiet.wake_seconds ?? 30 });
+  const quietDeps = deps(
+    field(h('div', { class: 'row' },
+      h('div', {}, h('label', { for: 'set-quiet-start' }, 'Start'), quietStart),
+      h('div', {}, h('label', { for: 'set-quiet-end' }, 'End'), quietEnd)),
+      hint('Quiet hours run from the first time to the second, and may cross midnight.')),
+    field(h('label', { for: 'set-quiet-bright' }, 'Brightness during quiet hours'), h('div', { class: 'row' }, quietBrightness, quietBrightVal),
+      hint('How dim the screen goes. Zero turns the backlight off completely.')),
+    field(h('label', { for: 'set-quiet-wake' }, 'Wake for N seconds on touch'), quietWake,
+      hint('A tap brings the screen back to normal brightness for this long, then it dims again. It stays on the page you were looking at.')));
+  quietEnabled.addEventListener('change', () => setDeps(quietDeps, quietEnabled.checked));
+  setDeps(quietDeps, quietEnabled.checked);
+
+  // ---- Night clock (device.night) ----
+  const night = d.night || {};
+  const nightEnabled = h('input', { type: 'checkbox', id: 'set-night-enabled' });
+  nightEnabled.checked = night.enabled ?? true;
+  const nightAfter = h('input', { type: 'number', id: 'set-night-after', min: 15, max: 240, value: night.after_min ?? 60 });
+  const nightDeps = deps(
+    field(h('label', { for: 'set-night-after' }, 'Show the clock when nothing is due within N minutes'), nightAfter,
+      hint('How quiet it has to get first. A lower number switches to the clock sooner.')));
+  nightEnabled.addEventListener('change', () => setDeps(nightDeps, nightEnabled.checked));
+  setDeps(nightDeps, nightEnabled.checked);
+
+  // ---- Weather ----
+  const wx = cfg.weather || {};
+  const wxEnabled = h('input', { type: 'checkbox', id: 'set-wx' });
+  wxEnabled.checked = wx.enabled ?? true;
+  const wxPerStop = h('input', { type: 'checkbox', id: 'set-wx-stop' });
+  wxPerStop.checked = wx.per_stop ?? true;
+  const wxUnits = h('select', { id: 'set-wx-units' },
+    h('option', { value: 'f', selected: (wx.units || 'f') === 'f' || undefined }, '°F'),
+    h('option', { value: 'c', selected: wx.units === 'c' || undefined }, '°C'));
+  const wxDeps = deps(
+    field(h('label', { class: 'inline' }, wxPerStop, ' Note the forecast at each stop’s next arrival when it differs (rain, snow, fog)'),
+      hint('Adds a short line to a stop’s panel when the weather around its next arrival is worth knowing about — rain, snow or fog. Nothing is shown on ordinary days.')),
+    field(h('label', { for: 'set-wx-units' }, 'Units'), wxUnits,
+      hint('Fahrenheit or Celsius, for every temperature the device shows.')),
+    field(h('p', { class: 'small muted' }, 'Forecasts come from Open-Meteo.com (free, no account) for each stop’s coordinates; stops within about a mile share one forecast. Stops added before this version may need coordinates - see the Stops page.')));
+  wxEnabled.addEventListener('change', () => setDeps(wxDeps, wxEnabled.checked));
+  setDeps(wxDeps, wxEnabled.checked);
 
   // ---- Profiles (top-level profiles, max 4) ----
   const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -2533,175 +2649,280 @@ async function renderSettings(root) {
   }
   renderProfiles();
 
-  const form = h('div', { class: 'card settings-grid' },
-    h('h2', {}, 'Device'),
-    h('label', { for: 'set-name' }, 'Device name'), h('div', { class: 'row' }, nameInput, mdnsPreview),
-    hint('What the device calls itself. It is also the web address of this page on your network: name.local in any browser at home.'),
-    h('label', { for: 'set-tz' }, 'Timezone'), tzSelect, tzCustom,
-    hint('Every clock time the device shows is in this zone. Eastern is the right one for Philadelphia, and it changes for daylight saving on its own.'),
-    h('label', { for: 'set-poll' }, 'Poll interval (seconds)'), pollInput,
-    hint('How often the device asks SEPTA for fresh times. It speeds up to every 15 seconds by itself whenever a bus is less than 3 minutes away, so this setting only affects the quiet stretches.'),
-    h('label', { for: 'set-rotation' }, 'Screen rotation'), rotSelect,
-    hint('Which way up the display is mounted. 0° is the tall portrait orientation the layout was designed around; 90° turns it on its side.'),
-    h('label', { for: 'set-bright' }, 'Screen brightness'), h('div', { class: 'row' }, brightInput, brightVal),
-    hint('How bright the backlight is during the day. Quiet hours below can dim it further at night.'),
-    h('label', { for: 'set-theme' }, 'Screen theme'), themeSelect,
-    hint('Light or dark colours on the device’s own screen. This web page follows your browser instead.'),
-    h('label', { class: 'inline' }, invertInput, ' Invert panel colors'),
-    hint('Only turn this on if colours look wrong on your panel — the light theme looking dark, the route badge orange instead of blue, or a white flash at boot. Otherwise leave it alone.'),
-    h('h2', {}, 'Alert ticker'),
-    hint('Service alerts and detours for your routes scroll along the bottom of the screen.'),
-    h('label', { for: 'set-ticker-lines' }, 'Height'), tickerLinesSelect,
-    hint('One line scrolls sideways like a news ticker. Two or more lines wrap the text and scroll it upward instead, which is easier to read but takes room from the arrivals.'),
-    h('label', { for: 'set-ticker-speed' }, 'Scroll speed'), h('div', { class: 'row' }, tickerSpeedInput, tickerSpeedVal),
-    hint('How fast the text moves, in pixels a second. Slower is easier to read from across the room.'),
-    h('label', { for: 'set-ticker-show' }, 'Show'), tickerShowSelect,
-    hint('Which messages the ticker carries. “Show service alerts” further down decides whether they are fetched from SEPTA at all.'),
+  // ---- Assemble the blocks ----
+  const sections = [
+    block('s-screen', 'Screen', 'Screen & appearance',
+      'How the device’s screen looks: colours, brightness, which way up, how big the text is, and what the top strip shows.',
+      field(h('label', { for: 'set-theme' }, 'Screen theme'), themeSelect,
+        hint('Light or dark colours on the device’s own screen. This web page follows your browser instead.')),
+      field(h('label', { for: 'set-bright' }, 'Screen brightness'), h('div', { class: 'row' }, brightInput, brightVal),
+        hint('How bright the backlight is during the day. Quiet hours, under Schedules, can dim it further at night.')),
+      field(h('label', { for: 'set-rotation' }, 'Screen rotation'), rotSelect,
+        hint('Which way up the display is mounted. 0° is the tall portrait orientation the layout was designed around; 90° turns it on its side.')),
+      field(h('label', { class: 'inline' }, invertInput, ' Invert panel colors'),
+        hint('Only turn this on if colours look wrong on your panel — the light theme looking dark, the route badge orange instead of blue, or a white flash at boot. Otherwise leave it alone.')),
+      field(h('label', { class: 'inline' }, largeTextInput, ' Large text (two rows per stop, big numbers)'),
+        hint('Two rows per stop with the minutes in large digits, readable from across a room. Fewer arrivals fit on the screen this way.')),
+      group(
+        field(h('label', { for: 'set-crowding' }, 'Crowding'), crowdingSelect,
+          hint('SEPTA reports how full each bus is, and the display can show it next to the destination as: empty, open (many seats), few seats, standing (standing room only), packed (crushed standing) or full (not boarding). Not every bus reports crowding — when one doesn’t, nothing is shown for it.')),
+        crowdIconDeps),
+      group(
+        field(h('h3', {}, 'Top strip'),
+          hint('The strip along the top of the device’s screen is narrow, so pick what it shows. Anything unticked is simply not drawn.'),
+          h('div', { class: 'checks' }, ...headerRows)))),
 
-    h('h2', {}, 'Display extras'),
-    h('label', { class: 'inline' }, largeTextInput, ' Large text (two rows per stop, big numbers)'),
-    hint('Two rows per stop with the minutes in large digits, readable from across a room. Fewer arrivals fit on the screen this way.'),
-    h('label', { for: 'set-crowding' }, 'Crowding'), crowdingSelect,
-    hint('SEPTA reports how full each bus is, and the display can show it next to the destination as: empty, open (many seats), few seats, standing (standing room only), packed (crushed standing) or full (not boarding). Not every bus reports crowding — when one doesn’t, nothing is shown for it.'),
-    h('label', { for: 'set-crowding-icons' }, 'Crowding icons'), crowdingIconsSelect,
-    hint('“Seats then people” is three chairs that empty out as the seats fill: 3 green chairs for empty, 2 green for open, 1 amber chair for few seats, then 1 amber person for standing, 2 red people for packed and 3 red people for full. “Crowd meter” is just one to three people: 1 green for empty or open, 2 amber for few seats or standing, 3 red for packed or full. Picking “Icons + word” above shows both.'),
+    block('s-schedules', 'Schedules', 'Schedules',
+      'What the screen shows when. These three layer on top of each other: profiles pick which stops are shown, the night clock takes over when nothing is due, and quiet hours dim the screen regardless of what is on it.',
+      group(
+        field(h('label', { class: 'inline toggle' }, quietEnabled, ' Quiet hours'),
+          hint('Dims or blanks the screen overnight so it is not glowing at you in bed. A tap on the screen wakes it briefly.')),
+        quietDeps),
+      group(
+        field(h('label', { class: 'inline toggle' }, nightEnabled, ' Night clock'),
+          hint('When nothing is due for a while the screen becomes a big clock with the date, the weather and each stop’s next departure — so it is useful the rest of the time too.')),
+        nightDeps),
+      group(
+        field(h('h3', {}, 'Commute profiles'),
+          hint('Profiles decide which stops appear at which times of the week — the outbound stop on weekday mornings, the inbound one in the evening. Outside every profile’s days and hours, all your stops are shown. Every stop keeps polling and logging either way.'),
+          profilesCard))),
 
-    h('h2', {}, 'Quiet hours'),
-    h('label', { class: 'inline' }, quietEnabled, ' Enable quiet hours'),
-    hint('Dims or blanks the screen overnight so it is not glowing at you in bed. A tap on the screen wakes it briefly.'),
-    h('label', { for: 'set-quiet-start' }, 'Start'), quietStart,
-    h('label', { for: 'set-quiet-end' }, 'End'), quietEnd,
-    hint('Quiet hours run from the first time to the second, and may cross midnight.'),
-    h('label', { for: 'set-quiet-bright' }, 'Brightness during quiet hours'), h('div', { class: 'row' }, quietBrightness, quietBrightVal),
-    hint('How dim the screen goes. Zero turns the backlight off completely.'),
-    h('label', { for: 'set-quiet-wake' }, 'Wake for N seconds on touch'), quietWake,
-    hint('A tap brings the screen back to normal brightness for this long, then it dims again. It stays on the page you were looking at.'),
+    block('s-alerts', 'Alerts', 'Alerts & reminders',
+      'The ways the display gets your attention: SEPTA’s service alerts on the ticker, and a nudge when it is time to leave.',
+      group(
+        field(h('label', { class: 'inline toggle' }, alertsInput, ' Show service alerts'),
+          hint('Fetches SEPTA’s alerts and detours for your routes. The ticker settings below pick which of them are displayed.')),
+        tickerDeps),
+      group(
+        field(h('label', { class: 'inline toggle' }, dueEnabled, ' Time to leave'),
+          hint('Nudges you the moment an arrival first comes within the minutes below, so you can leave without watching the screen.')),
+        dueDeps)),
 
-    h('h2', {}, 'Night clock'),
-    h('label', { class: 'inline' }, nightEnabled, ' Enable night clock'),
-    hint('When nothing is due for a while the screen becomes a big clock with the date, the weather and each stop’s next departure — so it is useful the rest of the time too.'),
-    h('label', { for: 'set-night-after' }, 'Show the clock when nothing is due within N minutes'), nightAfter,
-    hint('How quiet it has to get first. A lower number switches to the clock sooner.'),
+    block('s-data', 'Data & weather', 'Data & weather',
+      'Where the numbers come from, how often, and what is kept.',
+      field(h('label', { for: 'set-poll' }, 'Poll interval (seconds)'), pollInput,
+        hint('How often the device asks SEPTA for fresh times. It speeds up to every 15 seconds by itself whenever a bus is less than 3 minutes away, so this setting only affects the quiet stretches.')),
+      field(h('label', { class: 'inline' }, loggingInput, ' Log arrivals to SD card'),
+        hint('Writes every arrival to the SD card so the Stats page has something to work from. Turn it off and the Stats page stays empty.')),
+      group(
+        field(h('label', { class: 'inline toggle' }, wxEnabled, ' Show weather'),
+          hint('Puts the current temperature and a condition icon in the top strip of the screen.')),
+        wxDeps)),
 
-    h('h2', {}, 'Time to leave'),
-    h('label', { class: 'inline' }, dueEnabled, ' Enable'),
-    hint('Nudges you the moment an arrival first comes within the minutes below, so you can leave without watching the screen.'),
-    h('label', { for: 'set-due-minutes' }, 'Minutes before arrival'), dueMinutes,
-    hint('Roughly how long it takes you to walk to the stop.'),
-    h('label', { class: 'inline' }, dueLed, ' Blink the LED'),
-    hint('Blinks the small coloured LED on the board green — easy to catch from the corner of your eye.'),
-    h('label', { class: 'inline' }, dueScreen, ' Blink the row on screen'),
-    hint('Flashes that arrival’s minutes on the display.'),
-    h('label', { class: 'inline' }, dueChime, ' Two short beeps (board speaker)'),
-    hint('Two short beeps, once per bus. Needs a board with a speaker fitted, and stays silent during quiet hours.'),
+    block('s-device', 'Device', 'Device & network',
+      'The device’s name on your home network, and the clock it keeps.',
+      field(h('label', { for: 'set-name' }, 'Device name'), h('div', { class: 'row' }, nameInput, mdnsPreview),
+        hint('What the device calls itself. It is also the web address of this page on your network: name.local in any browser at home.')),
+      field(h('label', { for: 'set-tz' }, 'Timezone'), tzSelect, tzCustom,
+        hint('Every clock time the device shows is in this zone. Eastern is the right one for Philadelphia, and it changes for daylight saving on its own.'))),
 
-    h('h2', {}, 'Profiles'),
-    hint('Profiles decide which stops appear at which times of the week — the outbound stop on weekday mornings, the inbound one in the evening. Outside every profile’s days and hours, all your stops are shown. Every stop keeps polling and logging either way.'),
-    profilesCard,
+    buildPinBlock(state),
+    buildFirmwareBlock(state),
+  ];
 
-    h('h2', {}, 'Header'),
-    hint('The strip along the top of the device’s screen is narrow, so pick what it shows. Anything unticked is simply not drawn.'),
-    ...headerRows,
-    h('h2', {}, 'Weather'),
-    h('label', { class: 'inline' }, wxEnabled, ' Show weather'),
-    hint('Puts the current temperature and a condition icon in the top strip of the screen.'),
-    h('label', { class: 'inline' }, wxPerStop, ' Note the forecast at each stop\u2019s next arrival when it differs (rain, snow, fog)'),
-    hint('Adds a short line to a stop’s panel when the weather around its next arrival is worth knowing about — rain, snow or fog. Nothing is shown on ordinary days.'),
-    h('label', { for: 'set-wx-units' }, 'Units'), wxUnits,
-    hint('Fahrenheit or Celsius, for every temperature the device shows.'),
-    h('p', { class: 'small muted' }, 'Forecasts come from Open-Meteo.com (free, no account) for each stop\u2019s coordinates; stops within about a mile share one forecast. Stops added before this version may need coordinates - see the Stops page.'),
-    h('label', { class: 'inline', style: 'margin-top:1rem' }, loggingInput, ' Log arrivals to SD card'),
-    hint('Writes every arrival to the SD card so the Stats page has something to work from. Turn it off and the Stats page stays empty.'),
-    h('label', { class: 'inline' }, alertsInput, ' Show service alerts'),
-    hint('Fetches SEPTA’s alerts and detours for your routes. The ticker settings above pick which of them are displayed.'),
-    h('div', { style: 'margin-top:1rem' }, h('button', { class: 'primary', onclick: async () => {
-      const tz = tzSelect.value === '__custom__' ? tzCustom.value.trim() : tzSelect.value;
-      // Drop legacy fields the current UI never sets: show_crowding (folded into
-      // crowding on load) and use_https/tls_verify (HTTPS mode removed from firmware —
-      // strip them here too so an old config fetched from the device doesn't cause them
-      // to be echoed back on save).
-      const { show_crowding: _legacyShowCrowding, use_https: _legacyUseHttps, tls_verify: _legacyTlsVerify, ...dRest } = d;
-      const next = {
-        ...cfg,
-        device: {
-          ...dRest, name: nameInput.value.trim(), tz, poll_seconds: Number(pollInput.value),
-          brightness: Number(brightInput.value), rotation: Number(rotSelect.value),
-          theme: themeSelect.value, invert_colors: invertInput.checked,
-          ticker_lines: Number(tickerLinesSelect.value), ticker_speed: Number(tickerSpeedInput.value),
-          ticker_show: tickerShowSelect.value,
-          logging: loggingInput.checked,
-          header: Object.fromEntries(Object.entries(headerInputs).map(([k, cb]) => [k, cb.checked])),
-          large_text: largeTextInput.checked,
-          crowding: crowdingSelect.value,
-          crowding_icons: crowdingIconsSelect.value,
-          quiet: {
-            enabled: quietEnabled.checked, start: quietStart.value, end: quietEnd.value,
-            brightness: Number(quietBrightness.value), wake_seconds: Number(quietWake.value),
-          },
-          night: { enabled: nightEnabled.checked, after_min: Number(nightAfter.value) },
+  function collect() {
+    const tz = tzSelect.value === '__custom__' ? tzCustom.value.trim() : tzSelect.value;
+    // Drop legacy fields the current UI never sets: show_crowding (folded into
+    // crowding on load) and use_https/tls_verify (HTTPS mode removed from firmware —
+    // strip them here too so an old config fetched from the device doesn't cause them
+    // to be echoed back on save).
+    const { show_crowding: _legacyShowCrowding, use_https: _legacyUseHttps, tls_verify: _legacyTlsVerify, ...dRest } = d;
+    return {
+      ...cfg,
+      device: {
+        ...dRest, name: nameInput.value.trim(), tz, poll_seconds: Number(pollInput.value),
+        brightness: Number(brightInput.value), rotation: Number(rotSelect.value),
+        theme: themeSelect.value, invert_colors: invertInput.checked,
+        ticker_lines: Number(tickerLinesSelect.value), ticker_speed: Number(tickerSpeedInput.value),
+        ticker_show: tickerShowSelect.value,
+        logging: loggingInput.checked,
+        header: Object.fromEntries(Object.entries(headerInputs).map(([k, cb]) => [k, cb.checked])),
+        large_text: largeTextInput.checked,
+        crowding: crowdingSelect.value,
+        crowding_icons: crowdingIconsSelect.value,
+        quiet: {
+          enabled: quietEnabled.checked, start: quietStart.value, end: quietEnd.value,
+          brightness: Number(quietBrightness.value), wake_seconds: Number(quietWake.value),
         },
-        alerts: alertsInput.checked,
-        weather: { enabled: wxEnabled.checked, per_stop: wxPerStop.checked, units: wxUnits.value },
-        due: {
-          enabled: dueEnabled.checked, minutes: Number(dueMinutes.value),
-          led: dueLed.checked, screen: dueScreen.checked, chime: dueChime.checked,
-        },
-        profiles: profiles.map((p, pi) => ({
-          name: p.name.trim() || `Profile ${pi + 1}`,
-          days: [...p.days].sort((a, b) => a - b),
-          start: p.start,
-          end: p.end,
-          stops: p.order.filter((k) => p.included.has(k)),
-        })),
-      };
-      clear(banner);
-      try {
-        await api.saveConfig(next);
-        cfg = next;
-        banner.append(h('div', { class: 'banner ok', role: 'status' }, 'Settings saved.'));
-      } catch (e) {
-        banner.append(h('div', { class: 'banner danger', role: 'alert' }, e.path ? `${e.message} (${e.path})` : e.message));
+        night: { enabled: nightEnabled.checked, after_min: Number(nightAfter.value) },
+      },
+      alerts: alertsInput.checked,
+      weather: { enabled: wxEnabled.checked, per_stop: wxPerStop.checked, units: wxUnits.value },
+      due: {
+        enabled: dueEnabled.checked, minutes: Number(dueMinutes.value),
+        led: dueLed.checked, screen: dueScreen.checked, chime: dueChime.checked,
+      },
+      profiles: profiles.map((p, pi) => ({
+        name: p.name.trim() || `Profile ${pi + 1}`,
+        days: [...p.days].sort((a, b) => a - b),
+        start: p.start,
+        end: p.end,
+        stops: p.order.filter((k) => p.included.has(k)),
+      })),
+    };
+  }
+
+  return { sections, collect };
+}
+
+let settingsActive = false;
+
+async function renderSettings(root) {
+  settingsActive = true;
+  const listeners = [];
+  activeCleanup = () => {
+    settingsActive = false;
+    for (const [ev, fn] of listeners) window.removeEventListener(ev, fn);
+  };
+  root.append(h('p', { class: 'muted' }, 'Loading…'));
+  let cfg, state;
+  try {
+    [cfg, state] = await Promise.all([api.config(), api.state().catch(() => ({}))]);
+  } catch (e) { if (!settingsActive) return; clear(root); root.append(h('div', { class: 'banner danger' }, e.message)); return; }
+  if (!settingsActive) return;
+  clear(root);
+
+  // ---- Sticky nav: block pills + the filter box ----
+  const filterInput = h('input', { type: 'search', id: 'settings-filter', placeholder: 'Filter settings…', 'aria-label': 'Filter settings' });
+  const pills = h('div', { class: 'pills' });
+  const nav = h('div', { class: 'settings-nav' }, filterInput, pills);
+  const noMatch = h('p', { class: 'muted hidden', role: 'status' });
+  const content = h('div', { class: 'stack' });
+
+  // ---- Sticky save bar ----
+  const msg = h('div', { class: 'msg' });
+  const status = h('span', { class: 'status' });
+  // The .long halves drop out on narrow phones so the bar stays one row.
+  const resetBtn = h('button', { title: 'Put every setting back to what the device has saved', onclick: () => paint() }, 'Undo', h('span', { class: 'long' }, ' changes'));
+  const saveBtn = h('button', { class: 'primary', onclick: save }, 'Save', h('span', { class: 'long' }, ' settings'));
+  const bar = h('div', { class: 'save-bar' }, msg, status, resetBtn, saveBtn);
+
+  root.append(nav);
+  // The firmware sets config_recovered when it had to fall back to the last known-good
+  // config after a bad save — silence here would let the owner wonder why a setting
+  // reverted itself.
+  if (state.config_recovered) {
+    root.append(h('div', { class: 'banner warn', role: 'status' },
+      'The device restored its previous settings after a bad save. Check the settings below still say what you want, then save again.'));
+  }
+  root.append(noMatch, content, bar);
+
+  let form = null;      // { sections, collect } from buildSettingsForm
+  let baseline = '';    // JSON of the form as loaded or last saved; "unsaved" is a string compare
+  let stickyH = 0;      // height of the top bar + settings nav, for scroll offsets
+
+  // (Re)build the whole form from cfg: on first load, and for "Undo changes".
+  function paint() {
+    const y = window.scrollY;
+    form = buildSettingsForm(cfg, state);
+    clear(content);
+    content.append(...form.sections);
+    clear(pills);
+    for (const s of form.sections) {
+      pills.append(h('button', { class: 'pill', type: 'button', 'data-target': s.id, onclick: () => jumpTo(s) }, s.dataset.short));
+    }
+    baseline = JSON.stringify(form.collect());
+    clear(msg);
+    applyFilter();
+    checkDirty();
+    window.scrollTo(0, y);
+  }
+
+  function checkDirty() {
+    const dirty = !!form && JSON.stringify(form.collect()) !== baseline;
+    bar.classList.toggle('dirty', dirty);
+    saveBtn.disabled = !dirty;
+    resetBtn.disabled = !dirty;
+    status.textContent = dirty ? 'Unsaved changes' : 'No unsaved changes';
+    // A "saved" banner next to "unsaved changes" would contradict itself.
+    if (dirty && msg.querySelector('.ok')) clear(msg);
+  }
+  // Every control lives under `content`, so three delegated listeners cover them all —
+  // the profile buttons (add, remove, reorder) mutate their state before the click
+  // bubbles up here.
+  content.addEventListener('input', checkDirty);
+  content.addEventListener('change', checkDirty);
+  content.addEventListener('click', (ev) => { if (ev.target.closest('button')) checkDirty(); });
+
+  async function save() {
+    const next = form.collect();
+    clear(msg);
+    saveBtn.disabled = true;
+    resetBtn.disabled = true;
+    status.textContent = 'Saving…';
+    try {
+      await api.saveConfig(next);
+      cfg = next;
+      baseline = JSON.stringify(form.collect());
+      msg.append(h('div', { class: 'banner ok', role: 'status' }, 'Settings saved.'));
+    } catch (e) {
+      msg.append(h('div', { class: 'banner danger', role: 'alert' }, e.path ? `${e.message} (${e.path})` : e.message));
+    }
+    checkDirty();
+  }
+
+  // ---- Filter: hide every field whose label/hint/options do not contain the text ----
+  function applyFilter() {
+    const q = filterInput.value.trim().toLowerCase();
+    let any = false;
+    form.sections.forEach((s, i) => {
+      let shown = 0;
+      for (const f of s.querySelectorAll('.field')) {
+        const hit = !q || f.textContent.toLowerCase().includes(q);
+        f.classList.toggle('hidden', !hit);
+        if (hit) shown++;
       }
-    } }, 'Save settings')));
-  root.append(form);
-
-  root.append(buildPinCard(state));
-
-  root.append(h('div', { class: 'card' }, h('h2', {}, 'Firmware'),
-    h('p', {}, 'Version: ', h('strong', {}, state.firmware_version || 'unknown')),
-    h('p', {}, 'Board: ', h('strong', {}, state.board || 'unknown')),
-    hint('The board name matters when you update: a firmware image built for a different '
-      + 'board is refused, and the device says so rather than bricking itself.'),
-    h('label', { for: 'ota-file' }, 'Upload new firmware (.bin)'),
-    h('input', { type: 'file', id: 'ota-file', accept: '.bin' }),
-    h('div', { id: 'progress-wrap' }, h('div', { id: 'progress-bar' })),
-    h('div', { id: 'ota-status', class: 'small muted' }),
-    h('button', { class: 'primary', style: 'margin-top:.6rem', onclick: async (ev) => {
-      const fileInput = $('#ota-file');
-      const status = $('#ota-status');
-      const bar = $('#progress-bar');
-      if (!fileInput.files.length) { status.textContent = 'Choose a .bin file first.'; return; }
-      if (!confirm('Upload and install this firmware? The device will reboot when done.')) return;
-      ev.target.disabled = true;
-      status.textContent = 'Uploading…';
-      try {
-        await uploadFirmware(fileInput.files[0], (frac) => { bar.style.width = `${Math.round(frac * 100)}%`; });
-        status.textContent = 'Upload complete. Device is installing and will reboot.';
-      } catch (e) {
-        status.textContent = e.message;
-      } finally {
-        ev.target.disabled = false;
+      // A box with nothing left in it would show as a bare divider or an empty border.
+      for (const g of s.querySelectorAll('.group, .dependents, .danger-zone')) {
+        g.classList.toggle('hidden', !!q && !g.querySelector('.field:not(.hidden)'));
       }
-    } }, 'Upload')));
+      s.classList.toggle('hidden', !!q && !shown);
+      pills.children[i].classList.toggle('empty', !!q && !shown);
+      if (shown) any = true;
+    });
+    noMatch.textContent = `No settings match “${filterInput.value.trim()}”.`;
+    noMatch.classList.toggle('hidden', !q || any);
+    updateActive();
+  }
+  filterInput.addEventListener('input', debounce(applyFilter, 60));
 
-  root.append(h('div', { class: 'card' }, h('h2', {}, 'Maintenance'),
-    h('div', { class: 'row' },
-      h('button', { onclick: async () => {
-        if (!confirm('Reset Wi-Fi credentials? The device will start its setup access point again.')) return;
-        try { await api.wifiReset(); alert('Wi-Fi reset requested.'); } catch (e) { alert(e.message); }
-      } }, 'Reset Wi-Fi'),
-      h('button', { class: 'danger', onclick: async () => {
-        if (!confirm('Reboot the device now?')) return;
-        try { await api.reboot(); alert('Reboot requested.'); } catch (e) { alert(e.message); }
-      } }, 'Reboot device'))));
+  // ---- Jump links and the "you are here" pill ----
+  // An instant jump, not a smooth one: the block's scroll-margin-top keeps it clear of the
+  // sticky strips, and a page of settings is not the place for motion.
+  function jumpTo(s) {
+    s.scrollIntoView({ block: 'start' });
+    updateActive();
+  }
+  function measure() {
+    const top = ($('#topbar') || {}).offsetHeight || 0;
+    nav.style.top = `${top}px`;
+    stickyH = top + nav.offsetHeight;
+    root.style.setProperty('--sticky-h', `${stickyH}px`);
+  }
+  function updateActive() {
+    const vis = form.sections.filter((s) => !s.classList.contains('hidden'));
+    let cur = vis[0];
+    for (const s of vis) if (s.getBoundingClientRect().top <= stickyH + 24) cur = s;
+    // At the very bottom the last block is the one on screen even if its top never
+    // reaches the line.
+    if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) cur = vis[vis.length - 1];
+    for (const p of pills.children) p.classList.toggle('active', !!cur && p.dataset.target === cur.id);
+  }
+  let ticking = false;
+  const onScroll = () => {
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(() => { ticking = false; updateActive(); });
+  };
+  const onResize = () => { measure(); updateActive(); };
+  // Closing the tab with edits pending gets the browser's own "leave page?" prompt.
+  const onUnload = (ev) => { if (bar.classList.contains('dirty')) { ev.preventDefault(); ev.returnValue = ''; } };
+  listeners.push(['scroll', onScroll], ['resize', onResize], ['beforeunload', onUnload]);
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onResize);
+  window.addEventListener('beforeunload', onUnload);
+
+  paint();
+  measure();
+  updateActive();
 }
