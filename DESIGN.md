@@ -442,7 +442,7 @@ are stored exactly as sent.
 
 A save never leaves the live file half-written. `saveConfig()` serializes to `/config.json.tmp`,
 checks the byte count written equals the serialized length (a short write is what a full LittleFS
-looks like from the File API), re-reads and re-validates that file, rotates the current
+looks like from the File API), re-reads that file and compares its length and FNV-1a hash with the serialization (a byte-identical copy of an already-validated config needs no second parse, which cost ~15 KB of heap on the web task), rotates the current
 `/config.json` to `/config.prev.json`, and only then renames the temp file into place. Config
 writes are serialized with a mutex — `PUT /api/config` runs on the web server's task while
 `main.cpp` may still be writing defaults. Any failure returns false, `PUT /api/config` answers 500
