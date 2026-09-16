@@ -10,6 +10,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 
 #include <cstdio>
 #include <ctime>
@@ -438,7 +439,10 @@ void refreshDeviceInfoScreen(lv_obj_t *screen) {
     snprintf(buf, sizeof buf, "#%06x SD#  mounted, %.0f MB free", sub, (double)sd.free_bytes / (1024.0 * 1024.0));
   }
   lv_label_set_text(ctx->sd_label, buf);
-  snprintf(buf, sizeof buf, "#%06x heap#  %u KB free", sub, (unsigned)(ESP.getFreeHeap() / 1024));
+  // MALLOC_CAP_8BIT, not ESP.getFreeHeap(): the panel and the web app's "Heap free" tile have to
+  // agree, and the byte-addressable heap is the one a buffer can actually be given. ESP.getFreeHeap()
+  // reads ~34 KB high here because it also counts 32-bit-word-only IRAM (DESIGN.md SS2.1).
+  snprintf(buf, sizeof buf, "#%06x heap#  %u KB free", sub, (unsigned)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
   lv_label_set_text(ctx->heap_label, buf);
 }
 

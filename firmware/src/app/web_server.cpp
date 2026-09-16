@@ -390,12 +390,23 @@ void scheduleRestart() {
 // fragments (largest block ~12 KB), while the build itself needs only 1 KB ArduinoJson pools and,
 // since the zero-copy response (sendJsonStreamed), no body-sized contiguous block at all. The small
 // handlers (debug/ui, tap, oom) are deliberately not gated: they cost little and the test/UI use
-// them to observe the device precisely while it is under pressure. Normal use sits near 74 KB and
-// never trips this.
-constexpr size_t kMinHeavyResponseHeap = 24 * 1024;
+// them to observe the device precisely while it is under pressure.
+//
+// Both halves read MALLOC_CAP_8BIT since 2026-09-16 (DESIGN.md SS2.1). The free half used to read
+// ESP.getFreeHeap() = heap_caps_get_free_size(MALLOC_CAP_INTERNAL), which on this chip includes
+// ~34 KB of 32-bit-word-only IRAM heap that malloc() never hands out for a string or a buffer.
+// INTERNAL free therefore never falls below that ~34 KB, so a 24 KB INTERNAL floor could not fire
+// at all: the gate had been running on its largest-block half alone. 12 KB is derived from what the
+// build actually takes out of the byte-addressable heap - a Config copy (~3 KB of small strings), a
+// Snapshot copy, ArduinoJson's 1 KB slot pools plus its string pool for a ~4 KB document (~6 KB),
+// and one 2,872 B send buffer - and is deliberately set below that total, per the paragraph above:
+// the floor exists to skip a hopeless build, not to promise a successful one. The block half stays
+// at 8 KB, already 2.8x the only contiguous allocation on the path (ASYNC_RESPONCE_BUFF_SIZE =
+// CONFIG_LWIP_TCP_MSS * 2 = 2,872 B), the slack covering ArduinoJson's string pool.
+constexpr size_t kMinHeavyResponseFree8 = 12 * 1024;
 constexpr size_t kMinHeavyResponseBlock = 8 * 1024;
 bool refuseIfLowHeap(AsyncWebServerRequest *request) {
-  if (ESP.getFreeHeap() >= kMinHeavyResponseHeap &&
+  if (heap_caps_get_free_size(MALLOC_CAP_8BIT) >= kMinHeavyResponseFree8 &&
       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= kMinHeavyResponseBlock) {
     return false;
   }
@@ -408,7 +419,17 @@ void handleGetState(AsyncWebServerRequest *request) {
   JsonDocument doc;
   doc["time"] = (int64_t)time(nullptr);
   doc["uptime"] = (uint32_t)(millis() / 1000);
+  // Three heap numbers, and only the first is the historical one. `heap` stays ESP.getFreeHeap()
+  // (MALLOC_CAP_INTERNAL) because clients parse it - firmware/test/device/exhaustive_test.py, the
+  // web app, anyone's script - and silently changing what a published field means is worse than an
+  // optimistic number. `heap_8bit` is what an allocation can really get, and it is the one the web
+  // app shows and the gates in this file read; `largest_block_8bit` is the contiguous figure the
+  // OTA gate turns away on, so a refused upload can be explained without the serial cable.
+  // The difference between `heap` and `heap_8bit` is the 32-bit-word-only IRAM heap, ~34 KB on this
+  // build, which malloc() never returns for a buffer or a string (DESIGN.md SS2.1).
   doc["heap"] = ESP.getFreeHeap();
+  doc["heap_8bit"] = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  doc["largest_block_8bit"] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
   Config cfg = getActiveConfig();
 
@@ -599,11 +620,37 @@ void handlePostWifiReset(AsyncWebServerRequest *request) {
 //
 // Admission checks happen at index == 0, before Update.begin(), because that is the last moment
 // at which refusing costs nothing: after it, ~1.7 MB is already on the wire.
-constexpr size_t kMinOtaFreeHeap = 60 * 1024;
+// Both numbers are MALLOC_CAP_8BIT since 2026-09-16, and both were re-derived from what the OTA
+// path actually allocates rather than from the INTERNAL figure they had been tuned against
+// (DESIGN.md SS2.1). What Update takes off the byte-addressable heap is exactly one buffer:
+// Update.begin() does `new (std::nothrow) uint8_t[SPI_FLASH_SEC_SIZE]` = 4,096 B (Updater.cpp), and
+// the only other allocation on the path is a 16 B _skipBuffer at the first written sector. Nothing
+// in Update.write() is body-sized: ESPAsyncWebServer hands the multipart body over in ~1.4 KB
+// pieces and Update buffers them into that one sector.
+//
+// The old pair - 60 KB of INTERNAL free and a 16 KB block - is why an upload could not get in while
+// the device was polling. On 2026-09-16 every attempt was refused for ten minutes ("largest free
+// block 15 KB is below 16 KB" between polls, "free heap 4x KB is below 60 KB" during them) and a
+// reboot-then-upload or the serial cable was the only way in. Neither threshold described a real
+// requirement: 16 KB is 4x the one 4,096 B block Update asks for, and 60 KB of INTERNAL is ~26 KB
+// of byte-addressable heap, which sits inside the band a poll leaves behind, so the gate flapped
+// with the poll cycle. Measured over 114 samples on the owner's cyd-3248S035R, the 8-bit largest
+// block sits at 20,468 B for most of the cycle - comfortably past 16 KB - but drops to 14,324 B and
+// as far as 8,692 B while a poll is decoding a feed, which is exactly when someone reaches for an
+// update. That dip refused 30 of 114 attempts on the block half alone, and another 9 on the free
+// half: 34% of the time, for a 4,096 B allocation that would have succeeded in every one of them.
+//
+// So: 6 KB of largest block, 1.5x the 4,096 B buffer, which clears the measured 8,692 B floor with
+// room and still refuses a heap fragmented past the point where that buffer could land; and 16 KB
+// of 8-bit free for the request machinery and the rest of the device to keep working beside it.
+// The alternative - having the handler wait for the poller's idle gap - was rejected: index == 0
+// runs on the AsyncTCP task, and blocking there stalls every other connection, which is a worse
+// failure than the one being fixed, while the client is already mid-upload with ~1.7 MB to push.
+constexpr size_t kMinOtaFree8 = 16 * 1024;
 // Update.write() needs a contiguous scratch buffer; free heap alone can be healthy while the
 // largest block is fragmented down to a few KB, which is how a mid-flash failure used to happen
 // on a device that had been up for days (firmware/README.md, "Memory and flash budget").
-constexpr size_t kMinOtaLargestBlock = 16 * 1024;
+constexpr size_t kMinOtaLargestBlock = 6 * 1024;
 
 // Board identity, stamped into .rodata of every build and therefore into every firmware.bin
 // (review F08: there is no firmware signing, but flashing a 2.4"-capacitive image onto a 3.5"
@@ -717,14 +764,50 @@ void handleOtaUpload(AsyncWebServerRequest *request, const String &filename, siz
     }
 
     log_w("web_server: OTA upload starting: %s", filename.c_str());
-    size_t free_heap = ESP.getFreeHeap();
+    // Both the measurement and the message say "8-bit": the refusal text is what someone reads at
+    // 2 a.m. with a device that will not take an image, and it has to name the same number they can
+    // go and check in /api/state's heap_8bit. The thresholds are printed from the constants rather
+    // than spelled out, so a future re-derivation cannot leave the message lying.
+    //
+    // Every refusal ends with the way out, because a refusal that does not is how a device gets
+    // stranded - and the old 16 KB block threshold stranded real builds, both measured 2026-09-16
+    // on the owner's two-stop config:
+    //
+    //   3707f54          resting largest block 11,764 B   5 attempts over 10 min, all refused
+    //   released v0.2.0  resting largest block 16,372 B   3 attempts, all refused
+    //
+    // Neither is a dip during a poll; both are the steady state. v0.2.0 is the more unsettling of
+    // the two because it misses the old 16,384 B threshold by **twelve bytes** - 0.07% - which is
+    // not a build that sits comfortably under the line but one that happens to land on the wrong
+    // side of it. Do not read that as "v0.2.0 devices are lockable" in general: a different stop
+    // list or feed selection moves resting fragmentation either way, and over-widening a measured
+    // result to a whole population is the same mistake this comment already had to correct once.
+    //
+    // The thresholds below are low enough that neither build would be refused now, but "would not"
+    // is not "cannot": a long-lived device can always fragment past any floor, and at that point
+    // the only lever the owner has is a restart. It is not taken automatically - this is a display
+    // on someone's wall and a failed upload is not a reason to blank it - so the message says it
+    // and the owner decides. The message says "within the first minute" because the escape window
+    // is build-dependent and can be short: 3707f54 reboots to 23,540 B and stays there, but v0.2.0
+    // returns to its resting 16,372 B about 45 s after boot (an upload at uptime 13 s returned 200).
+    const std::string kRetryHint = "; restart the device (Settings, or POST /api/reboot) and upload"
+                                   " again within the first minute - a freshly booted heap is"
+                                   " unfragmented and does not stay that way";
+    // Bytes, not rounded kilobytes. The old message said "largest free block 15 KB is below 16 KB"
+    // on a v0.2.0 device that was actually 16,372 B against 16,384 - twelve bytes short. Integer
+    // division turned a knife edge into what read like a comfortable kilobyte, and anyone debugging
+    // it would go hunting for what was eating 1 KB. A number a human is expected to act on gets
+    // reported exactly (found by desktop-c8's v0.2.0 measurement, 2026-09-16).
+    size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    if (free_heap < kMinOtaFreeHeap) {
-      otaFail(503, "refusing OTA: free heap " + std::to_string(free_heap / 1024) + " KB is below 60 KB");
+    if (free8 < kMinOtaFree8) {
+      otaFail(503, "refusing OTA: 8-bit free heap " + std::to_string(free8) + " B is below " +
+                     std::to_string(kMinOtaFree8) + " B" + kRetryHint);
       return;
     }
     if (largest < kMinOtaLargestBlock) {
-      otaFail(503, "refusing OTA: largest free block " + std::to_string(largest / 1024) + " KB is below 16 KB");
+      otaFail(503, "refusing OTA: largest 8-bit free block " + std::to_string(largest) + " B is below " +
+                     std::to_string(kMinOtaLargestBlock) + " B" + kRetryHint);
       return;
     }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {

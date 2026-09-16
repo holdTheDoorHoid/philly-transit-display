@@ -756,13 +756,23 @@ uint32_t nextIntervalS(const Config &cfg, bool ok, bool urgent, uint32_t &consec
 // 1 Hz redraw - for exactly as long as the scan takes, which is the freeze this change exists to
 // remove. Take, release, scan, take, store.
 // Below this much free heap (or this small a largest block) the idle-slice work waits: a
-// StatsAggregator is ~8 KB and a proxied body needs a 4 KB write buffer, and taking them while a
-// PUT /api/config is being parsed on the web task is how "Unable to allocate FD" / 500s happened
-// in the 2026-09-15 device suite. Nothing here is urgent; it runs on the next slice instead.
-constexpr size_t kIdleWorkMinFreeHeap = 40 * 1024;
+// StatsAggregator is ~8 KB and taking it while a PUT /api/config is being parsed on the web task is
+// how "Unable to allocate FD" / 500s happened in the 2026-09-15 device suite. Nothing here is
+// urgent; it runs on the next slice instead.
+//
+// Both halves read MALLOC_CAP_8BIT since 2026-09-16 (DESIGN.md SS2.1). The free half was
+// ESP.getFreeHeap() = MALLOC_CAP_INTERNAL, which includes ~34 KB of 32-bit-word-only IRAM heap, so
+// a 40 KB INTERNAL floor was asking for about 6 KB of the heap an allocation can actually use and
+// almost never fired - the largest-block half had been doing the work alone. 16 KB is what the
+// slice really takes: the ~8 KB contiguous StatsAggregator (heap-allocated precisely because it is
+// too big for a task stack, proxy_worker.cpp) plus the same again for the CSV scan's strings and
+// whatever the web task is holding at that moment. The block half stays at 12 KB, 1.5x that 8 KB
+// object. The 4 KB proxy write buffer the old comment cited is not in this sum: it is
+// `static uint8_t wbuf[4096]` in proxy_worker.cpp and never comes off the heap at all.
+constexpr size_t kIdleWorkMinFree8 = 16 * 1024;
 constexpr size_t kIdleWorkMinLargestBlock = 12 * 1024;
 bool idleWorkHasHeadroom() {
-  return ESP.getFreeHeap() >= kIdleWorkMinFreeHeap &&
+  return heap_caps_get_free_size(MALLOC_CAP_8BIT) >= kIdleWorkMinFree8 &&
          heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= kIdleWorkMinLargestBlock;
 }
 

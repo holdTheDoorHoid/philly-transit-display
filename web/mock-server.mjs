@@ -430,7 +430,14 @@ function buildState(query) {
   return {
     time: now,
     uptime: Math.floor(process.uptime()),
+    // Three heap numbers, as the firmware sends them since 2026-09-16 (DESIGN.md 2.1).
+    // `heap` is ESP.getFreeHeap() and overstates usable memory by the IRAM heap, exactly
+    // 33,708 B on the owner's board; `heap_8bit` is what an allocation can really get and is
+    // what the "Heap free" tile shows. The mock keeps the same offset so the tile here reads
+    // like the tile on a device rather than ~33 KB too high.
     heap: 142000 + Math.round(Math.sin(now / 37) * 8000),
+    heap_8bit: 142000 + Math.round(Math.sin(now / 37) * 8000) - 33708,
+    largest_block_8bit: 46000 + Math.round(Math.cos(now / 53) * 6000),
     wifi: { ssid: 'MockWiFi-5G', rssi: -58, ip: '192.168.1.42', mdns: `${config.device.name}.local` },
     sd: { mounted: true, free_mb: 7423, log_bytes: 128933 },
     last_poll: stale

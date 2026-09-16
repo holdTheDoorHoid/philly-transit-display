@@ -25,6 +25,42 @@
   On the Settings page specifically: anything you've typed is never thrown away by this, and if
   Save happens to land at a busy moment you're told to just press it again rather than the
   change silently vanishing.
+- Firmware updates over the web no longer get turned away while the display is busy, and the
+  memory figures the device reports are now the honest ones. The device has two kinds of free
+  memory: a region only usable in whole-word chunks, which nothing here can put a buffer or a
+  piece of text into, and the ordinary kind, which is what everything actually uses. Every safety
+  check and every number on screen had been counting both together, which made the device look
+  like it had 33 KB more room than it really had. Three consequences, all now fixed:
+  - **Updating over the web used to fail for no good reason.** On 2026-09-16 every attempt was
+    refused for ten minutes while the display was fetching arrivals, and plugging in a cable was
+    the only way through. The check was demanding a 16 KB run of free memory when the update
+    actually needs 4 KB, and its other half moved up and down with the arrival fetches. Measured
+    across 114 samples of normal operation, updates would have been refused 34% of the time
+    before, and 4% now - and the 4% that remain are moments when memory is genuinely tight, which
+    is what the check is for. Confirmed on the device: four uploads attempted in the exact window
+    that used to be refused were all accepted.
+  - **Two other safety checks had quietly not been running at all.** The ones protecting the
+    status page and the background statistics work were set to thresholds that the miscounted
+    figure could never fall below, so half of each check was dead. They now use the real number,
+    at levels worked out from what each job actually needs.
+  - **"Heap free" in the web app and on the device's own info page** now show the memory that can
+    really be used. Expect this to read about 33 KB lower than before; nothing got worse, the old
+    number was just counting memory that was never available. Anything reading the device's data
+    feed sees the original figure unchanged, with the honest one added alongside it.
+  - **If an update is ever refused, the message now tells you what to do about it** - restart the
+    display and upload again within the first minute - and reports exact byte counts instead of
+    rounding to the nearest kilobyte. The rounding mattered: a v0.2.0 device that was twelve bytes
+    short of the old limit reported itself as "15 KB below 16 KB", which reads like something is
+    using up a whole kilobyte rather than like a coin toss.
+
+  **If you are running the released v0.2.0 on another device, read this.** On the owner's stop
+  configuration, v0.2.0 settles twelve bytes below the old update limit and then refuses every
+  update over the web, indefinitely. Restarting it clears the way, but only for about 45 seconds
+  before it settles back, so the upload has to follow the restart immediately. Updating over the
+  USB cable always works and is the reliable escape. Devices updated to this release are not
+  affected - the new limit has real room in it rather than twelve bytes. Whether any particular
+  v0.2.0 device hits this depends on its stops and which feeds it has switched on; it was measured
+  on one configuration, not predicted for all of them.
 - HTTPS to the data sources (SEPTA, Open-Meteo, Indego), measured on the owner's board and kept
   as a prototype. A firmware built with `-DTRANSIT_HTTPS` (the `cyd-*-https` envs) asks for a
   verified, encrypted connection on every fetch, with each source pinned to its one root

@@ -744,9 +744,23 @@ fw = os.environ.get('CYD_FW') or os.path.abspath(
     os.path.join(S, '..', '..', '.pio', 'build', os.environ.get('CYD_ENV', 'cyd-3248S035R'), 'firmware.bin'))
 if os.path.exists(fw):
     ver_before = state().get('firmware_version')
-    # The OTA handler refuses uploads below 60 KB free heap, and right after section F's reboot the
-    # first poll (Indego's 400 KB stream included) is still running: wait for it and for heap to settle.
-    wait_for(lambda: state().get('last_poll', {}).get('ok') and state().get('heap', 0) > 70000, 120, 5)
+    # The OTA handler's admission gate is 16 KB of 8-bit free heap and a 6 KB largest 8-bit block
+    # (web_server.cpp kMinOtaFree8 / kMinOtaLargestBlock, DESIGN.md SS2.1), and right after section
+    # F's reboot the first poll (Indego's 400 KB stream included) is still running: wait for it and
+    # for the heap to settle. This waits on the numbers the gate actually reads. The old wait was
+    # `heap > 70000` against `heap` = ESP.getFreeHeap(), which counts ~34 KB of IRAM the gate never
+    # sees, so it was really asking for ~36 KB of 8-bit heap - more than this board has free while
+    # polling - and it passed only because the wait times out and the suite goes on regardless.
+    # Firmware older than 2026-09-16 does not send heap_8bit; fall back to the historical number
+    # there so the suite can still be pointed at an older build.
+    def ota_heap_ready():
+        s = state()
+        if not s.get('last_poll', {}).get('ok'):
+            return False
+        if s.get('heap_8bit') is None:
+            return s.get('heap', 0) > 70000
+        return s['heap_8bit'] >= 16 * 1024 and s.get('largest_block_8bit', 0) >= 6 * 1024
+    wait_for(ota_heap_ready, 120, 5)
     # An upload with no file at all, and one for a different board, must both be refused before
     # anything is written (review F08).
     r = curl(PINH + ['-w', '\n%{http_code}', '-X', 'POST', B + '/api/ota'], 30)

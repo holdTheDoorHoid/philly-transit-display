@@ -168,26 +168,64 @@ so a config edit can look like it had no effect. Run `pio run -t clean` (or dele
 
 ### Heap, stage by stage (`[heap]` lines on the serial console at boot)
 
-| After | Free | Largest block |
-|---|---:|---:|
-| display (LVGL + 19 KB draw buffer) | 216 KB | 110 KB |
-| config + arrival tracker (~12 KB) + poller task stack (10 KB) | 178 KB | 110 KB |
-| Wi-Fi connected | 127 KB | 86 KB |
-| web server, mDNS, SNTP | 100 KB | 61 KB |
-| SD card mounted | 69 KB | 32 KB |
-| UI screens built | 68 KB | 31 KB |
-| steady state while polling | ~86 KB | ~43 KB |
+**Read the `free8` column.** It is the byte-addressable heap - what a buffer, a `std::string` or a
+`JsonDocument` can actually be given. `free` is `ESP.getFreeHeap()`, kept here because it is what the
+serial log and `/api/state`'s `heap` have always printed, but on this chip it also counts an IRAM
+heap region that only 32-bit word access can reach, and `malloc()` never hands that out for data.
 
-**The "free" column overstates what a buffer can get, by about 34 KB** (found 2026-09-16 while
-measuring HTTPS, DESIGN.md §2.1). `ESP.getFreeHeap()` - the number in the table, in `/api/state`'s
-`heap`, and behind the 60 KB OTA gate, the 24 KB `/api/state` gate and the 40 KB idle-work gate - is
-`heap_caps_get_free_size(MALLOC_CAP_INTERNAL)`, and on the classic ESP32 that includes the IRAM heap
-region that only 32-bit word access can use. `malloc()` never hands that region out for a string, a
-body buffer or a TLS record. The byte-addressable heap (`MALLOC_CAP_8BIT`) on the owner's board is
-**~46 KB free at idle and ~27-42 KB at the moment a fetch starts**, with the largest block already
-measured in those terms. Since 2026-09-16 the `[heap]` boot lines and the `[net_poller]` heartbeat
-print both (`free=` and `free8=`); the gates above still use the INTERNAL number and their thresholds
-were tuned against it, so they are not wrong, but anyone sizing a new allocation should read `free8`.
+| After | `free8` (usable) | `free` (`ESP.getFreeHeap()`) | Largest block |
+|---|---:|---:|---:|
+| display (LVGL + 19 KB draw buffer) | 183 KB | 216 KB | 110 KB |
+| config + arrival tracker (~12 KB) + poller task stack (10 KB) | 145 KB | 178 KB | 110 KB |
+| Wi-Fi connected | 94 KB | 127 KB | 86 KB |
+| web server, mDNS, SNTP | 67 KB | 100 KB | 61 KB |
+| SD card mounted | 36 KB | 69 KB | 32 KB |
+| UI screens built | 35 KB | 68 KB | 31 KB |
+| steady state while polling (re-measured 2026-09-16) | ~39 KB | ~73 KB | ~20 KB |
+
+The gap between the two columns is **33,708 B**, and it is a fixed region rather than a moving
+figure: it is sized once when the app's IRAM code is placed and is never allocated from. Read from
+paired measurements on the owner's cyd-3248S035R across two firmware builds and every point from
+`display` to a poll in flight, and separately by a second agent across three boots, it comes back as
+33,708 B. So the `free8` column above is the `free` column minus that constant. The largest-block
+column was always `MALLOC_CAP_8BIT` and is unchanged.
+
+One caveat on reading it out of `/api/state`: `heap` and `heap_8bit` are two counters sampled a few
+microseconds apart inside one handler, `heap` first. An allocation landing between the two reads
+lowers `heap_8bit` only, so the subtraction reads a few bytes **high** - 38 of 39 consecutive
+samples gave 33,708 and one gave 33,736, at a mid-poll instant when another task was most likely
+allocating. Every deviation seen has been positive, which is that artefact's signature and not a
+region that varies. Treat a gap of 33,708 plus a few tens of bytes as the constant.
+
+The boot rows are the historical `[heap]` readings restated; only the last row was re-measured on
+2026-09-16, and it moved - it had said ~86 KB `free` with a ~43 KB block, which is higher than the
+`UI screens built` row above it and did not match anything the board reports today. If the boot rows
+are ever re-taken, take them from a single boot's `[heap]` lines, which now print `free8` directly
+and need no arithmetic.
+
+Measured on the owner's board at steady state on 2026-09-16: **39.8 KB of `free8` against 73.5 KB of
+`free`**. Across 114 samples of ordinary polling (two stops, the owner's own config), `free8` ran
+11.0-36.6 KB - median 34.9 KB, 5th percentile 17.4 KB - and the largest 8-bit block 8.7-20.5 KB,
+median 20.5 KB. Both bottom out together, in the moments a poll is decoding a feed: that is the heap
+genuinely being busy, and it is what the gates are there to wait out. A second agent sampling a
+clean build with the same two-stop config got 36.8-39.3 KB of `free8` at idle, which agrees.
+
+Sampling note, because it changes the numbers: only samples where a poll had already completed and
+the device had not just rebooted are counted. Fresh-boot samples read ~48 KB of `free8` with a
+47 KB largest block - the cleanest heap the device ever has - and including them inflates both the
+ceiling and the apparent admission rates. The `[heap]` boot lines and the `[net_poller]` heartbeat
+print both numbers (`free=` and `free8=`), and `/api/state` carries `heap` (unchanged, INTERNAL)
+beside `heap_8bit` and `largest_block_8bit`.
+
+Every heap gate in the firmware reads `MALLOC_CAP_8BIT` as of 2026-09-16, with thresholds re-derived
+from what each path actually allocates (DESIGN.md §2.1): OTA needs 16 KB free and a 6 KB block,
+because `Update.begin()` allocates exactly one 4,096 B sector buffer; `/api/state` and `/api/config`
+need 12 KB free and an 8 KB block, against one 2,872 B send buffer and ArduinoJson's 1 KB pools; the
+poller's idle slice needs 16 KB free and a 12 KB block for its ~8 KB `StatsAggregator`. Before that
+they compared INTERNAL free against thresholds that only meant something in 8-bit terms, and two of
+the three could not fire at all: INTERNAL free never drops below the 33,708 B of IRAM, so a 24 KB
+`/api/state` floor and a 40 KB idle-work floor were unreachable, and those gates were running on
+their largest-block halves alone.
 
 Rules that fell out of this, all learned the hard way (each one was a boot loop first):
 
