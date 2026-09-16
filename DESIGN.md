@@ -251,9 +251,9 @@ number could not fire:
 
 | Gate | Was | In real (8-bit) terms | Could it fire? | Now |
 |---|---|---|---|---|
-| `/api/state`, `/api/config` | 24 KB INTERNAL free, 8 KB block | ~0 KB of usable heap | **never** | 12 KB `free8`, 8 KB block |
-| poller idle slice | 40 KB INTERNAL free, 12 KB block | ~6 KB of usable heap | **almost never** | 16 KB `free8`, 12 KB block |
-| OTA admission | 60 KB INTERNAL free, 16 KB block | ~26 KB of usable heap | yes, constantly | 16 KB `free8`, 6 KB block |
+| `/api/state`, `/api/config` | 24 KB INTERNAL free, 8 KB block | ~0 KB of usable heap | **never** | 12 KB `free8`, 7,924 B block |
+| poller idle slice | 40 KB INTERNAL free, 12 KB block | ~6 KB of usable heap | **almost never** | 16 KB `free8`, 12,020 B block |
+| OTA admission | 60 KB INTERNAL free, 16 KB block | ~26 KB of usable heap | yes, constantly | 16 KB `free8`, 5,876 B block |
 
 The first two had been running on their largest-block halves alone, which is why they behaved
 sensibly despite the free half being unreachable - the comments described a check that was not
@@ -264,17 +264,23 @@ requirement was **4x** anything the OTA path allocates. `Update.begin()` takes e
 the path is a 16 B `_skipBuffer`. Nothing in `Update.write()` is body-sized - ESPAsyncWebServer
 delivers the multipart body in ~1.4 KB pieces and Update accumulates them into that one sector.
 
-Each new threshold is derived from what its path actually allocates, not from a round number:
+Each new threshold is derived from what its path actually allocates, not from a round number -
+and the *block* halves are then moved off the 512-byte lattice largest-block sizes land on (the
+`kMinOtaLargestBlock` comment in `web_server.cpp` carries that measurement), which is why they read
+5,876 / 7,924 / 12,020 rather than 6 / 8 / 12 KB. Where this document quotes a threshold it quotes
+the constant, in bytes: a rounded restatement is how the pre-lattice figures survived a whole
+release in four places here after the code had moved (found in the RC review, 2026-09-16).
 
-- **OTA** - one 4,096 B sector buffer, so a 6 KB block (1.5x) and 16 KB of `free8` for the request
-  machinery and for the rest of the device to keep running through a ~1.7 MB upload.
+- **OTA** - one 4,096 B sector buffer, so a 5,876 B block (1.43x) and 16 KB of `free8` for the
+  request machinery and for the rest of the device to keep running through a ~1.7 MB upload.
 - **`/api/state` / `/api/config`** - a Config copy, a Snapshot copy, ArduinoJson's 1 KB slot pools
   and string pool for a ~4 KB document, and one 2,872 B send buffer
-  (`ASYNC_RESPONCE_BUFF_SIZE` = `CONFIG_LWIP_TCP_MSS * 2`). The 8 KB block is 2.8x that buffer; the
-  12 KB free floor is deliberately *below* the full transient cost, because §12.1's reasoning still
-  holds - the floor exists to skip a hopeless build, not to promise a successful one.
-- **Idle slice** - the ~8 KB contiguous `StatsAggregator`, so a 12 KB block (1.5x) and 16 KB of
-  `free8`. The "4 KB proxy write buffer" the old comment cited is not in the sum: it is
+  (`ASYNC_RESPONCE_BUFF_SIZE` = `CONFIG_LWIP_TCP_MSS * 2`). The 7,924 B block is 2.76x that
+  buffer; the 12 KB free floor is deliberately *below* the full transient cost, because §12.1's
+  reasoning still holds - the floor exists to skip a hopeless build, not to promise a successful
+  one.
+- **Idle slice** - the ~8 KB contiguous `StatsAggregator`, so a 12,020 B block (~1.5x) and 16 KB
+  of `free8`. The "4 KB proxy write buffer" the old comment cited is not in the sum: it is
   `static uint8_t wbuf[4096]` and never comes off the heap.
 
 Measured against 114 samples of ordinary polling on the owner's board - two stops, the owner's own
@@ -885,6 +891,14 @@ stop per slice, at most every 10 minutes per stop or on request, evicting stops 
 configured. It used to stream a month of CSV per stop synchronously on whichever task asked, so
 opening the stats page froze touch and the clock for as long as the card took.
 
+**Nor may it wait on the poller's mutex.** Every accessor the LVGL task uses takes that lock for at
+most 50 ms and gives up rather than waiting: `getStopSummary()`, and since the RC review
+`tryGetPollStatus()`, which the device page calls on every tick it is shown (it had been calling
+the blocking `getPollStatus()`, a 1 s wait, on the display task). The blocking form is for the web
+task only. §12.1 records the `vTaskPriorityDisinheritAfterTimeout` assert that exactly a 1 s wait
+from this task produced. On a miss the caller redraws the value it last read, which costs one tick
+of staleness on a line that already shows an age - never a blank "no poll yet".
+
 **The idle loop runs one deferred job per slice** and re-checks the poll deadline afterwards.
 Draining the whole queue back to back (a 400 KB stop-list proxy and a 30-day stats scan are each
 seconds of work) pushed the next transit poll well past its deadline with nothing noticing.
@@ -903,9 +917,9 @@ concurrent download gets a 503 rather than a truncated file.
 Memory rules: no full framebuffer; LVGL partial buffer is 1/10 of the screen in RGB565 (the library default of 1/4 with 3-byte pixels does not fit, see `firmware/boards/README.md`); large long-lived objects (ArrivalTracker ~16 KB, StatsAggregator ~8 KB) are heap-allocated, never file-scope globals, because the ESP32's static .bss budget is separate from and much smaller than the heap; one
 TLS connection at a time; ArduinoJson documents sized from measured payloads (§4) with 25 %
 headroom; log free heap once per poll at `INFO`; refuse to start OTA below 16 KB of `MALLOC_CAP_8BIT`
-free with a 6 KB largest block (§2.1 - the byte-addressable heap, not `ESP.getFreeHeap()`).
+free with a 5,876 B largest block (§2.1 - the byte-addressable heap, not `ESP.getFreeHeap()`).
 
-Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-15, with the §12 hardening, the full feature set uses 93.9 % on `cyd-3248S035R` and 93.7 % on the tightest board, `cyd-2432S024C` (~112 KB headroom); `firmware/README.md` ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
+Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-16, with the §12 hardening, the screen pass, the LVGL pool safety work and the release-candidate fixes, the full feature set uses **1,859,434 B (97.8 %)** on `cyd-3248S035R` — 41,110 B of headroom — and 1,855,226 B (97.6 %) on `cyd-2432S024C`; the tightest env of all is the HTTPS prototype `cyd-3248S035R-https` (§2.1), which ships in no image. (This line read "93.9 % / 93.7 %, ~112 KB headroom" until 2026-09-16, which was the 2026-09-15 measurement left behind by three later passes — the same failure §2.1's threshold note describes, so the figures here are now absolute bytes with the date they were taken.) `firmware/README.md` carries the per-env table and ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
 
 Build/flash: `pio run -e cyd-3248S035R`, `pio run -e cyd-3248S035R -t upload --upload-port
 /dev/ttyUSB0`. Releases publish `bootloader.bin`, `partitions.bin`, `firmware.bin` per env plus an
@@ -1106,7 +1120,7 @@ Status codes beyond the per-route ones below:
 |---|---|---|
 | 401 | `{"error":"pin required"}` / `{"error":"wrong pin"}` | Protected route, `X-Pin` missing or wrong |
 | 429 | `{"error":"too many attempts","retry_s":N}` | Five consecutive wrong PINs; every protected route is locked for 30 s. A correct PIN resets the counter; a *missing* header never counts towards it |
-| 421 | `{"error":"this device is not reachable under that host name"}` | The `Host` header is not the device's IP, `<device name>` or `<device name>.local`, `192.168.4.1` or `localhost` (optional `:port`, case-insensitive). DNS-rebinding defence — checked before any handler runs, on every route |
+| 421 | `{"error":"this device is not reachable under that host name"}` | The `Host` header is not the device's IP, `<device name>` or `<device name>.local`, `192.168.4.1` or `localhost` (optional `:port`, case-insensitive). DNS-rebinding defence — checked before any handler runs, on every route, and additionally at the first byte of a `POST /api/ota` upload, whose callback runs before the middleware chain (§12) |
 | 409 | `{"error":"another firmware upload is in progress"}` | A second `POST /api/ota` while one is streaming |
 | 500 | `{"error":"..."}` | `PUT /api/config` could not write the file (the live config is unchanged, §6) |
 
@@ -1117,7 +1131,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | Method, path | Purpose |
 |---|---|
 | `GET /` , `/app.js`, `/app.css`, `/favicon.svg` | Web UI, served gzip with `Cache-Control: max-age=3600`, ETag = firmware build id |
-| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes, dropped_rows, write_ok, error} (§9.1), last_poll {ok, age_s, error, since_s}, `stops[]` each with `arrivals[]` (§8 shape), `ok`, `health`, `source_ts`, `source_age_s` (-1 when the feed carried no timestamp) and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, stale, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8; `age_s` is the main location's last successful fetch, `stale` once that is over an hour old), plus `board` (the PlatformIO env this image was built for, e.g. `cyd-3248S035R`), `auth {pin_required}`, `config_recovered` (§6) and `last_restart {esp, reason, detail, uptime_s}` (§12.1). `last_poll.since_s` is seconds since a poll cycle last *completed* — success or failure — and is `-1` until the first cycle of this boot; it is deliberately not `age_s`, which only moves when a poll *reports*, so a poller stuck inside a fetch freezes `age_s` while `since_s` keeps climbing. `last_restart.esp` is `esp_reset_reason()` (1 power-on, 3 software restart, 4 panic, …); `reason` is `poll_stall`, `heap_wedge` or `""`, and names only the restarts this firmware asked for itself; `detail` is the one-line plain-English version with the numbers that caused it. The note lives in RTC memory, survives `ESP.restart()` but not a power cycle, and is reported for exactly one boot. A firmware built with `-DTRANSIT_HTTPS` (§2.1) adds `transport {policy, last, https_ok, https_failed, cert_failed, http_by_heap, http_by_policy, refused_by_heap, last_tls_error, last_https_ms, heap_need, gate_free, gate_largest}`: `last` is the transport of the most recent fetch that asked for `https://` (`https`, `http`, `https_failed`, `refused`, or `none`), the counters are per boot, and `gate_*` are the 8-bit heap numbers of the last gate decision against `heap_need`. Absent from shipping builds |
+| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes, dropped_rows, write_ok, error} (§9.1), last_poll {ok, age_s, error, since_s}, `stops[]` each with `arrivals[]` (§8 shape), `ok`, `health`, `source_ts`, `source_age_s` (-1 when the feed carried no timestamp) and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, stale, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8; `age_s` is the main location's last successful fetch, `stale` once that is over an hour old), plus `board` (the PlatformIO env this image was built for, e.g. `cyd-3248S035R`), `auth {pin_required}`, `config_recovered` (§6) and `last_restart {esp, reason, detail, uptime_s}` (§12.1). `last_poll.since_s` is seconds since a poll cycle last *completed* — success or failure — and is `-1` until the first cycle of this boot; it is deliberately not `age_s`, which only moves when a poll *reports*, so a poller stuck inside a fetch freezes `age_s` while `since_s` keeps climbing. `last_restart.esp` is `esp_reset_reason()` (1 power-on, 3 software restart, 4 panic, …); `reason` is `poll_stall`, `heap_wedge`, `lvgl_pool` or `""`, and names only the restarts this firmware asked for itself; `detail` is the one-line plain-English version with the numbers that caused it. The note lives in RTC memory, survives `ESP.restart()` but not a power cycle, and is reported for exactly one boot. A firmware built with `-DTRANSIT_HTTPS` (§2.1) adds `transport {policy, last, https_ok, https_failed, cert_failed, http_by_heap, http_by_policy, refused_by_heap, last_tls_error, last_https_ms, heap_need, gate_free, gate_largest}`: `last` is the transport of the most recent fetch that asked for `https://` (`https`, `http`, `https_failed`, `refused`, or `none`), the counters are per boot, and `gate_*` are the 8-bit heap numbers of the last gate decision against `heap_need`. Absent from shipping builds |
 | `GET /api/config` | Current config (§6) |
 | `PUT /api/config` | Replace config; validates; persists; triggers immediate re-poll. 400 on error |
 | `GET /api/proxy/stops?route=17` | Streams SEPTA `Stops` for a route to the browser (setup only) |
@@ -1255,11 +1269,27 @@ Main screen (portrait by default; every size derives from the runtime resolution
   board can draw would otherwise be a boot loop with the offending config still on disk. A stop
   panel costs ~6.2 KB on a 320-wide board and ~4.4 KB on a 240-tall one, which puts the ceiling at
   four stops and six respectively — under §6's maximum of eight.
+
+  **Panels are not the same size**, which the first version of this guard assumed and the RC review
+  caught. Each is sized from its own stop's `show` value, 1–4 rows (§6), six widgets a row, so a
+  four-row panel costs roughly three times a one-row one — and estimating the next panel as "the
+  largest built so far" let a config ordered small-panels-first admit a big panel on a small
+  panel's measurement. `visibleStops()` order changes with the active profile (§6), so the same
+  config could be safe in the morning and crash in the evening, and the crash is the boot loop
+  above. The estimate is now `max(largest panel measured, rows × largest per-row cost measured)`,
+  which is an upper bound for any row count given identical widgets per row. Measured in
+  `ui-sim-pool` on 320×480 with four one-row stops followed by four four-row stops: the old
+  estimate admitted six panels and finished on 3,704 B of pool, having let a 10,080 B panel in on a
+  4,424 B measurement against a 512 B reserve; the scaled one admits five and finishes on 13,752 B.
+  The `N more stops will not fit` caption is also built **before** the first panel and hidden,
+  rather than out of whatever the loop leaves — it is the one allocation that must not fail,
+  because it is the one that explains the failure.
 - Pool exhaustion has its own simulator environment, because the normal one cannot show it:
   `pio run -e ui-sim` builds with a 512 KB pool for 64-bit host pointers. `ui-sim-pool` scales
   `LV_MEM_SIZE` to the board's by the measured host/board ratio (0.66, fitted against six figures
   from the owner's board and accurate to ~1.5 %), and `program <dir> pool` sweeps 2–8 stops across
-  all four panel sizes. It reproduces the four-stop arrivals page at 31,664 B against 31,656 B
+  all four panel sizes, then again with non-uniform `show` values in both orders (the shape the
+  paragraph above describes). It reproduces the four-stop arrivals page at 31,664 B against 31,656 B
   measured. `POST /api/debug/page` (§7) drives the cycle on real hardware.
 - Stats page: header `Statistics  last 30 days` with `tap for device info` on the right (hidden
   at 240 wide); one stop-style panel per configured stop, titled with the route badge and the
@@ -1560,7 +1590,25 @@ only this browser's copy and says so. `/api/state`'s `auth.pin_required`, `board
 `config_recovered` are all surfaced there — the last as *"The device restored its previous settings
 after a bad save."*
 
-### 10.2 Honest numbers on the Stats page
+### 10.2 Reads that retry, and reads that give up
+
+`GET /api/state` and `GET /api/config` are the two heap-gated reads (§12.1): during a poll cycle
+they legitimately answer 503, and `/api/state` can come back as a 200 with a zero-length body.
+`resilientRead()` folds 503, an empty 200, an unparseable body, a network error and a timeout into
+one "busy" outcome and retries with capped, jittered backoff, sharing one in-flight request per
+endpoint so several open tabs cannot amplify the pressure they are retrying against. A top-bar line
+says so and clears itself.
+
+It does **not** retry forever. A 4xx other than 429 is the device answering definitively, and
+retrying one is how the blank page this mechanism exists to prevent comes back through a different
+door: `renderNow` awaits `api.config()` before it fetches state, so a permanent 421 — browsing an
+old `<name>.local` after the display was renamed — left the Now page on "Connecting to the
+display…" for as long as the tab stayed open, with no error anywhere. Those reject, the view shows
+the message, and the top-bar line switches from "retrying…" to what happened; 421 is worded for the
+owner ("it has probably been renamed — open it at its current name or IP address") rather than
+echoing the header. 429 stays retryable: it carries `retry_s` and means "later", not "no".
+
+### 10.3 Honest numbers on the Stats page
 
 Two rules, because a statistic that overstates its own certainty is worse than no statistic:
 
@@ -1587,7 +1635,7 @@ still has usable — if old — times: it keeps its arrival rows with an amber "
 short `error` text above them, and only a stop that is genuinely empty or unavailable gets the red
 banner in place of its rows.
 
-### 10.3 Untrusted text
+### 10.4 Untrusted text
 
 Agency and user text reaches the DOM only through the `h()` helper, which appends text nodes; the UI
 contains no `innerHTML`, `insertAdjacentHTML` or `outerHTML`. The one third-party sink that renders
@@ -1618,9 +1666,19 @@ current PIN. The owner learns the PIN from the serial console at boot (`[auth] w
 or the device info screen — both require physical possession of the display, which is the
 deliberate recovery path: there is no way to reset it over the network.
 
-**Cross-site and rebinding.** The `Host` header is checked on every request before any handler
+**Cross-site and rebinding.** The `Host` header is checked on every request before its handler
 runs and must name the device (its IP, `<device name>`, `<device name>.local`, `192.168.4.1` or
-`localhost`, optional port, case-insensitive); anything else is 421. That is what stops a page on
+`localhost`, optional port, case-insensitive); anything else is 421. "Before its handler" is the
+exact claim, corrected in the RC review: the middleware chain runs only once a request's **body**
+has been parsed (ESPAsyncWebServer 3.12.1 `WebRequest.cpp`, which switches to `PARSE_REQ_BODY` at
+end-of-headers and calls `_runMiddlewareChain()` afterwards), while `handleBody`/`handleUpload` run
+during the parse. So `POST /api/ota`'s upload callback used to reach `Update.begin()` and up to
+1.7 MB of `Update.write()` before the chain answered 421 - the response was refused, the flash
+writes were not. It now repeats the host check itself, at `index == 0`, before anything is written.
+Not a live bypass even before that (the route is PIN-gated, and see CORS below), but "the check
+gates the response" and "the check gates the side effect" are different properties. The JSON body
+handlers are unaffected: `AsyncCallbackJsonWebHandler::handleBody` only `calloc`s a buffer and
+copies into it, and the handler proper runs after the chain. That is what stops a page on
 the public internet from resolving its own domain to the device's LAN address and then talking to
 it with the attacker's origin. CORS is not enabled, so a cross-origin page cannot attach `X-Pin`
 without a preflight this server does not answer — a blind form POST therefore cannot carry the
@@ -1692,8 +1750,9 @@ none, calls `std::terminate` directly - and this SDK is built with a zero-byte p
 (`CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0`). The firmware now supplies the pool itself, without
 rebuilding the SDK: libstdc++ sizes it at static-init by calling the weak hook
 `__cxx_eh_arena_size_get()`, and `firmware/src/app/cxx_exception_pool.cpp` defines that hook (2 KB =
-16 in-flight `std::bad_alloc`s at 128 B each, twice what the four allocating tasks can have
-mid-throw at once) together with `__cxx_init_dummy`, so the SDK's `-u __cxx_init_dummy` is satisfied
+16 in-flight `std::bad_alloc`s at 128 B each, well over the six the **three** allocating tasks
+listed above can have mid-throw at once - one each, plus a dependent exception from a rethrow; the
+file's own arithmetic, and the count that agrees with it) together with `__cxx_init_dummy`, so the SDK's `-u __cxx_init_dummy` is satisfied
 by our object and `libcxx.a(cxx_init.cpp.obj)`, which carries the SDK's zero-returning definition, is
 never linked. The file explains why `--wrap` cannot do this and why `--allow-multiple-definition` was
 not used; the link map is the proof. Cost: one 2 KB `malloc` before `app_main()`, never freed; the
@@ -1720,9 +1779,16 @@ calling task, while the heap is plentiful. It cannot be done once centrally - th
 per-task, so **every task that can throw must warm itself, on itself**, and any new one must too:
 `main.cpp setup()` for loopTask (which is also the LVGL display loop), `net_poller.cpp
 pollerTask()` (which covers the queued proxy and stats jobs, since they run on that task), and
-`web_server.cpp`'s first-thing middleware for the AsyncTCP task, which the library creates and we
+`web_server.cpp`'s first-in-chain middleware for the AsyncTCP task, which the library creates and we
 therefore cannot warm at its entry - it warms on request number one and costs one
-`pthread_getspecific` per request thereafter. Two details the implementation depends on and the
+`pthread_getspecific` per request thereafter. The middleware is not literally first on the request
+path, though, and for one route that matters: the chain does not run until a request's body has
+been parsed (§12, "Cross-site and rebinding"), so `handleOtaUpload()` warms on its own entry too.
+Without that, a device whose *first* request is a firmware upload ran `checkPin()`, the heap gates,
+`Update.begin()` and `otaFail()`'s `std::string` concatenations on a task that had never thrown -
+precisely the cold-first-throw shape above. Warming only makes the throw catchable, so the upload
+callback is also wrapped in its own `bad_alloc` guard: nothing in ESPAsyncWebServer catches what
+escapes one, and `guarded()` does not reach it. Two details the implementation depends on and the
 file documents: GCC folds a `try { throw 0; } catch (int) {}` whose handler it can see into a plain
 jump, so the throw lives behind a `noinline` call, and both ABI entry points are declared
 `__attribute__((const))` in `<cxxabi.h>`, so a call whose result goes unused is deleted - every
@@ -1735,7 +1801,7 @@ of the device suite reboots first and makes `/api/debug/oom` the first request t
 run any later it answers `caught:true` whether the first-throw path works or not. The heavy read handlers (`/api/state`,
 `/api/config`) still refuse up front with a fixed-literal 503 when byte-addressable free heap is under
 `kMinHeavyResponseFree8` (12 KB, `MALLOC_CAP_8BIT` since 2026-09-16 - the 24 KB INTERNAL floor it
-replaced could never fire, §2.1) or the largest block under 8 KB - no longer because the failure
+replaced could never fire, §2.1) or the largest block under `kMinHeavyResponseBlock` (7,924 B) - no longer because the failure
 would be uncatchable, but because a build that is going to fail costs CPU and heap the poller wants,
 and a 503 the client retries is the cheaper answer. The same handlers are zero-copy since the same
 date (`sendJsonStreamed()`): the finished document is moved into a holder a chunked response owns
@@ -1860,25 +1926,65 @@ of a boot has completed (`firmware/src/app/poller_liveness.h`, covered by `pio t
 test_liveness`). It is a multiple of the **active** interval, not a constant, because
 `device.poll_seconds` is user-settable from 5 to 600 s (§6.1) and the failure backoff stretches the
 interval to 300 s (§4.7) - a fixed "no poll for two minutes" would reboot a device that was merely
-configured to poll slowly, or one backing off from a SEPTA outage. The 5-minute floor is what keeps
-a *short* interval from becoming a hair trigger: one cycle's own worst case is bounded by
-`http_fetch.cpp` rather than by the interval (three attempts per URL, each with an absolute
-deadline of 2x the 15 s fetch timeout, plus retry backoff - about 93 s for a single trickling URL),
-and the poller additionally runs one queued proxy or stats job between cycles. The floor clears all
-of that, so a genuinely slow network produces a late cycle, never a reboot. Detection latency at
-the default cadence is therefore five minutes, deliberately.
+configured to poll slowly, or one backing off from a SEPTA outage.
+
+**What the clock measures, and why it is not "a cycle completed" (corrected 2026-09-16).** The
+first version of this net stamped only at the end of a cycle and justified its 5-minute floor as
+"comfortably above one worst-case cycle, about 93 s". That 93 s was a *per-URL* figure used as a
+per-cycle one, and a cycle fetches one TripUpdates feed, one TransitView per route and one schedule
+per stop. On a network that silently **drops** packets - an ISP outage with DHCP still up, a
+captive portal, heavy loss; a network that *refuses* fails in milliseconds and never gets near this
+- a cycle's real cost was minutes per stop, so a device with several configured stops could take
+longer than the window to finish a perfectly legitimate cycle, and the net would restart it
+mid-cycle, over and over, with nothing wrong but the Wi-Fi. `config_store.h` allows eight stops and
+the poller polls `cfg.stops`, not the visible subset, so the worst case was about an hour.
+
+No window derived from the stop count can both cover that and still restart a frozen board soon
+enough to matter, so the fix was to measure the right thing and to stop the cost compounding:
+
+1. **Two stamps.** `net_poller.cpp` stamps liveness at every **fetch** the poller starts as well as
+   at the end of every cycle, and the net judges the later of the two (`PollerLiveness::idle_ms`).
+   A fetch in flight is evidence the poller is going round, which is the only question this net
+   asks. `last_poll.since_s` in `/api/state` keeps its old meaning - seconds since a cycle
+   *completed* - so nothing the owner sees changed.
+2. **The retry layers no longer multiply.** `http_fetch.cpp` already spends three attempts and
+   0.5 s + 1 s of backoff on a URL. Above it, `septa_source.cpp`'s `fetchPlausibleSchedule` and
+   `net_poller.cpp`'s BusSchedules wrapper each retried again - and both existed for a backend that
+   *answers* with the wrong service day (§4.4, NOTES.md 9), which always comes back with a real
+   HTTP status. Both now stop on a transport-level failure (`FetchResult::status <= 0`, "could not
+   be made at all"), which takes one stop's schedule from up to twelve URL fetches per cycle to
+   one. Nothing about the wrong-service-day behaviour changed; host tests cover both halves.
+
+The floor therefore has to clear **one fetch**, not one cycle, and one fetch is bounded:
+3 attempts x (DNS + 4 s connect) + 1.5 s of backoff. The DNS term is not bounded by this firmware
+and is worth naming: `HTTPClient::connect()` resolves through `NetworkClient::connect(host, ...)`,
+whose `Network.hostByName()` takes no timeout at all and runs *before* `setConnectTimeout()` applies
+to the socket. What bounds it is lwIP's own schedule - `DNS_MAX_RETRIES` 4 on a 1 s timer with
+1/1/2/3 s between sends is ~7 s per configured server, and `DNS_MAX_SERVERS` is 3 - so ~21 s worst
+case, read off lwIP's configuration rather than measured on the board. One fetch is then 76.5 s,
+and the 5-minute floor is 3.9x it; `poller_liveness.h` `static_assert`s that ratio and
+`test_liveness` checks it, so a future change to the retry policy breaks the build rather than
+someone's wall. Detection latency at the default cadence stays five minutes, at any stop count,
+deliberately. Resolving names ourselves and connecting by `IPAddress` would put the DNS bound back
+under our control, and was rejected: it would send `Host: <ip>`, which SEPTA's CDN and Cloudflare
+both need the real name in.
 
 Four things are exempted, each of which would otherwise be a device that reboots itself for no
 reason. **A firmware upload:** `web_server.cpp`'s `otaBusy()` is checked first, and the net also
 stands down for a full window *after* an upload ends, so a stall timer earned during an OTA cannot
-fire the moment the upload finishes or is aborted - a reboot mid-write leaves a half-written
-partition. **Setup and AP mode:** the net is armed by `startNetPoller()`, the last thing `setup()`
+fire the moment the upload finishes or is aborted. A reboot mid-write is not a brick and never was
+- `esp_ota_set_boot_partition()` runs inside `Update.end(true)`, so an interrupted upload leaves a
+half-written *inactive* slot and the device comes back on the image it is already running - but it
+throws the owner's upload away at the worst moment and looks exactly like a crash. The heap-wedge
+counter in `pollerTask()` takes the same exemption for the same reason (added 2026-09-16; it had
+none, and `wedged_polls` carries across an upload, so a device already near the threshold could
+restart itself mid-`Update.write()`). **Setup and AP mode:** the net is armed by `startNetPoller()`, the last thing `setup()`
 does, so it is off for the whole unprovisioned / captive-portal path - during which `loop()` is not
 running anyway, because `connectWifiOrPortal()` does not return until Wi-Fi is up. **Boot:** the
 extra grace covers `pollerTask`'s 45 s NTP wait plus the first cycle. **A slow or absent network:**
-this one needs no exemption at all, and that is the point of stamping on *any* outcome - a failed
-fetch is still a completed cycle, so a device with no internet keeps the stamp moving and only its
-backoff changes. Verified in the code rather than assumed: `pollOnce()` publishes a snapshot with
+this one needs no exemption at all, and that is the point of stamping on *any* outcome and at every
+fetch - a failed fetch is still a completed cycle, and a fetch still in flight is still a stamp, so
+a device with no internet keeps the clock moving and only its backoff changes. Verified in the code rather than assumed: `pollOnce()` publishes a snapshot with
 per-stop errors and returns a deadline on every path, including the out-of-memory one. There is
 therefore no boot loop available to a device whose router is down, and even a genuine repeated
 stall is bounded to roughly one restart per seven minutes by boot time plus the grace window.
@@ -1889,8 +1995,14 @@ before this change, so `GET /api/state` gained `last_restart {esp, reason, detai
 survives `ESP.restart()` but not a power cycle - the right lifetime for "the last boot rebooted
 itself, here is why" - written immediately before the restart and cleared the first time it is
 read, so it is reported for exactly one boot and a later unrelated reset cannot inherit a stale
-one. Both self-heal paths write it (`poll_stall`, `heap_wedge`), and the numbers that caused the
-reboot go over serial first. `last_poll.since_s` exposes the live observable the same way.
+one. All three self-heal paths write it (`poll_stall`, `heap_wedge`, `lvgl_pool`), and the numbers that
+caused the reboot go over serial first. `lvgl_pool` was added in the RC review (2026-09-16):
+`lv_assert_hook.cpp` called `esp_restart()` without a note, so an exhausted LVGL pool looked
+identical in `/api/state` to a deliberate reboot or an OTA - which matters most for exactly that
+failure, because an arrivals page that does not fit reproduces the same crash on every boot and
+what the owner actually has is a boot loop. `detail` carries the pool's free size and its
+high-water mark, which together say whether it was exhausted or merely fragmented.
+`last_poll.since_s` exposes the live observable the same way.
 
 Residual risk, stated rather than hidden: if `loopTask` itself stops, nothing checks the poller -
 but a board whose display loop has stopped is dead to the user anyway, and that is the failure the

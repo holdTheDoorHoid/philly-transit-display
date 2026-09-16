@@ -395,6 +395,19 @@ transit::FetchResult doGet(const char *url, std::function<bool(const uint8_t *, 
     // and the overall fetch budget is preserved by absoluteDeadlineMs() and the retry loop.
     // The same cap reaches a TLS socket: NetworkClientSecure passes it to select() for the TCP
     // connect and to SO_RCVTIMEO, and the handshake loop has its own bound (kTlsHandshakeTimeoutS).
+    //
+    // WHAT THIS DOES NOT COVER: name resolution. HTTPClient::connect() calls
+    // NetworkClient::connect(host, port, _connectTimeout), whose first act is
+    // `Network.hostByName(host, srv)` - and hostByName takes no timeout argument at all
+    // (Arduino-ESP32 3.2.1, Network/src/NetworkClient.cpp / NetworkManager.cpp, which goes straight
+    // to lwip_getaddrinfo). setConnectTimeout() applies only AFTER an address is in hand. So on a
+    // network that blackholes DNS, every attempt pays lwIP's own retry schedule before this timeout
+    // is worth anything: DNS_MAX_RETRIES 4 on a 1 s timer with 1/1/2/3 s between sends is ~7 s per
+    // configured server, and DNS_MAX_SERVERS is 3, so ~21 s worst case. That is read off lwIP's
+    // configuration, not measured here. It is bounded, but not by us, and poller_liveness.h's
+    // window is sized with it included. Resolving ourselves and connecting by IPAddress would put
+    // the bound back under our control but would also send `Host: <ip>`, which SEPTA's CDN and
+    // Cloudflare both need the real name in - so this stays documented rather than fixed.
     const uint16_t read_to = (uint16_t)std::min<uint32_t>(timeout_ms, kStreamReadTimeoutMs);
     http.setConnectTimeout((int32_t)read_to);
     http.setTimeout(read_to);

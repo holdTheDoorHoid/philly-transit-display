@@ -81,12 +81,14 @@ only when the screen is tapped (`DESIGN.md` §12).
 
 ## Memory and flash budget
 
-Measured on the owner's ESP32-3248S035R (classic ESP32, 4 MB flash, no PSRAM); the top three rows
-are 2026-09-15, the rest 2026-09-14.
+Measured on the owner's ESP32-3248S035R (classic ESP32, 4 MB flash, no PSRAM); the top four rows
+are 2026-09-16/15, the rest 2026-09-14.
 The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) per OTA slot.
 
 | Build (`cyd-3248S035R`) | Flash | Static RAM |
 |---|---:|---:|
+| 2026-09-16 release-candidate review fixes (the per-fetch liveness stamp, the transport-failure early exits, the OTA upload warm + guard + Host check, the row-scaled panel guard, `tryGetPollStatus()`, the `lvgl_pool` restart note), on top of `next` at ec0c1ab | 1,859,434 B (97.8 %) | 95,932 B |
+| The same `next` (ec0c1ab) without them - the baseline that delta is measured against | 1,857,854 B (97.8 %) | 95,868 B |
 | 2026-09-16 poller-liveness net (the cycle stamp, the display-loop check, `last_restart` + `last_poll.since_s` on `/api/state`), on top of `next` at 2f48828 | 1,856,922 B (97.7 %) | 95,868 B |
 | The same `next` (2f48828) without it — the baseline that delta is measured against | 1,855,442 B (97.6 %) | 95,836 B |
 | 2026-09-16 LVGL pool safety (one page resident at a time, the panel guard, the `/api/debug/page` hook and the pool fields on `/api/debug/ui`, the logged assert handler) | 1,847,562 B (97.2 %) | 95,732 B |
@@ -98,6 +100,19 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 | Everything incl. weather, Indego, profiles, night page, 48 px font | 1,858,446 B (97.8 %) | 95,300 B (29.1 %) |
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
+
+The release-candidate review fixes are **+1,580 B of flash and +64 B of static RAM** on the 3.5"
+board, leaving **41,110 B** of app slot. All six board envs build on the same tree:
+`cyd-3248S035C` 1,871,646 B (98.5 %), `cyd-2432S028R` and `cyd-2432S024R` 1,844,034 B (97.0 %),
+`cyd-2432S028Rv3` 1,842,978 B (97.0 %), `cyd-2432S024C` 1,855,226 B (97.6 %). The HTTPS prototype
+`cyd-3248S035R-https` (§2.1; in no shipping image) is still the tightest env of all and still fits:
+1,877,642 B (98.8 %), 22,902 B spare. Most of the delta is
+comment-free code in four places - the `max()` and the per-row division in `main_screen.cpp`, the
+OTA callback's split and its `bad_alloc` guard, `tryGetPollStatus()`, and the `lvgl_pool` branch on
+`/api/state` with its `snprintf` format string. The liveness change itself is nearly free: two
+`volatile uint32_t` stores and one `min()`, plus the `constexpr` arithmetic in
+`poller_liveness.h`, which still inlines into one comparison. The two early exits on a transport
+failure (`septa_source.cpp`, the BusSchedules wrapper) are a comparison each.
 
 The poller-liveness net (`DESIGN.md` §12.1) is **+1,480 B of flash and +32 B of static RAM** on the
 3.5" board, leaving 43,622 B of app slot. Most of it is the two `snprintf` format strings and the

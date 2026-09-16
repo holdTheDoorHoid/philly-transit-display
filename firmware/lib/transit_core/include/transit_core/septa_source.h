@@ -111,7 +111,11 @@ class SeptaSource : public TransitSource {
 //
 // fetchPlausibleSchedule() calls SeptaSource::fetchSchedule up to kScheduleFetchAttempts times
 // while the earliest upcoming entry is more than kSchedulePlausibleS away, and keeps the response
-// whose first upcoming trip is soonest. Returns true if the kept response looked plausible (first
+// whose first upcoming trip is soonest. It stops early on a TRANSPORT failure (FetchResult::status
+// <= 0, "the request could not be made at all"): the retries here are for a backend that answers
+// with the wrong service day, and the transport has already spent its own attempts and backoff on
+// the URL, so asking again only multiplies a dead network by three.
+// Returns true if the kept response looked plausible (first
 // upcoming trip within kSchedulePlausibleS); false if every attempt looked wrong (the best one is
 // still written to *out so a genuinely sparse overnight schedule is displayed) or nothing usable
 // came back at all (*out untouched). Callers cache a false result only briefly (ScheduleCache::

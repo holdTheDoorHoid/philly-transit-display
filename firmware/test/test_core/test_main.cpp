@@ -101,6 +101,8 @@ void test_fetch_plausible_schedule_retries_past_wrong_service_day();
 void test_fetch_plausible_schedule_accepts_first_good_answer_without_retrying();
 void test_fetch_plausible_schedule_keeps_best_effort_when_every_answer_is_wrong();
 void test_fetch_plausible_schedule_leaves_out_untouched_on_total_failure();
+void test_fetch_plausible_schedule_stops_on_a_transport_failure();
+void test_fetch_plausible_schedule_still_retries_a_backend_that_answers();
 void test_poll_bus_stops_marks_wrong_day_schedule_as_suspect();
 void test_poll_bus_stops_truncated_tripupdates_is_reported();
 void test_poll_bus_stops_invalid_protobuf_is_reported();
@@ -205,6 +207,8 @@ int main(int argc, char** argv) {
   RUN_TEST(test_fetch_plausible_schedule_accepts_first_good_answer_without_retrying);
   RUN_TEST(test_fetch_plausible_schedule_keeps_best_effort_when_every_answer_is_wrong);
   RUN_TEST(test_fetch_plausible_schedule_leaves_out_untouched_on_total_failure);
+  RUN_TEST(test_fetch_plausible_schedule_stops_on_a_transport_failure);
+  RUN_TEST(test_fetch_plausible_schedule_still_retries_a_backend_that_answers);
   RUN_TEST(test_poll_bus_stops_marks_wrong_day_schedule_as_suspect);
   RUN_TEST(test_poll_bus_stops_truncated_tripupdates_is_reported);
   RUN_TEST(test_poll_bus_stops_invalid_protobuf_is_reported);

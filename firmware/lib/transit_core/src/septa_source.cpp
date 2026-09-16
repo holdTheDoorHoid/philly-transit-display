@@ -257,8 +257,18 @@ bool fetchPlausibleSchedule(SeptaSource& src, const std::string& stop_id, Epoch 
     // plausible": an empty-but-valid answer still means the source is up, and a stop must not be
     // marked unavailable for it.
     if (o.ok) any_ok = true;
+    // A TRANSPORT failure ends the loop rather than costing another round of it. status 0 (or
+    // negative, where the transport reports one) means the request could not be made at all -
+    // DNS, connect, or a transport that already exhausted its own attempts and backoff on this
+    // exact URL. These retries exist for a SEPTA backend that ANSWERS with the wrong service day
+    // (NOTES.md 9), which always comes back with a real status; repeating a dead network here
+    // just multiplies it by kScheduleFetchAttempts. On a blackholing network that multiplication,
+    // stacked under the firmware's own BusSchedules retry, put a single stop's schedule at up to
+    // twelve URL fetches per poll cycle - minutes per stop - which is what let the liveness net
+    // reboot a healthy device mid-cycle (firmware/src/app/poller_liveness.h).
+    if (o.transport.status <= 0) break;
     Epoch first = earliestUpcoming(fetched, now);
-    if (first == 0) continue;  // transport/parse failure, or nothing upcoming: try again
+    if (first == 0) continue;  // parse failure, or nothing upcoming: try again
     if (best_first == 0 || first < best_first) {
       best = std::move(fetched);
       best_first = first;

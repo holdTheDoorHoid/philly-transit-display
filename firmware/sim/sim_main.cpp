@@ -410,6 +410,46 @@ uint32_t pageCost(const Config &cfg, const transit::Snapshot &snap, Canvas &c, c
   return cost;
 }
 
+// NON-UNIFORM panels, which the sweep above does not produce: every stop there asks for 3 rows.
+// A real config sets `show` per stop, 1..4 (model.h), so panels differ in size by roughly 3x - and
+// main_screen.cpp's guard used to estimate the next panel as "the largest built so far", which let
+// a config ordered small-panels-first admit a 4-row panel with only a 1-row panel's worth of pool
+// left. visibleStops() order changes with the active profile too, so the same config could be safe
+// in the morning and crash in the evening.
+//
+// This runs both orders in the SCALED pool (`pio run -e ui-sim-pool`), where an exhausted
+// LV_MEM_SIZE aborts rather than being absorbed (lv_conf.h's UI_SIM branch), and prints what the
+// page leaves behind. Measured 2026-09-16 on 320x480, small-panels-first: the old estimate
+// admitted six panels and finished on 3,704 B of pool, having let a 10,080 B panel in on a 4,424 B
+// measurement against a 512 B reserve - a ~5.6 KB overdraw that survived here and would not have
+// on a board whose fonts or stop list sit a little differently. The scaled estimate admits five
+// and finishes on 13,752 B. Watch that last column: if it collapses again, the guard has regressed.
+void mixedPanelSweep() {
+  static const Res kAll[] = {{320, 480}, {480, 320}, {320, 240}, {240, 320}};
+  std::printf("\nNon-uniform panels: eight stops, four asking for 1 row and four for 4, in both\n"
+              "orders. The small-first row is the one that used to run the pool out.\n\n");
+  std::printf("%-9s %-14s %5s %9s\n", "board", "show per stop", "objs", "free");
+  for (const Res &r : kAll) {
+    transit_app::ui::g_sim_small_board = (r.h <= 240 || (r.w == 240 && r.h == 320));
+    Canvas c = openDisplay(r.w, r.h);
+    for (int first : {1, 4}) {
+      Config cfg = stopsConfig("dark", 8);
+      std::string shown;
+      for (size_t i = 0; i < cfg.stops.size(); ++i) {
+        cfg.stops[i].show = (uint8_t)(i < cfg.stops.size() / 2 ? first : 5 - first);
+        shown += std::to_string((int)cfg.stops[i].show);
+      }
+      ownerSummaries();
+      transit::Snapshot snap = transit_app::buildDemoSnapshot((transit::Epoch)time(nullptr));
+      (void)pageCost(cfg, snap, c, "main");
+      std::printf("%-9s %-14s %5u %9.0f\n",
+                  (std::to_string(r.w) + "x" + std::to_string(r.h)).c_str(), shown.c_str(),
+                  (unsigned)g_last_objects, g_last_free * kHostToBoard);
+    }
+    closeDisplay(c);
+  }
+}
+
 void poolSweep() {
   static const Res kAll[] = {{320, 480}, {480, 320}, {320, 240}, {240, 320}};
   std::printf("\nLVGL pool cost per page. Host bytes, and x%.2f for the board (see kHostToBoard).\n",
@@ -456,6 +496,7 @@ void poolSweep() {
               "6.2 KB per stop on a 320-wide/480-tall panel and 4.4 KB on a 240-tall one, so five\n"
               "stops does not fit the 36 KB pool on the bigger boards however the pages are ordered -\n"
               "which is what main_screen.cpp's panel guard is for.\n", kHostToBoard);
+  mixedPanelSweep();
 }
 
 }  // namespace

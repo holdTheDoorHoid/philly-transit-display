@@ -36,6 +36,11 @@ namespace {
 // loop runs (see the note where they are created), so this is NOT a page tail to be predicted; it
 // is only a margin on the "will the next panel fit" question.
 //
+// It no longer has to cover the "N more stops will not fit" caption either. That label used to be
+// built after the loop, out of whatever the loop had left - i.e. the one allocation most likely to
+// fail was the one that explains the failure, and 512 B was thin cover for a label plus its text.
+// It is now built before the first panel and hidden, so it cannot fail; see the loop below.
+//
 // Small on purpose, and it was 3 KB first. `pio run -e ui-sim-pool` (the simulator with its pool
 // scaled to the board's) showed 3 KB dropping the FOURTH stop panel on a 320x480 board - a
 // configuration that measurably works on hardware, 31,656 B with 2,472 B left. Dropping a stop the
@@ -353,13 +358,51 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   // on disk: a boot loop the owner cannot get out of over the network. The guard therefore has to
   // live inside the loop, where the pool can simply be looked at between panels. Stop while there
   // is room, and say on the panel how many stops did not fit.
+  //
+  // PANELS ARE NOT UNIFORM, which the first version of this guard assumed (fixed 2026-09-16). Each
+  // one is sized from its own stop's `show` value, 1 to 4 rows (model.h), six widgets per row - so
+  // a four-row panel costs roughly three times a one-row one. Estimating the next panel as "the
+  // largest built so far" let a config ordered small-panels-first admit a large panel with only
+  // small_cost + kPanelTailReserve left, and visibleStops() order changes with the active profile,
+  // so the same config could be safe in the morning and crash in the evening - a boot loop, with
+  // the config still on disk, recoverable only by reflashing.
+  //
+  // So the estimate is scaled by row count. From a panel of r_i rows costing c_i, and with cost
+  // modelled as base + rows * row_cost (identical widgets per row, so base and row_cost are
+  // constant across panels on this board), an upper bound for a panel of r rows is
+  //
+  //     est(r) = max( max_i c_i , r * max_i ceil(c_i / r_i) )
+  //
+  // For r <= r_i the first term already exceeds it, since cost rises with rows. For r > r_i,
+  // r * (c_i / r_i) = r*base/r_i + r*row_cost >= base + r*row_cost whenever r >= r_i, because base
+  // is positive. Both terms are maxima over every panel measured, so the bound only tightens.
   int dropped_panels = 0;
-  uint32_t panel_cost = 0;  // the largest panel built so far - measured on this board, not guessed
+  uint32_t panel_cost = 0;       // the largest WHOLE panel built so far - measured, not guessed
+  uint32_t panel_cost_row = 0;   // ...and the largest per-row cost, for scaling to a bigger panel
+
+  // The overflow caption is built BEFORE the panels and hidden, not after them out of whatever is
+  // left. It is small, but "small" is not "free", and a page that has just stopped adding panels
+  // because the pool is nearly gone is the worst moment to ask for anything: the label that says
+  // what went wrong would be the allocation that runs the pool out. Built first it cannot fail;
+  // if no panel is dropped it is deleted again and costs nothing but the peak.
+  lv_obj_t *overflow_note = makeLabel(panels_area, fontSmall(h), colorLate());
+  lv_obj_set_width(overflow_note, lv_pct(100));
+  lv_label_set_text(overflow_note, "0 more stops will not fit in this display's memory");
+  lv_obj_add_flag(overflow_note, LV_OBJ_FLAG_HIDDEN);
 
   for (const StopConfig &s : visibleStops(cfg, time(nullptr))) {
+    // DESIGN.md SS6/SS8: each stop shows `show` arrival rows (1..4). F31 - this loop used to run to
+    // the screen's capacity for every panel, so the per-stop setting was accepted by the config
+    // schema, echoed back by GET /api/config, and then ignored by the only thing that could act on
+    // it: a stop asking for 1 row still got 3. Capacity is still the ceiling - four 48 px rows do
+    // not fit a 240 px panel however politely they are requested. Computed before the pool check
+    // because the check needs it.
+    int panel_rows = std::min<int>(row_capacity, std::max<int>(1, (int)s.show));
+
     lv_mem_monitor_t pool;
     lv_mem_monitor(&pool);
-    if (panel_cost != 0 && pool.free_size < panel_cost + kPanelTailReserve) {
+    const uint32_t need = std::max<uint32_t>(panel_cost, (uint32_t)panel_rows * panel_cost_row);
+    if (need != 0 && pool.free_size < need + kPanelTailReserve) {
       dropped_panels++;  // keep counting: the caption below says how many
       continue;
     }
@@ -393,12 +436,6 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_label_set_text(pw.no_data_label, "no data yet");
     lv_obj_add_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
 
-    // DESIGN.md SS6/SS8: each stop shows `show` arrival rows (1..4). F31 - this loop used to run to
-    // the screen's capacity for every panel, so the per-stop setting was accepted by the config
-    // schema, echoed back by GET /api/config, and then ignored by the only thing that could act on
-    // it: a stop asking for 1 row still got 3. Capacity is still the ceiling - four 48 px rows do
-    // not fit a 240 px panel however politely they are requested.
-    int panel_rows = std::min<int>(row_capacity, std::max<int>(1, (int)s.show));
     for (int r = 0; r < panel_rows; ++r) {
       lv_obj_t *row = makeBox(panel);
       lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
@@ -441,16 +478,22 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_mem_monitor(&pool);
     uint32_t cost = pool_before > pool.free_size ? pool_before - pool.free_size : 0;
     if (cost > panel_cost) panel_cost = cost;
-    Serial.printf("[lvmem] panel %s: %u B, pool free %u\n", s.key.c_str(), (unsigned)cost,
-                  (unsigned)pool.free_size);
+    // Rounded UP: the per-row figure is only ever multiplied back up to estimate a bigger panel,
+    // so a truncating division would understate exactly the case this exists for.
+    const uint32_t per_row = (cost + (uint32_t)panel_rows - 1) / (uint32_t)panel_rows;
+    if (per_row > panel_cost_row) panel_cost_row = per_row;
+    Serial.printf("[lvmem] panel %s: %u B over %d row(s), %u B/row, pool free %u\n", s.key.c_str(),
+                  (unsigned)cost, panel_rows, (unsigned)per_row, (unsigned)pool.free_size);
   }
   if (dropped_panels > 0) {
-    Serial.printf("[lvmem] %d stop panel(s) left off the arrivals page: %u B free, a panel costs %u B\n",
-                  dropped_panels, (unsigned)lvglPoolFree(), (unsigned)panel_cost);
-    lv_obj_t *note = makeLabel(panels_area, fontSmall(h), colorLate());
-    lv_obj_set_width(note, lv_pct(100));
-    lv_label_set_text_fmt(note, "%d more stop%s will not fit in this display's memory",
+    Serial.printf("[lvmem] %d stop panel(s) left off the arrivals page: %u B free, largest panel %u B, %u B/row\n",
+                  dropped_panels, (unsigned)lvglPoolFree(), (unsigned)panel_cost, (unsigned)panel_cost_row);
+    lv_label_set_text_fmt(overflow_note, "%d more stop%s will not fit in this display's memory",
                           dropped_panels, dropped_panels == 1 ? "" : "s");
+    lv_obj_remove_flag(overflow_note, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_to_index(overflow_note, -1);  // built first, but it belongs under the panels
+  } else {
+    lv_obj_delete(overflow_note);  // nothing to say: give the pool its ~0.5 KB back
   }
 
   lv_obj_set_user_data(screen, ctx);

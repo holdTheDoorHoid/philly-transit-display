@@ -736,9 +736,13 @@ check('F back after reboot', code == 200 and d and d.get('uptime', 999) < 90, (c
 check('F config intact after reboot', device_name() == base['device']['name'])
 
 # ---------- F2. poller liveness reporting (DESIGN.md SS12.1) ----------
-# The liveness net keyed on WHEN a poll cycle last completed - as opposed to the heap-wedge
-# self-heal, which counts how many completed and FAILED and therefore cannot see a poller that has
-# stopped completing cycles at all. Two things are checked here, both of them on the reporting side:
+# The liveness net watches whether the poller is DOING anything - starting a fetch, or finishing a
+# cycle of any outcome - as opposed to the heap-wedge self-heal, which counts how many cycles
+# completed and FAILED and therefore cannot see a poller that has stopped completing cycles at all.
+# (It keyed on cycle completion alone until 2026-09-16; a legitimate cycle on a blackholing network
+# can run for many minutes, so that judged a healthy device stalled. The fetch stamp is internal;
+# last_poll.since_s still reports cycle completion, which is what this section samples.)
+# Two things are checked here, both of them on the reporting side:
 # the observable the net watches (last_poll.since_s) and the record it leaves behind when it fires
 # (last_restart). The firing itself cannot be provoked from here - it needs a poller wedged inside
 # lwIP - so what this section proves is that the fields exist, carry sane values, and say the RIGHT
@@ -774,18 +778,21 @@ else:
     since = (state().get('last_poll') or {}).get('since_s')
     check('F2 last_poll.since_s goes non-negative once a cycle completes', ready, since)
     if ready:
-        # Watch it over a couple of poll intervals. It must keep coming back down - a monotonically
-        # climbing since_s IS the stalled poller, and past main.cpp's window (5 min at the default
-        # cadence, kStallFloorMs in src/app/poller_liveness.h) the board would restart itself.
+        # Watch it over a couple of poll intervals. It must keep coming back down: a monotonically
+        # climbing since_s on a HEALTHY network is a poller that has stopped. (It is no longer the
+        # number main.cpp restarts on - that is the later of this stamp and the per-fetch one, and
+        # is not exposed - so a device mid-cycle on a dead network may exceed 300 s here without
+        # restarting. On the bench, with SEPTA reachable, it should never come close.)
         samples = []
         for _ in range(6):
             time.sleep(10)
             samples.append((state().get('last_poll') or {}).get('since_s'))
         numeric = [s for s in samples if isinstance(s, int)]
         check('F2 since_s stays sampled over a minute', len(numeric) == len(samples), samples)
-        check('F2 since_s never approaches the stall window (300 s)', bool(numeric) and max(numeric) < 240, samples)
-        # It has to come back DOWN at least once over the minute. A since_s that only climbs is the
-        # stalled poller itself: the device is still up only because the window has not elapsed.
+        check('F2 since_s never approaches the stall window (300 s) on a healthy network',
+              bool(numeric) and max(numeric) < 240, samples)
+        # It has to come back DOWN at least once over the minute. On a healthy network a since_s
+        # that only climbs is the stalled poller itself.
         dropped = any(b < a for a, b in zip(numeric, numeric[1:]))
         check('F2 since_s drops back at least once, so cycles really are completing', dropped, samples)
     # Uptime and the liveness net must agree: a device that had self-healed would say so.

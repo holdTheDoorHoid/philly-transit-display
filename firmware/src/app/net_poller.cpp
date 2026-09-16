@@ -31,6 +31,7 @@
 #include "transit_stats/tracker.h"
 #include "weather_service.h"
 #include "bike_service.h"
+#include "web_server.h"  // otaBusy(): the wedge counter stands down during a firmware upload
 
 using transit::Alert;
 using transit::Mode;
@@ -122,14 +123,27 @@ uint32_t g_poll_seconds = 30;
 volatile bool g_invalidate_sched_cache = false;
 
 // ---- Liveness stamps (DESIGN.md SS12.1, net_poller.h "Liveness") -----------------------------
-// Written by the poller task at the end of every cycle whatever the outcome; read lock-free by
-// main.cpp's display loop, which is the only task that can notice this one has stopped. Aligned
-// 32-bit words and plain bools, like g_alerts_fetched_ms above: no mutex, because the reader is
-// the display task and it must never wait on the poller's lock (DESIGN.md SS5).
+// Written by the poller task at the end of every cycle whatever the outcome, and at the start of
+// every fetch it makes; read lock-free by main.cpp's display loop, which is the only task that can
+// notice this one has stopped. Aligned 32-bit words and plain bools, like g_alerts_fetched_ms
+// above: no mutex, because the reader is the display task and it must never wait on the poller's
+// lock (DESIGN.md SS5).
 volatile bool g_liveness_armed = false;
 volatile bool g_before_first_cycle = true;
 volatile uint32_t g_cycle_end_ms = 0;
+volatile uint32_t g_progress_ms = 0;
 volatile uint32_t g_cycle_interval_ms = 30000;
+
+// "The poller is still going round." Called from makeHttpGetEx()'s lambda, so every network round
+// trip a cycle makes - transit, rail, alerts, weather, bikes - refreshes it. Without this the net
+// could only see whole cycles, and a legitimate cycle on a blackholing network runs for minutes
+// (poller_liveness.h): the window needed to cover one would have been too wide to catch a freeze.
+// One 32-bit store, on the poller task, no allocation, cannot throw.
+inline void notePollerProgress() { g_progress_ms = millis(); }
+
+// How long the LVGL task may wait for g_mutex. DESIGN.md SS5: it must never block on the poller,
+// and SS12.1 records a vTaskPriorityDisinheritAfterTimeout assert caused by a 1 s wait from it.
+constexpr uint32_t kUiLockWaitMs = 50;
 
 // ---- Self-heal restart note (DESIGN.md SS12.1) ------------------------------------------------
 // RTC slow memory: kept across ESP.restart() (and across a panic), not across a power cycle, which
@@ -155,7 +169,7 @@ void captureRestartNote() {
   done = true;
   if (g_rtc_note.magic == kNoteMagic) {
     uint32_t r = g_rtc_note.reason;
-    g_prev_note.reason = r <= (uint32_t)SelfHeal::PollStall ? (SelfHeal)r : SelfHeal::None;
+    g_prev_note.reason = r <= (uint32_t)kSelfHealMax ? (SelfHeal)r : SelfHeal::None;
     g_prev_note.uptime_s = g_rtc_note.uptime_s;
     g_prev_note.a = g_rtc_note.a;
     g_prev_note.b = g_rtc_note.b;
@@ -361,6 +375,7 @@ transit::HttpGetEx makeHttpGetEx(uint32_t timeout_ms) {
         std::vector<uint8_t> body;
         bool overflow = false;
         ReplyInfo reply;
+        notePollerProgress();
         transit::FetchResult transport = transit_app::getEx(
             url.c_str(),
             [&](const uint8_t *d, size_t n) {
@@ -406,10 +421,21 @@ transit::HttpGetEx makeHttpGetEx(uint32_t timeout_ms) {
           return result;
         }
         result.status = status;
+        // A TRANSPORT failure is not what these retries are for, and repeating them multiplies a
+        // dead network by four. transit_app::getEx() has already spent its three attempts, its
+        // 0.5 s + 1 s of backoff and (on a blackholing network) a DNS timeout per attempt on this
+        // exact URL; status <= 0 means none of that reached a server. What this loop exists for is
+        // a SEPTA *error body* - a real reply from a backend holding the wrong service day - and
+        // that always comes back with a status. Before this check, one stop's schedule cost up to
+        // 12 URL fetches per cycle (4 here x 3 in fetchPlausibleSchedule), which on a blackholing
+        // network is minutes per stop and was half of why the liveness net could reboot a healthy
+        // board mid-cycle (poller_liveness.h).
+        if (status <= 0) break;
         vTaskDelay(pdMS_TO_TICKS(400 * (attempt + 1)));
       }
       return result;
     }
+    notePollerProgress();
     return transit_app::getEx(url.c_str(), std::move(onData), timeout_ms);
   };
 }
@@ -1104,17 +1130,34 @@ void pollerTask(void * /*arg*/) {
       // stands. Deliberate: it is the longer, safer number for the liveness window below.
     }
 
-    // The liveness stamp (DESIGN.md SS12.1). Written here, on the ONE path every cycle takes,
-    // whatever happened inside it - a good poll, a failed poll, a caught bad_alloc. It says "the
-    // poller is still going round", which is the thing the wedge counter below cannot say: that
-    // counter only advances on cycles that COMPLETE AND REPORT FAILURE, so a poller that stops
-    // completing cycles at all freezes it at whatever it was. Nothing here can throw or block.
+    // The cycle stamp (DESIGN.md SS12.1). Written here, on the ONE path every cycle takes, whatever
+    // happened inside it - a good poll, a failed poll, a caught bad_alloc. It says "the poller is
+    // still going round", which is the thing the wedge counter below cannot say: that counter only
+    // advances on cycles that COMPLETE AND REPORT FAILURE, so a poller that stops completing cycles
+    // at all freezes it at whatever it was. Nothing here can throw or block.
+    //
+    // g_progress_ms is reset with it, so the two are equal between cycles and notePollerProgress()
+    // only ever moves it forward from here. The net judges the later of the two: a cycle can
+    // legitimately take minutes on a blackholing network, so "a cycle completed" cannot be the only
+    // evidence the poller is alive (poller_liveness.h has the arithmetic).
     g_cycle_end_ms = millis();
+    g_progress_ms = g_cycle_end_ms;
     g_before_first_cycle = false;
 
-    // Wedge detection (see above): a failed poll while the largest free block is critically small.
-    // getPollStatus() reflects what pollOnce() just published.
-    if (!getPollStatus().ok && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < kWedgeLargestBlock) {
+    // HAZARD: a firmware upload, exactly as in main.cpp's liveness net. An OTA takes the heap for
+    // the length of a ~1.7 MB write, which is precisely the condition this counter looks for, and
+    // `wedged_polls` carries across an upload, so a device already near the threshold could restart
+    // itself mid-Update.write(). That is not a brick - the boot partition only switches at
+    // Update.end(true), so a half-written inactive slot is inert and the device comes back on the
+    // image it already had - but it throws away the owner's upload at the worst moment and looks
+    // like a crash. Stand down while one is running, and forget the count rather than resume it:
+    // whatever the heap was doing before the upload is not evidence about what it is doing after.
+    //
+    // Wedge detection otherwise (see above): a failed poll while the largest free block is
+    // critically small. getPollStatus() reflects what pollOnce() just published.
+    if (otaBusy()) {
+      wedged_polls = 0;
+    } else if (!getPollStatus().ok && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < kWedgeLargestBlock) {
       if (++wedged_polls >= kWedgePollsBeforeReboot) {
         size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
         Serial.printf("[net_poller] heap wedged: %u consecutive failed polls with largest block < %u B (free %u); rebooting to recover\n",
@@ -1138,9 +1181,21 @@ void pollerTask(void * /*arg*/) {
       // drained the whole queue back to back without ever checking it: two queued jobs - a
       // 400 KB Stops proxy and a 30-day stats scan are both seconds of work - could push the
       // next transit poll a long way past its deadline, and nothing in the loop noticed.
-      if (idleWorkHasHeadroom() && runQueuedProxyJob() && (int32_t)(millis() - deadline) >= 0) break;
+      //
+      // Each completed job is also a liveness stamp. A job is the poller doing something, and a
+      // long one (a 400 KB proxy fetch, a month of CSV through the aggregator) would otherwise sit
+      // inside the window with nothing refreshing it. The loop itself cannot livelock - it exits on
+      // a deadline the previous cycle computed from a bounded interval - so stamping here cannot
+      // hide a stuck poller.
+      if (idleWorkHasHeadroom() && runQueuedProxyJob()) {
+        notePollerProgress();
+        if ((int32_t)(millis() - deadline) >= 0) break;
+      }
       // At most one stop's stats summary per slice, same reason (F27).
-      if (computeOneRequestedSummary() && (int32_t)(millis() - deadline) >= 0) break;
+      if (computeOneRequestedSummary()) {
+        notePollerProgress();
+        if ((int32_t)(millis() - deadline) >= 0) break;
+      }
     }
   }
 }
@@ -1174,6 +1229,7 @@ void startNetPoller(uint32_t poll_seconds) {
   // connectWifiOrPortal() does not even return during the portal, so loop() is not yet running to
   // ask. g_before_first_cycle keeps the extra boot grace on until a cycle has actually finished.
   g_cycle_end_ms = millis();
+  g_progress_ms = g_cycle_end_ms;
   g_cycle_interval_ms = g_poll_seconds * 1000UL;
   g_before_first_cycle = true;
   // Only if there IS a poller task. If xTaskCreatePinnedToCore() failed there is nothing to stamp
@@ -1186,9 +1242,15 @@ void startNetPoller(uint32_t poll_seconds) {
 
 PollerLiveness getPollerLiveness() {
   PollerLiveness lv;
+  const uint32_t now = millis();
   lv.armed = g_liveness_armed;
   lv.before_first_cycle = g_before_first_cycle;
-  lv.since_ms = millis() - g_cycle_end_ms;  // unsigned: correct across the 49-day millis() wrap
+  lv.since_ms = now - g_cycle_end_ms;  // unsigned: correct across the 49-day millis() wrap
+  // The LATER of the two stamps, i.e. the SMALLER age. g_progress_ms is set to g_cycle_end_ms at
+  // every cycle end, so this is never larger than since_ms; the min() is belt and braces against a
+  // torn read of two words the poller writes independently.
+  const uint32_t idle = now - g_progress_ms;
+  lv.idle_ms = idle < lv.since_ms ? idle : lv.since_ms;
   lv.interval_ms = g_cycle_interval_ms;
   return lv;
 }
@@ -1242,6 +1304,23 @@ PollStatus getPollStatus() {
   return copy;
 }
 
+bool tryGetPollStatus(PollStatus *out) {
+  // Short wait, and give up rather than block: the caller is the LVGL task, which must never wait
+  // on another task's lock (DESIGN.md SS5; SS12.1 records the priority-disinherit assert a 1 s wait
+  // from here produced). Leaving *out alone on a miss is the point - the device page then redraws
+  // the value it last read instead of blanking to "no poll yet" for one tick.
+  if (out == nullptr || g_mutex == nullptr) return false;
+  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(kUiLockWaitMs)) != pdTRUE) return false;
+  try {
+    *out = g_status;  // copies a std::string, so it can throw; the mutex must not be lost with it
+  } catch (const std::bad_alloc &) {
+    xSemaphoreGive(g_mutex);
+    throw;  // loop()'s guard in main.cpp skips the frame
+  }
+  xSemaphoreGive(g_mutex);
+  return true;
+}
+
 AlertsStatus getAlertsStatus() {
   AlertsStatus s;
   uint32_t t = g_alerts_fetched_ms;
@@ -1257,7 +1336,7 @@ StopSummaryView getStopSummary(const std::string &stop_key) {
   if (g_mutex == nullptr) return view;
   // Short wait, and give up rather than block: this runs on the LVGL task, which must never wait
   // on another task's lock (DESIGN.md SS5). A missed refresh costs one screen update.
-  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return view;
+  if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(kUiLockWaitMs)) != pdTRUE) return view;
   uint32_t now_ms = millis();
   SummaryCacheEntry *entry = nullptr;
   for (auto &e : g_summary_cache) {

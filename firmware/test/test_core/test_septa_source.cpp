@@ -292,6 +292,38 @@ void test_fetch_plausible_schedule_leaves_out_untouched_on_total_failure() {
   TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(out.size()));
 }
 
+// A network that blackholes packets is not a wrong-service-day answer, and must not be paid for
+// three times. The transport reports status 0 ("could not be made at all") after it has already
+// spent its own attempts and backoff on the URL; fetchPlausibleSchedule stops there. Before this,
+// one stop's schedule cost kScheduleFetchAttempts transport failures per poll cycle, and with the
+// firmware's own BusSchedules retry under it that was up to twelve URL fetches - minutes per stop
+// on a dead network, which is what let the liveness net reboot a healthy board mid-cycle.
+void test_fetch_plausible_schedule_stops_on_a_transport_failure() {
+  int calls = 0;
+  HttpGetEx http = [&calls](const std::string&, std::function<bool(const uint8_t*, size_t)>) -> FetchResult {
+    ++calls;
+    return FetchResult{};  // status 0, nothing delivered: the request could not be made at all
+  };
+  SeptaSource src;
+  std::vector<SchedEntry> out;
+  bool fetched_ok = true;
+  TEST_ASSERT_FALSE(fetchPlausibleSchedule(src, "21297", 1789351200, http, &out, &fetched_ok));
+  TEST_ASSERT_EQUAL_INT(1, calls);
+  TEST_ASSERT_FALSE(fetched_ok);  // the stop is still marked unavailable, as before
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(out.size()));
+}
+
+// The wrong-service-day retries are NOT what was removed: a backend that answers (any real status)
+// with an implausible schedule is still asked again, up to kScheduleFetchAttempts times.
+void test_fetch_plausible_schedule_still_retries_a_backend_that_answers() {
+  int calls = 0;
+  HttpGet http = makeSequenceHttp({"busschedules_21297_wrong_day.json"}, &calls);
+  SeptaSource src;
+  std::vector<SchedEntry> out;
+  TEST_ASSERT_FALSE(fetchPlausibleSchedule(src, "21297", 1789351200, http, &out));
+  TEST_ASSERT_EQUAL_INT(kScheduleFetchAttempts, calls);
+}
+
 // pollBusStops() routes an implausible schedule through ScheduleCache::putSuspect rather than
 // put(), so the glue layer can expire it quickly.
 void test_poll_bus_stops_marks_wrong_day_schedule_as_suspect() {
