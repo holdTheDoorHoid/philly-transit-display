@@ -97,12 +97,14 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
 
-The pool-safety pass is +6,136 B on the 3.5" board and +7,408 B on the 2.4" capacitive one, which
-leaves 53,018 B and 57,278 B of app slot respectively. Of that, 1,256 B was `LV_ASSERT_HANDLER`
-passing `__func__`: the macro expands at ~400 sites inside LVGL and gave each of their functions a
-static name string, so the handler prints its own return address instead (`addr2line` names it).
+The pool-safety pass is +6,172 B on the 3.5" board and +7,460 B on the 2.4" capacitive one, which
+leaves 52,982 B and 57,226 B of app slot respectively. It would have been 1,256 B more: passing
+`__func__` to `LV_ASSERT_HANDLER` gave a static name string to each of the ~400 LVGL functions the
+macro expands in, so the handler prints its own return address instead and `addr2line` names it.
+Every env still builds - `cyd-2432S028R` is 1,832,146 B and the HTTPS prototype
+`cyd-3248S035R-https` 1,871,934 B (98.5 %, the tightest of the four).
 
-The tightest board tracks it closely: `cyd-2432S024C` is 1,843,266 B (97.0 %) / 95,852 B after the
+The tightest board tracks it closely: `cyd-2432S024C` is 1,843,318 B (97.0 %) / 95,852 B after the
 pool-safety pass, 1,835,858 B (96.6 %) / 95,788 B after the
 screen pass (1,828,134 B before it, same day; the Data sources card never appears on its 240-tall
 layouts but its code is linked); it was 1,781,266 B (93.7 %) / 95,716 B at v0.2.0 and
