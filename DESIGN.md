@@ -957,7 +957,14 @@ calls `std::terminate` directly (this SDK builds with a zero-byte emergency exce
 `CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0`). The heavy read handlers (`/api/state`,
 `/api/config`) therefore refuse up front with a fixed-literal 503 when free heap is below
 `kMinHeavyResponseHeap` (22 KB), so they never begin the large allocation that could reach that
-state; clients retry the 503 (§12.1).
+state; clients retry the 503 (§12.1). A residual limit remains: under the rare convergence of an
+invalid-stop configuration (whose continuous failed fetches depress the heap), rapid repeated
+configuration saves (each parses a 16 KB body and rebuilds the screen), and simultaneous `/api/state`
+reads, the classic ESP32's heap can still be exhausted mid-build faster than an entry check can see,
+and the device reboots to recover (configuration is durably saved, so nothing is lost). No entry gate
+closes this fully because the poller shares the heap across cores; only an SDK rebuilt with a nonzero
+emergency exception pool, or a zero-copy `/api/state`, would. It does not occur under normal use
+(single spaced reads, valid stops, occasional saves), where the heap sits near 74 KB.
 
 Task watchdog (2026-09-15): `CONFIG_ESP_TASK_WDT_PANIC=y` in this SDK, and HTTPClient waits for the
 response line and each header in `Stream::timedRead()`, a busy loop that yields only to

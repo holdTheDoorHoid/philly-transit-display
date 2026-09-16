@@ -366,6 +366,10 @@ wait_for(lambda: any(x['key'] == 'tmp-99999' for x in state().get('stops', [])),
 tsnap = [x for x in state().get('stops', []) if x['key'] == 'tmp-99999']  # re-fetch: health settles a poll after the PUT
 check('D unavailable stop reports health unavailable', tsnap and tsnap[0].get('health') == 'unavailable' and tsnap[0].get('error'), tsnap and (tsnap[0].get('health'), tsnap[0].get('error')))
 check('D night page suppressed while the only shown stop is unavailable', ui().get('page') == 'main' and ui().get('active_profile') == 'Night test', ui())
+# Drop the broken tmp-99999 stop now (see note above); the night-real-stop test below uses k0.
+cfg['stops'] = [x for x in cfg['stops'] if x['key'] != 'tmp-99999']
+cfg['profiles'][0]['stops'] = [k0]
+put_cfg(cfg); wait_for(lambda: not any(x['key'] == 'tmp-99999' for x in state().get('stops', [])), 20, 2)
 def soonest_k0_min():
     return min([a['eta_s'] for x in state().get('stops', []) if x['key'] == k0 for a in x.get('arrivals', [])] or [9999]) // 60
 if soonest_k0_min() >= 17:

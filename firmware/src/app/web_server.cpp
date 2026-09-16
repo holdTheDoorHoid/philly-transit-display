@@ -348,12 +348,18 @@ void scheduleRestart() {
 // with a fixed-literal 503 that needs almost no heap, whenever free memory is below what building
 // it would need. The small handlers (debug/ui, tap) are deliberately not gated: they cost little
 // and the test/UI use them to observe the device precisely while it is under pressure.
-constexpr size_t kMinHeavyResponseHeap = 28 * 1024;
-constexpr size_t kMinHeavyResponseBlock = 12 * 1024;  // the JsonDocument + serialized String need a
-                                                       // contiguous block; free heap alone lies when
-                                                       // the heap is fragmented (device suite: free
-                                                       // > 22 KB but largest block ~2 KB, so the build
-                                                       // still bad_alloc'd -> OOM-while-throwing).
+// A modest floor for the heap-heavy read handlers: refuse with a fixed-literal 503 (needs almost
+// no heap) when memory is clearly too low to build the response, so the common low-heap case does
+// not begin an allocation that could fail into the uncatchable OOM-while-throwing path (this SDK
+// has a zero-byte emergency exception pool). It is deliberately NOT set high enough to "guarantee"
+// a build under a concurrent allocation on the other core - an entry check cannot, since the poller
+// shares this heap and can drop it mid-build - because a high floor just makes /api/state 503 for a
+// long time after the heap fragments (largest block ~12 KB) while the actual build needs only a
+// ~5 KB contiguous block. Under the rare convergence of an invalid-stop config, rapid config churn
+// and concurrent reads that can still exhaust the heap, the poller's self-heal reboot (net_poller)
+// recovers the device; config is durably saved. Normal use sits near 74 KB and never trips this.
+constexpr size_t kMinHeavyResponseHeap = 24 * 1024;
+constexpr size_t kMinHeavyResponseBlock = 8 * 1024;
 bool refuseIfLowHeap(AsyncWebServerRequest *request) {
   if (ESP.getFreeHeap() >= kMinHeavyResponseHeap &&
       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= kMinHeavyResponseBlock) {
