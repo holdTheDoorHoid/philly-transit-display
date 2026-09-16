@@ -16,6 +16,7 @@
 #include <cstring>
 #include <string>
 
+#include "cpu_yield.h"
 #include "transit_stats/events.h"
 #include "ui_lock.h"
 
@@ -318,7 +319,17 @@ bool streamLogLines(const std::string &filename, const std::function<bool(const 
   constexpr size_t kLineBufCap = transit_stats::kMaxCsvLineBytes + 1;
   char buf[kLineBufCap];
   bool keep_going = true;
+  // DESIGN.md SS12.1 / cpu_yield.h. THE chokepoint for every CSV scan in this firmware: the stats
+  // page's per-stop summaries, GET /api/stats, GET /api/stats/overview and the log export all come
+  // through here, and three of those four run on the poller task, at priority 1 on core 0, where
+  // IDLE0 (priority 0) is what the task watchdog checks. A month of CSV takes 5-8 s of that task
+  // measured on the owner's board, with nothing in the loop ever blocking - so the watchdog's own
+  // feeder never ran and the board panicked, with the backtrace landing wherever the CPU happened
+  // to be (serializeJson, in the run that found this). The yield lives HERE, in the loop nobody
+  // else writes, rather than at the four call sites that would each have to remember it.
+  CpuYielder yielder;
   while (keep_going && f.available()) {
+    yielder.tick();
     size_t before = f.position();
     size_t n = f.readBytesUntil('\n', buf, transit_stats::kMaxCsvLineBytes);
     if (n == 0) {

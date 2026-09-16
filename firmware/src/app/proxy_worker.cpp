@@ -18,6 +18,7 @@
 
 #include "config_store.h"
 #include "http_fetch.h"
+#include "json_response.h"
 #include "sd_logger.h"
 #include "transit_core/septa_source.h"
 #include "transit_stats/aggregate.h"
@@ -287,11 +288,22 @@ void runStatsJob(const ProxyJob &job) {
   auto req = lockRequest(job);
   if (!req) return;  // client disconnected while we were reading the SD card
 
+  // Streamed, not serialised here (json_response.h). This line used to be
+  // `String body; serializeJson(doc, body); req->send(200, ..., body)`, and it was the frame the
+  // 2026-09-16 device suite's task-watchdog panic decoded to:
+  //   decomposeFloat (ArduinoJson FloatParts.hpp:57) <- TextFormatter::writeFloat
+  //     <- JsonSerializer... <- serializeJson <- runStatsJob <- runJob <- runQueuedProxyJob
+  //     <- pollerTask (net_poller.cpp:1213)
+  // The floats were not the cost - this document is ~5 KB with 28 of them, measured. The cost was
+  // that the WHOLE job, the month-of-CSV scan included, ran on the poller task without once
+  // blocking, so IDLE0 never got in and the watchdog fired wherever the CPU was at the 5 s mark.
+  // The scan now yields (sd_logger.cpp streamLogLines), and the serialisation moves off this task
+  // entirely: the chunked filler runs on the AsyncTCP task, one bounded send-chunk at a time, as
+  // the socket drains. It also drops the String and AsyncBasicResponse's copy of it - two
+  // body-sized allocations on a heap whose largest block sits at 5-25 KB.
   JsonDocument doc;
   agg->toJson(doc);
-  String body;
-  serializeJson(doc, body);
-  req->send(200, "application/json", body);
+  sendJsonStreamed(req.get(), doc);
 }
 
 // Same streaming pass for GET /api/stats/overview: every stop key and Indego station at once
@@ -332,9 +344,7 @@ void runOverviewJob(const ProxyJob &job) {
   if (!req) return;
   JsonDocument doc;
   agg->toJson(doc);
-  String body;
-  serializeJson(doc, body);
-  req->send(200, "application/json", body);
+  sendJsonStreamed(req.get(), doc);  // same reasoning as runStatsJob(); ~5 KB, measured
 }
 
 void runJob(const ProxyJob &job) {

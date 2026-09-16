@@ -1,7 +1,6 @@
 #include "web_server.h"
 
 #include <Arduino.h>
-#include <ChunkPrint.h>  // ESPAsyncWebServer's per-chunk Print sink, see sendJsonStreamed()
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <Update.h>
@@ -17,8 +16,10 @@
 
 #include "auth.h"
 #include "config_store.h"
+#include "cpu_yield.h"  // cpuStretchMsMax() for /api/debug/ui (DESIGN.md SS12.1)
 #include "cxx_exception_pool.h"
 #include "demo_data.h"
+#include "json_response.h"
 #include "net_poller.h"
 #include "weather_service.h"
 #include "ui/ui.h"
@@ -222,36 +223,9 @@ void sendJson(AsyncWebServerRequest *request, int code, JsonDocument &doc) {
   request->send(code, "application/json", body);
 }
 
-// DESIGN.md SS12.1 "zero-copy": the heavy responses (/api/state, /api/config) do not go through
-// sendJson(). The document is MOVED, not copied, into a holder the chunked response owns, and
-// serialised straight into each TCP send chunk as the socket drains (the filler re-walks the
-// document per chunk, skipping what was already sent - the same ChunkPrint ESPAsyncWebServer's own
-// AsyncJsonResponse uses). So the response holds the document plus one 2 x MSS send buffer - not,
-// as sendJson() costs, the document plus a String of the whole body plus AsyncBasicResponse's own
-// copy of that String, which needed a body-sized contiguous block twice at the worst moment.
-// Chunked transfer encoding, so there is no measuring pass and no Content-Length; every client this
-// device has (the web app's fetch(), curl, the device suite) handles that. Deliberately NOT used for
-// the small responses: their String is a few dozen bytes, while any chunked response allocates the
-// 2.9 KB send buffer (nothrow, retried on the next poll), which is the wrong trade for
-// /api/debug/ui, the endpoint the suite uses to watch the device while it is starved. Same overflow
-// rule as sendJson(): a truncated document is a 503, never an empty or partial 200. Why
-// AsyncJsonResponse itself is not used: it costs two more ArduinoJson serializer instantiations
-// (its ChunkPrint-typed fill and measureJson's counting pass, ~2.2 KB of flash) plus its class;
-// this serialises through a Print&, which config_store.cpp's two sinks do as well, so all three
-// share one instantiation. Measured on cyd-3248S035R: about +0.8 KB of flash for this path, against
-// +4.5 KB with AsyncJsonResponse.
-void sendJsonStreamed(AsyncWebServerRequest *request, JsonDocument &doc) {
-  if (doc.overflowed()) {
-    request->send(503, "application/json", "{\"error\":\"out of memory building the response, retry\"}");
-    return;
-  }
-  std::shared_ptr<JsonDocument> held = std::make_shared<JsonDocument>(std::move(doc));
-  request->send(request->beginChunkedResponse("application/json", [held](uint8_t *buf, size_t max_len, size_t index) -> size_t {
-    ChunkPrint dest(buf, index, max_len);
-    serializeJson(*held, static_cast<Print &>(dest));
-    return dest.written();  // 0 once `index` has reached the end of the document = last chunk
-  }));
-}
+// sendJsonStreamed() - the zero-copy chunked path for the heavy responses - now lives in
+// json_response.h, because the queued stats jobs on the poller task need it too (DESIGN.md SS12.1,
+// and cpu_yield.h for why serialising on that task was a watchdog problem as well as a heap one).
 
 void sendError(AsyncWebServerRequest *request, int code, const std::string &message, const std::string &path = "") {
   JsonDocument doc;
@@ -1294,6 +1268,11 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["lock_misses"] = d.lock_misses;
     doc["tick_ms"] = d.tick_ms;
     doc["tick_ms_max"] = d.tick_ms_max;
+    // DESIGN.md SS12.1: the longest the poller task has run a CPU-bound loop without letting IDLE0
+    // in, since boot. The task watchdog panics the board at 5,000; cpu_yield.h aims for 40. This is
+    // the observable that keeps "do not starve IDLE0" a rule with a number attached instead of a
+    // convention that comes back as a backtrace.
+    doc["cpu_stretch_ms_max"] = cpuStretchMsMax();
     JsonObject costs = doc["lv_page_cost"].to<JsonObject>();
     costs["main"] = d.page_cost[0];
     costs["night"] = d.page_cost[1];
