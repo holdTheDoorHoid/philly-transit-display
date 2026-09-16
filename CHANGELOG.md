@@ -44,10 +44,23 @@ their comments said.
   still saved, the only way out was a USB cable. The guard now scales its estimate by how many rows
   the next panel actually wants, and the "N more stops will not fit" line at the bottom is now
   reserved up front rather than squeezed out of what is left.
-- **The Device info screen no longer waits on the fetching to draw itself.** It asked the fetcher
-  for its status on every refresh and would wait up to a second for an answer, which is exactly the
-  pattern that caused a crash earlier in this project's history. It now waits a twentieth of that
-  and, if the fetcher is busy, redraws the last answer it got.
+- **The display no longer waits on the fetching to draw itself - anywhere - and the crash that
+  caused is gone.** The entry below fixed one screen that did this. Testing the release candidate
+  found the same pattern in seven more places and crashed a display through one of them: the bike
+  counts on the arrivals page asked the fetcher for its numbers, waited half a second for an answer
+  while the fetcher was busy, and the display restarted. The weather in the header, the weather note
+  under each stop, the SD card line, the statistics and the arrivals themselves were all still
+  written the same way; only two had been fixed. Now the screen never waits for the fetcher at all -
+  it either gets an answer immediately or redraws the one it had a second ago. The most a busy
+  moment can cost is one second of staleness on one line, and there is no wait left that could turn
+  into a restart.
+
+  The other half of the same fix is that the fetcher stops making the screen wait in the first
+  place. It used to copy the whole list of arrivals twice - once to hand it over, once for the
+  screen to pick up - with the screen locked out for the duration of both. It now hands over a
+  reference instead of a copy. The screen is quicker, and the display has meaningfully more memory
+  free from one minute to the next, which is the thing that was making the web page answer "busy,
+  try again" after a few hours up.
 - **When the display restarts because it ran out of drawing memory, it now says so.** That restart
   used to be indistinguishable from an ordinary one, which is unhelpful precisely when it matters:
   a stop list that does not fit crashes the same way on every switch-on, so what you have is a boot

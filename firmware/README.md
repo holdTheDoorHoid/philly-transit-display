@@ -81,12 +81,14 @@ only when the screen is tapped (`DESIGN.md` §12).
 
 ## Memory and flash budget
 
-Measured on the owner's ESP32-3248S035R (classic ESP32, 4 MB flash, no PSRAM); the top four rows
+Measured on the owner's ESP32-3248S035R (classic ESP32, 4 MB flash, no PSRAM); the top six rows
 are 2026-09-16/15, the rest 2026-09-14.
 The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) per OTA slot.
 
 | Build (`cyd-3248S035R`) | Flash | Static RAM |
 |---|---:|---:|
+| 2026-09-16 the display task's zero-wait lock policy (`src/app/ui_lock.h`, the `LastGood` fallback in every shared accessor, the Snapshot published and read as `shared_ptr<const>`, `lock_misses`/`tick_ms` on `/api/debug/ui`), on top of `next` at 187b37e | 1,862,942 B (98.0 %) | 96,404 B |
+| The same `next` (187b37e) without it - the baseline that delta is measured against | 1,859,434 B (97.8 %) | 95,932 B |
 | 2026-09-16 release-candidate review fixes (the per-fetch liveness stamp, the transport-failure early exits, the OTA upload warm + guard + Host check, the row-scaled panel guard, `tryGetPollStatus()`, the `lvgl_pool` restart note), on top of `next` at ec0c1ab | 1,859,434 B (97.8 %) | 95,932 B |
 | The same `next` (ec0c1ab) without them - the baseline that delta is measured against | 1,857,854 B (97.8 %) | 95,868 B |
 | 2026-09-16 poller-liveness net (the cycle stamp, the display-loop check, `last_restart` + `last_poll.since_s` on `/api/state`), on top of `next` at 2f48828 | 1,856,922 B (97.7 %) | 95,868 B |

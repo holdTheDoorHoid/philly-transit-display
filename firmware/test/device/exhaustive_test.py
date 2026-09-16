@@ -874,6 +874,11 @@ errs = [l for l in serial_lines if re.search(r'\bE \(|error', l, re.I)][:5]
 check('Z serial: no crash lines except the three requested reboots (A0, F, OTA)', len([l for l in crashes if 'rst:0x' in l]) <= 3 and not [l for l in crashes if 'Guru' in l or 'Backtrace' in l or 'abort' in l], crashes[:5])
 check('Z serial: no LVGL warnings', warns == 0, warns)
 print('== serial lines captured', len(serial_lines), 'errors sample', errs)
+# Keep the capture. A crash line is only half an answer - the other half is the addresses after it,
+# which need `xtensa-esp32-elf-addr2line -pfiaC -e <elf>` and therefore need the raw text to still
+# exist after the run. Overwritten each run, like exhaustive_results.json beside it.
+with open(os.path.join(S, 'exhaustive_serial.log'), 'w') as fh:
+    fh.write('\n'.join(serial_lines) + '\n')
 passed = sum(1 for r in results if r[1]); print('\n== %d/%d checks passed' % (passed, len(results)))
 for name, ok, detail in results:
     if not ok: print('   FAILED:', name, '--', str(detail)[:300])
