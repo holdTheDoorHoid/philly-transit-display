@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Memory: the firmware now gives the C++ runtime a 2 KB emergency exception pool, so an
+  out-of-memory error can always be caught and answered with a 503 or a skipped frame instead
+  of rebooting the device (this used to be the one uncatchable case, DESIGN.md 12.1). Done by
+  supplying the pool-size hook from the firmware itself - no SDK rebuild. `POST /api/debug/oom`
+  (PIN) proves it on the device: it drains the heap, forces the failure, and reports
+  `caught:true`. `/api/state` and `/api/config` are streamed straight into the network buffers
+  instead of being built as a second copy first, lowering the peak memory of the busiest request.
+- Web: the Settings page is arranged into blocks of settings that affect each other (Screen &
+  appearance, Schedules, Alerts & reminders, Data & weather, Device & network, Web PIN,
+  Firmware & maintenance) with a one-line intro each; a setting that only matters when another
+  is on sits under it and is dimmed while it is off; jump pills and a "Filter settings" box find
+  a setting by name or description; one sticky save bar shows unsaved changes with Undo; reboot
+  and Wi-Fi reset sit in a fenced "Restart and reset" area with plain-language hints.
+
 ## v0.2.0 - 2026-09-16
 
 An external adversarial review of v0.1.2 (32 findings) drove this pass. HTTPS to SEPTA remains
