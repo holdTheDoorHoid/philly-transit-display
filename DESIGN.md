@@ -1525,7 +1525,7 @@ from a few entries instead of reserving the cap; `pollOnce()`, queued proxy/stat
 errors, or a 503) rather than resetting. Measured after the fix: heap ~54 KB minimum during a
 poll, largest block ~32 KB median - that heap figure is `ESP.getFreeHeap()`, i.e. **~20 KB of
 byte-addressable heap** (§2.1), which is the number that explains why `/api/state` answers 503
-during a plain HTTP fetch; re-measured over 297 samples on 2026-09-16 the usable minimum is 5.7 KB
+during a plain HTTP fetch; re-measured over 114 clean samples on 2026-09-16 the usable minimum is 11.0 KB
 with a median of 34.9 KB, and the largest block runs 2.9-47.1 KB, median 20.5 KB. **Invariant:** every long-running task that does STL allocation catches
 `std::bad_alloc` at its top level, because an uncaught throw is `std::terminate` = reboot. There
 are three: the poller task (net_poller.cpp, inner per-stop + outer cycle), the AsyncTCP web

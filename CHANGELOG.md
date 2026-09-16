@@ -12,9 +12,10 @@
     refused for ten minutes while the display was fetching arrivals, and plugging in a cable was
     the only way through. The check was demanding a 16 KB run of free memory when the update
     actually needs 4 KB, and its other half moved up and down with the arrival fetches. Measured
-    across 297 samples of normal operation, updates would have been refused 28% of the time
-    before, and 3% now - and the 3% that remain are moments when memory is genuinely tight, which
-    is what the check is for.
+    across 114 samples of normal operation, updates would have been refused 34% of the time
+    before, and 4% now - and the 4% that remain are moments when memory is genuinely tight, which
+    is what the check is for. Confirmed on the device: four uploads attempted in the exact window
+    that used to be refused were all accepted.
   - **Two other safety checks had quietly not been running at all.** The ones protecting the
     status page and the background statistics work were set to thresholds that the miscounted
     figure could never fall below, so half of each check was dead. They now use the real number,
