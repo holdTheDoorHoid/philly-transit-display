@@ -3,6 +3,7 @@
 #include <Arduino.h>
 
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <HTTPClient.h>
 
@@ -105,6 +106,9 @@ const std::string &scheduleCookie() {
   return g_sched_cookie;
 }
 
+// A single blocking stream read must stay under the 5 s task watchdog (see get()).
+constexpr uint32_t kStreamReadTimeoutMs = 4000;
+
 uint32_t absoluteDeadlineMs(uint32_t timeout_ms) {
   uint64_t budget = (uint64_t)timeout_ms * 2;
   if (budget > kAbsoluteDeadlineCapMs) budget = kAbsoluteDeadlineCapMs;
@@ -142,8 +146,16 @@ transit::FetchResult doGet(const char *url, std::function<bool(const uint8_t *, 
     NetworkClient *client = &plain_client;
 
     HTTPClient http;
-    http.setConnectTimeout((int32_t)timeout_ms);
-    http.setTimeout((uint16_t)timeout_ms);
+    // Cap the per-read/connect timeout well under this SDK's 5 s task watchdog. HTTPClient waits
+    // for the response line and each header in Stream::timedRead() - a busy loop that yields only
+    // to same-or-higher-priority tasks, so at the poller's priority 1 it does NOT let IDLE0 (the
+    // task the watchdog checks) run. A single read that blocked for the full fetch timeout would
+    // therefore panic the watchdog. Bounding one read to kStreamReadTimeoutMs keeps every busy-wait
+    // under 5 s; a streaming body still flows because each read returns as soon as bytes arrive,
+    // and the overall fetch budget is preserved by absoluteDeadlineMs() and the retry loop.
+    const uint16_t read_to = (uint16_t)std::min<uint32_t>(timeout_ms, kStreamReadTimeoutMs);
+    http.setConnectTimeout((int32_t)read_to);
+    http.setTimeout(read_to);
     http.setReuse(false);  // DESIGN.md SS4.7: never hold a socket across the idle gap
 
     if (!http.begin(*client, url)) {

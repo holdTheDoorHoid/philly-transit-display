@@ -952,11 +952,17 @@ are three: the poller task (net_poller.cpp, inner per-stop + outer cycle), the A
 handlers (web_server.cpp `guarded()` + the JSON-body handlers, answering 503), and the LVGL
 display loop (main.cpp `loop()`, skipping the frame). Any new task on either core must do the same.
 
-Task watchdog (2026-09-15): `CONFIG_ESP_TASK_WDT_PANIC=y` in this SDK, and HTTPClient waits for
-response headers in `Stream::timedRead()`, a busy loop with no yield, for up to the 15 s fetch
-timeout. With the poller at priority 1 on core 0 a slow SEPTA answer starved IDLE0 and the watchdog
-rebooted the board. The poller therefore runs at priority 0 (round-robin with IDLE0 every tick);
-everything else on the device runs above it, so its share of the CPU is unchanged. Idle-slice work
+Task watchdog (2026-09-15): `CONFIG_ESP_TASK_WDT_PANIC=y` in this SDK, and HTTPClient waits for the
+response line and each header in `Stream::timedRead()`, a busy loop that yields only to
+same-or-higher-priority tasks, so at the poller's priority 1 it does not let IDLE0 (the task the
+watchdog checks on core 0) run. A single read blocked for the whole 15 s fetch timeout therefore
+panicked the watchdog. The fix is to bound one stream read/connect to `kStreamReadTimeoutMs` (4 s,
+under the 5 s watchdog) in `http_fetch.cpp`; a streaming body still flows because each read returns
+as soon as bytes arrive, and the overall fetch budget is kept by the absolute deadline and the
+retry loop. (Dropping the poller to priority 0 also cured the watchdog but made it the lowest task
+on core 0, so under web load it was starved while holding the snapshot mutex and the display task's
+1 s `getSnapshot()` wait asserted in `vTaskPriorityDisinheritAfterTimeout`; priority 1 + the capped
+read is the fix that avoids both.) Idle-slice work
 (stats summaries, queued proxy jobs) additionally waits for 40 KB free heap and a 12 KB largest
 block so it never collides with a config save on the web task.
 

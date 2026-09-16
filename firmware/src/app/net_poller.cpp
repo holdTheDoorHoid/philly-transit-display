@@ -53,15 +53,15 @@ constexpr uint32_t kOptionalFetchTimeoutMs = 8000;
 // product; a weather refresh that makes them late is a bad trade at any price.
 constexpr uint32_t kOptionalWorkReserveMs = 5000;
 constexpr uint32_t kTaskStackBytes = 10240;
-// Priority 0 - the same as the idle task - on purpose. HTTPClient waits for response headers in
-// Stream::timedRead(), a busy loop with no yield, for up to the 15 s fetch timeout; at priority 1
-// on core 0 that starves IDLE0, and this SDK's task watchdog (5 s, CONFIG_ESP_TASK_WDT_PANIC=y)
-// then PANICS and reboots the board. Seen in the 2026-09-15 device suite as a reset with a
-// backtrace ending in millis() <- timedRead() <- handleHeaderResponse(). At priority 0 FreeRTOS
-// round-robins the poller with IDLE0 every tick, the watchdog is fed, and the poller still gets
-// the CPU whenever nothing higher is runnable - which is the same as before, since everything
-// else on the device runs above priority 0.
-constexpr UBaseType_t kTaskPriority = 0;
+// Priority 1 (above IDLE0, below the ESP-IDF network/timer tasks) - the original value. It was
+// briefly dropped to 0 to stop HTTPClient's header busy-wait (Stream::timedRead, no yield to a
+// lower priority) from starving IDLE0 and tripping the 5 s task watchdog, but priority 0 made the
+// poller the lowest task on core 0: under concurrent web load it was starved while holding the
+// snapshot mutex, so the display task's 1 s getSnapshot() wait timed out and asserted in
+// vTaskPriorityDisinheritAfterTimeout (device suite, 2026-09-15). The watchdog is instead cured at
+// its source - a single stream read now times out well under 5 s (kStreamReadTimeoutMs in
+// http_fetch.cpp) - so the poller can stay at priority 1 and never starves the mutex.
+constexpr UBaseType_t kTaskPriority = 1;
 
 // DESIGN.md SS4.7.
 constexpr uint32_t kBusSchedulesRefreshMs = 10 * 60 * 1000;
@@ -655,12 +655,20 @@ void logHeapHeartbeat() {
 // that belong to the same Snapshot arrive.
 void publishSnapshot(const Snapshot &snap) {
   if (xSemaphoreTake(g_mutex, portMAX_DELAY) == pdTRUE) {
-    g_status.has_polled = true;
-    g_status.ok = snap.last_poll_ok;
-    g_status.last_http_status = snap.last_poll_ok ? 200 : 0;
-    g_status.last_poll_epoch = (uint32_t)snap.generated;
-    g_status.last_error = snap.last_error;
-    g_snapshot = snap;
+    // try/give: g_snapshot = snap copies vectors (allocates); a bad_alloc here must not leave the
+    // mutex held, or every getSnapshot() on the display task would block forever (the loop guard
+    // in main.cpp turns a UI-side throw into a skipped frame, but only if it is not deadlocked).
+    try {
+      g_status.has_polled = true;
+      g_status.ok = snap.last_poll_ok;
+      g_status.last_http_status = snap.last_poll_ok ? 200 : 0;
+      g_status.last_poll_epoch = (uint32_t)snap.generated;
+      g_status.last_error = snap.last_error;
+      g_snapshot = snap;
+    } catch (const std::bad_alloc &) {
+      xSemaphoreGive(g_mutex);
+      throw;  // caught by pollOnce's / pollerTask's bad_alloc handler; snapshot keeps its old value
+    }
     xSemaphoreGive(g_mutex);
   }
 
@@ -1038,7 +1046,14 @@ void requestRepoll(bool data_changed) {
 transit::Snapshot getSnapshot() {
   transit::Snapshot copy;
   if (g_mutex != nullptr && xSemaphoreTake(g_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-    copy = g_snapshot;
+    // try/give as in publishSnapshot: the copy allocates, and a bad_alloc must release the mutex
+    // (the caller - ui::tick on the display task - has its own bad_alloc guard in loop()).
+    try {
+      copy = g_snapshot;
+    } catch (const std::bad_alloc &) {
+      xSemaphoreGive(g_mutex);
+      throw;
+    }
     xSemaphoreGive(g_mutex);
   }
   return copy;
