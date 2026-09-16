@@ -279,12 +279,34 @@ if newest:
     check('A log has bike rows', any(',bike,indego-' in l for l in lines) or not base['bike'].get('enabled'), newest)
 
 # ---------- B. config round-trips ----------
+def refused(d):
+    """True for a gate refusal body - {"error": "low memory, retry"} - which parses as a perfectly
+    good dict and so slips past an `is not None` guard. DESIGN.md SS12.1: any heavy read can answer
+    this, and get_json() already retries it; this is for the case where every retry was refused."""
+    return isinstance(d, dict) and 'error' in d and 'device' not in d
+
 def roundtrip(name, mutate, expect=None, wait=2.5):
     cfg = copy.deepcopy(base); mutate(cfg)
     code = put_cfg(cfg); time.sleep(wait)
     got = config()
-    ok = code == 200 and got is not None and (expect(got) if expect else True)
-    check('B ' + name, ok, (code, None if got is None else str(got.get('device', {}))[:160]))
+    # expect() indexes the body (g['device'][...]), so it must never see a refusal or a surprise
+    # shape: an exception here aborts the whole run, which on 2026-09-16 left the owner's display
+    # on a test config because the run never reached its restore step. Report, never raise.
+    why = None
+    if code != 200:
+        ok, why = False, 'PUT %s' % code
+    elif got is None:
+        ok, why = False, 'GET body was not JSON'
+    elif refused(got):
+        ok, why = False, 'GET refused after every retry: %s' % str(got)[:60]
+    elif expect is None:
+        ok = True
+    else:
+        try:
+            ok = bool(expect(got))
+        except Exception as e:
+            ok, why = False, '%s reading the response: %s' % (type(e).__name__, e)
+    check('B ' + name, ok, why or (code, str(got.get('device', {}))[:160] if isinstance(got, dict) else got))
     return got
 
 roundtrip('name', lambda c: c['device'].update(name='display-test'), lambda g: g['device']['name'] == 'display-test')
@@ -666,9 +688,21 @@ if os.path.exists(fw):
 
 # ---------- restore ----------
 put_cfg(base); time.sleep(3)
-restored = True  # the atexit safety net above has nothing left to do
 final = config()
-check('Z restored owner config (invert off)', final and [x['key'] for x in final['stops']] == [x['key'] for x in backup['stops']] and final['device']['invert_colors'] is False)
+# Verify BEFORE clearing the atexit safety net, and never index the body blind: /api/config can
+# answer a refusal that parses as a dict. Declaring the restore done and then crashing on the
+# verification is how the owner's display was left on a four-stop test config on 2026-09-16.
+try:
+    restore_ok = (not refused(final)
+                  and [x['key'] for x in final['stops']] == [x['key'] for x in backup['stops']]
+                  and final['device']['invert_colors'] is False)
+except Exception as e:
+    restore_ok, final = False, '%s reading the restored config: %s' % (type(e).__name__, e)
+check('Z restored owner config (invert off)', restore_ok, str(final)[:160])
+if restore_ok:
+    restored = True  # only now has the atexit safety net nothing left to do
+else:
+    print('     !! restore NOT verified - leaving the atexit safety net armed')
 stop_serial = True; time.sleep(1.5)
 crashes = [l for l in serial_lines if re.search(r'Guru|abort\(\)|Backtrace|rst:0x', l)]
 warns = sum(1 for l in serial_lines if '[Warn]' in l)
