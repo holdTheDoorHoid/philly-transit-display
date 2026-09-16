@@ -56,7 +56,10 @@ for as long as the connection is open, in two pieces of 16.7 KB that each have t
 block, and about 12 KB more for a second or two while the connection is being set up. The board
 *reports* 70-80 KB free while it runs, but about 34 KB of that is a kind of memory the processor can
 only read in whole words, which no buffer, string or network record can use; the memory an ordinary
-allocation can actually get is about 46 KB free at idle and 27-42 KB at the moment a fetch starts.
+allocation can actually get is about 35-39 KB free at idle and 27-42 KB at the moment a fetch starts.
+(The "46 KB at idle" this paragraph carried until 2026-09-16 came from an instrumented prototype
+build and could not be reproduced; two independent measurements on the owner's own configuration
+agree on the lower figure. It does not change the conclusion below - it widens the gap.)
 So on this board, with the software the ESP32 vendor ships, HTTPS does not fit - not sometimes,
 never: the prototype asked for it on every fetch for the whole test and was refused every time,
 while the arrivals kept flowing over plain HTTP exactly as before. The obvious cheap fix - do the
@@ -202,7 +205,7 @@ paying.
 
 Every heap number this project had written down - the README's stage table, `/api/state`'s `heap`,
 the 60 KB OTA gate, the 24 KB `/api/state` gate, the 40 KB idle-work gate, §12.1's "~75-80 KB free"
-- is `ESP.getFreeHeap()`, which is `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)`
+- was `ESP.getFreeHeap()`, which is `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)`
 (`cores/esp32/Esp.cpp`). On the classic ESP32 that includes the IRAM heap region left over after
 the app's IRAM code, which is **32-bit-word addressable only**: `malloc()` never hands it out for a
 buffer, a `std::string`, a `JsonDocument` or a TLS record (those come from `MALLOC_CAP_8BIT`).
@@ -233,6 +236,72 @@ HTTP fetch, and why the OTA gate ("largest free block 15 KB is below 16 KB") ref
 attempt for ten minutes on 2026-09-16 while the device was polling every 15 s - a reboot followed by
 an immediate upload, or the serial cable, is the way in. The gates themselves are tuned to the
 INTERNAL number and keep working; a follow-up should restate them in 8-bit terms.
+
+#### The follow-up: every gate re-derived in 8-bit terms (2026-09-16)
+
+Done, and two of the three gates turned out not to have been working at all. The IRAM share is not
+"about 34 KB", it is **exactly 33,708 B**: five paired `free`/`free8` readings on the owner's
+cyd-3248S035R, across two firmware builds and every point from `display` to a poll in flight, gave
+that same difference every time. The region is sized once when the app's IRAM code is placed and is
+never allocated from. That makes the restatement exact rather than approximate - and it makes the
+consequence exact too. `MALLOC_CAP_INTERNAL` free **never drops below 33,708 B**, so any gate whose
+floor sat under that number could not fire:
+
+| Gate | Was | In real (8-bit) terms | Could it fire? | Now |
+|---|---|---|---|---|
+| `/api/state`, `/api/config` | 24 KB INTERNAL free, 8 KB block | ~0 KB of usable heap | **never** | 12 KB `free8`, 8 KB block |
+| poller idle slice | 40 KB INTERNAL free, 12 KB block | ~6 KB of usable heap | **almost never** | 16 KB `free8`, 12 KB block |
+| OTA admission | 60 KB INTERNAL free, 16 KB block | ~26 KB of usable heap | yes, constantly | 16 KB `free8`, 6 KB block |
+
+The first two had been running on their largest-block halves alone, which is why they behaved
+sensibly despite the free half being unreachable - the comments described a check that was not
+happening. The third had the opposite problem: 26 KB of byte-addressable heap sits *inside* the
+26.6-29 KB band a poll leaves behind, so the gate flapped with the poll cycle, and the 16 KB block
+requirement was **4x** anything the OTA path allocates. `Update.begin()` takes exactly one
+`new uint8_t[SPI_FLASH_SEC_SIZE]` = 4,096 B (Arduino's `Updater.cpp`); the only other allocation on
+the path is a 16 B `_skipBuffer`. Nothing in `Update.write()` is body-sized - ESPAsyncWebServer
+delivers the multipart body in ~1.4 KB pieces and Update accumulates them into that one sector.
+
+Each new threshold is derived from what its path actually allocates, not from a round number:
+
+- **OTA** - one 4,096 B sector buffer, so a 6 KB block (1.5x) and 16 KB of `free8` for the request
+  machinery and for the rest of the device to keep running through a ~1.7 MB upload.
+- **`/api/state` / `/api/config`** - a Config copy, a Snapshot copy, ArduinoJson's 1 KB slot pools
+  and string pool for a ~4 KB document, and one 2,872 B send buffer
+  (`ASYNC_RESPONCE_BUFF_SIZE` = `CONFIG_LWIP_TCP_MSS * 2`). The 8 KB block is 2.8x that buffer; the
+  12 KB free floor is deliberately *below* the full transient cost, because §12.1's reasoning still
+  holds - the floor exists to skip a hopeless build, not to promise a successful one.
+- **Idle slice** - the ~8 KB contiguous `StatsAggregator`, so a 12 KB block (1.5x) and 16 KB of
+  `free8`. The "4 KB proxy write buffer" the old comment cited is not in the sum: it is
+  `static uint8_t wbuf[4096]` and never comes off the heap.
+
+Measured against 114 samples of ordinary polling on the owner's board - two stops, the owner's own
+config, counting only samples where a poll had completed and the device had not just rebooted - the
+OTA gate's admission rate goes from **66% to 96%**. Every one of the remaining refusals is the
+`free8` half, at moments when `free8` is genuinely down near its 11.0 KB floor with a largest block
+to match. The block half never refused once at 6 KB, against a measured block floor of 8,692 B. The
+4% that still refuse are the heap actually being busy, which is the case the gate is for; the 34%
+that used to refuse were an accounting error.
+
+Two cautions on those percentages. Fresh-boot samples are excluded deliberately: right after a
+reboot the device has ~48 KB of `free8` and a 47 KB largest block, the cleanest heap it ever has, so
+including them flatters every gate and hides exactly the mid-poll case that was failing. And the
+ceiling matters as much as the floor - `free8` at healthy idle tops out at **36.6 KB** here, with a
+second agent independently measuring 36.8-39.3 KB on a clean build with the same config. Any gate
+restated by moving the old INTERNAL number across unchanged would land above that ceiling and be
+permanently false: the 40 KB idle-work floor in particular would never once have been satisfied.
+That is the trap in this whole class of fix, and it is why each threshold above is derived from an
+allocation rather than converted from its predecessor.
+
+The alternative fix for the OTA case - having the handler wait for the poller's idle gap - was
+rejected. `index == 0` runs on the AsyncTCP task, and blocking there stalls every other connection
+on the device, which is a worse failure than the one being repaired, while the client is already
+mid-upload with ~1.7 MB to push.
+
+`/api/state` keeps `heap` as `ESP.getFreeHeap()` - clients parse it, and silently changing what a
+published field means is worse than an optimistic number - and gains `heap_8bit` and
+`largest_block_8bit` beside it. The web app's "Heap free" tile and the device page on the panel both
+show `heap_8bit`, falling back to `heap` against firmware that predates the field.
 
 #### Could the fetch simply run at a better moment? (measured 2026-09-16, and no)
 
@@ -686,7 +755,8 @@ concurrent download gets a 503 rather than a truncated file.
 
 Memory rules: no full framebuffer; LVGL partial buffer is 1/10 of the screen in RGB565 (the library default of 1/4 with 3-byte pixels does not fit, see `firmware/boards/README.md`); large long-lived objects (ArrivalTracker ~16 KB, StatsAggregator ~8 KB) are heap-allocated, never file-scope globals, because the ESP32's static .bss budget is separate from and much smaller than the heap; one
 TLS connection at a time; ArduinoJson documents sized from measured payloads (§4) with 25 %
-headroom; log free heap once per poll at `INFO`; refuse to start OTA if free heap < 60 KB.
+headroom; log free heap once per poll at `INFO`; refuse to start OTA below 16 KB of `MALLOC_CAP_8BIT`
+free with a 6 KB largest block (§2.1 - the byte-addressable heap, not `ESP.getFreeHeap()`).
 
 Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-15, with the §12 hardening, the full feature set uses 93.9 % on `cyd-3248S035R` and 93.7 % on the tightest board, `cyd-2432S024C` (~112 KB headroom); `firmware/README.md` ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
 
@@ -1402,7 +1472,10 @@ response is executed).
 
 ### 12.1 Memory posture (2026-09-14)
 The classic ESP32 has ~320 KB of DRAM and no PSRAM; with LVGL, Wi-Fi, the async web server and the
-feature set of §6 there is ~75-80 KB of heap free at runtime. Big long-lived objects are allocated
+feature set of §6 there is **~40-46 KB of usable heap free at runtime** (`MALLOC_CAP_8BIT`,
+restated 2026-09-16 - §2.1). The "~75-80 KB" this section carried until then was
+`ESP.getFreeHeap()`, which also counts the 33,708 B IRAM heap that `malloc()` never hands out for
+data; that figure is not wrong, it just is not memory anything here can use. Big long-lived objects are allocated
 before Wi-Fi, every large allocation is `nothrow`, proxied bodies stream through LittleFS, and
 `/api/state` answers 503 instead of a truncated document when it cannot be built. Known limit: four
 simultaneous `/api/state` requests can leave the last one as an empty HTTP 200 (the network stack's
@@ -1417,7 +1490,10 @@ into a boot loop. Rules: retention caps are small (32 feed updates, 32 vehicles)
 from a few entries instead of reserving the cap; `pollOnce()`, queued proxy/stats jobs and
 `PUT /api/config` catch `std::bad_alloc` and report "out of memory" (a failed poll with per-stop
 errors, or a 503) rather than resetting. Measured after the fix: heap ~54 KB minimum during a
-poll, largest block ~32 KB median. **Invariant:** every long-running task that does STL allocation catches
+poll, largest block ~32 KB median - that heap figure is `ESP.getFreeHeap()`, i.e. **~20 KB of
+byte-addressable heap** (§2.1), which is the number that explains why `/api/state` answers 503
+during a plain HTTP fetch; re-measured over 297 samples on 2026-09-16 the usable minimum is 5.7 KB
+with a median of 34.9 KB, and the largest block runs 2.9-47.1 KB, median 20.5 KB. **Invariant:** every long-running task that does STL allocation catches
 `std::bad_alloc` at its top level, because an uncaught throw is `std::terminate` = reboot. There
 are three: the poller task (net_poller.cpp, inner per-stop + outer cycle), the AsyncTCP web
 handlers (web_server.cpp `guarded()` + the JSON-body handlers, answering 503) and its chunked-response
@@ -1441,8 +1517,9 @@ request reboots the device. The device suite runs it. Known gap (2026-09-16, §2
 *first* throw allocates its per-thread `__cxa_eh_globals` with a plain `malloc` and terminates if
 that fails, which the pool does not cover, so on a fresh boot the proof itself aborted the device;
 warming every throwing task's exception globals at start is the fix, filed as its own task. The heavy read handlers (`/api/state`,
-`/api/config`) still refuse up front with a fixed-literal 503 when free heap is under
-`kMinHeavyResponseHeap` (24 KB) or the largest block under 8 KB - no longer because the failure
+`/api/config`) still refuse up front with a fixed-literal 503 when byte-addressable free heap is under
+`kMinHeavyResponseFree8` (12 KB, `MALLOC_CAP_8BIT` since 2026-09-16 - the 24 KB INTERNAL floor it
+replaced could never fire, §2.1) or the largest block under 8 KB - no longer because the failure
 would be uncatchable, but because a build that is going to fail costs CPU and heap the poller wants,
 and a 503 the client retries is the cheaper answer. The same handlers are zero-copy since the same
 date (`sendJsonStreamed()`): the finished document is moved into a holder a chunked response owns

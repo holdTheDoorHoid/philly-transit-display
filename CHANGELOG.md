@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Firmware updates over the web no longer get turned away while the display is busy, and the
+  memory figures the device reports are now the honest ones. The device has two kinds of free
+  memory: a region only usable in whole-word chunks, which nothing here can put a buffer or a
+  piece of text into, and the ordinary kind, which is what everything actually uses. Every safety
+  check and every number on screen had been counting both together, which made the device look
+  like it had 33 KB more room than it really had. Three consequences, all now fixed:
+  - **Updating over the web used to fail for no good reason.** On 2026-09-16 every attempt was
+    refused for ten minutes while the display was fetching arrivals, and plugging in a cable was
+    the only way through. The check was demanding a 16 KB run of free memory when the update
+    actually needs 4 KB, and its other half moved up and down with the arrival fetches. Measured
+    across 297 samples of normal operation, updates would have been refused 28% of the time
+    before, and 3% now - and the 3% that remain are moments when memory is genuinely tight, which
+    is what the check is for.
+  - **Two other safety checks had quietly not been running at all.** The ones protecting the
+    status page and the background statistics work were set to thresholds that the miscounted
+    figure could never fall below, so half of each check was dead. They now use the real number,
+    at levels worked out from what each job actually needs.
+  - **"Heap free" in the web app and on the device's own info page** now show the memory that can
+    really be used. Expect this to read about 33 KB lower than before; nothing got worse, the old
+    number was just counting memory that was never available. Anything reading the device's data
+    feed sees the original figure unchanged, with the honest one added alongside it.
 - HTTPS to the data sources (SEPTA, Open-Meteo, Indego), measured on the owner's board and kept
   as a prototype. A firmware built with `-DTRANSIT_HTTPS` (the `cyd-*-https` envs) asks for a
   verified, encrypted connection on every fetch, with each source pinned to its one root

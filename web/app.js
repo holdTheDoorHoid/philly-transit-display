@@ -94,6 +94,15 @@ function humanBytes(n) {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
+// Which of /api/state's heap numbers the "Heap free" tile shows. `heap_8bit` is the byte-addressable
+// heap - what a buffer, a string or a JSON document can actually be given - and is the honest one.
+// `heap` is ESP.getFreeHeap(), which on this chip also counts ~34 KB of 32-bit-word-only IRAM that
+// malloc() never hands out for data, so it reads about 34 KB high (DESIGN.md §2.1). Firmware from
+// before 2026-09-16 sends only `heap`; that build gets the old number rather than a blank tile,
+// which is the one case where showing the optimistic figure beats showing nothing.
+function heapFree(state) {
+  return state.heap_8bit != null ? state.heap_8bit : state.heap;
+}
 function slugify(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'stop';
 }
@@ -557,7 +566,7 @@ function renderStatusStrip(strip, state) {
     ['Wi-Fi', wifi.ssid ? `${wifi.ssid} (${wifi.rssi ?? '?'} dBm)` : 'Disconnected'],
     ['IP', wifi.ip || '--'],
     ['SD card', sd.mounted ? `${humanBytes((sd.free_mb || 0) * 1024 * 1024)} free` : 'Not mounted'],
-    ['Heap free', humanBytes(state.heap)],
+    ['Heap free', humanBytes(heapFree(state))],
     ['Last poll', lp.ok === false ? 'Failed' : fmtAgo(lp.age_s)],
     ['Uptime', fmtAgo(state.uptime)],
   ];
