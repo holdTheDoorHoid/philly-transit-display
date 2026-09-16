@@ -938,6 +938,16 @@ simultaneous `/api/state` requests can leave the last one as an empty HTTP 200 (
 send buffer, not the handler); the device stays up. Scripted clients should treat an empty 200 as a
 retry. See `firmware/README.md` "Memory and flash budget" for the numbers and the knobs.
 
+Addendum (2026-09-15): C++ exceptions are enabled in this SDK (`-fexceptions`), so a `std::vector`
+growth or `reserve()` that cannot get memory throws `std::bad_alloc`, and an uncaught throw is
+`std::terminate` = reboot. The largest free block between polls on the owner's board is only
+10-32 KB, so a cap-sized `reserve()` (a 64-update or 48-vehicle block is ~10 KB contiguous) turned
+into a boot loop. Rules: retention caps are small (32 feed updates, 32 vehicles) and vectors grow
+from a few entries instead of reserving the cap; `pollOnce()`, queued proxy/stats jobs and
+`PUT /api/config` catch `std::bad_alloc` and report "out of memory" (a failed poll with per-stop
+errors, or a 503) rather than resetting. Measured after the fix: heap ~54 KB minimum during a
+poll, largest block ~32 KB median.
+
 ## 13. Milestones
 
 - **M0** Repo, design, skeleton, CI that builds every env and runs host tests.
