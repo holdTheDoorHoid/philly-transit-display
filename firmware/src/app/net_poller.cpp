@@ -951,8 +951,21 @@ void pollerTask(void * /*arg*/) {
   for (;;) {
     // pollOnce() publishes the arrivals as soon as it has them and returns the deadline it set
     // for the next cycle (F12), so the interval is derived once, in the place that also budgets
-    // the optional work against it.
-    uint32_t deadline = pollOnce(consecutive_failures);
+    // the optional work against it. The whole cycle is wrapped as a backstop against std::bad_alloc:
+    // pollOnce() catches it around the arrival fetch itself (to set per-stop "out of memory"
+    // health), but the optional tail - route liveness, alerts, weather, bikes, SD logging - can
+    // also allocate, and with -fexceptions on an uncaught throw there is std::terminate = reboot
+    // (seen 2026-09-15: bad_alloc in fetchTransitViewEx from refreshRouteLiveness). Caught here it
+    // is just a short-retry failed cycle; if the heap is genuinely wedged the counter below reboots.
+    uint32_t deadline;
+    try {
+      deadline = pollOnce(consecutive_failures);
+    } catch (const std::bad_alloc &) {
+      Serial.printf("[net_poller] out of memory during the poll cycle (free %u, largest %u); short retry\n",
+                    (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+      consecutive_failures = std::min<uint32_t>(consecutive_failures + 1, 4);
+      deadline = millis() + 15000;
+    }
 
     // Wedge detection (see above): a failed poll while the largest free block is critically small.
     // getPollStatus() reflects what pollOnce() just published.
