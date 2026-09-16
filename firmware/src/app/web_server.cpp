@@ -1054,9 +1054,22 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["ticker"] = d.ticker;
     doc["rows"] = d.rows;
     doc["header_weather"] = d.header_weather;
+    // LVGL's static pool (lv_conf.h LV_MEM_SIZE), not the ESP heap. lv_total is what TLSF reports
+    // as usable; lv_max_used is the high-water since boot, the number that says whether a page
+    // cycle ever came close to the ceiling. lv_page_cost is what each page's last build took -
+    // main, night, stats, device - and lv_page_refusals counts the builds the pool would not take
+    // (the device stayed where it was instead; DESIGN.md SS8).
     doc["lv_used"] = d.lv_used;
     doc["lv_free"] = d.lv_free;
     doc["lv_max_used"] = d.lv_max_used;
+    doc["lv_total"] = d.lv_total;
+    doc["lv_frag_pct"] = d.lv_frag_pct;
+    doc["lv_page_refusals"] = d.page_refusals;
+    JsonObject costs = doc["lv_page_cost"].to<JsonObject>();
+    costs["main"] = d.page_cost[0];
+    costs["night"] = d.page_cost[1];
+    costs["stats"] = d.page_cost[2];
+    costs["device"] = d.page_cost[3];
     doc["hor_res"] = d.hor_res;
     doc["ver_res"] = d.ver_res;
     doc["heap"] = ESP.getFreeHeap();
@@ -1067,6 +1080,44 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     if (!requirePin(request)) return;  // it changes what the screen shows, so it is state-changing
     ui::requestTap();
     request->send(200, "application/json", "{\"ok\":true}");
+  });
+  // POST /api/debug/page?page=main|night|stats|device (or the same word as the whole body): drive
+  // the page cycle from the LAN without a finger on the panel. It exists because the LVGL pool is
+  // the one thing the native simulator cannot reproduce - firmware/sim builds with a 512 KB
+  // LV_MEM_SIZE for 64-bit pointers - so the peak a page transition reaches has to be measured on
+  // the hardware, and that needs thirty cycles, not thirty taps. ui::requestPage() only sets a
+  // flag the LVGL task reads in tick(); nothing here touches an lv_obj from the web server task.
+  g_server.on("/api/debug/page", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!requirePin(request)) return;  // it changes what the screen shows, like /api/debug/tap
+    std::string page;
+    if (request->hasParam("page")) {
+      page = request->getParam("page")->value().c_str();       // ?page=stats
+    } else if (request->hasParam("page", true)) {
+      page = request->getParam("page", true)->value().c_str();  // page=stats as a form field
+    } else if (request->_tempObject != nullptr) {
+      page = (const char *)request->_tempObject;                // a raw body, from the handler below
+    }
+    if (!ui::requestPage(page)) {
+      sendError(request, 400, "page must be main, night, stats or device", "page");
+      return;
+    }
+    request->send(200, "application/json", "{\"ok\":true}");
+  }, nullptr, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+    // A raw body ("stats"), which is what curl -d sends. It is only PARSED here - the PIN check
+    // lives in the handler above, which runs after this, and applying the page from an unchecked
+    // body would be an auth bypass. Short by construction, so one chunk is the only case worth
+    // handling; _tempObject is free()d with the request by ESPAsyncWebServer.
+    if (index != 0 || len != total || len == 0 || len > 16 || request->_tempObject != nullptr) return;
+    char *buf = (char *)malloc(len + 1);
+    if (buf == nullptr) return;
+    size_t n = 0;
+    for (size_t i = 0; i < len; i++) {
+      char c = (char)data[i];
+      if (c == '\n' || c == '\r' || c == ' ') continue;
+      buf[n++] = c;
+    }
+    buf[n] = '\0';
+    request->_tempObject = buf;
   });
   g_server.on("/api/debug/oom", HTTP_POST, handleDebugOom);  // SS12.1 exception-pool proof; PIN-gated
   g_server.on("/api/wifi/reset", HTTP_POST, handlePostWifiReset);

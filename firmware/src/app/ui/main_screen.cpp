@@ -30,6 +30,20 @@ namespace transit_app::ui {
 
 namespace {
 
+// LVGL pool the stop-panel loop must leave behind for the rest of the page: the Indego strip and
+// the alert ticker are built AFTER it, and the page still has to have room to rewrite its labels
+// once a second. Measured on cyd-3248S035R 2026-09-16 (the `[lvmem] panel ...` serial lines with
+// four stops configured): the tail after the last panel is MEASURED_TAIL B, and a three-row panel
+// is ~6.2 KB, so this reserve has to be big enough to stop a fifth panel and small enough to let a
+// fourth through. See the guard in createMainScreen().
+constexpr uint32_t kPanelTailReserve = 2048;
+
+uint32_t lvglPoolFree() {
+  lv_mem_monitor_t m;
+  lv_mem_monitor(&m);
+  return m.free_size;
+}
+
 struct RowWidgets {
   lv_obj_t *route_badge;
   lv_obj_t *destination;
@@ -238,7 +252,28 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   // ---- Stop panels (ui_common.h makePanelsArea/makePanel: the stats page uses the same) ----
   lv_obj_t *panels_area = makePanelsArea(screen);
 
+  // LVGL pool guard (ui.cpp's "LVGL pool safety" note, DESIGN.md SS8). DESIGN.md SS6 allows eight
+  // stops (config_store.h kMaxStops) and eight of these panels do not fit LVGL's 36 KB pool: on
+  // cyd-3248S035R a three-row panel measured ~6.2 KB and the whole four-stop arrivals page 31,656 B
+  // of a 36,864 B pool, so the fifth stop is already over. This page is the FIRST thing built, at
+  // boot, before anything has measured what it costs, so ui.cpp's remembered-cost check has nothing
+  // to check against - and LVGL 9.5 dereferences the result of a failed lv_realloc() rather than
+  // returning, so running the pool out here is a crash on power-up with the offending config still
+  // on disk: a boot loop the owner cannot get out of over the network. The guard therefore has to
+  // live inside the loop, where the pool can simply be looked at between panels. Stop while there
+  // is room, and say on the panel how many stops did not fit.
+  int dropped_panels = 0;
+  uint32_t panel_cost = 0;  // the largest panel built so far - measured on this board, not guessed
+
   for (const StopConfig &s : visibleStops(cfg, time(nullptr))) {
+    lv_mem_monitor_t pool;
+    lv_mem_monitor(&pool);
+    if (panel_cost != 0 && pool.free_size < panel_cost + kPanelTailReserve) {
+      dropped_panels++;  // keep counting: the caption below says how many
+      continue;
+    }
+    uint32_t pool_before = pool.free_size;
+
     PanelWidgets pw;
     pw.stop_key = s.key;
     pw.route = s.route;
@@ -311,6 +346,20 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     }
 
     ctx->panels.push_back(pw);
+
+    lv_mem_monitor(&pool);
+    uint32_t cost = pool_before > pool.free_size ? pool_before - pool.free_size : 0;
+    if (cost > panel_cost) panel_cost = cost;
+    Serial.printf("[lvmem] panel %s: %u B, pool free %u\n", s.key.c_str(), (unsigned)cost,
+                  (unsigned)pool.free_size);
+  }
+  if (dropped_panels > 0) {
+    Serial.printf("[lvmem] %d stop panel(s) left off the arrivals page: %u B free, a panel costs %u B\n",
+                  dropped_panels, (unsigned)lvglPoolFree(), (unsigned)panel_cost);
+    lv_obj_t *note = makeLabel(panels_area, fontSmall(h), colorLate());
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_text_fmt(note, "%d more stop%s will not fit in this display's memory",
+                          dropped_panels, dropped_panels == 1 ? "" : "s");
   }
 
   // ---- Indego section (only shown when bike_service has stations) ----

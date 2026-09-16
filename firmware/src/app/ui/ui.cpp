@@ -36,10 +36,17 @@ transit::Snapshot currentSnapshot() {
 #endif
 }
 
+// The four pages, of which exactly one is ever built (see the pool note above buildSlot()).
 lv_obj_t *g_main_screen = nullptr;
 lv_obj_t *g_night_screen = nullptr;
 lv_obj_t *g_stats_screen = nullptr;
 lv_obj_t *g_device_info_screen = nullptr;
+// An empty screen that owns nothing, built once at init() and never freed. Every transition parks
+// on it so the page being left can be deleted BEFORE the next one is built - LVGL refuses to
+// delete the active screen (it warns and nulls act_scr), and building first is exactly the peak
+// this rework exists to remove. It also carries the one message below.
+lv_obj_t *g_parking_screen = nullptr;
+lv_obj_t *g_parking_label = nullptr;
 lv_obj_t *g_wifi_setup_screen = nullptr;
 lv_obj_t *g_wifi_setup_ssid_label = nullptr;
 lv_obj_t *g_wifi_setup_pass_label = nullptr;
@@ -59,6 +66,14 @@ int g_applied_brightness = -1;
 std::vector<std::string> g_shown_keys;  // stops the arrivals page shows (profiles.h), per build
 bool g_due_active = false;
 volatile bool g_tap_requested = false;
+// Page change queued from off the LVGL task (POST /api/debug/page) or from a screen's own event
+// handler (the tap). -1 = nothing queued. Applied by applyPendingPage(), never by the setter:
+// building or deleting an lv_obj from the web task, or deleting a screen from inside its own
+// event, is a crash either way.
+volatile int g_pending_page = -1;
+uint32_t g_page_refusals = 0;  // builds the pool could not take (GET /api/debug/ui)
+bool g_pool_tight = false;     // the page that is up left under kPageRuntimeHeadroom free
+bool g_stalled = false;        // parked on the message screen; only a tap or a config change retries
 UiDebug g_debug;  // written at the end of tick() under g_pending_mutex, read by the web task
 
 // Config handed over from another task (web server); applied on the LVGL task in tick().
@@ -83,44 +98,261 @@ void attachTapHandlers(lv_obj_t *scr) {
   lv_obj_add_event_cb(scr, onScreenTapped, LV_EVENT_CLICKED, nullptr);
 }
 
-// Deletes a page that may not exist. Async because the caller is usually the page's own
-// LV_EVENT_CLICKED handler (onScreenTapped): LVGL frees it on the next lv_timer_handler() pass,
-// after the event has fully unwound, instead of underneath it.
-void dropPage(lv_obj_t *&scr) {
+// ---------------------------------------------------------------------------
+// LVGL pool safety (DESIGN.md SS8 "one page at a time")
+//
+// LVGL allocates every widget from its own static pool - LV_MEM_SIZE in lv_conf.h, 36 KB of .bss,
+// ~33 KB usable once its TLSF control block is out - and NOT from the ESP heap. `lv_free` in
+// GET /api/debug/ui is what is left of that.
+//
+// LVGL 9.5 cannot survive lv_malloc() returning NULL in the middle of a build. lv_obj_class.c's
+// create path does
+//     parent->spec_attr->children = lv_realloc(...);
+//     parent->spec_attr->children[child_cnt - 1] = obj;
+// with no check on the realloc, so an exhausted pool is a NULL dereference; the LV_ASSERT_MALLOC
+// sites that do check it hit LV_ASSERT_HANDLER instead, which this project routes through
+// lv_assert_hook.cpp. Either way the device reboots in the owner's living room, on a tap. There
+// is no "handle the allocation failure" answer available from outside LVGL - the only defence is
+// never to start a build that cannot fit. Hence:
+//
+//   * exactly ONE page is resident. Every transition parks on g_parking_screen, deletes the page
+//     it is leaving, and only then builds the next one. Before this rework the switch built the
+//     next page first, so Main -> Stats peaked at main + night + stats all resident at once.
+//   * only one of the arrivals page and the night clock exists at a time. The flip happens at
+//     most a couple of times a day (when the evening's last bus goes out of range) and costs one
+//     rebuild; keeping both costs the night page's share of the pool around the clock.
+//   * every successful build records what it cost (g_page_cost), and a later build of the same
+//     page is refused unless the pool still has that much (plus kRebuildSlack). A page is always
+//     built into a pool that has just been emptied, so the first build is the best attempt that
+//     will ever be made: if it does not fit then, nothing would have made it fit. What the
+//     remembered cost catches is creep - a page that grows or leaks run over run - which a fixed
+//     floor cannot see, and it self-calibrates per board and per stop count with no magic number.
+//   * a refused build shows a readable message instead of a blank panel or a crash, logs one
+//     [lvmem] line, and is counted in GET /api/debug/ui as `page_refusals`.
+//
+// What the check deliberately does NOT do is reserve runtime headroom on top of the build cost.
+// It was written that way first and it locked the owner out of their own arrivals page: with four
+// stops configured that page measures 31,656 B of a 36,864 B pool on cyd-3248S035R, so demanding
+// cost + 3 KB refused a page that had been resident seconds earlier and left the device parked on
+// the device info screen (measured 2026-09-16: three refusals in three cycles). A page that fits
+// is built. Whether it leaves a comfortable margin afterwards is a different question, answered
+// by the kPageRuntimeHeadroom warning - and by main_screen.cpp's panel guard, which is what stops
+// a configuration too big for the pool from ever being built in the first place.
+// ---------------------------------------------------------------------------
+
+// The night clock gets its own accounting slot even though it shares Page::Main with the arrivals
+// page: they are separately built and separately sized.
+enum PageSlot { kSlotMain = 0, kSlotNight, kSlotStats, kSlotDevice, kSlotCount };
+const char *const kSlotName[kSlotCount] = {"main", "night", "stats", "device"};
+uint32_t g_page_cost[kSlotCount] = {0, 0, 0, 0};
+
+// What a built page wants left over while it is up: lv_label_set_text() reallocates its text
+// buffer on every change, and the ticker's lv_anim and lv_async_call records come out of the same
+// pool. Measured churn across a full page cycle is ~400 B with two stops. This is a WARNING
+// threshold, not a reservation - see the note above.
+constexpr uint32_t kPageRuntimeHeadroom = 3 * 1024;
+
+// Slack on the rebuild check, to absorb the difference in TLSF per-block overhead between the
+// build that measured the cost and this one. Small on purpose: the check is about creep.
+constexpr uint32_t kRebuildSlack = 512;
+
+uint32_t poolFreeBytes() {
+  lv_mem_monitor_t m;
+  lv_mem_monitor(&m);
+  return m.free_size;
+}
+
+// Re-reads the palette into the parking screen (ui_common.h setTheme()); called again from
+// rebuildScreens() so a theme change reaches it like every other screen.
+void applyParkingStyle() {
+  if (g_parking_screen == nullptr) return;
+  lv_obj_set_style_bg_color(g_parking_screen, colorBg(), 0);
+  lv_obj_set_style_bg_opa(g_parking_screen, LV_OPA_COVER, 0);
+  if (g_parking_label == nullptr) return;
+  int32_t w, h;
+  screenSize(w, h);
+  lv_obj_set_style_text_color(g_parking_label, colorText(), 0);
+  lv_obj_set_style_text_font(g_parking_label, fontBody(h), 0);
+}
+
+// Built once, before any page, and never freed - it has to exist at the moment the pool is too
+// full for anything else, which is not a moment at which to allocate. ~200 B of pool, against the
+// ~20 KB a page costs. Its label is the one thing this UI can say when a page will not fit; a tap
+// on it retries, and the web UI stays up so the stop list can be shortened from a phone.
+void buildParkingScreen() {
+  if (g_parking_screen != nullptr) return;
+  int32_t w, h;
+  screenSize(w, h);
+  g_parking_screen = lv_obj_create(nullptr);
+  lv_obj_set_size(g_parking_screen, w, h);
+  lv_obj_set_style_border_width(g_parking_screen, 0, 0);
+  lv_obj_set_style_pad_all(g_parking_screen, 12, 0);
+  lv_obj_remove_flag(g_parking_screen, LV_OBJ_FLAG_SCROLLABLE);
+  g_parking_label = lv_label_create(g_parking_screen);
+  lv_obj_set_width(g_parking_label, lv_pct(96));
+  lv_obj_center(g_parking_label);
+  lv_label_set_long_mode(g_parking_label, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(g_parking_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(g_parking_label, "Not enough display memory for this page.\n\nShow fewer stops in Settings, then tap the screen.");
+  lv_obj_add_flag(g_parking_label, LV_OBJ_FLAG_HIDDEN);
+  attachTapHandlers(g_parking_screen);
+  applyParkingStyle();
+}
+
+// Deletes a page synchronously and clears the pointer. Safe ONLY when the caller is not inside
+// that screen's own event handler and the screen is not the active one - which is what parking
+// on g_parking_screen first guarantees. Every caller goes through parkAndDropPages().
+void deletePageNow(lv_obj_t *&scr) {
   if (scr == nullptr) return;
-  lv_obj_delete_async(scr);
-  scr = nullptr;
+  lv_obj_t *doomed = scr;
+  scr = nullptr;  // cleared first: the LV_EVENT_DELETE handlers run inside lv_obj_delete()
+  lv_obj_delete(doomed);
 }
 
-// Only the two pages that can be up without a tap are resident. The stats and device pages are
-// built when tapped to and freed when tapped away from: with stat tiles and the Network/Device
-// panels they are ~30 objects each, and LVGL's pool is 36 KB (lv_conf.h) of which the arrivals
-// page alone takes ~20 KB with the owner's two stops. Keeping all four resident left ~3 KB
-// for label text updates and the blank screen a rebuild loads; a config change with four stops
-// configured would not have fit at all. Building on demand costs a few ms on the tap.
-void buildScreens() {
-  g_active_profile = activeProfileIndex(g_cfg, time(nullptr));
-  g_shown_keys.clear();
-  for (const transit::StopConfig &s : visibleStops(g_cfg, time(nullptr))) g_shown_keys.push_back(s.key);
-  g_main_screen = createMainScreen(g_cfg);
-  g_night_screen = createNightScreen(g_cfg);
-  g_stats_screen = nullptr;
-  g_device_info_screen = nullptr;
-  attachTapHandlers(g_main_screen);
-  attachTapHandlers(g_night_screen);
+// Loads the parking screen and frees every page. After this the pool holds nothing but the
+// parking screen, so whatever is built next gets the whole pool.
+void parkAndDropPages() {
+  if (g_parking_screen != nullptr && lv_screen_active() != g_parking_screen) {
+    lv_screen_load(g_parking_screen);
+  }
+  deletePageNow(g_main_screen);
+  deletePageNow(g_night_screen);
+  deletePageNow(g_stats_screen);
+  deletePageNow(g_device_info_screen);
 }
 
-// Loads the arrivals page or the night clock, whichever the data calls for (Page::Main only).
-void showMainOrNight(const transit::Snapshot &snap) {
+// Builds one page into the (just emptied) pool and gives it its first refresh, so the cost
+// recorded includes the real label text and not the placeholders create*Screen() leaves. Returns
+// nullptr, having built nothing, when the pool cannot be trusted to take it.
+lv_obj_t *buildSlot(PageSlot slot, const transit::Snapshot &snap) {
+  uint32_t before = poolFreeBytes();
+  uint32_t known = g_page_cost[slot];
+  if (known != 0 && before < known + kRebuildSlack) {
+    g_page_refusals++;
+    Serial.printf("[lvmem] refused to build %s: %u B free, last build cost %u B\n",
+                  kSlotName[slot], (unsigned)before, (unsigned)known);
+    return nullptr;
+  }
+  lv_obj_t *scr = nullptr;
+  switch (slot) {
+    case kSlotMain:
+      scr = createMainScreen(g_cfg);
+      if (scr != nullptr) refreshMainScreen(scr, g_cfg, snap);
+      break;
+    case kSlotNight:
+      scr = createNightScreen(g_cfg);
+      if (scr != nullptr) refreshNightScreen(scr, g_cfg, snap);
+      break;
+    case kSlotStats:
+      scr = createStatsScreen(g_cfg);
+      if (scr != nullptr) refreshStatsScreen(scr);
+      break;
+    case kSlotDevice:
+      scr = createDeviceInfoScreen(g_cfg);
+      if (scr != nullptr) refreshDeviceInfoScreen(scr);
+      break;
+    default:
+      break;
+  }
+  if (scr == nullptr) {
+    g_page_refusals++;
+    Serial.printf("[lvmem] %s did not build (pool free %u)\n", kSlotName[slot], (unsigned)poolFreeBytes());
+    return nullptr;
+  }
+  attachTapHandlers(scr);
+  uint32_t after = poolFreeBytes();
+  uint32_t cost = before > after ? before - after : 0;
+  if (cost > g_page_cost[slot]) g_page_cost[slot] = cost;
+  g_pool_tight = after < kPageRuntimeHeadroom;
+  Serial.printf("[lvmem] built %s: %u B, pool free %u%s\n", kSlotName[slot], (unsigned)cost,
+                (unsigned)after, g_pool_tight ? "  ** tight: under 3 KB left for text updates **" : "");
+  return scr;
+}
+
+// Parks and shows the one message this UI has for "the pool would not take the page". Better than
+// a blank panel: the web UI is still up, so the owner can shorten the stop list from their phone.
+void showPoolMessage() {
+  g_stalled = true;
+  if (g_parking_screen == nullptr) return;
+  if (lv_screen_active() != g_parking_screen) lv_screen_load(g_parking_screen);
+  if (g_parking_label != nullptr) lv_obj_remove_flag(g_parking_label, LV_OBJ_FLAG_HIDDEN);
+}
+
+void hidePoolMessage() {
+  g_stalled = false;
+  if (g_parking_label != nullptr) lv_obj_add_flag(g_parking_label, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Loads the arrivals page or the night clock, whichever the data calls for (Page::Main only),
+// building it and freeing the other if the answer changed. Returns false when neither would fit.
+bool showMainOrNight(const transit::Snapshot &snap) {
   bool night = nightConditionMet(g_cfg, snap, g_shown_keys, (transit::Epoch)time(nullptr));
+  if ((night ? g_night_screen : g_main_screen) == nullptr) {
+    parkAndDropPages();
+    lv_obj_t *built = buildSlot(night ? kSlotNight : kSlotMain, snap);
+    if (built == nullptr && night) {
+      // Fall back to the arrivals page: "here is what we know" beats a blank clock, and it is the
+      // page the owner expects to find on the wall.
+      night = false;
+      built = buildSlot(kSlotMain, snap);
+    }
+    if (built == nullptr) return false;
+    if (night) g_night_screen = built; else g_main_screen = built;
+  }
   lv_obj_t *want = night ? g_night_screen : g_main_screen;
   if (lv_screen_active() != want) lv_screen_load(want);
   g_night = night;
-  if (night) {
-    refreshNightScreen(g_night_screen, g_cfg, snap);
-  } else {
-    refreshMainScreen(g_main_screen, g_cfg, snap);
+  return true;
+}
+
+// Builds and loads whatever g_page says, assuming the pool has already been emptied for it.
+bool showCurrentPage(const transit::Snapshot &snap) {
+  switch (g_page) {
+    case Page::Stats:
+      if (g_stats_screen == nullptr) g_stats_screen = buildSlot(kSlotStats, snap);
+      if (g_stats_screen == nullptr) return false;
+      if (lv_screen_active() != g_stats_screen) lv_screen_load(g_stats_screen);
+      return true;
+    case Page::DeviceInfo:
+      if (g_device_info_screen == nullptr) g_device_info_screen = buildSlot(kSlotDevice, snap);
+      if (g_device_info_screen == nullptr) return false;
+      if (lv_screen_active() != g_device_info_screen) lv_screen_load(g_device_info_screen);
+      return true;
+    case Page::Main:
+    default:
+      return showMainOrNight(snap);
   }
+}
+
+// The one place the visible page changes. NEVER call it from a screen's own event handler: it
+// deletes the screen that event belongs to, which is a use-after-free. onScreenTapped() defers it
+// through lv_async_call() and the web hook leaves it to tick(); both run after the event unwound.
+void loadPage(Page target) {
+  transit::Snapshot snap = currentSnapshot();
+  parkAndDropPages();
+  hidePoolMessage();
+  g_page = target;
+  if (showCurrentPage(snap)) return;
+  // Refused. Fall back to the ARRIVALS page, never to the page we came from. The arrivals page is
+  // the product; Stats and Device info are places you visit. Falling back to wherever we happened
+  // to be would let a tap strand the display on a secondary page - which is exactly what a wrong
+  // headroom constant did on 2026-09-16: with four stops configured the device cycled
+  // stats -> device -> (main refused) -> device for as long as it was tapped, and the arrivals
+  // page, the whole point of the thing, became unreachable. A refused page returns you home.
+  if (target != Page::Main) {
+    Serial.println("[lvmem] page refused - going back to the arrivals page");
+    g_page = Page::Main;
+    if (showCurrentPage(snap)) return;
+  }
+  showPoolMessage();
+}
+
+// Recomputes the profile and the visible stop list. Both feed the page builders, so this runs
+// before anything is built.
+void refreshShownKeys() {
+  g_active_profile = activeProfileIndex(g_cfg, time(nullptr));
+  g_shown_keys.clear();
+  for (const transit::StopConfig &s : visibleStops(g_cfg, time(nullptr))) g_shown_keys.push_back(s.key);
 }
 
 // DESIGN.md SS6 "quiet": backlight schedule with wake-on-touch. Returns true while dimmed.
@@ -144,22 +376,18 @@ bool applyQuietHours() {
   return dim;
 }
 
-// Tears down and recreates every screen (rotation, theme, ticker or stop list changed). A blank
-// screen is loaded first because LVGL will not delete the active screen. Each screen frees its
-// own context struct from an LV_EVENT_DELETE handler.
+// Tears down and rebuilds the visible page (rotation, theme, ticker or stop list changed). Each
+// screen frees its own context struct from an LV_EVENT_DELETE handler. The remembered build costs
+// are dropped with it: a config change is exactly the thing that makes a page a different size,
+// and carrying a four-stop cost into a two-stop configuration would refuse builds that fit.
 void rebuildScreens() {
-  lv_obj_t *blank = lv_obj_create(nullptr);
-  lv_obj_set_style_bg_color(blank, colorBg(), 0);
-  lv_obj_set_style_bg_opa(blank, LV_OPA_COVER, 0);
-  lv_screen_load(blank);
-  if (g_main_screen) lv_obj_delete(g_main_screen);
-  if (g_night_screen) lv_obj_delete(g_night_screen);
-  if (g_stats_screen) lv_obj_delete(g_stats_screen);
-  if (g_device_info_screen) lv_obj_delete(g_device_info_screen);
-  buildScreens();
+  parkAndDropPages();
+  hidePoolMessage();
+  for (uint32_t &c : g_page_cost) c = 0;
+  applyParkingStyle();
+  refreshShownKeys();
   g_page = Page::Main;
-  showMainOrNight(currentSnapshot());
-  lv_obj_delete(blank);
+  if (!showCurrentPage(currentSnapshot())) showPoolMessage();
 }
 
 void onScreenPressed(lv_event_t *e) {
@@ -174,36 +402,40 @@ void onScreenPressed(lv_event_t *e) {
   }
 }
 
+// DESIGN.md SS8: Main -> Stats -> Device info -> Main.
+Page nextPage(Page p) {
+  switch (p) {
+    case Page::Main: return Page::Stats;
+    case Page::Stats: return Page::DeviceInfo;
+    default: return Page::Main;
+  }
+}
+
+// Runs the queued page change, from anywhere that is NOT inside a screen's own event handler.
+void applyPendingPage() {
+  int want = g_pending_page;
+  if (want < 0) return;
+  g_pending_page = -1;
+  loadPage((Page)want);
+}
+
+void pageChangeAsyncCb(void *) {
+  applyPendingPage();
+}
+
 void onScreenTapped(lv_event_t *e) {
   (void)e;
   if (g_swallow_click) {
     g_swallow_click = false;
     return;
   }
-  // Each step builds the next page, loads it (lv_screen_load with no animation switches at once,
-  // so the page we came from is no longer active), then drops the page we came from.
-  switch (g_page) {
-    case Page::Main:
-      g_page = Page::Stats;
-      g_stats_screen = createStatsScreen(g_cfg);
-      attachTapHandlers(g_stats_screen);
-      lv_screen_load(g_stats_screen);
-      refreshStatsScreen(g_stats_screen);
-      break;
-    case Page::Stats:
-      g_page = Page::DeviceInfo;
-      g_device_info_screen = createDeviceInfoScreen(g_cfg);
-      attachTapHandlers(g_device_info_screen);
-      lv_screen_load(g_device_info_screen);
-      refreshDeviceInfoScreen(g_device_info_screen);
-      dropPage(g_stats_screen);
-      break;
-    case Page::DeviceInfo:
-      g_page = Page::Main;
-      showMainOrNight(currentSnapshot());
-      dropPage(g_device_info_screen);
-      break;
-  }
+  // The transition deletes this screen, so it cannot run here - the event is still unwinding
+  // through the object it would free. Queue it and let lv_async_call() run it on the next
+  // lv_timer_handler() pass, which is the same few-millisecond deferral lv_obj_delete_async()
+  // uses and is imperceptible on a tap. lv_async_call() takes ~24 B of the pool; if even that is
+  // gone it fails, and the flag stays set for tick() to pick up within the second.
+  g_pending_page = (int)nextPage(g_page);
+  lv_async_call(pageChangeAsyncCb, nullptr);
 }
 
 }  // namespace
@@ -213,10 +445,10 @@ void init(const Config &cfg) {
   setTheme(g_cfg.device.theme);
   if (g_pending_mutex == nullptr) g_pending_mutex = xSemaphoreCreateMutex();
 
-  buildScreens();
-
+  buildParkingScreen();
+  refreshShownKeys();
   g_page = Page::Main;
-  showMainOrNight(currentSnapshot());
+  if (!showCurrentPage(currentSnapshot())) showPoolMessage();
   g_initialized = true;
 }
 
@@ -372,41 +604,72 @@ void tick() {
     onScreenPressed(nullptr);
     onScreenTapped(nullptr);
   }
+  // POST /api/debug/page, and the tap above if lv_async_call() could not take it. We are on the
+  // LVGL task and not inside any screen's event handler, so the transition is safe here.
+  applyPendingPage();
 
   bool dimmed = applyQuietHours();
   transit::Snapshot snap = currentSnapshot();
   g_due_active = dueAlertTick(g_cfg, snap, g_shown_keys, dimmed, (transit::Epoch)time(nullptr));
 
-  switch (g_page) {
-    case Page::Main:
-      showMainOrNight(snap);
-      break;
-    case Page::DeviceInfo:
-      refreshDeviceInfoScreen(g_device_info_screen);
-      break;
-    case Page::Stats:
-      // Stats are a 30-day rollup (DESIGN.md SS8); no need to re-stream the SD card at the same
-      // ~1Hz cadence as the live arrivals screen. getStopSummary() answers from a cache the poller refreshes (10 min, never blocking this task)
-      // (net_poller.cpp), so this just re-reads that cache while the page is visible.
-      refreshStatsScreen(g_stats_screen);
-      break;
+  // Parked on the message screen: a build was refused and nothing has changed since. Retrying it
+  // every second would just be the same refusal (or, for a page never built, the same crash) at
+  // 1 Hz. A tap or a config change clears it.
+  if (!g_stalled) {
+    switch (g_page) {
+      case Page::Main:
+        // Also flips between the arrivals page and the night clock, rebuilding whichever the data
+        // now calls for - only one of the two is ever resident.
+        if (!showMainOrNight(snap)) {
+          showPoolMessage();
+        } else if (g_night) {
+          refreshNightScreen(g_night_screen, g_cfg, snap);
+        } else {
+          refreshMainScreen(g_main_screen, g_cfg, snap);
+        }
+        break;
+      case Page::DeviceInfo:
+        if (g_device_info_screen != nullptr) refreshDeviceInfoScreen(g_device_info_screen);
+        break;
+      case Page::Stats:
+        // Stats are a 30-day rollup (DESIGN.md SS8); no need to re-stream the SD card at the same
+        // ~1Hz cadence as the live arrivals screen. getStopSummary() answers from a cache the poller refreshes (10 min, never blocking this task)
+        // (net_poller.cpp), so this just re-reads that cache while the page is visible.
+        if (g_stats_screen != nullptr) refreshStatsScreen(g_stats_screen);
+        break;
+    }
   }
 
   UiDebug d;
-  d.page = g_page == Page::Stats ? "stats" : g_page == Page::DeviceInfo ? "device" : (g_night ? "night" : "main");
+  d.page = g_stalled ? "stalled"
+           : g_page == Page::Stats ? "stats"
+           : g_page == Page::DeviceInfo ? "device"
+                                        : (g_night ? "night" : "main");
   d.dimmed = dimmed;
   d.brightness = g_applied_brightness;
   d.due_active = g_due_active;
   d.chimes = dueChimesPlayed();
   d.active_profile = g_active_profile >= 0 && (size_t)g_active_profile < g_cfg.profiles.size() ? g_cfg.profiles[(size_t)g_active_profile].name : "";
   d.shown_stops = g_shown_keys;
-  mainScreenDebug(g_main_screen, d.hidden_panels, d.ticker, d.rows);
+  if (g_main_screen != nullptr) {
+    mainScreenDebug(g_main_screen, d.hidden_panels, d.ticker, d.rows);
+  }
   d.header_weather = g_cfg.weather.enabled ? headerWeatherText() : "";
   lv_mem_monitor_t m;
   lv_mem_monitor(&m);
   d.lv_used = m.total_size - m.free_size;
   d.lv_free = m.free_size;
   d.lv_max_used = m.max_used;
+  // LV_MEM_SIZE, not lv_mem_monitor's total_size: the monitor walks the pool and sums the BLOCKS
+  // it finds, so its total shrinks as fragmentation adds per-block TLSF headers (33,264 on a
+  // freshly built arrivals page, 34,416 a page change later - a moving ceiling is useless to
+  // compare a high-water mark against). lv_used + lv_free therefore falls a little short of
+  // lv_total, and that difference is TLSF's own overhead.
+  d.lv_total = LV_MEM_SIZE;
+  d.lv_frag_pct = m.frag_pct;
+  d.page_refusals = g_page_refusals;
+  d.pool_tight = g_pool_tight;
+  for (int i = 0; i < kSlotCount; i++) d.page_cost[i] = g_page_cost[i];
   lv_display_t *disp = lv_display_get_default();
   d.hor_res = lv_display_get_horizontal_resolution(disp);
   d.ver_res = lv_display_get_vertical_resolution(disp);
@@ -418,7 +681,10 @@ void tick() {
 
 UiDebug debugSnapshot() {
   UiDebug d;
-  if (g_pending_mutex && xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+  // 500 ms, not 200: this is how the device suite watches the panel, including while the UI task
+  // is mid-rebuild and holding core 1, and a timeout here answers a default-constructed UiDebug -
+  // an all-zero pool reading that looks like data. Seen intermittently at 200 ms on 2026-09-16.
+  if (g_pending_mutex && xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
     d = g_debug;
     xSemaphoreGive(g_pending_mutex);
   }
@@ -427,6 +693,24 @@ UiDebug debugSnapshot() {
 
 void requestTap() {
   g_tap_requested = true;
+}
+
+bool requestPage(const std::string &name) {
+  // Queued exactly like requestTap(): a volatile int the LVGL task picks up in tick(). Nothing
+  // here touches an lv_obj - building or freeing one from the web server task is a crash, and
+  // the whole point of this hook is to exercise the pool safely.
+  int want;
+  if (name == "main" || name == "night") {
+    want = (int)Page::Main;  // "night" is Page::Main; the data decides which of the two is built
+  } else if (name == "stats") {
+    want = (int)Page::Stats;
+  } else if (name == "device") {
+    want = (int)Page::DeviceInfo;
+  } else {
+    return false;
+  }
+  g_pending_page = want;
+  return true;
 }
 
 bool consumeTap() {
