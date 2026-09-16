@@ -224,8 +224,10 @@ the poller's idle slice needs 16 KB free and a 12,020 B block for its ~8 KB `Sta
 
 **The block figures look arbitrary on purpose.** `heap_caps_get_largest_free_block()` returns values
 on a 512-byte lattice at offset 500 (`500 + 512k` - all 24 distinct values measured here fit it
-exactly), so a threshold written as a round `m * 1024` lands 12 B above a lattice point: a device
-resting there is refused by a hair while the next value up clears by 1,012 B. That is exactly how
+exactly), and **any multiple of 512 lands exactly 12 B above a lattice point, because 512 - 500 =
+12**: a device resting there is refused by a hair while the next value up clears by 1,012 B. Note
+this catches more than round kilobytes - 5,632, 7,680 and 11,776 are all multiples of 512 and all
+equally bad. That is exactly how
 the old 16,384 B OTA gate locked out a board resting at 16,372. 5,876 / 7,924 / 12,020 are
 `756 + 512k`, i.e. mid-gap, 256 B from either neighbour. Do not "tidy" them to round kilobytes. Before that
 they compared INTERNAL free against thresholds that only meant something in 8-bit terms, and two of

@@ -327,13 +327,18 @@ a threshold placed on a lattice boundary.
 
 **`heap_caps_get_largest_free_block()` returns values on a 512-byte lattice at offset 500.** Every
 one of 24 distinct values measured here fits `500 + 512k` exactly, and two other agents confirmed
-the same structure independently across four images on separate captures. A threshold written as a
-round `m * 1024` therefore lands **exactly 12 B above a lattice point** - the worst placement
-available. A build resting on that point is refused by a hair, while the next lattice value up
-clears by 1,012 B. So a "narrow miss" against a round-KB gate is *always* a 12-byte miss; it is
-never a comfortable margin, because the nearest failing value below is 1,036 B short. Nothing about
-v0.2.0's twelve bytes is accidental, and calling it a coin toss (as an earlier draft of this section
-did) gets the mechanism backwards.
+the same structure independently - 22 of 25 and 27 of 30 distinct values on separate captures across
+four images, the misses in every set being deep mid-poll readings.
+
+The rule that follows is one line of arithmetic, and it is more general than "avoid round
+kilobytes": **any multiple of 512 sits exactly 12 B above a lattice point, because 512 - 500 = 12.**
+The point below `512m` is `500 + 512(m-1)` = `512m - 12`, for every m. Verified exhaustively over
+`512m` from 1,024 to 19,968: the margin is 12 B every single time, never more, never less. So a
+build resting on a lattice point is refused by a hair while the next value up clears by 1,012 B, and
+a "narrow miss" against such a threshold is *always* a 12-byte miss - never a comfortable margin,
+because the nearest failing value below is 1,036 B short. Nothing about v0.2.0's twelve bytes is
+accidental, and calling it a coin toss (as an earlier draft of this section did) gets the mechanism
+backwards.
 
 All four round thresholds in play had it, with the bottom two observed at rest on real devices:
 
@@ -352,11 +357,25 @@ above what its path allocates (1.43x, 2.76x and 1.47x respectively); they needed
 boundary.
 
 Note that `m * 1024 - 512` does **not** fix this, which is worth stating because it is the obvious
-correction and it was the first one proposed: 5,632 sits 12 B above 5,620, reproducing the pathology
-one residue over. Seen through a 1024-byte window the lattice looks like two families at `+1012` and
-`+500`; it is one 512-byte lattice, and only a mid-gap value escapes both.
+correction and it was the first one proposed: 5,632, 7,680 and 11,776 are themselves multiples of
+512, so they sit 12 B above 5,620, 7,668 and 11,764 respectively - the same pathology one residue
+over. That correction only looks mid-gap under a two-family model of the lattice, which is what a
+1024-byte window shows you: `500 + 512(2j)` has residue 500 mod 1024 and `500 + 512(2j+1)` has
+residue 1012, odd and even terms of one sequence seen through a window twice its period. Inferring
+a period from too narrow a window is the actual error here, and it is worth naming because the
+mid-gap calculation depends on exactly that quantity.
 
-The free-size thresholds are unaffected: `free8` is a sum over every free block and does not lattice.
+The free-size thresholds are unaffected: `free8` is a sum over every free block, not one contiguous
+run, and it does not lattice. Checked rather than assumed - 128 distinct `free8` values from serial
+captures are 4-byte aligned and nothing more, with 81 distinct residues mod 512 and 107 mod 1024.
+So `kMinOtaFree8`, `kMinHeavyResponseFree8` and `kIdleWorkMinFree8` stay where their allocation
+derivations put them.
+
+**Known gap:** four readings across two independent sample sets do not fit the lattice - 2,932 here,
+and 1,396 / 4,340 / 5,876 elsewhere. All four are deep mid-poll values taken while the heap is
+actively churning, and none is a resting value, but that is exactly when a gate may be consulted.
+The lattice is a reliable description of resting behaviour and an incomplete one under churn, so do
+not assume a mid-poll refusal lands on a lattice point.
 
 None of this should be over-read as "shipped devices are lockable". It is one configuration,
 measured. What it does establish is that a *different* configuration resting one lattice point lower
