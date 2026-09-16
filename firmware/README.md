@@ -12,7 +12,7 @@ export PATH="$HOME/.platformio/penv/bin:$PATH"
 cd firmware
 pio run -e cyd-3248S035R        # the owner's board; see platformio.ini for the other envs
 pio run -e cyd-3248S035R-https  # the same board with the HTTPS prototype compiled in (DESIGN.md §2.1)
-pio test -e native              # transit_core + transit_stats host tests (173 cases)
+pio test -e native              # transit_core + transit_stats + poller-liveness host tests (184 cases)
 pio run -e ui-sim               # host screenshot simulator (sim/README.md)
 pio run -e ui-sim-pool          # the same, with LVGL's pool scaled to the board's (DESIGN.md §8)
 ```
@@ -87,6 +87,8 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 
 | Build (`cyd-3248S035R`) | Flash | Static RAM |
 |---|---:|---:|
+| 2026-09-16 poller-liveness net (the cycle stamp, the display-loop check, `last_restart` + `last_poll.since_s` on `/api/state`), on top of `next` at 2f48828 | 1,856,922 B (97.7 %) | 95,868 B |
+| The same `next` (2f48828) without it — the baseline that delta is measured against | 1,855,442 B (97.6 %) | 95,836 B |
 | 2026-09-16 LVGL pool safety (one page resident at a time, the panel guard, the `/api/debug/page` hook and the pool fields on `/api/debug/ui`, the logged assert handler) | 1,847,562 B (97.2 %) | 95,732 B |
 | 2026-09-16 screen pass (phone-style Wi-Fi bars, stats page with the on-time meter in three layouts, device page with SEPTA/SD health and the Data sources card, stats+device built on demand) on top of the exception pool and streamed `/api/state` | 1,840,258 B (96.8 %) | 95,652 B |
 | Same tree without the screen pass (`next`, 2026-09-16) | 1,832,302 B (96.4 %) | 95,652 B |
@@ -96,6 +98,14 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 | Everything incl. weather, Indego, profiles, night page, 48 px font | 1,858,446 B (97.8 %) | 95,300 B (29.1 %) |
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
+
+The poller-liveness net (`DESIGN.md` §12.1) is **+1,480 B of flash and +32 B of static RAM** on the
+3.5" board, leaving 43,622 B of app slot. Most of it is the two `snprintf` format strings and the
+`last_restart` object on `/api/state`; the threshold arithmetic itself is a `constexpr` header
+(`src/app/poller_liveness.h`) that inlines into one comparison, and the RTC note is 20 B in
+`.rtc_noinit` at `0x50000200`, which is not app-slot flash at all. The other two tight envs still
+build on the same tree: `cyd-3248S035R-https` 1,875,114 B (98.7 %, the tightest) / 96,404 B, and
+`cyd-2432S024C` 1,852,734 B (97.5 %) / 96,004 B.
 
 The pool-safety pass is +6,172 B on the 3.5" board and +7,460 B on the 2.4" capacitive one, which
 leaves 52,982 B and 57,226 B of app slot respectively. It would have been 1,256 B more: passing
