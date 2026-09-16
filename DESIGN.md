@@ -1986,18 +1986,33 @@ stress section only gets there sooner. Free heap is fine and stays fine - it is 
 that decays with uptime, which is why a reading of `ESP.getFreeHeap()` makes this look healthy
 right up until a read is refused.
 
-Two things follow. **The self-heal cannot see this state**, and not for the reason the paragraph
-above gives: polls keep *succeeding* (their buffers are small enough to fit the gaps), so the
-consecutive-failure tally never climbs and the reboot never fires. What is wedged is the heavy read
-handlers, which are not what the tally counts. And **a browser is not a paced client**: the web UI
-retries (§10.2) so it degrades to "busy, try again" rather than breaking, but after some hours of
-uptime the Stats and Settings pages can be unreadable until the device is rebooted. That is a real,
-open, user-visible defect, distinct from the display-task lock work in §5 - which reduces the churn
-that feeds it (one whole-Snapshot allocate/free per second is gone, and `/api/state` no longer
-copies one per request) but does not claim to cure it. Nothing defragments a running heap. The
-device suite now states this as **one named check** - "heap recovered enough for the gated reads" -
-rather than letting thirty-five config round-trips each report the same wedge as their own failure;
-the pacing there exists to stop the noise, not to hide the condition.
+**The self-heal cannot see this state**, and not for the reason the paragraph above gives: polls
+keep *succeeding* (their buffers are small enough to fit the gaps), so the consecutive-failure tally
+never climbs and the reboot never fires. What is refusing is the heavy read handlers, which are not
+what the tally counts.
+
+**It is a band, not a latch** - and this is the part that is easy to get wrong in both directions.
+The largest block oscillates around the 7,924 B gate under load, and an eager client holds it below:
+both observations above came from clients retrying every 1.5-4 s, which is itself the allocation
+pressure they were waiting out. It recovers WITHOUT a reboot once that eases - measured in the same
+run, 2,932 B during the config round-trips to 8,692 B a section later, no restart in between. So
+"unreadable until you reboot it" would be an overstatement, and the earlier reboot that appeared to
+cure it was never tested against simply waiting.
+
+What is left after that hedging is still real, and is two things. The **resting** value drifts down
+with uptime: 5,108 B at 812 s on a board doing nothing but answering a probe every four seconds is
+already under the gate before any burst. And the shipping web UI is, by design, the *gentle* client
+here - `resilientRead()` backs off with jitter and shares one in-flight request per endpoint (§10.2)
+precisely so tabs cannot amplify this - so a browser sees "busy, try again" and then its page, which
+is the designed behaviour rather than a break. The device suite was harsher than the product, which
+is why it reported the condition as thirty-five unrelated failures.
+
+This is open, and it is **not** claimed as cured by §5's lock work - which removes real churn from
+it (one whole-Snapshot allocate/free per second is gone, and `/api/state` no longer copies one per
+request) without curing it. Nothing defragments a running heap. The device suite now states the
+condition as **one named check** - "heap recovered enough for the gated reads" - rather than letting
+each config round-trip report it as its own failure: the pacing there exists to stop the noise, not
+to hide the condition, and if the heap does not come back that check is what fails.
 
 **What that self-heal does NOT cover, corrected 2026-09-16.** The paragraph above used to read as
 though it covered "the poller stops being useful". It does not, and the difference is the whole of
