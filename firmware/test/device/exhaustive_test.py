@@ -344,7 +344,9 @@ check('D temp stop present with no arrivals (after the next poll)', present and 
 cfg['profiles'] = [{'name': 'Night test', 'days': [today_dow()], 'start': now_hhmm(-5), 'end': now_hhmm(30), 'stops': ['tmp-99999']}]
 cfg['stops'][1].update(alt_of='', alt_after_min=15); cfg['device']['night'] = {'enabled': True, 'after_min': 60}
 put_cfg(cfg); time.sleep(6)
-check('D unavailable stop reports health unavailable', tmp_snap and tmp_snap[0].get('health') == 'unavailable' and tmp_snap[0].get('error'), tmp_snap and (tmp_snap[0].get('health'), tmp_snap[0].get('error')))
+wait_for(lambda: any(x['key'] == 'tmp-99999' for x in state().get('stops', [])), 30, 3)
+tsnap = [x for x in state().get('stops', []) if x['key'] == 'tmp-99999']  # re-fetch: health settles a poll after the PUT
+check('D unavailable stop reports health unavailable', tsnap and tsnap[0].get('health') == 'unavailable' and tsnap[0].get('error'), tsnap and (tsnap[0].get('health'), tsnap[0].get('error')))
 check('D night page suppressed while the only shown stop is unavailable', ui().get('page') == 'main' and ui().get('active_profile') == 'Night test', ui())
 soonest = min([a['eta_s'] for x in state().get('stops', []) if x['key'] == k0 for a in x.get('arrivals', [])] or [0]) // 60
 if soonest >= 17:
@@ -363,10 +365,15 @@ put_cfg(copy.deepcopy(base)); time.sleep(3)
 check('D back to base: main, all stops', ui().get('page') == 'main' and len(ui().get('shown_stops', [])) == len(base['stops']), ui())
 # due + chime
 cfg = copy.deepcopy(base); cfg['due'] = {'enabled': True, 'minutes': 15, 'led': True, 'screen': True, 'chime': True}
+pre_eta = min([a['eta_s'] for x in state().get('stops', []) for a in x.get('arrivals', [])] or [9999])
 chimes0 = ui().get('chimes', 0); put_cfg(cfg); time.sleep(4); d = ui()
 first_eta = min([a['eta_s'] for x in state().get('stops', []) for a in x.get('arrivals', [])] or [9999])
 check('D due active with 15 min window', d.get('due_active') is True or first_eta > 900, (d.get('due_active'), first_eta))
-check('D chime played for a live due trip', d.get('chimes', 0) > chimes0 or first_eta > 900, (chimes0, d.get('chimes'), first_eta))
+# The chime is edge-triggered: it fires when an arrival first CROSSES into the window. If the
+# nearest bus was already inside it when the alert was enabled there is no crossing and correctly
+# no chime, and with no bus within 15 min none is expected either - both are the non-crossing case.
+already_inside = pre_eta <= 15 * 60
+check('D chime played for a live due trip', d.get('chimes', 0) > chimes0 or first_eta > 900 or already_inside, (chimes0, d.get('chimes'), pre_eta, first_eta))
 put_cfg(copy.deepcopy(base)); time.sleep(3)
 # quiet hours + wake by tap
 cfg = copy.deepcopy(base); cfg['device']['quiet'] = {'enabled': True, 'start': now_hhmm(-5), 'end': now_hhmm(30), 'brightness': 10, 'wake_seconds': 5}
