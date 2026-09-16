@@ -1255,11 +1255,27 @@ Main screen (portrait by default; every size derives from the runtime resolution
   board can draw would otherwise be a boot loop with the offending config still on disk. A stop
   panel costs ~6.2 KB on a 320-wide board and ~4.4 KB on a 240-tall one, which puts the ceiling at
   four stops and six respectively — under §6's maximum of eight.
+
+  **Panels are not the same size**, which the first version of this guard assumed and the RC review
+  caught. Each is sized from its own stop's `show` value, 1–4 rows (§6), six widgets a row, so a
+  four-row panel costs roughly three times a one-row one — and estimating the next panel as "the
+  largest built so far" let a config ordered small-panels-first admit a big panel on a small
+  panel's measurement. `visibleStops()` order changes with the active profile (§6), so the same
+  config could be safe in the morning and crash in the evening, and the crash is the boot loop
+  above. The estimate is now `max(largest panel measured, rows × largest per-row cost measured)`,
+  which is an upper bound for any row count given identical widgets per row. Measured in
+  `ui-sim-pool` on 320×480 with four one-row stops followed by four four-row stops: the old
+  estimate admitted six panels and finished on 3,704 B of pool, having let a 10,080 B panel in on a
+  4,424 B measurement against a 512 B reserve; the scaled one admits five and finishes on 13,752 B.
+  The `N more stops will not fit` caption is also built **before** the first panel and hidden,
+  rather than out of whatever the loop leaves — it is the one allocation that must not fail,
+  because it is the one that explains the failure.
 - Pool exhaustion has its own simulator environment, because the normal one cannot show it:
   `pio run -e ui-sim` builds with a 512 KB pool for 64-bit host pointers. `ui-sim-pool` scales
   `LV_MEM_SIZE` to the board's by the measured host/board ratio (0.66, fitted against six figures
   from the owner's board and accurate to ~1.5 %), and `program <dir> pool` sweeps 2–8 stops across
-  all four panel sizes. It reproduces the four-stop arrivals page at 31,664 B against 31,656 B
+  all four panel sizes, then again with non-uniform `show` values in both orders (the shape the
+  paragraph above describes). It reproduces the four-stop arrivals page at 31,664 B against 31,656 B
   measured. `POST /api/debug/page` (§7) drives the cycle on real hardware.
 - Stats page: header `Statistics  last 30 days` with `tap for device info` on the right (hidden
   at 240 wide); one stop-style panel per configured stop, titled with the route badge and the
