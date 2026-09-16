@@ -199,17 +199,25 @@ function askForPin(message) {
   return pinPromptOpen;
 }
 
-async function rawFetchJSON(url, opts) {
+async function rawFetchJSON(url, opts, timeoutMs) {
   let res;
+  // Only the heavy, memory-gated reads (GET /api/state, GET /api/config) pass a
+  // timeout: a device that's overloaded enough to hang mid-response should be treated
+  // the same as one that answered 503, not left to hang the page forever. Everything
+  // else (writes, proxy calls, stats) keeps the browser's own default.
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
-    res = await fetch(url, opts);
+    res = await fetch(url, controller ? { ...(opts || {}), signal: controller.signal } : opts);
   } catch (e) {
     throw new ApiError('Network error: could not reach the device.', null, 0);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   let body = null;
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('application/json')) {
-    try { body = await res.json(); } catch (e) { /* ignore parse failure */ }
+    try { body = await res.json(); } catch (e) { /* ignore parse failure -- treated like a missing body below */ }
   }
   if (!res.ok) {
     const msg = res.status === 429 ? retryMessage(body)
@@ -245,9 +253,94 @@ function asPinError(e) {
   return e;
 }
 
+// PUT /api/config is memory-gated the same way the heavy reads are (DESIGN.md §12.1)
+// and can answer 503 too. Unlike a read, a write is never retried automatically — the
+// device is telling us it's busy building the *next* thing, and stacking retried saves
+// on top would be the eager-retry mistake this project has already crashed a device
+// with once. So: say it calmly, not as a raw "Request failed (HTTP 503)", and leave the
+// edit exactly where it was so a second press of Save is all it takes. Shared by
+// Settings' save button and the Stops page's own PUT /api/config (reorder/add/remove)
+// so the wording can't drift between the two the way HINT_* keeps hint text in sync.
+function writeErrorMessage(e) {
+  if (e instanceof ApiError && e.status === 503) {
+    return { cls: 'warn', text: 'The display is busy right now and couldn’t save. Nothing was changed — try again in a moment.' };
+  }
+  return { cls: 'danger', text: e.path ? `${e.message} (${e.path})` : e.message };
+}
+
+/* ---- Resilient reads: GET /api/state and GET /api/config (DESIGN.md §12.1).
+   These two "heavy" endpoints deliberately refuse with a 503 when the device is short
+   on heap mid-poll, and /api/state can additionally come back as a genuine HTTP 200
+   with a zero-length body (the network stack's send buffer, not an application error).
+   Roughly a third to a half of requests can be refused during a poll cycle. None of
+   that is a real error: it clears in a second or two, and the documented contract is
+   "retry." A 503, an empty 200, a body that fails to parse, a network error and a
+   timeout are folded into the exact same "busy" outcome here, so every caller (the Now
+   page's poll, Settings' load) sees one simple thing: the promise resolves a bit late
+   sometimes, and never rejects for a reason the owner needs to see.
+
+   The retry loop is deliberately open-ended (capped, jittered backoff, no give-up) —
+   the device is healthy and this clears on its own, so stopping would just bring back
+   the blank/stuck page this exists to prevent. `inflightReads` keeps at most one
+   request per endpoint in flight app-wide: a second caller (the next poll tick, or a
+   different view wanting the same data) joins the retry already running instead of
+   starting its own, which matters because eager retries are exactly what amplifies the
+   memory pressure they're retrying against. */
+const HEAVY_TIMEOUT_MS = 8000;
+const RETRY_BASE_MS = 1000;
+const RETRY_MAX_MS = 8000;
+const RETRY_JITTER = 0.4; // +/- 40%, so several open tabs don't retry in lockstep
+
+function jitteredDelay(attempt) {
+  const base = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS);
+  const spread = base * RETRY_JITTER;
+  return Math.round(base - spread + Math.random() * spread * 2);
+}
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+// One entry per watched endpoint: whether it's currently being refused, how many
+// attempts in a row, and when it last actually succeeded (for "how stale" wording).
+// `connListeners` gets a call after every change so the top-bar indicator (see the
+// bottom of this file) can repaint without each view wiring up its own polling.
+const connStatus = {
+  state: { busy: false, attempt: 0, lastGoodAt: null },
+  config: { busy: false, attempt: 0, lastGoodAt: null },
+};
+const connListeners = new Set();
+function watchConn(fn) { connListeners.add(fn); fn(); return () => connListeners.delete(fn); }
+function notifyConn() { for (const fn of connListeners) fn(); }
+function markBusy(key, attempt) { connStatus[key].busy = true; connStatus[key].attempt = attempt; notifyConn(); }
+function markGood(key) { connStatus[key].busy = false; connStatus[key].attempt = 0; connStatus[key].lastGoodAt = Date.now(); notifyConn(); }
+
+const inflightReads = new Map();
+function resilientRead(key, url) {
+  const existing = inflightReads.get(key);
+  if (existing) return existing;
+  const promise = (async () => {
+    let attempt = 0;
+    for (;;) {
+      try {
+        const body = await rawFetchJSON(url, undefined, HEAVY_TIMEOUT_MS);
+        // A successful-looking response with nothing in it is the documented empty-200:
+        // treat it exactly like a 503 rather than handing callers a null "state".
+        if (body == null) throw new ApiError('The display is busy right now.', null, 503);
+        markGood(key);
+        return body;
+      } catch (e) {
+        attempt++;
+        markBusy(key, attempt);
+        await sleep(jitteredDelay(attempt));
+      }
+    }
+  })();
+  inflightReads.set(key, promise);
+  promise.finally(() => { if (inflightReads.get(key) === promise) inflightReads.delete(key); });
+  return promise;
+}
+
 const api = {
-  state: () => fetchJSON('/api/state'),
-  config: () => fetchJSON('/api/config'),
+  state: () => resilientRead('state', '/api/state'),
+  config: () => resilientRead('config', '/api/config'),
   saveConfig: (cfg) => fetchJSON('/api/config', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg),
   }, true),
@@ -399,12 +492,34 @@ function router() {
 window.addEventListener('hashchange', router);
 window.addEventListener('DOMContentLoaded', router);
 
+/* ======================== top-bar "device is busy" indicator ======================== */
+// One line, shared by every view, reflecting whatever resilientRead() is currently
+// retrying (see the API layer above). It says so quietly and disappears on its own the
+// moment a read succeeds — no page has to wire this up itself.
+(() => {
+  const bar = $('#conn-status');
+  if (!bar) return;
+  watchConn(() => {
+    const busyState = connStatus.state.busy;
+    const busyConfig = connStatus.config.busy;
+    if (!busyState && !busyConfig) { bar.classList.remove('show'); bar.textContent = ''; return; }
+    const parts = [];
+    if (busyState) {
+      const age = connStatus.state.lastGoodAt ? fmtAgo((Date.now() - connStatus.state.lastGoodAt) / 1000) : null;
+      parts.push(age ? `live data (last update ${age})` : 'live data');
+    }
+    if (busyConfig) parts.push('settings');
+    bar.textContent = `The display is busy right now — retrying ${parts.join(' and ')}…`;
+    bar.classList.add('show');
+  });
+})();
+
 /* ======================== Now view ======================== */
 
 function renderNow(root) {
   const wrap = h('div', { class: 'stack' });
   const banner = h('div', { id: 'now-banner' });
-  const strip = h('div', { id: 'status-strip', class: 'card' }, 'Loading device status…');
+  const strip = h('div', { id: 'status-strip', class: 'card muted' }, 'Connecting to the display…');
   const profileLine = h('div', { id: 'now-profile' });
   const stops = h('div', { id: 'now-stops', class: 'stack' });
   const bike = h('div', { id: 'now-bike' });
@@ -442,6 +557,13 @@ function renderNow(root) {
       renderBikeCard(bike, state.bike, bikeStyle);
       renderAlerts(alerts, state.alerts || []);
     } catch (e) {
+      // api.state()/api.config() already absorb the documented 503/empty-200/network/
+      // timeout cases into a silent retry (see resilientRead above) and the top-bar
+      // indicator says so — this only fires for something genuinely unexpected, so it's
+      // fine for it to look like a real error. Whatever was already on screen (from the
+      // last successful tick) is left exactly as it was; a stop's panel only ever
+      // reflects data this page actually received.
+      if (stopped) return;
       clear(banner);
       banner.append(h('div', { class: 'banner danger', role: 'alert' }, e.message || 'Could not load state.'));
     }
@@ -1063,7 +1185,8 @@ async function persistConfig(cfg, onOk) {
   } catch (e) {
     if (!stopsActive) return;
     drawStops();
-    stopsBanner(e.path ? `${e.message} (${e.path})` : e.message, 'danger');
+    const { cls, text } = writeErrorMessage(e);
+    stopsBanner(text, cls);
   }
 }
 
@@ -2806,10 +2929,20 @@ async function renderSettings(root) {
     settingsActive = false;
     for (const [ev, fn] of listeners) window.removeEventListener(ev, fn);
   };
-  root.append(h('p', { class: 'muted' }, 'Loading…'));
-  let cfg, state;
+  root.append(h('p', { class: 'muted' }, 'Connecting to the display…'));
+  let cfg;
+  // state is best-effort and loaded separately, below — it only supplies the firmware
+  // version/board line and the "restored its previous settings" banner, and it must
+  // never be able to hold the form itself hostage. It did, once: /api/state and
+  // /api/config are refused independently (DESIGN.md §12.1), so a device that's happy
+  // to answer /api/config but still busy on /api/state used to leave this page stuck on
+  // "Connecting…" forever even though there was nothing actually wrong with the config.
+  let state = {};
   try {
-    [cfg, state] = await Promise.all([api.config(), api.state().catch(() => ({}))]);
+    // A heavy, memory-gated read (DESIGN.md §12.1): retries a refusal on its own and
+    // does not reject for that reason, so this only throws on something genuinely
+    // unexpected.
+    cfg = await api.config();
   } catch (e) { if (!settingsActive) return; clear(root); root.append(h('div', { class: 'banner danger' }, e.message)); return; }
   if (!settingsActive) return;
   clear(root);
@@ -2832,12 +2965,18 @@ async function renderSettings(root) {
   root.append(nav);
   // The firmware sets config_recovered when it had to fall back to the last known-good
   // config after a bad save — silence here would let the owner wonder why a setting
-  // reverted itself.
-  if (state.config_recovered) {
-    root.append(h('div', { class: 'banner warn', role: 'status' },
-      'The device restored its previous settings after a bad save. Check the settings below still say what you want, then save again.'));
+  // reverted itself. A placeholder element (not a one-time conditional append) because
+  // state can resolve after this page is already up — see the api.state() call at the
+  // bottom of this function.
+  const recoveredBanner = h('div', {});
+  function paintRecoveredBanner() {
+    clear(recoveredBanner);
+    if (state.config_recovered) {
+      recoveredBanner.append(h('div', { class: 'banner warn', role: 'status' },
+        'The device restored its previous settings after a bad save. Check the settings below still say what you want, then save again.'));
+    }
   }
-  root.append(noMatch, content, bar);
+  root.append(recoveredBanner, noMatch, content, bar);
 
   let form = null;      // { sections, collect } from buildSettingsForm
   let baseline = '';    // JSON of the form as loaded or last saved; "unsaved" is a string compare
@@ -2888,7 +3027,11 @@ async function renderSettings(root) {
       baseline = JSON.stringify(form.collect());
       msg.append(h('div', { class: 'banner ok', role: 'status' }, 'Settings saved.'));
     } catch (e) {
-      msg.append(h('div', { class: 'banner danger', role: 'alert' }, e.path ? `${e.message} (${e.path})` : e.message));
+      // The typed edits are never touched here — `next` above came from the form, and
+      // failure leaves `cfg`/`form` exactly as they were, so nothing the owner typed is
+      // lost. They just need to press Save again.
+      const { cls, text } = writeErrorMessage(e);
+      msg.append(h('div', { class: `banner ${cls}`, role: cls === 'danger' ? 'alert' : 'status' }, text));
     }
     checkDirty();
   }
@@ -2957,4 +3100,19 @@ async function renderSettings(root) {
   paint();
   measure();
   updateActive();
+  paintRecoveredBanner();
+
+  // state loads in the background, independent of cfg above (see the comment where
+  // `state` is declared). If it's still refusing by the time the owner has started
+  // typing, leaving the firmware-version line as "unknown" a while longer is a far
+  // smaller cost than the alternative: repainting the whole form out from under an
+  // edit in progress would silently drop it. So this only ever repaints when the form
+  // is clean — checkDirty()/the save bar's "dirty" class is the single source of truth
+  // for that, same as Undo changes uses.
+  api.state().then((s) => {
+    if (!settingsActive) return;
+    state = s || {};
+    paintRecoveredBanner();
+    if (!bar.classList.contains('dirty')) paint();
+  }).catch(() => {});
 }
