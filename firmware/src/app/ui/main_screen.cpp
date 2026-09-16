@@ -6,6 +6,7 @@
 // stale or fabricated numbers (DESIGN.md SS8).
 #include "main_screen.h"
 
+#include <Arduino.h>
 #include <WiFi.h>
 
 #include <algorithm>
@@ -30,13 +31,22 @@ namespace transit_app::ui {
 
 namespace {
 
-// LVGL pool the stop-panel loop must leave behind for the rest of the page: the Indego strip and
-// the alert ticker are built AFTER it, and the page still has to have room to rewrite its labels
-// once a second. Measured on cyd-3248S035R 2026-09-16 (the `[lvmem] panel ...` serial lines with
-// four stops configured): the tail after the last panel is MEASURED_TAIL B, and a three-row panel
-// is ~6.2 KB, so this reserve has to be big enough to stop a fifth panel and small enough to let a
-// fourth through. See the guard in createMainScreen().
-constexpr uint32_t kPanelTailReserve = 2048;
+// What the stop-panel loop has to leave in the LVGL pool when it stops adding panels. Everything
+// else on the page - the header, the Indego strip, the ticker - is already built by the time the
+// loop runs (see the note where they are created), so this is NOT a page tail to be predicted; it
+// is only a margin on the "will the next panel fit" question.
+//
+// Small on purpose, and it was 3 KB first. `pio run -e ui-sim-pool` (the simulator with its pool
+// scaled to the board's) showed 3 KB dropping the FOURTH stop panel on a 320x480 board - a
+// configuration that measurably works on hardware, 31,656 B with 2,472 B left. Dropping a stop the
+// owner asked for is the failure this guard exists to avoid being worse than.
+//
+// The value barely matters for the case it is really for. Free when the loop considers a fifth
+// panel on that board is ~1.1 KB against a panel costing ~10.1 KB (host bytes, ui-sim-pool), so a
+// fifth stop is refused by a factor of nine whatever this is; and the reading is taken mid-build
+// with LVGL's layout transients still outstanding, so it errs low - toward dropping a panel rather
+// than toward running the pool out.
+constexpr uint32_t kPanelTailReserve = 512;
 
 uint32_t lvglPoolFree() {
   lv_mem_monitor_t m;
@@ -252,6 +262,87 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   // ---- Stop panels (ui_common.h makePanelsArea/makePanel: the stats page uses the same) ----
   lv_obj_t *panels_area = makePanelsArea(screen);
 
+  // The Indego strip and the alert ticker are built HERE, before the stop panels, even though they
+  // sit below them on screen. Child order on `screen` is unchanged - they still follow
+  // panels_area, and the panels go inside panels_area - so the layout is identical (verified by
+  // re-rendering every simulator PNG and comparing checksums). What changes is who gets the pool
+  // first: both of these are fixed-size (the bike strip always builds kMaxBikeStations rows,
+  // shown or not, and the ticker is one box and one label), while the panel loop below is the
+  // part that scales with the stop list. Building the fixed part first means the panel guard only
+  // has to leave room for label text, not for a page tail it would otherwise have to predict.
+  // ---- Indego section (only shown when bike_service has stations) ----
+  // A panel like the stop panels: "[bicycle] Indego" header with a stale-age note on the right,
+  // then one row per station: name (ellipsized) and the counts meter right-aligned.
+  ctx->bike_box = makeBox(screen);
+  lv_obj_set_size(ctx->bike_box, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_color(ctx->bike_box, colorPanelBg(), 0);
+  lv_obj_set_style_pad_all(ctx->bike_box, 4, 0);
+  lv_obj_set_style_pad_row(ctx->bike_box, 2, 0);
+  lv_obj_set_flex_flow(ctx->bike_box, LV_FLEX_FLOW_COLUMN);
+  lv_obj_add_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
+  auto makeBikeRow = [&](lv_obj_t *parent) {
+    lv_obj_t *row = makeBox(parent);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_pad_column(row, 6, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    return row;
+  };
+  {
+    lv_obj_t *head = makeBikeRow(ctx->bike_box);
+    lv_obj_t *icon = makeLabel(head, fontIcons(), colorText());
+    lv_label_set_text(icon, "\xEF\x88\x86");  // U+F206 bicycle
+    lv_obj_t *title = makeLabel(head, fontBody(h), colorText());
+    lv_label_set_text(title, "Indego");
+    ctx->bike_age = makeLabel(head, fontSmall(h), colorSkipped());
+    lv_obj_set_flex_grow(ctx->bike_age, 1);
+    lv_obj_set_style_text_align(ctx->bike_age, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_text(ctx->bike_age, "");
+    lv_obj_add_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN);
+  }
+  for (size_t i = 0; i < kMaxBikeStations; ++i) {
+    MainScreenCtx::BikeRow br;
+    br.row = makeBikeRow(ctx->bike_box);
+    br.name = makeLabel(br.row, fontSmall(h), colorText());
+    lv_obj_set_flex_grow(br.name, 1);
+    lv_label_set_long_mode(br.name, LV_LABEL_LONG_DOT);
+    lv_label_set_text(br.name, "");
+    br.counts = makeLabel(br.row, fontIcons(), colorText());
+    lv_label_set_recolor(br.counts, true);
+    lv_obj_set_style_text_letter_space(br.counts, 1, 0);
+    lv_label_set_text(br.counts, "");
+    lv_obj_add_flag(br.row, LV_OBJ_FLAG_HIDDEN);
+    ctx->bike_rows.push_back(br);
+  }
+
+  // ---- Alert ticker (only shown when refreshMainScreen finds alerts) ----
+  ctx->ticker_lines = std::max<int>(1, std::min<int>(cfg.device.ticker_lines, 8));
+  ctx->ticker_speed = cfg.device.ticker_speed;
+  ctx->ticker_show = cfg.device.ticker_show;
+  const lv_font_t *ticker_font = fontSmall(h);
+  const int32_t ticker_pad = 4;
+  const int32_t line_space = 2;
+  int32_t ticker_h = ctx->ticker_lines * lv_font_get_line_height(ticker_font) + (ctx->ticker_lines - 1) * line_space + 2 * ticker_pad;
+
+  ctx->ticker_box = makeBox(screen);
+  lv_obj_set_size(ctx->ticker_box, lv_pct(100), ticker_h);
+  lv_obj_set_style_bg_color(ctx->ticker_box, colorPanelBg(), 0);
+  lv_obj_set_style_pad_all(ctx->ticker_box, ticker_pad, 0);
+  lv_obj_add_flag(ctx->ticker_box, LV_OBJ_FLAG_HIDDEN);
+
+  ctx->ticker_label = makeLabel(ctx->ticker_box, ticker_font, colorText());
+  lv_obj_set_style_text_line_space(ctx->ticker_label, line_space, 0);
+  if (ctx->ticker_lines <= 1) {
+    lv_label_set_long_mode(ctx->ticker_label, LV_LABEL_LONG_CLIP);  // one line, as wide as its text
+    lv_obj_set_width(ctx->ticker_label, LV_SIZE_CONTENT);
+  } else {
+    lv_label_set_long_mode(ctx->ticker_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->ticker_label, lv_pct(100));
+  }
+  lv_label_set_text(ctx->ticker_label, "");
+
   // LVGL pool guard (ui.cpp's "LVGL pool safety" note, DESIGN.md SS8). DESIGN.md SS6 allows eight
   // stops (config_store.h kMaxStops) and eight of these panels do not fit LVGL's 36 KB pool: on
   // cyd-3248S035R a three-row panel measured ~6.2 KB and the whole four-stop arrivals page 31,656 B
@@ -361,79 +452,6 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_label_set_text_fmt(note, "%d more stop%s will not fit in this display's memory",
                           dropped_panels, dropped_panels == 1 ? "" : "s");
   }
-
-  // ---- Indego section (only shown when bike_service has stations) ----
-  // A panel like the stop panels: "[bicycle] Indego" header with a stale-age note on the right,
-  // then one row per station: name (ellipsized) and the counts meter right-aligned.
-  ctx->bike_box = makeBox(screen);
-  lv_obj_set_size(ctx->bike_box, lv_pct(100), LV_SIZE_CONTENT);
-  lv_obj_set_style_bg_color(ctx->bike_box, colorPanelBg(), 0);
-  lv_obj_set_style_pad_all(ctx->bike_box, 4, 0);
-  lv_obj_set_style_pad_row(ctx->bike_box, 2, 0);
-  lv_obj_set_flex_flow(ctx->bike_box, LV_FLEX_FLOW_COLUMN);
-  lv_obj_add_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
-  auto makeBikeRow = [&](lv_obj_t *parent) {
-    lv_obj_t *row = makeBox(parent);
-    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_pad_all(row, 0, 0);
-    lv_obj_set_style_pad_column(row, 6, 0);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    return row;
-  };
-  {
-    lv_obj_t *head = makeBikeRow(ctx->bike_box);
-    lv_obj_t *icon = makeLabel(head, fontIcons(), colorText());
-    lv_label_set_text(icon, "\xEF\x88\x86");  // U+F206 bicycle
-    lv_obj_t *title = makeLabel(head, fontBody(h), colorText());
-    lv_label_set_text(title, "Indego");
-    ctx->bike_age = makeLabel(head, fontSmall(h), colorSkipped());
-    lv_obj_set_flex_grow(ctx->bike_age, 1);
-    lv_obj_set_style_text_align(ctx->bike_age, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_label_set_text(ctx->bike_age, "");
-    lv_obj_add_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN);
-  }
-  for (size_t i = 0; i < kMaxBikeStations; ++i) {
-    MainScreenCtx::BikeRow br;
-    br.row = makeBikeRow(ctx->bike_box);
-    br.name = makeLabel(br.row, fontSmall(h), colorText());
-    lv_obj_set_flex_grow(br.name, 1);
-    lv_label_set_long_mode(br.name, LV_LABEL_LONG_DOT);
-    lv_label_set_text(br.name, "");
-    br.counts = makeLabel(br.row, fontIcons(), colorText());
-    lv_label_set_recolor(br.counts, true);
-    lv_obj_set_style_text_letter_space(br.counts, 1, 0);
-    lv_label_set_text(br.counts, "");
-    lv_obj_add_flag(br.row, LV_OBJ_FLAG_HIDDEN);
-    ctx->bike_rows.push_back(br);
-  }
-
-  // ---- Alert ticker (only shown when refreshMainScreen finds alerts) ----
-  ctx->ticker_lines = std::max<int>(1, std::min<int>(cfg.device.ticker_lines, 8));
-  ctx->ticker_speed = cfg.device.ticker_speed;
-  ctx->ticker_show = cfg.device.ticker_show;
-  const lv_font_t *ticker_font = fontSmall(h);
-  const int32_t ticker_pad = 4;
-  const int32_t line_space = 2;
-  int32_t ticker_h = ctx->ticker_lines * lv_font_get_line_height(ticker_font) + (ctx->ticker_lines - 1) * line_space + 2 * ticker_pad;
-
-  ctx->ticker_box = makeBox(screen);
-  lv_obj_set_size(ctx->ticker_box, lv_pct(100), ticker_h);
-  lv_obj_set_style_bg_color(ctx->ticker_box, colorPanelBg(), 0);
-  lv_obj_set_style_pad_all(ctx->ticker_box, ticker_pad, 0);
-  lv_obj_add_flag(ctx->ticker_box, LV_OBJ_FLAG_HIDDEN);
-
-  ctx->ticker_label = makeLabel(ctx->ticker_box, ticker_font, colorText());
-  lv_obj_set_style_text_line_space(ctx->ticker_label, line_space, 0);
-  if (ctx->ticker_lines <= 1) {
-    lv_label_set_long_mode(ctx->ticker_label, LV_LABEL_LONG_CLIP);  // one line, as wide as its text
-    lv_obj_set_width(ctx->ticker_label, LV_SIZE_CONTENT);
-  } else {
-    lv_label_set_long_mode(ctx->ticker_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(ctx->ticker_label, lv_pct(100));
-  }
-  lv_label_set_text(ctx->ticker_label, "");
 
   lv_obj_set_user_data(screen, ctx);
   // Freed with the screen (ui.cpp rebuildScreens() deletes and recreates screens on a config

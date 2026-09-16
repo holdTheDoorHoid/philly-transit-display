@@ -157,6 +157,17 @@ uint32_t lvUsed() {
   return m.total_size - m.free_size;
 }
 
+// The pool's free bytes. This - not lvUsed() - is what the pool sweep measures deltas of, because
+// it is the metric ui.cpp's buildSlot() records on the device (and what GET /api/debug/ui reports
+// as lv_free), so the two are directly comparable. lv_mem_monitor's total_size is the sum of the
+// BLOCKS it walks, so it moves with fragmentation and a used-delta taken from it is not a byte
+// count of anything.
+uint32_t lvFree() {
+  lv_mem_monitor_t m;
+  lv_mem_monitor(&m);
+  return m.free_size;
+}
+
 // ---- Configurations ----
 transit::StopConfig busStop(const char *key, const char *route, const char *stop_id, const char *direction,
                             const char *headsign, const char *label, const char *stop_name) {
@@ -323,23 +334,156 @@ struct Res {
   int32_t w, h;
 };
 
+// ---- Pool sweep (`program <out_dir> pool`) ----
+//
+// What it answers: how the LVGL pool cost of each page grows with the stop count, on each of the
+// four panel sizes, with every page built into an EMPTY pool exactly as ui.cpp now builds them.
+//
+// What it cannot answer: the absolute number of bytes on the board. The host build has 64-bit
+// pointers and a 512 KB LV_MEM_SIZE (platformio.ini), and lv_obj is pointer-heavy, so every figure
+// here is larger than the ESP32's.
+//
+// kHostToBoard is that gap, and it is not a guess - it was fitted against six figures measured on
+// cyd-3248S035R on 2026-09-16 through GET /api/debug/ui's `lv_page_cost`, which records the same
+// free-bytes delta this sweep does:
+//
+//   page    stops   board B   host B   ratio
+//   main      2      19,280   29,240   0.6594
+//   main      4      31,656   47,864   0.6614
+//   stats     2       8,220   12,472   0.6591
+//   stats     4      12,860   19,896   0.6464
+//   device    2      10,336   15,816   0.6535
+//   device    4      10,288   15,792   0.6515
+//
+// Spread 0.646-0.661 across two page shapes and two stop counts, so 0.66 predicts this board to
+// about 1.5 %. It has NOT been checked on the 240-tall boards; those rows are the same arithmetic
+// applied to a build nobody has measured, and should be read as "roughly this" until someone does.
+constexpr double kHostToBoard = 0.66;
+constexpr uint32_t kBoardPool = 36 * 1024;  // LV_MEM_SIZE on every board env (lv_conf.h)
+
+Config stopsConfig(const std::string &theme, int n) {
+  Config c = ownerConfig(theme);
+  c.device.crowding = "icons";  // the owner's setting, so the sweep calibrates against their board
+  static const char *const kExtra[][7] = {
+      {"17-10255", "17", "10255", "0", "2nd-Market", "17 Northbound", "Market St & 10th St"},
+      {"17-10258", "17", "10258", "1", "20th-Johnston", "17 Southbound", "Market St & 11th St"},
+      {"17-10262", "17", "10262", "0", "2nd-Market", "17 Northbound", "Market St & 12th St"},
+      {"17-10266", "17", "10266", "1", "20th-Johnston", "17 Southbound", "Market St & 13th St"},
+      {"17-10270", "17", "10270", "0", "2nd-Market", "17 Northbound", "Market St & 15th St"},
+      {"17-10274", "17", "10274", "1", "20th-Johnston", "17 Southbound", "Market St & 16th St"},
+  };
+  for (int i = 0; (int)c.stops.size() < n && i < (int)(sizeof(kExtra) / sizeof(kExtra[0])); ++i) {
+    c.stops.push_back(busStop(kExtra[i][0], kExtra[i][1], kExtra[i][2], kExtra[i][3], kExtra[i][4],
+                              kExtra[i][5], kExtra[i][6]));
+  }
+  return c;
+}
+
+// Builds one page into an empty pool, refreshes it (so the cost includes the real label text, not
+// the placeholders create*Screen() leaves), measures, and frees it again.
+uint32_t g_last_objects = 0;   // objects in the page pageCost() last built
+uint32_t g_last_free = 0;      // pool free with that page up
+
+uint32_t pageCost(const Config &cfg, const transit::Snapshot &snap, Canvas &c, const char *which) {
+  uint32_t before = lvFree();
+  lv_obj_t *scr = nullptr;
+  if (std::strcmp(which, "main") == 0) {
+    scr = ui::createMainScreen(cfg);
+    ui::refreshMainScreen(scr, cfg, snap);
+  } else if (std::strcmp(which, "night") == 0) {
+    scr = ui::createNightScreen(cfg);
+    ui::refreshNightScreen(scr, cfg, snap);
+  } else if (std::strcmp(which, "stats") == 0) {
+    scr = ui::createStatsScreen(cfg);
+    ui::refreshStatsScreen(scr);
+  } else {
+    scr = ui::createDeviceInfoScreen(cfg);
+    ui::refreshDeviceInfoScreen(scr);
+  }
+  settle(c, 2);
+  uint32_t after = lvFree();
+  uint32_t cost = before > after ? before - after : 0;
+  g_last_objects = countObjs(scr);
+  g_last_free = after;
+  lv_screen_load(c.blank);
+  lv_obj_delete(scr);
+  return cost;
+}
+
+void poolSweep() {
+  static const Res kAll[] = {{320, 480}, {480, 320}, {320, 240}, {240, 320}};
+  std::printf("\nLVGL pool cost per page. Host bytes, and x%.2f for the board (see kHostToBoard).\n",
+              kHostToBoard);
+  std::printf("\"1 page\" is what this design's worst moment costs - only the largest page is ever\n"
+              "resident. \"all 4\" is what the switch cost before the rework, when Stats -> Device\n"
+              "held main + night + stats + device at once. Board pool is %u B.\n\n", (unsigned)kBoardPool);
+  std::printf("This build's pool is %u B = %.0f board-equivalent bytes.\n\n", (unsigned)LV_MEM_SIZE,
+              LV_MEM_SIZE * kHostToBoard);
+  std::printf("%-9s %5s  %7s %7s %7s %7s   %8s %5s   %8s %5s  %5s %8s\n", "board", "stops", "main",
+              "night", "stats", "device", "1 page", "fits", "all 4", "fits", "objs", "free");
+  for (const Res &r : kAll) {
+    transit_app::ui::g_sim_small_board = (r.h <= 240 || (r.w == 240 && r.h == 320));
+    Canvas c = openDisplay(r.w, r.h);
+    for (int n = 2; n <= 8; ++n) {
+      Config cfg = stopsConfig("dark", n);
+      ownerSummaries();
+      transit::Snapshot snap = transit_app::buildDemoSnapshot((transit::Epoch)time(nullptr));
+      uint32_t m = pageCost(cfg, snap, c, "main");
+      uint32_t main_objs = g_last_objects, main_free = g_last_free;
+      uint32_t ni = pageCost(cfg, snap, c, "night");
+      uint32_t st = pageCost(cfg, snap, c, "stats");
+      uint32_t dv = pageCost(cfg, snap, c, "device");
+      // What this rework costs at its worst: the largest single page. What the old switch cost at
+      // its worst: main + night + stats + device, which is what Stats -> Device held at once.
+      uint32_t one = m;
+      if (ni > one) one = ni;
+      if (st > one) one = st;
+      if (dv > one) one = dv;
+      uint32_t old_peak = m + ni + st + dv;
+      double one_b = one * kHostToBoard, old_b = old_peak * kHostToBoard;
+      // `objs` is the arrivals page's object count: when it stops growing with the stop count,
+      // main_screen.cpp's panel guard has started leaving panels off. `free` is what the arrivals
+      // page leaves in the pool, in board-equivalent bytes.
+      std::printf("%-9s %5d  %7.0f %7.0f %7.0f %7.0f   %8.0f %5s   %8.0f %5s  %5u %8.0f\n",
+                  (std::to_string(r.w) + "x" + std::to_string(r.h)).c_str(), n, m * kHostToBoard,
+                  ni * kHostToBoard, st * kHostToBoard, dv * kHostToBoard, one_b,
+                  one_b < kBoardPool ? "yes" : "NO", old_b, old_b < kBoardPool ? "yes" : "NO",
+                  (unsigned)main_objs, main_free * kHostToBoard);
+    }
+    closeDisplay(c);
+  }
+  std::printf("\nAll figures are board bytes (host bytes x %.2f). The arrivals page grows by about\n"
+              "6.2 KB per stop on a 320-wide/480-tall panel and 4.4 KB on a 240-tall one, so five\n"
+              "stops does not fit the 36 KB pool on the bigger boards however the pages are ordered -\n"
+              "which is what main_screen.cpp's panel guard is for.\n", kHostToBoard);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: %s <out_dir> [full]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s <out_dir> [full|pool]\n", argv[0]);
     return 2;
   }
   Job job;
   job.out_dir = argv[1];
-  bool full = argc >= 3 && std::strcmp(argv[2], "full") == 0;
-  mkdir(job.out_dir.c_str(), 0755);
+  const char *mode = argc >= 3 ? argv[2] : "";
+  bool full = std::strcmp(mode, "full") == 0;
+  bool pool_only = std::strcmp(mode, "pool") == 0;
+  if (!pool_only) mkdir(job.out_dir.c_str(), 0755);
 
   setenv("TZ", "EST5EDT,M3.2.0,M11.1.0", 1);  // the default device.tz: the clock reads as Philly time
   tzset();
 
   lv_init();
   lv_tick_set_cb(tickCb);
+
+  if (pool_only) {
+    ui::setTheme("dark");
+    poolSweep();
+    std::printf("lv_used after teardown = %u bytes (should be back near zero)\n", (unsigned)lvUsed());
+    return 0;
+  }
 
   std::vector<Res> resolutions = {{320, 480}, {480, 320}, {320, 240}};
   if (full) resolutions.push_back({240, 320});
