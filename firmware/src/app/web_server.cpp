@@ -690,14 +690,16 @@ constexpr size_t kMinOtaFree8 = 16 * 1024;
 // 5,876 and not 6 * 1024, which looks arbitrary and is not. This allocator hands out largest-block
 // sizes on a 512-byte lattice at offset 500 - every one of 24 distinct values measured here fits
 // `500 + 512k` exactly, and desktop-c8 and desktop-e9 confirmed the same structure independently
-// across four images. A threshold written as a round m * 1024 therefore lands exactly 12 B above a
-// lattice point, the worst placement there is: a device resting on that point is refused by a hair,
-// and the next value up clears by 1,012 B. That is not a hypothetical. It is why the old 16,384 B
+// across four images. ANY multiple of 512 therefore lands exactly 12 B above a lattice point, since
+// 512 - 500 = 12 puts the point below 512m at 512m - 12 for every m - the worst placement there is:
+// a device resting on that point is refused by a hair, and the next value up clears by 1,012 B.
+// That catches more than round kilobytes; 5,632 and 7,680 are just as bad. That is not a hypothetical. It is why the old 16,384 B
 // gate locked out a v0.2.0 board resting at 16,372, and resting values of 8,180 and 12,276 were
 // observed against the other two round thresholds.
 //
-// Note m * 1024 - 512 does NOT fix it: 5,632 sits 12 B above 5,620, the same pathology one residue
-// over. Mid-gap on a 512 lattice at offset 500 is `756 + 512k`, which is 256 B from either
+// Note m * 1024 - 512 does NOT fix it: 5,632 is itself a multiple of 512 and sits 12 B above 5,620,
+// the same pathology one residue over. Mid-gap on a 512 lattice at offset 500 is `756 + 512k`,
+// which is not a multiple of 512 and is 256 B from either
 // neighbour - so a build resting on any lattice point is admitted or refused with real margin, and
 // a small change in allocation cannot flip admission. 5,876 is still 1.43x the single 4,096 B
 // buffer this gate exists to protect.
