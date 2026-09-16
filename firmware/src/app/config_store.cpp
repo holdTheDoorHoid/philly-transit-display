@@ -827,10 +827,38 @@ bool loadConfig(Config &cfg) {
 
 bool configRecovered() { return g_config_recovered; }
 
+// FNV-1a over the bytes serializeJson() emits. saveConfig() verifies the temp file by streaming it
+// back through this and comparing length + hash with what was written, instead of parsing it into
+// a second JsonDocument + Config: that re-parse needed ~15 KB more heap on the async web server's
+// task, and under the 2026-09-15 device suite's rapid-fire saves it failed for a couple of minutes
+// at a time ("failed to write config to LittleFS", 500) while the poller held the rest of the heap.
+// A file that is byte-identical to the serialization of an already-validated Config is, by
+// construction, valid JSON that loads back into the same Config - which is all the re-parse proved.
+class Fnv1aPrint : public Print {
+ public:
+  size_t write(uint8_t b) override {
+    hash_ = (hash_ ^ b) * 16777619u;
+    ++count_;
+    return 1;
+  }
+  size_t write(const uint8_t *buf, size_t n) override {
+    for (size_t i = 0; i < n; ++i) write(buf[i]);
+    return n;
+  }
+  uint32_t hash() const { return hash_; }
+  size_t count() const { return count_; }
+
+ private:
+  uint32_t hash_ = 2166136261u;
+  size_t count_ = 0;
+};
+
 bool saveConfig(const Config &cfg) {
   JsonDocument doc;
   configToJson(cfg, doc);
-  size_t want = measureJson(doc);
+  Fnv1aPrint expect;
+  serializeJson(doc, expect);
+  const size_t want = expect.count();
   if (want == 0) {
     log_e("config_store: serialized config measured 0 bytes");
     return false;
@@ -853,6 +881,7 @@ bool saveConfig(const Config &cfg) {
     }
     size_t written = serializeJson(doc, f);
     f.close();
+    doc.clear();  // the document has done its job; free it before the read-back
     if (written != want) {
       // A short write is what a full LittleFS looks like from here: the File API reports success
       // per chunk and simply stops accepting bytes. Anything but an exact match is a failure, so
@@ -861,9 +890,25 @@ bool saveConfig(const Config &cfg) {
       LittleFS.remove(kConfigTmpPath);
       break;
     }
-    Config verify;
-    if (!readConfigFile(kConfigTmpPath, verify)) {
-      log_e("config_store: %s did not read back as a valid config", kConfigTmpPath);
+    // Read it back and compare length + hash with what serializeJson() produced (see Fnv1aPrint).
+    Fnv1aPrint got;
+    {
+      File r = LittleFS.open(kConfigTmpPath, "r");
+      if (!r) {
+        log_e("config_store: failed to reopen %s for verification", kConfigTmpPath);
+        LittleFS.remove(kConfigTmpPath);
+        break;
+      }
+      uint8_t buf[128];
+      while (r.available()) {
+        size_t n = r.read(buf, sizeof buf);
+        if (n == 0) break;
+        got.write(buf, n);
+      }
+      r.close();
+    }
+    if (got.count() != want || got.hash() != expect.hash()) {
+      log_e("config_store: %s did not read back identically (%u of %u bytes)", kConfigTmpPath, (unsigned)got.count(), (unsigned)want);
       LittleFS.remove(kConfigTmpPath);
       break;
     }

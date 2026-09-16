@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <ESPAsyncWebServer.h>
+#include <LittleFS.h>
 #include <Update.h>
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
@@ -353,6 +354,10 @@ void handleGetState(AsyncWebServerRequest *request) {
   sdj["mounted"] = sd.mounted;
   sdj["free_mb"] = (double)sd.free_bytes / (1024.0 * 1024.0);
   sdj["log_bytes"] = logBytes();
+  // LittleFS (config + proxied bodies) occupancy, so a full filesystem is visible before saves fail.
+  JsonObject fsj = doc["fs"].to<JsonObject>();
+  fsj["used_kb"] = (uint32_t)(LittleFS.usedBytes() / 1024);
+  fsj["total_kb"] = (uint32_t)(LittleFS.totalBytes() / 1024);
   sdj["dropped_rows"] = sd.dropped_rows;  // F26: rows that did not land on the card since boot
   sdj["write_ok"] = sd.last_write_ok;
   sdj["error"] = sd.error;

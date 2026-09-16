@@ -277,7 +277,8 @@ check('C3 PUT /api/config without a PIN is 401', code == 401 and body and body.g
 r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', B + '/api/reboot'])
 check('C3 POST /api/reboot without a PIN is 401', r.stdout == b'401', r.stdout)
 code, d = get_json('/api/state')
-check('C3 state advertises pin_required and board', code == 200 and d.get('auth', {}).get('pin_required') is True and isinstance(d.get('board'), str) and d['board'], (code, d.get('auth'), d.get('board')))
+d = d or {}
+check('C3 state advertises pin_required and board', code == 200 and d.get('auth', {}).get('pin_required') is True and isinstance(d.get('board'), str) and bool(d.get('board')), (code, d.get('auth'), d.get('board')))
 check('C3 state reports config_recovered', 'config_recovered' in (d or {}), list(d or {})[:12])
 code, _ = get_json('/api/config')
 check('C3 GET /api/config stays open', code == 200, code)

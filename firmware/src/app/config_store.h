@@ -158,7 +158,8 @@ bool loadConfig(Config &cfg);
 bool configRecovered();
 
 // Serializes `cfg`, writes it to kConfigTmpPath, verifies the byte count, reads
-// it back and re-validates it, rotates the current file to kConfigPrevPath, and
+// it back and compares length + FNV-1a hash with what was serialized (no second
+// parse: that cost ~15 KB of heap on the web task), rotates the current file to kConfigPrevPath, and
 // only then renames the temp file over kConfigPath. Returns false - leaving the
 // live config untouched - on any filesystem error or short write, so
 // PUT /api/config answers 500 rather than replacing a good config with a
