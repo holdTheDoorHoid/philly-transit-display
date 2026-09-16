@@ -27,9 +27,15 @@ def get(path, timeout=15, pin=False):
     return int(code or 0), body
 
 def get_json(path):
-    code, body = get(path)
-    if code == 503 or (code == 200 and not body):  # DESIGN.md SS12.1: the device answers 503/empty under memory pressure; clients retry
-        time.sleep(1.5); code, body = get(path)
+    # DESIGN.md SS12.1: /api/state can answer an empty 200 (or 503) under memory pressure and the
+    # client must retry - the data is there, the async send buffer momentarily was not. Retry a
+    # handful of times before giving up so a state()-based assertion does not flake on that.
+    code, body = 0, b''
+    for attempt in range(6):
+        code, body = get(path)
+        if not (code == 503 or (code == 200 and not body)):
+            break
+        time.sleep(1.2)
     try: return code, json.loads(body)
     except Exception: return code, None
 
