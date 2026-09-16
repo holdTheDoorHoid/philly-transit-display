@@ -319,19 +319,13 @@ check('C3 429 body carries retry_s', lcode == b'429' and isinstance(lj.get('retr
 time.sleep(32)
 check('C3 recovers after the lockout expires', put_cfg(copy.deepcopy(base)) == 200)
 
-# Host-header check: a rebinding attacker's own domain must not be served (421).
-r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-H', 'Host: evil.example.com', B + '/api/state'])
+# Host-header check (rebinding defence): the middleware runs on every route before the handler, so
+# probe the small, un-gated /api/debug/ui - /api/state has its own memory gate that can answer 503
+# under the fragmentation the config-save churn above leaves behind, which is unrelated to Host.
+r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-H', 'Host: evil.example.com', B + '/api/debug/ui'])
 check('C3 wrong Host is 421', r.stdout == b'421', r.stdout)
-# Retry the documented 503/empty (SS12.1) so a momentary low-heap does not read as a Host rejection.
-hostport = 'Host: ' + B.replace('http://', '') + ':80'
-def host_code():
-    for _ in range(8):
-        c = curl(['-o', '/dev/null', '-w', '%{http_code}', '-H', hostport, B + '/api/state']).stdout
-        if c not in (b'503', b'000'): return c
-        time.sleep(1.5)
-    return c
-hc = host_code()
-check('C3 own IP with a port is accepted', hc == b'200', hc)
+r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-H', 'Host: ' + B.replace('http://', '') + ':80', B + '/api/debug/ui'])
+check('C3 own IP with a port is accepted', r.stdout == b'200', r.stdout)
 r = curl(['-D', '-', '-o', '/dev/null', B + '/']); h = r.stdout.decode()
 check('C3 index sends frame + nosniff headers', 'X-Frame-Options: DENY' in h and "frame-ancestors 'none'" in h and 'X-Content-Type-Options: nosniff' in h, h[:300])
 time.sleep(2)
