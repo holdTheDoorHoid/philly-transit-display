@@ -322,11 +322,45 @@ poll, their steady state - both measured on the owner's two-stop config on 2026-
 | `3707f54` | 11,764 B | 4,620 B short | 5 over 10 min, all refused |
 | released **v0.2.0** | 16,372 B | **12 B short** | 3, all refused |
 
-The v0.2.0 row is the alarming one. It misses by twelve bytes - 0.07% - which is not a build that
-sits safely under the threshold but one that happens to land on the wrong side of it. That cuts
-both ways and neither direction should be over-read: it is not evidence that shipped devices are
-generally lockable (a different stop list or feed selection moves resting fragmentation either way),
-and it is not evidence that they are safe. It is one configuration, measured.
+The v0.2.0 row misses by twelve bytes, and that number is not a coincidence - it is the signature of
+a threshold placed on a lattice boundary.
+
+**`heap_caps_get_largest_free_block()` returns values on a 512-byte lattice at offset 500.** Every
+one of 24 distinct values measured here fits `500 + 512k` exactly, and two other agents confirmed
+the same structure independently across four images on separate captures. A threshold written as a
+round `m * 1024` therefore lands **exactly 12 B above a lattice point** - the worst placement
+available. A build resting on that point is refused by a hair, while the next lattice value up
+clears by 1,012 B. So a "narrow miss" against a round-KB gate is *always* a 12-byte miss; it is
+never a comfortable margin, because the nearest failing value below is 1,036 B short. Nothing about
+v0.2.0's twelve bytes is accidental, and calling it a coin toss (as an earlier draft of this section
+did) gets the mechanism backwards.
+
+All four round thresholds in play had it, with the bottom two observed at rest on real devices:
+
+| Threshold | Lattice point below | Short by | Next value up | Observed resting there |
+|---|---:|---:|---:|---|
+| 16,384 old OTA block | 16,372 | 12 | 17,396 | yes, v0.2.0, 8 minutes |
+| 12,288 idle-work block | 12,276 | 12 | 13,300 | yes |
+| 8,192 `/api/state` block | 8,180 | 12 | 9,204 | yes |
+| 6,144 new OTA block | 6,132 | 12 | 7,156 | - |
+
+Fixed by moving all three block thresholds mid-gap: **5,876** (OTA), **7,924** (`/api/state`) and
+**12,020** (idle slice), which are `756 + 512k` and therefore 256 B from either neighbour. A device
+resting on any lattice point is now admitted or refused with real margin, and a small change in
+allocation cannot flip admission. The derivations did not need redoing - each is still comfortably
+above what its path allocates (1.43x, 2.76x and 1.47x respectively); they needed moving off the
+boundary.
+
+Note that `m * 1024 - 512` does **not** fix this, which is worth stating because it is the obvious
+correction and it was the first one proposed: 5,632 sits 12 B above 5,620, reproducing the pathology
+one residue over. Seen through a 1024-byte window the lattice looks like two families at `+1012` and
+`+500`; it is one 512-byte lattice, and only a mid-gap value escapes both.
+
+The free-size thresholds are unaffected: `free8` is a sum over every free block and does not lattice.
+
+None of this should be over-read as "shipped devices are lockable". It is one configuration,
+measured. What it does establish is that a *different* configuration resting one lattice point lower
+would have been locked out just as precisely.
 
 The new 6 KB threshold admits both boards with real headroom, because it comes from the single
 4,096 B buffer the update path allocates rather than from a round number. But a sufficiently
@@ -350,6 +384,48 @@ lwIP asserts on `MEMP_SYS_TIMEOUT` exhaustion before the poller's own failure co
 wedge threshold, and no admission floor prevents that. What the change does do in that regime is
 shed optional work earlier than before, because the two gates that could not fire now can - a softer
 landing, not a cure.
+
+#### One visible consequence: `/api/state` now answers 503 during an OTA (measured 2026-09-16)
+
+Waking a gate that could never fire means it fires. Sampling `/api/state` once a second through a
+full 1.85 MB upload on the owner's board: fourteen consecutive `200`s, then six consecutive
+`503 {"error":"low memory, retry"}`, then recovery. An in-flight OTA holds a large sustained
+allocation - the same sampling put `free8` at least 21 KB below its idle baseline - and it pushes
+the byte-addressable heap under the 12 KB floor for several seconds. The old gate could not see
+this: its free half was 24 KB of `INTERNAL`, which is *below zero* in 8-bit terms, and the largest
+block stayed at 10.7-13.8 KB, above the 8 KB half that did work. So `/api/state` used to keep
+answering here, and now it does not.
+
+That is the right behaviour, not a regression to tune away. During an upload the heavy read handler
+is competing with `Update` for the last few KB of usable heap, and a failed flash is far worse than
+a status endpoint that is briefly unavailable - a 503 is cheap, fixed-literal, and retried. The gate
+backing off *protects the upload*. Clients should expect it: the web app keeps its last data and
+retries rather than blanking, and any script polling `/api/state` through an OTA must treat 503 as
+"retry", exactly as the low-memory contract has always said.
+
+**A gated endpoint cannot report the condition that gates it.** This caught the investigation above
+and it is general, so it belongs here rather than in a footnote. An earlier pass reported `free8`
+bottoming at 18,016 B during an upload - comfortably above the 12 KB floor, which made the 503s look
+unexplained. The number was survivorship-biased: `free8` is read *from* `/api/state`, and
+`/api/state` refuses precisely when `free8` is low, so only the samples taken when there was enough
+heap to build a reply ever came back. The endpoint cannot report the heap at the moment it is too
+low to report anything.
+
+The consequence generalises to any measurement campaign against this firmware: **every heap figure
+read from `/api/state` or `/api/config` is conditioned on `refuseIfLowHeap()` having passed**, so
+minima and low percentiles from those bodies are biased upward, and biased hardest at exactly the
+values a threshold decision turns on. Do not derive a gate threshold from them. Three sources do
+not have this failure mode:
+
+- `GET /api/debug/ui` - deliberately left outside the gate (see the comment on `refuseIfLowHeap`,
+  "the small handlers are deliberately not gated ... to observe the device precisely while it is
+  under pressure"). It carries `heap` and `largest_block`. Still an HTTP request, so it perturbs
+  what it measures, but it does not vanish when the answer gets interesting.
+- The `[net_poller]` serial heartbeat and the `[poll-heap]` trace - not requests at all, and the
+  only genuinely unperturbed source.
+- Recording the **status code** alongside every sample, so a refusal appears in the data as a
+  refusal rather than as a missing row. That is what turned "unexplained errors" into a
+  characterised behaviour in one pass.
 
 `/api/state` keeps `heap` as `ESP.getFreeHeap()` - clients parse it, and silently changing what a
 published field means is worse than an optimistic number - and gains `heap_8bit` and

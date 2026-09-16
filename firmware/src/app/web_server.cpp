@@ -404,8 +404,12 @@ void scheduleRestart() {
 // the floor exists to skip a hopeless build, not to promise a successful one. The block half stays
 // at 8 KB, already 2.8x the only contiguous allocation on the path (ASYNC_RESPONCE_BUFF_SIZE =
 // CONFIG_LWIP_TCP_MSS * 2 = 2,872 B), the slack covering ArduinoJson's string pool.
+//
+// 7,924 rather than 8,192, and the odd-looking number is the point - see kMinOtaLargestBlock for
+// the lattice this avoids. A round 8 KB sits 12 B above a real resting value (8,180), which is the
+// worst placement available.
 constexpr size_t kMinHeavyResponseFree8 = 12 * 1024;
-constexpr size_t kMinHeavyResponseBlock = 8 * 1024;
+constexpr size_t kMinHeavyResponseBlock = 7924;
 bool refuseIfLowHeap(AsyncWebServerRequest *request) {
   if (heap_caps_get_free_size(MALLOC_CAP_8BIT) >= kMinHeavyResponseFree8 &&
       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= kMinHeavyResponseBlock) {
@@ -682,7 +686,22 @@ constexpr size_t kMinOtaFree8 = 16 * 1024;
 // Update.write() needs a contiguous scratch buffer; free heap alone can be healthy while the
 // largest block is fragmented down to a few KB, which is how a mid-flash failure used to happen
 // on a device that had been up for days (firmware/README.md, "Memory and flash budget").
-constexpr size_t kMinOtaLargestBlock = 6 * 1024;
+//
+// 5,876 and not 6 * 1024, which looks arbitrary and is not. This allocator hands out largest-block
+// sizes on a 512-byte lattice at offset 500 - every one of 24 distinct values measured here fits
+// `500 + 512k` exactly, and desktop-c8 and desktop-e9 confirmed the same structure independently
+// across four images. A threshold written as a round m * 1024 therefore lands exactly 12 B above a
+// lattice point, the worst placement there is: a device resting on that point is refused by a hair,
+// and the next value up clears by 1,012 B. That is not a hypothetical. It is why the old 16,384 B
+// gate locked out a v0.2.0 board resting at 16,372, and resting values of 8,180 and 12,276 were
+// observed against the other two round thresholds.
+//
+// Note m * 1024 - 512 does NOT fix it: 5,632 sits 12 B above 5,620, the same pathology one residue
+// over. Mid-gap on a 512 lattice at offset 500 is `756 + 512k`, which is 256 B from either
+// neighbour - so a build resting on any lattice point is admitted or refused with real margin, and
+// a small change in allocation cannot flip admission. 5,876 is still 1.43x the single 4,096 B
+// buffer this gate exists to protect.
+constexpr size_t kMinOtaLargestBlock = 5876;
 
 // Board identity, stamped into .rodata of every build and therefore into every firmware.bin
 // (review F08: there is no firmware signing, but flashing a 2.4"-capacitive image onto a 3.5"

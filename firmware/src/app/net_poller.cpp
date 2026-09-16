@@ -811,8 +811,12 @@ uint32_t nextIntervalS(const Config &cfg, bool ok, bool urgent, uint32_t &consec
 // whatever the web task is holding at that moment. The block half stays at 12 KB, 1.5x that 8 KB
 // object. The 4 KB proxy write buffer the old comment cited is not in this sum: it is
 // `static uint8_t wbuf[4096]` in proxy_worker.cpp and never comes off the heap at all.
+// 12,020 and not 12 * 1024: largest-block sizes land on a 512-byte lattice at offset 500, so a
+// round 12 KB sits 12 B above a real resting value of 12,276 and would refuse it by a hair while
+// the next value up clears by 1,012 B. `756 + 512k` is mid-gap, 256 B from either neighbour.
+// web_server.cpp's kMinOtaLargestBlock carries the full explanation and the measurements.
 constexpr size_t kIdleWorkMinFree8 = 16 * 1024;
-constexpr size_t kIdleWorkMinLargestBlock = 12 * 1024;
+constexpr size_t kIdleWorkMinLargestBlock = 12020;
 bool idleWorkHasHeadroom() {
   return heap_caps_get_free_size(MALLOC_CAP_8BIT) >= kIdleWorkMinFree8 &&
          heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= kIdleWorkMinLargestBlock;
