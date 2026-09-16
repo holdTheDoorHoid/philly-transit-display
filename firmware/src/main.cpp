@@ -18,6 +18,7 @@
 
 #include "app/auth.h"
 #include "app/config_store.h"
+#include "app/cxx_exception_pool.h"
 #include "app/http_fetch.h"
 #include "app/hw_probe.h"
 #include "app/net_poller.h"
@@ -105,6 +106,11 @@ void setup() {
 
   smartdisplay_init();
   heapStage("display");
+  // DESIGN.md SS12.1: what libstdc++'s emergency exception pool asked for at static-init, i.e.
+  // which __cxx_eh_arena_size_get the linker kept - 2048 is cxx_exception_pool.cpp's, 0 would be the
+  // SDK's. Whether the pool then really catches an OOM-while-throwing is what POST /api/debug/oom
+  // proves; this line only shows the request was made. Always-on, like the [heap] stages above.
+  Serial.printf("[heap] eh_pool    arena=%u\n", (unsigned)__cxx_eh_arena_size_get());
 
   if (!LittleFS.begin(false)) {
     log_w("main: LittleFS mount failed, formatting");

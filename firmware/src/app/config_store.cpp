@@ -856,8 +856,13 @@ class Fnv1aPrint : public Print {
 bool saveConfig(const Config &cfg) {
   JsonDocument doc;
   configToJson(cfg, doc);
+  // Both serializeJson() calls in this function hand their sink over as a Print&, deliberately:
+  // ArduinoJson instantiates a whole serializer (~1.2 KB of flash) per static sink type, and
+  // web_server.cpp's streamed /api/state response serialises to a Print& too, so the three share one
+  // instantiation instead of costing one each (Fnv1aPrint, fs::File, and the response's ChunkPrint).
+  // The writes were virtual calls either way; nothing else changes.
   Fnv1aPrint expect;
-  serializeJson(doc, expect);
+  serializeJson(doc, static_cast<Print &>(expect));
   const size_t want = expect.count();
   if (want == 0) {
     log_e("config_store: serialized config measured 0 bytes");
@@ -879,7 +884,7 @@ bool saveConfig(const Config &cfg) {
       log_e("config_store: failed to open %s for writing", kConfigTmpPath);
       break;
     }
-    size_t written = serializeJson(doc, f);
+    size_t written = serializeJson(doc, static_cast<Print &>(f));
     f.close();
     doc.clear();  // the document has done its job; free it before the read-back
     if (written != want) {

@@ -1,6 +1,7 @@
 #include "web_server.h"
 
 #include <Arduino.h>
+#include <ChunkPrint.h>  // ESPAsyncWebServer's per-chunk Print sink, see sendJsonStreamed()
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <Update.h>
@@ -100,10 +101,12 @@ const char *healthToString(transit::Health h) {
   }
 }
 
-void serializeSnapshot(const Snapshot &snap, JsonObject out) {
+// `cfg` is the caller's copy of the active config (handleGetState already holds one): the web UI
+// titles each panel from its fields, so they are echoed next to the live data. Taking it by
+// reference rather than copying again keeps a second Config (eight stops of std::strings) out of
+// the request's peak (SS12.1).
+void serializeSnapshot(const Snapshot &snap, const Config &cfg, JsonObject out) {
   transit::Epoch now = (transit::Epoch)time(nullptr);
-  // The web UI titles each panel from these config fields, so echo them next to the live data.
-  Config cfg = getActiveConfig();
   JsonArray stops = out["stops"].to<JsonArray>();
   for (const StopSnapshot &s : snap.stops) {
     JsonObject so = stops.add<JsonObject>();
@@ -212,6 +215,37 @@ void sendJson(AsyncWebServerRequest *request, int code, JsonDocument &doc) {
     return;
   }
   request->send(code, "application/json", body);
+}
+
+// DESIGN.md SS12.1 "zero-copy": the heavy responses (/api/state, /api/config) do not go through
+// sendJson(). The document is MOVED, not copied, into a holder the chunked response owns, and
+// serialised straight into each TCP send chunk as the socket drains (the filler re-walks the
+// document per chunk, skipping what was already sent - the same ChunkPrint ESPAsyncWebServer's own
+// AsyncJsonResponse uses). So the response holds the document plus one 2 x MSS send buffer - not,
+// as sendJson() costs, the document plus a String of the whole body plus AsyncBasicResponse's own
+// copy of that String, which needed a body-sized contiguous block twice at the worst moment.
+// Chunked transfer encoding, so there is no measuring pass and no Content-Length; every client this
+// device has (the web app's fetch(), curl, the device suite) handles that. Deliberately NOT used for
+// the small responses: their String is a few dozen bytes, while any chunked response allocates the
+// 2.9 KB send buffer (nothrow, retried on the next poll), which is the wrong trade for
+// /api/debug/ui, the endpoint the suite uses to watch the device while it is starved. Same overflow
+// rule as sendJson(): a truncated document is a 503, never an empty or partial 200. Why
+// AsyncJsonResponse itself is not used: it costs two more ArduinoJson serializer instantiations
+// (its ChunkPrint-typed fill and measureJson's counting pass, ~2.2 KB of flash) plus its class;
+// this serialises through a Print&, which config_store.cpp's two sinks do as well, so all three
+// share one instantiation. Measured on cyd-3248S035R: about +0.8 KB of flash for this path, against
+// +4.5 KB with AsyncJsonResponse.
+void sendJsonStreamed(AsyncWebServerRequest *request, JsonDocument &doc) {
+  if (doc.overflowed()) {
+    request->send(503, "application/json", "{\"error\":\"out of memory building the response, retry\"}");
+    return;
+  }
+  std::shared_ptr<JsonDocument> held = std::make_shared<JsonDocument>(std::move(doc));
+  request->send(request->beginChunkedResponse("application/json", [held](uint8_t *buf, size_t max_len, size_t index) -> size_t {
+    ChunkPrint dest(buf, index, max_len);
+    serializeJson(*held, static_cast<Print &>(dest));
+    return dest.written();  // 0 once `index` has reached the end of the document = last chunk
+  }));
 }
 
 void sendError(AsyncWebServerRequest *request, int code, const std::string &message, const std::string &path = "") {
@@ -339,25 +373,21 @@ void scheduleRestart() {
 }
 
 // Admission floor for the heap-heavy read handlers (/api/state copies the whole Snapshot plus
-// weather and bike views into a JsonDocument; /api/config serializes the whole config). C++
-// exceptions in this SDK have a ZERO-byte emergency pool (CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0),
-// so when the heap is exhausted a std::bad_alloc cannot even allocate its own exception object and
-// __cxa_allocate_exception calls std::terminate directly - past every try/catch, a hard reboot
-// (device suite, 2026-09-15: bad_alloc in getBikes() <- handleGetState under load). The guarded()
-// wrappers only help while a throw can still be allocated. So refuse the heavy response up front,
-// with a fixed-literal 503 that needs almost no heap, whenever free memory is below what building
-// it would need. The small handlers (debug/ui, tap) are deliberately not gated: they cost little
-// and the test/UI use them to observe the device precisely while it is under pressure.
-// A modest floor for the heap-heavy read handlers: refuse with a fixed-literal 503 (needs almost
-// no heap) when memory is clearly too low to build the response, so the common low-heap case does
-// not begin an allocation that could fail into the uncatchable OOM-while-throwing path (this SDK
-// has a zero-byte emergency exception pool). It is deliberately NOT set high enough to "guarantee"
-// a build under a concurrent allocation on the other core - an entry check cannot, since the poller
-// shares this heap and can drop it mid-build - because a high floor just makes /api/state 503 for a
-// long time after the heap fragments (largest block ~12 KB) while the actual build needs only a
-// ~5 KB contiguous block. Under the rare convergence of an invalid-stop config, rapid config churn
-// and concurrent reads that can still exhaust the heap, the poller's self-heal reboot (net_poller)
-// recovers the device; config is durably saved. Normal use sits near 74 KB and never trips this.
+// weather and bike views into a JsonDocument; /api/config serializes the whole config): refuse with
+// a fixed-literal 503 (needs almost no heap) when memory is clearly too low to build the response.
+// Until 2026-09-16 this was the only defence against the uncatchable OOM-while-throwing reboot
+// (device suite, 2026-09-15: bad_alloc in getBikes() <- handleGetState under load, with this SDK's
+// zero-byte emergency exception pool). Now that cxx_exception_pool.cpp gives libstdc++ a pool the
+// throw is catchable and guarded() answers 503 either way, so the gate is about cost, not safety: a
+// build that is going to fail burns CPU and heap the poller wants, and the client retries a 503 just
+// the same. It is deliberately NOT set high enough to "guarantee" a build under a concurrent
+// allocation on the other core - an entry check cannot, since the poller shares this heap and can
+// drop it mid-build - because a high floor just makes /api/state 503 for a long time after the heap
+// fragments (largest block ~12 KB), while the build itself needs only 1 KB ArduinoJson pools and,
+// since the zero-copy response (sendJsonStreamed), no body-sized contiguous block at all. The small
+// handlers (debug/ui, tap, oom) are deliberately not gated: they cost little and the test/UI use
+// them to observe the device precisely while it is under pressure. Normal use sits near 74 KB and
+// never trips this.
 constexpr size_t kMinHeavyResponseHeap = 24 * 1024;
 constexpr size_t kMinHeavyResponseBlock = 8 * 1024;
 bool refuseIfLowHeap(AsyncWebServerRequest *request) {
@@ -425,9 +455,9 @@ void handleGetState(AsyncWebServerRequest *request) {
 #else
   Snapshot snap = getSnapshot();
 #endif
-  serializeSnapshot(snap, doc.as<JsonObject>());
+  serializeSnapshot(snap, cfg, doc.as<JsonObject>());
 
-  sendJson(request, 200, doc);
+  sendJsonStreamed(request, doc);
 }
 
 void handleGetConfig(AsyncWebServerRequest *request) {
@@ -435,7 +465,7 @@ void handleGetConfig(AsyncWebServerRequest *request) {
   Config cfg = getActiveConfig();
   JsonDocument doc;
   configToJson(cfg, doc);
-  sendJson(request, 200, doc);
+  sendJsonStreamed(request, doc);
 }
 
 // True when the parts of the config that decide what is fetched differ (stops, weather, bike).
@@ -488,9 +518,11 @@ void handlePutConfigInner(AsyncWebServerRequest *request, JsonVariant &json, con
   if (onConfigChanged) {
     onConfigChanged(data_changed);
   }
+  // Same streamed response as GET /api/config: the 16 KB request document is still alive here, so
+  // this is the moment a second body copy hurt most (SS12.1).
   JsonDocument doc;
   configToJson(cfg, doc);
-  sendJson(request, 200, doc);
+  sendJsonStreamed(request, doc);
 }
 
 // DESIGN.md SS7: POST /api/pin, body {"pin":"new"}, authenticated with the CURRENT pin in X-Pin.
@@ -761,6 +793,46 @@ void handleProxySchedule(AsyncWebServerRequest *request) {
   queueScheduleProxy(request, request->getParam("stop_id")->value().c_str());
 }
 
+// DESIGN.md SS12.1: the deterministic on-device proof of the C++ emergency exception pool
+// (cxx_exception_pool.cpp). Takes the heap away in shrinking blocks until even a 16-byte allocation
+// fails, then forces a std::bad_alloc: with no pool, __cxa_allocate_exception cannot get the ~100
+// bytes for the exception object and calls std::terminate - a reboot - before any catch block runs;
+// with the pool it lands in the catch below. Every block is freed before the response is built, and
+// the body is snprintf'd into a stack buffer so answering needs no heap of its own. "largest" is the
+// largest free block at the moment of the throw: under ~100 bytes proves the exception object came
+// from the pool and not from a hole another task opened meanwhile. PIN-gated because it starves
+// every other task for the sub-millisecond it holds the blocks (the poller and the display loop
+// catch their own bad_alloc and carry on; lwIP tolerates a NULL pbuf; LVGL draws from its own pool).
+void handleDebugOom(AsyncWebServerRequest *request) {
+  if (!requirePin(request)) return;
+  constexpr size_t kMaxBlocks = 200;
+  static const size_t kBlockSizes[] = {1024, 256, 64, 16};
+  void *blocks[kMaxBlocks];
+  size_t n = 0;
+  const uint32_t free_before = ESP.getFreeHeap();
+  for (size_t size : kBlockSizes) {
+    while (n < kMaxBlocks) {
+      void *p = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+      if (!p) break;
+      blocks[n++] = p;
+    }
+  }
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  bool caught = false;
+  char *volatile probe = nullptr;  // volatile: the compiler may otherwise elide an unused new/delete pair
+  try {
+    probe = new char[4096];
+    delete[] probe;
+  } catch (const std::bad_alloc &) {
+    caught = true;
+  }
+  for (size_t i = 0; i < n; ++i) heap_caps_free(blocks[i]);
+  char body[128];
+  snprintf(body, sizeof body, "{\"caught\":%s,\"blocks\":%u,\"largest\":%u,\"free_before\":%u,\"free_after\":%u}",
+           caught ? "true" : "false", (unsigned)n, (unsigned)largest, (unsigned)free_before, (unsigned)ESP.getFreeHeap());
+  request->send(200, "application/json", body);
+}
+
 // Static list embedded in firmware (transit_core/rail_stations.h) - no network needed, so this
 // runs directly on the web server's own task.
 void handleRailStations(AsyncWebServerRequest *request) {
@@ -974,6 +1046,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     ui::requestTap();
     request->send(200, "application/json", "{\"ok\":true}");
   });
+  g_server.on("/api/debug/oom", HTTP_POST, handleDebugOom);  // SS12.1 exception-pool proof; PIN-gated
   g_server.on("/api/wifi/reset", HTTP_POST, handlePostWifiReset);
 
   g_server.on("/api/proxy/stops", HTTP_GET, handleProxyStops);
