@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased - 2026-09-15 review fixes
+## v0.2.0 - 2026-09-16
 
 An external adversarial review of v0.1.2 (32 findings) drove this pass. HTTPS to SEPTA remains
 deferred to its own release; firmware signing was deliberately not added.
