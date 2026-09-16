@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "config_store.h"
+#include "cxx_exception_pool.h"
 #include "http_fetch.h"
 #include "sd_logger.h"
 #include "proxy_worker.h"
@@ -977,6 +978,12 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
 }
 
 void pollerTask(void * /*arg*/) {
+  // DESIGN.md SS12.1: pay this task's one-time __cxa_eh_globals allocation now, while the heap is
+  // still untouched. Without it the FIRST throw on this task does a plain malloc inside __cxa_throw
+  // and calls std::terminate if it fails - and this task's first throw is, by construction, the
+  // bad_alloc the catch blocks below exist for. Covers the queued proxy and stats jobs too: they
+  // run on this task, not one of their own.
+  transit_app::warmExceptionGlobals("net_poller");
   // Created before Wi-Fi so the stack comes from an unfragmented heap; polling starts when
   // startNetPoller() flips g_enabled.
   while (!g_enabled) {
