@@ -10,10 +10,15 @@ flow differently and the 2.4"/2.8" boards also use a different big-minutes font.
 export PATH="$HOME/.platformio/penv/bin:$PATH"
 cd firmware
 pio run -e ui-sim
-.pio/build/ui-sim/program ../docs/screens          # owner's board + 320x240, every page, both themes
-.pio/build/ui-sim/program ../docs/screens full     # + 240x320, the four-stop config, stale header,
-                                                   #   offline device page, stats with no on-time data
+.pio/build/ui-sim/program ../docs/screens/after       # owner's board + 320x240, every page, both themes
+.pio/build/ui-sim/program ../docs/screens/after full  # + 240x320, the four-stop config, stale header,
+                                                      #   device page with everything failing, stats
+                                                      #   with no on-time data
 ```
+
+`docs/screens/before/` holds the v0.2.0 renders and `docs/screens/after/` the current ones, so a
+layout change can be compared side by side; regenerate `after/` with `full` before committing a
+screen change.
 
 Each PNG is named `<page>-<WxH>-<theme>[-variant].png`. The program also prints, per
 resolution, the LVGL pool usage after all four screens are built and the object count per screen -
@@ -38,7 +43,8 @@ path; `fakes.cpp` implements the app services the screens call):
 | `WiFi.status()/RSSI()/SSID()/localIP()` | `sim::wifi_*` knobs (`stubs/WiFi.h`) |
 | `millis()`, `delay()`, `ESP.getFreeHeap()`, `ESP.restart()`, `log_*` | `stubs/Arduino.h` - restart and Wi-Fi reset print a line and do nothing |
 | `auth::pin()` | `123456` (the README's example, never a real device's PIN) |
-| `getSdStatus()` | mounted, 3720 MB free (`sim::sd_mounted`) |
+| `getSdStatus()` | mounted, 3720 MB free (`sim::sd_mounted`), write health from `sim::sd_dropped_rows`/`sim::sd_error` |
+| `getPollStatus()` | last SEPTA poll ok, 12 s ago (`sim::poll_ok`, `sim::poll_age_s`, `sim::poll_error`) |
 | `getStopSummary(key)` | canned `StopSummaryView`s set per render (`sim::setSummary`); an unset key is "loading" |
 | `getBikes()` | two Indego stations |
 | `headerWeatherIcon()/Temp()/Text()`, `stopWeatherNote()` | `sim::weather_*`, `sim::stop_note` |

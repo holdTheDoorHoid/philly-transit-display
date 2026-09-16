@@ -9,6 +9,20 @@
   (PIN) proves it on the device: it drains the heap, forces the failure, and reports
   `caught:true`. `/api/state` and `/api/config` are streamed straight into the network buffers
   instead of being built as a second copy first, lowering the peak memory of the busiest request.
+- Screen: the Wi-Fi signal in the top strip is four bars filled in solid, like a phone's status
+  bar, instead of a symbol with a number beside it. The same bars appear on the device page.
+- Screen: the statistics page now looks like part of the arrivals page - the same top strip, one
+  card per stop with its route badge and title - and shows the on-time percentage as a big
+  number over a filled bar (green, amber or red), with the average lateness in the arrival
+  badge colours, the worst hour and the ghost count as labelled tiles, and the arrival count
+  underneath. The card adapts to every board: two stops on the 3.5" board get the full layout,
+  four stops on a 2.4" board get one line each, nothing is clipped.
+- Screen: the device page is arranged as a Network card (signal bars, network name, the web
+  address, IP address, and whether the last SEPTA update worked) and a card named after the
+  device (the web PIN in large digits, SD card status - with a warning when log rows are not
+  being written - free memory and uptime), with the hold-to-reset-Wi-Fi button along the bottom.
+  These two pages are now built when you tap to them and freed when you leave, so a four-stop
+  setup fits in the display's memory.
 - Web: the Settings page is arranged into blocks of settings that affect each other (Screen &
   appearance, Schedules, Alerts & reminders, Data & weather, Device & network, Web PIN,
   Firmware & maintenance) with a one-line intro each; a setting that only matters when another
