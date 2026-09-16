@@ -318,8 +318,11 @@ check('D state reports active profile', state().get('active_profile') == 'Test w
 cfg['profiles'][0]['days'] = [(today_dow() + 3) % 7]; put_cfg(cfg); time.sleep(3); d = ui()
 check('D profile inactive on other day', d.get('active_profile') == '' and len(d.get('shown_stops', [])) == len(base['stops']), d)
 # alternatives: k1 alternative to k0 with 60 min -> hidden while k0 has a bus within 60 min
-cfg = copy.deepcopy(base); cfg['stops'][1].update(alt_of=k0, alt_after_min=60); put_cfg(cfg); time.sleep(3); d = ui()
-check('D alternative hidden while primary is near', k1 in d.get('hidden_panels', []), d)
+cfg = copy.deepcopy(base); cfg['stops'][1].update(alt_of=k0, alt_after_min=60); put_cfg(cfg)
+# The screen is rebuilt on save and repopulated by the re-poll, which with today's 540 KB feed can take
+# 10-20 s; wait for the panel decision rather than sampling a half-built screen.
+hidden = wait_for(lambda: k1 in ui().get('hidden_panels', []), 60, 3); d = ui()
+check('D alternative hidden while primary is near', hidden, d)
 # alternative to a stop with no data -> shown
 cfg = copy.deepcopy(base); tmp = dict(cfg['stops'][0]); tmp.update(key='tmp-99999', stop_id='99999', label='Temp no-service', stop_name='nowhere', lat=0, lng=0, alt_of='', alt_after_min=15)
 cfg['stops'].append(tmp); cfg['stops'][1].update(alt_of='tmp-99999', alt_after_min=5); put_cfg(cfg)
@@ -328,16 +331,28 @@ time.sleep(2); d = ui()
 check('D alternative shown when primary has no data', k1 not in d.get('hidden_panels', []), d)
 st = state(); tmp_snap = [x for x in st.get('stops', []) if x['key'] == 'tmp-99999']
 check('D temp stop present with no arrivals (after the next poll)', present and tmp_snap and tmp_snap[0].get('arrivals') == [], (present, tmp_snap))
-# night page: profile showing only the no-service stop
+# Review F13: a stop whose source failed (stop_id 99999 -> SEPTA error) is `unavailable`, and an
+# outage must never look like "nothing due", so the night page is NOT shown for it - the arrivals
+# page stays up with the reason. Assert exactly that, then exercise the night page with a real stop
+# when the timetable allows (the night rule needs after_min >= 15 and nothing due within it).
 cfg['profiles'] = [{'name': 'Night test', 'days': [today_dow()], 'start': now_hhmm(-5), 'end': now_hhmm(30), 'stops': ['tmp-99999']}]
 cfg['stops'][1].update(alt_of='', alt_after_min=15); cfg['device']['night'] = {'enabled': True, 'after_min': 60}
-put_cfg(cfg)
-check('D night page when nothing is due', wait_for(lambda: ui().get('page') == 'night', 90, 3), ui())
-check('D tap from night goes to stats', post('/api/debug/tap') == 200 and wait_for(lambda: ui().get('page') == 'stats', 10, 1), ui().get('page'))
-check('D tap to device page', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'device'))
-check('D tap back to night', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'night'))
-cfg['device']['night']['enabled'] = False; put_cfg(cfg); time.sleep(3)
-check('D night disabled -> main page', ui().get('page') == 'main', ui())
+put_cfg(cfg); time.sleep(6)
+check('D unavailable stop reports health unavailable', tmp_snap and tmp_snap[0].get('health') == 'unavailable' and tmp_snap[0].get('error'), tmp_snap and (tmp_snap[0].get('health'), tmp_snap[0].get('error')))
+check('D night page suppressed while the only shown stop is unavailable', ui().get('page') == 'main' and ui().get('active_profile') == 'Night test', ui())
+soonest = min([a['eta_s'] for x in state().get('stops', []) if x['key'] == k0 for a in x.get('arrivals', [])] or [0]) // 60
+if soonest >= 17:
+    cfg['profiles'][0]['stops'] = [k0]; cfg['device']['night'] = {'enabled': True, 'after_min': 15}; put_cfg(cfg)
+    reached = wait_for(lambda: ui().get('page') == 'night', 90, 3)
+    check('D night page when nothing is due within after_min (real stop)', reached, (soonest, ui()))
+    if reached:
+        check('D tap from night goes to stats', post('/api/debug/tap') == 200 and wait_for(lambda: ui().get('page') == 'stats', 10, 1), ui().get('page'))
+        check('D tap to device page', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'device'))
+        check('D tap back to night', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'night'))
+    cfg['device']['night']['enabled'] = False; put_cfg(cfg); time.sleep(3)
+    check('D night disabled -> main page', ui().get('page') == 'main', ui())
+else:
+    print('SKIP D night page with a real stop: next bus at %s is %d min away (need >= 17)' % (k0, soonest))
 put_cfg(copy.deepcopy(base)); time.sleep(3)
 check('D back to base: main, all stops', ui().get('page') == 'main' and len(ui().get('shown_stops', [])) == len(base['stops']), ui())
 # due + chime

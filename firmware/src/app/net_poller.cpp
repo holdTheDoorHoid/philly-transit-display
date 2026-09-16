@@ -53,7 +53,15 @@ constexpr uint32_t kOptionalFetchTimeoutMs = 8000;
 // product; a weather refresh that makes them late is a bad trade at any price.
 constexpr uint32_t kOptionalWorkReserveMs = 5000;
 constexpr uint32_t kTaskStackBytes = 10240;
-constexpr UBaseType_t kTaskPriority = 1;
+// Priority 0 - the same as the idle task - on purpose. HTTPClient waits for response headers in
+// Stream::timedRead(), a busy loop with no yield, for up to the 15 s fetch timeout; at priority 1
+// on core 0 that starves IDLE0, and this SDK's task watchdog (5 s, CONFIG_ESP_TASK_WDT_PANIC=y)
+// then PANICS and reboots the board. Seen in the 2026-09-15 device suite as a reset with a
+// backtrace ending in millis() <- timedRead() <- handleHeaderResponse(). At priority 0 FreeRTOS
+// round-robins the poller with IDLE0 every tick, the watchdog is fed, and the poller still gets
+// the CPU whenever nothing higher is runnable - which is the same as before, since everything
+// else on the device runs above priority 0.
+constexpr UBaseType_t kTaskPriority = 0;
 
 // DESIGN.md SS4.7.
 constexpr uint32_t kBusSchedulesRefreshMs = 10 * 60 * 1000;
@@ -699,9 +707,21 @@ uint32_t nextIntervalS(const Config &cfg, bool ok, bool urgent, uint32_t &consec
 // CSV off SD), and holding g_mutex through it would block getSnapshot() - i.e. the LVGL task's
 // 1 Hz redraw - for exactly as long as the scan takes, which is the freeze this change exists to
 // remove. Take, release, scan, take, store.
+// Below this much free heap (or this small a largest block) the idle-slice work waits: a
+// StatsAggregator is ~8 KB and a proxied body needs a 4 KB write buffer, and taking them while a
+// PUT /api/config is being parsed on the web task is how "Unable to allocate FD" / 500s happened
+// in the 2026-09-15 device suite. Nothing here is urgent; it runs on the next slice instead.
+constexpr size_t kIdleWorkMinFreeHeap = 40 * 1024;
+constexpr size_t kIdleWorkMinLargestBlock = 12 * 1024;
+bool idleWorkHasHeadroom() {
+  return ESP.getFreeHeap() >= kIdleWorkMinFreeHeap &&
+         heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= kIdleWorkMinLargestBlock;
+}
+
 bool computeOneRequestedSummary() {
   std::string key;
   if (g_mutex == nullptr) return false;
+  if (!idleWorkHasHeadroom()) return false;
   if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
   for (const auto &e : g_summary_cache) {
     if (e.requested) {
@@ -930,7 +950,7 @@ void pollerTask(void * /*arg*/) {
       // drained the whole queue back to back without ever checking it: two queued jobs - a
       // 400 KB Stops proxy and a 30-day stats scan are both seconds of work - could push the
       // next transit poll a long way past its deadline, and nothing in the loop noticed.
-      if (runQueuedProxyJob() && (int32_t)(millis() - deadline) >= 0) break;
+      if (idleWorkHasHeadroom() && runQueuedProxyJob() && (int32_t)(millis() - deadline) >= 0) break;
       // At most one stop's stats summary per slice, same reason (F27).
       if (computeOneRequestedSummary() && (int32_t)(millis() - deadline) >= 0) break;
     }
