@@ -930,6 +930,69 @@ const STATIC = {
   '/favicon.svg': { file: 'favicon.svg', type: 'image/svg+xml' },
 };
 
+/* ------------------------------ fault injection (dev/test only) ------------------------------
+   DESIGN.md §12.1: GET /api/state and GET /api/config refuse with a 503 when the device
+   is short on heap mid-poll, and /api/state can additionally come back as a genuine
+   empty 200 (the network stack's send buffer running out, not an application error).
+   This block reproduces both, plus the network-level failures a real device's TCP stack
+   can also produce under load (a hung connection, a dropped one), so the web UI's
+   retry/backoff/never-blank behavior can be exercised without hardware. Off by default —
+   nothing here does anything unless faults are turned on one of three ways:
+
+     MOCK_FAULT_RATE=0.4 node web/mock-server.mjs         env vars, fixed for the process
+     MOCK_FAULT_MODES=503,empty node web/mock-server.mjs  (see defaults below)
+
+     GET  /__test__/faults                                 read the live config
+     POST /__test__/faults  {"rate":0.4,"modes":["503","empty","slow","reset"]}
+                                                             change it without a restart —
+                                                             what the browser-driven tests
+                                                             below use, so faults can be
+                                                             turned on and back off again
+                                                             against a page that's already
+                                                             loaded and polling
+
+     GET /api/state?fault=503                               force just this one request,
+                                                              regardless of the rate — for
+                                                              a quick one-off check */
+let faults = {
+  rate: Math.max(0, Math.min(1, Number(process.env.MOCK_FAULT_RATE) || 0)),
+  modes: (process.env.MOCK_FAULT_MODES || '503,empty,slow,reset').split(',').map((s) => s.trim()).filter(Boolean),
+  paths: (process.env.MOCK_FAULT_PATHS || '/api/state,/api/config').split(',').map((s) => s.trim()).filter(Boolean),
+  slowMs: Number(process.env.MOCK_FAULT_SLOW_MS) || 6000,
+};
+
+// Handles the request itself and returns true when the caller should do nothing further
+// (a fault answered it, or destroyed the connection); false to fall through to the real
+// route below — which is also how "slow" works, by delaying and then falling through.
+async function maybeFault(req, res, pathname, q) {
+  const forced = q.get('fault');
+  let mode = forced;
+  if (!mode && faults.rate > 0 && faults.paths.includes(pathname) && Math.random() < faults.rate) {
+    mode = faults.modes[Math.floor(Math.random() * faults.modes.length)];
+  }
+  if (!mode) return false;
+  if (mode === '503') {
+    sendJSON(res, 503, { error: 'device is busy, try again shortly' });
+    return true;
+  }
+  if (mode === 'empty') {
+    // The documented empty-200: HTTP 200, zero-length body, no JSON at all — not a
+    // truncated document, genuinely nothing.
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': 0, 'Cache-Control': 'no-store' });
+    res.end();
+    return true;
+  }
+  if (mode === 'slow') {
+    await new Promise((r) => setTimeout(r, faults.slowMs));
+    return false;
+  }
+  if (mode === 'reset' || mode === 'network') {
+    req.socket.destroy();
+    return true;
+  }
+  return false;
+}
+
 /* ------------------------------ server ------------------------------ */
 
 // One OTA at a time, so a second upload can be answered with 409 like the firmware does.
@@ -941,6 +1004,18 @@ const server = http.createServer(async (req, res) => {
   const q = url.searchParams;
 
   try {
+    if (pathname === '/__test__/faults' && req.method === 'GET') return sendJSON(res, 200, faults);
+    if (pathname === '/__test__/faults' && req.method === 'POST') {
+      const { buf } = await readBody(req);
+      let parsed;
+      try { parsed = JSON.parse(buf.toString('utf8') || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'Invalid JSON body' }); }
+      if (parsed.rate != null) faults.rate = Math.max(0, Math.min(1, Number(parsed.rate) || 0));
+      if (Array.isArray(parsed.modes) && parsed.modes.length) faults.modes = parsed.modes;
+      if (Array.isArray(parsed.paths) && parsed.paths.length) faults.paths = parsed.paths;
+      if (parsed.slowMs != null) faults.slowMs = Math.max(0, Number(parsed.slowMs) || 0);
+      return sendJSON(res, 200, faults);
+    }
+
     if (STATIC[pathname] && req.method === 'GET') {
       const spec = STATIC[pathname];
       const filePath = path.join(webDir, spec.file);
@@ -949,6 +1024,8 @@ const server = http.createServer(async (req, res) => {
       res.end(body);
       return;
     }
+
+    if (await maybeFault(req, res, pathname, q)) return;
 
     if (pathname === '/api/state' && req.method === 'GET') return sendJSON(res, 200, buildState(q));
 
@@ -1057,4 +1134,9 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`Philly Transit Display mock server listening on http://localhost:${PORT}`);
   console.log(`  admin PIN: ${MOCK_PIN_DEFAULT} (X-Pin header; 5 wrong tries locks for ${MOCK_PIN_LOCK_S}s)`);
+  if (faults.rate > 0) {
+    console.log(`  fault injection: ${Math.round(faults.rate * 100)}% of [${faults.paths.join(', ')}] -> [${faults.modes.join(', ')}]`);
+  } else {
+    console.log('  fault injection: off (POST /__test__/faults or MOCK_FAULT_RATE to turn it on)');
+  }
 });
