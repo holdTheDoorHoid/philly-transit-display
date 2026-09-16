@@ -946,7 +946,11 @@ into a boot loop. Rules: retention caps are small (32 feed updates, 32 vehicles)
 from a few entries instead of reserving the cap; `pollOnce()`, queued proxy/stats jobs and
 `PUT /api/config` catch `std::bad_alloc` and report "out of memory" (a failed poll with per-stop
 errors, or a 503) rather than resetting. Measured after the fix: heap ~54 KB minimum during a
-poll, largest block ~32 KB median.
+poll, largest block ~32 KB median. **Invariant:** every long-running task that does STL allocation catches
+`std::bad_alloc` at its top level, because an uncaught throw is `std::terminate` = reboot. There
+are three: the poller task (net_poller.cpp, inner per-stop + outer cycle), the AsyncTCP web
+handlers (web_server.cpp `guarded()` + the JSON-body handlers, answering 503), and the LVGL
+display loop (main.cpp `loop()`, skipping the frame). Any new task on either core must do the same.
 
 Task watchdog (2026-09-15): `CONFIG_ESP_TASK_WDT_PANIC=y` in this SDK, and HTTPClient waits for
 response headers in `Stream::timedRead()`, a busy loop with no yield, for up to the 15 s fetch

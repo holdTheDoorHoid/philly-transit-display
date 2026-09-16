@@ -11,8 +11,10 @@
 #include <WiFi.h>
 #include <esp32_smartdisplay.h>
 #include <esp_mac.h>
+#include <esp_heap_caps.h>
 
 #include <ctime>
+#include <new>
 
 #include "app/auth.h"
 #include "app/config_store.h"
@@ -191,17 +193,34 @@ void setup() {
 }
 
 void loop() {
-  pumpLvgl();
+  // This is loopTask on core 1 - the LVGL / display task. It allocates: ui::tick() copies the
+  // live Snapshot (vectors of arrivals and strings) out from under the poller's mutex, and LVGL
+  // widget updates allocate from the heap too. C++ exceptions are on in this SDK (-fexceptions),
+  // so a std::bad_alloc here that nothing catches is std::terminate = reboot - which is how a
+  // burst of concurrent web requests, eating the heap while the UI tried to copy the snapshot,
+  // rebooted the board (device suite, 2026-09-15, abort in Snapshot::operator= <- getSnapshot()
+  // <- ui::tick()). A dropped frame is harmless; the next tick redraws. Never let it be fatal.
+  try {
+    pumpLvgl();
 
-  if (g_apply_network_settings) {
-    g_apply_network_settings = false;
-    applyNetworkSettings();
-  }
+    if (g_apply_network_settings) {
+      g_apply_network_settings = false;
+      applyNetworkSettings();
+    }
 
-  static uint32_t last_ui_refresh_ms = 0;
-  uint32_t now = millis();
-  if (now - last_ui_refresh_ms >= 1000) {
-    transit_app::ui::tick();
-    last_ui_refresh_ms = now;
+    static uint32_t last_ui_refresh_ms = 0;
+    uint32_t now = millis();
+    if (now - last_ui_refresh_ms >= 1000) {
+      transit_app::ui::tick();
+      last_ui_refresh_ms = now;
+    }
+  } catch (const std::bad_alloc &) {
+    static uint32_t last_oom_log_ms = 0;
+    uint32_t now = millis();
+    if (now - last_oom_log_ms >= 5000) {  // rate-limit: under real pressure this can fire every tick
+      Serial.printf("[main] out of memory in the display loop (free %u, largest %u); skipping this frame\n",
+                    (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+      last_oom_log_ms = now;
+    }
   }
 }
