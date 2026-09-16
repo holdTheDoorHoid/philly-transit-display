@@ -251,9 +251,9 @@ number could not fire:
 
 | Gate | Was | In real (8-bit) terms | Could it fire? | Now |
 |---|---|---|---|---|
-| `/api/state`, `/api/config` | 24 KB INTERNAL free, 8 KB block | ~0 KB of usable heap | **never** | 12 KB `free8`, 8 KB block |
-| poller idle slice | 40 KB INTERNAL free, 12 KB block | ~6 KB of usable heap | **almost never** | 16 KB `free8`, 12 KB block |
-| OTA admission | 60 KB INTERNAL free, 16 KB block | ~26 KB of usable heap | yes, constantly | 16 KB `free8`, 6 KB block |
+| `/api/state`, `/api/config` | 24 KB INTERNAL free, 8 KB block | ~0 KB of usable heap | **never** | 12 KB `free8`, 7,924 B block |
+| poller idle slice | 40 KB INTERNAL free, 12 KB block | ~6 KB of usable heap | **almost never** | 16 KB `free8`, 12,020 B block |
+| OTA admission | 60 KB INTERNAL free, 16 KB block | ~26 KB of usable heap | yes, constantly | 16 KB `free8`, 5,876 B block |
 
 The first two had been running on their largest-block halves alone, which is why they behaved
 sensibly despite the free half being unreachable - the comments described a check that was not
@@ -264,17 +264,23 @@ requirement was **4x** anything the OTA path allocates. `Update.begin()` takes e
 the path is a 16 B `_skipBuffer`. Nothing in `Update.write()` is body-sized - ESPAsyncWebServer
 delivers the multipart body in ~1.4 KB pieces and Update accumulates them into that one sector.
 
-Each new threshold is derived from what its path actually allocates, not from a round number:
+Each new threshold is derived from what its path actually allocates, not from a round number -
+and the *block* halves are then moved off the 512-byte lattice largest-block sizes land on (the
+`kMinOtaLargestBlock` comment in `web_server.cpp` carries that measurement), which is why they read
+5,876 / 7,924 / 12,020 rather than 6 / 8 / 12 KB. Where this document quotes a threshold it quotes
+the constant, in bytes: a rounded restatement is how the pre-lattice figures survived a whole
+release in four places here after the code had moved (found in the RC review, 2026-09-16).
 
-- **OTA** - one 4,096 B sector buffer, so a 6 KB block (1.5x) and 16 KB of `free8` for the request
-  machinery and for the rest of the device to keep running through a ~1.7 MB upload.
+- **OTA** - one 4,096 B sector buffer, so a 5,876 B block (1.43x) and 16 KB of `free8` for the
+  request machinery and for the rest of the device to keep running through a ~1.7 MB upload.
 - **`/api/state` / `/api/config`** - a Config copy, a Snapshot copy, ArduinoJson's 1 KB slot pools
   and string pool for a ~4 KB document, and one 2,872 B send buffer
-  (`ASYNC_RESPONCE_BUFF_SIZE` = `CONFIG_LWIP_TCP_MSS * 2`). The 8 KB block is 2.8x that buffer; the
-  12 KB free floor is deliberately *below* the full transient cost, because §12.1's reasoning still
-  holds - the floor exists to skip a hopeless build, not to promise a successful one.
-- **Idle slice** - the ~8 KB contiguous `StatsAggregator`, so a 12 KB block (1.5x) and 16 KB of
-  `free8`. The "4 KB proxy write buffer" the old comment cited is not in the sum: it is
+  (`ASYNC_RESPONCE_BUFF_SIZE` = `CONFIG_LWIP_TCP_MSS * 2`). The 7,924 B block is 2.76x that
+  buffer; the 12 KB free floor is deliberately *below* the full transient cost, because §12.1's
+  reasoning still holds - the floor exists to skip a hopeless build, not to promise a successful
+  one.
+- **Idle slice** - the ~8 KB contiguous `StatsAggregator`, so a 12,020 B block (~1.5x) and 16 KB
+  of `free8`. The "4 KB proxy write buffer" the old comment cited is not in the sum: it is
   `static uint8_t wbuf[4096]` and never comes off the heap.
 
 Measured against 114 samples of ordinary polling on the owner's board - two stops, the owner's own
@@ -911,9 +917,9 @@ concurrent download gets a 503 rather than a truncated file.
 Memory rules: no full framebuffer; LVGL partial buffer is 1/10 of the screen in RGB565 (the library default of 1/4 with 3-byte pixels does not fit, see `firmware/boards/README.md`); large long-lived objects (ArrivalTracker ~16 KB, StatsAggregator ~8 KB) are heap-allocated, never file-scope globals, because the ESP32's static .bss budget is separate from and much smaller than the heap; one
 TLS connection at a time; ArduinoJson documents sized from measured payloads (§4) with 25 %
 headroom; log free heap once per poll at `INFO`; refuse to start OTA below 16 KB of `MALLOC_CAP_8BIT`
-free with a 6 KB largest block (§2.1 - the byte-addressable heap, not `ESP.getFreeHeap()`).
+free with a 5,876 B largest block (§2.1 - the byte-addressable heap, not `ESP.getFreeHeap()`).
 
-Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-15, with the §12 hardening, the full feature set uses 93.9 % on `cyd-3248S035R` and 93.7 % on the tightest board, `cyd-2432S024C` (~112 KB headroom); `firmware/README.md` ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
+Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-16, with the §12 hardening, the screen pass, the LVGL pool safety work and the release-candidate fixes, the full feature set uses **1,859,434 B (97.8 %)** on `cyd-3248S035R` — 41,110 B of headroom — and 1,855,226 B (97.6 %) on `cyd-2432S024C`; the tightest env of all is the HTTPS prototype `cyd-3248S035R-https` (§2.1), which ships in no image. (This line read "93.9 % / 93.7 %, ~112 KB headroom" until 2026-09-16, which was the 2026-09-15 measurement left behind by three later passes — the same failure §2.1's threshold note describes, so the figures here are now absolute bytes with the date they were taken.) `firmware/README.md` carries the per-env table and ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
 
 Build/flash: `pio run -e cyd-3248S035R`, `pio run -e cyd-3248S035R -t upload --upload-port
 /dev/ttyUSB0`. Releases publish `bootloader.bin`, `partitions.bin`, `firmware.bin` per env plus an
@@ -1744,8 +1750,9 @@ none, calls `std::terminate` directly - and this SDK is built with a zero-byte p
 (`CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0`). The firmware now supplies the pool itself, without
 rebuilding the SDK: libstdc++ sizes it at static-init by calling the weak hook
 `__cxx_eh_arena_size_get()`, and `firmware/src/app/cxx_exception_pool.cpp` defines that hook (2 KB =
-16 in-flight `std::bad_alloc`s at 128 B each, twice what the four allocating tasks can have
-mid-throw at once) together with `__cxx_init_dummy`, so the SDK's `-u __cxx_init_dummy` is satisfied
+16 in-flight `std::bad_alloc`s at 128 B each, well over the six the **three** allocating tasks
+listed above can have mid-throw at once - one each, plus a dependent exception from a rethrow; the
+file's own arithmetic, and the count that agrees with it) together with `__cxx_init_dummy`, so the SDK's `-u __cxx_init_dummy` is satisfied
 by our object and `libcxx.a(cxx_init.cpp.obj)`, which carries the SDK's zero-returning definition, is
 never linked. The file explains why `--wrap` cannot do this and why `--allow-multiple-definition` was
 not used; the link map is the proof. Cost: one 2 KB `malloc` before `app_main()`, never freed; the
@@ -1794,7 +1801,7 @@ of the device suite reboots first and makes `/api/debug/oom` the first request t
 run any later it answers `caught:true` whether the first-throw path works or not. The heavy read handlers (`/api/state`,
 `/api/config`) still refuse up front with a fixed-literal 503 when byte-addressable free heap is under
 `kMinHeavyResponseFree8` (12 KB, `MALLOC_CAP_8BIT` since 2026-09-16 - the 24 KB INTERNAL floor it
-replaced could never fire, §2.1) or the largest block under 8 KB - no longer because the failure
+replaced could never fire, §2.1) or the largest block under `kMinHeavyResponseBlock` (7,924 B) - no longer because the failure
 would be uncatchable, but because a build that is going to fail costs CPU and heap the poller wants,
 and a 503 the client retries is the cheaper answer. The same handlers are zero-copy since the same
 date (`sendJsonStreamed()`): the finished document is moved into a holder a chunked response owns

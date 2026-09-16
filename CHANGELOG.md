@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased - release-candidate fixes
+
+Seven defects found reading the v0.3.0 release candidate end to end. Four of them could restart or
+boot-loop a display in someone's home; the rest are safety nets that were not quite doing what
+their comments said.
+
+- **The new "restart if fetching has stopped" safety net could restart a perfectly healthy display,
+  over and over.** It judged the display by whether a whole round of fetching had *finished*, and
+  gave that five minutes. But on a network that has gone quiet without saying so - the internet
+  down while the Wi-Fi still works, a hotel or café sign-in page, a bad connection - one round can
+  legitimately take far longer than that: every request waits out its own timeouts, and there is
+  one request per stop, several times over. A display with six or more stops on such a network
+  could never finish a round at all, so the net restarted it mid-round, forever, until the network
+  came back. Two changes: the display now also reports in every time it *starts* a request, not
+  only when it finishes a round, so "is it still going?" is answered by what it is actually doing;
+  and three layers of the fetching code that each retried the same dead request independently now
+  stop as soon as the network itself is unreachable, instead of multiplying (one stop's timetable
+  could cost twelve full attempts a round; it now costs one). The retrying that exists for a real
+  reason - SEPTA sometimes answering with the wrong day's timetable - is untouched. A display with
+  the maximum eight stops on a blackholing network now keeps working through it, and a display that
+  has genuinely frozen is still restarted within about five minutes, whatever its stop list.
+- **Firmware uploads could restart the display instead of installing.** Two separate things. The
+  groundwork that makes the device survive running out of memory has to be done once per internal
+  worker, early, and the upload path ran before the place that does it — so on a display whose
+  first-ever web request was a firmware upload, running out of memory during that upload was fatal
+  rather than a polite refusal. And the older memory safety net had no pause for uploads, so a
+  display already near its threshold could restart itself part-way through writing the new image.
+  Neither could damage a display (the new image is only switched to once it has arrived complete),
+  but both threw the upload away at the worst possible moment. Both fixed.
+- **The check that stops a hostile web page from reaching your display now runs before the display
+  writes anything, not just before it answers.** For a firmware upload it used to run afterwards,
+  so a rebound request was refused — but only after the device had already written up to 1.7 MB to
+  its spare memory. Not something an attacker could actually reach (uploads need the PIN, which a
+  web page cannot supply from another site), but the check is worth having where it claims to be.
+- **A display could boot-loop on a stop list it had happily accepted.** Stops can each ask for one
+  to four arrival rows, and a four-row panel takes about three times the drawing memory of a
+  one-row one. The guard that stops the arrivals page running out of memory measured the biggest
+  panel it had built so far and assumed the next one was no bigger — so a list that happens to put
+  the small stops first could let a big one in with nowhere near enough room. Since which stops are
+  shown changes by time of day, the same settings could be fine in the morning and crash in the
+  evening — and because it crashes while drawing the first screen at switch-on, with the settings
+  still saved, the only way out was a USB cable. The guard now scales its estimate by how many rows
+  the next panel actually wants, and the "N more stops will not fit" line at the bottom is now
+  reserved up front rather than squeezed out of what is left.
+- **The Device info screen no longer waits on the fetching to draw itself.** It asked the fetcher
+  for its status on every refresh and would wait up to a second for an answer, which is exactly the
+  pattern that caused a crash earlier in this project's history. It now waits a twentieth of that
+  and, if the fetcher is busy, redraws the last answer it got.
+- **When the display restarts because it ran out of drawing memory, it now says so.** That restart
+  used to be indistinguishable from an ordinary one, which is unhelpful precisely when it matters:
+  a stop list that does not fit crashes the same way on every switch-on, so what you have is a boot
+  loop with no explanation. The web page can now ask why it last restarted and get "ran out of
+  screen memory", with the numbers.
+- **The web page no longer gets stuck on "Connecting to the display…" forever.** It retries a busy
+  display indefinitely, which is right — a busy display answers in a second or two. But it did the
+  same for answers that will never change, the common one being opening the page at the display's
+  *old* name after renaming it. Those now stop, and say what happened and what to do about it.
+- Documentation: four memory thresholds in DESIGN.md still quoted the pre-release round numbers
+  after the code had moved to exact ones, and two places disagreed about how many internal workers
+  the device has. Both corrected, with a note that thresholds are quoted in bytes from now on.
+
 ## v0.3.0 - 2026-09-16
 
 - **The display now notices when it has quietly stopped fetching arrivals, and restarts itself.**
