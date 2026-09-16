@@ -74,6 +74,22 @@ Five wrong PINs in a row lock every protected route for 30 seconds (HTTP 429, wi
 the body). A *missing* header never counts towards that, so a script that has not been told about
 the PIN cannot lock the owner out.
 
+**Both halves of that print to the console now** (2026-09-16): `[auth] wrong PIN on <method> <path>`
+for each attempt, and `[auth] N wrong PINs in a row; every protected route is locked for 30 s` when
+the lockout engages. They are plain `Serial.printf`, not `log_w`, because `CORE_DEBUG_LEVEL` is 1
+and `log_w` compiles to nothing at that level - so until this change a device that locked every
+setting-changing route for thirty seconds said nothing at all about it. The reason it was noticed:
+a device-suite run reported eleven `PUT 429`s in a section that sends no wrong PIN anywhere, and
+there was no evidence to work from. What the code says about that is narrow and worth writing down,
+because it is most of the diagnosis: 429 has exactly one producer (five consecutive
+`auth::Result::Wrong`), a missing header is `Missing` and never counts, and a correct PIN zeroes the
+streak - so a client that always sends the right value can only get there if the `X-Pin` header
+arrived **present but damaged**, five times running. It has not reproduced since (fourteen
+hand-issued correct-PIN PUTs at the suite's cadence and body size, then two full suite runs, all
+clean), so this is a hook for the next occurrence rather than a fix. If it does recur and the route
+alone is not enough, log `strlen(provided)` beside it - an empty or short value would settle it
+immediately, and a length leaks nothing.
+
 The setup AP has its own generated password (NVS `ptd`/`ap_pass`), shown on the panel with a QR
 code when the portal is open. A device that already has Wi-Fi credentials does not open that
 portal on its own — it retries its stored network with a 5 s → 60 s backoff and opens the portal
@@ -87,6 +103,8 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 
 | Build (`cyd-3248S035R`) | Flash | Static RAM |
 |---|---:|---:|
+| 2026-09-16 the two reboot paths (`src/app/cpu_yield.*` + the yield in `streamLogLines()`, the stats jobs answering through `json_response.h`, `HostGuardHandler` replacing the server middleware, `src/app/host_match.h`, the auth console lines), on top of `next` at baf20a0 | 1,861,742 B (98.0 %) | 96,460 B |
+| The same `next` (baf20a0) without them - the baseline that delta is measured against | 1,862,942 B (98.0 %) | 96,404 B |
 | 2026-09-16 the display task's zero-wait lock policy (`src/app/ui_lock.h`, the `LastGood` fallback in every shared accessor, the Snapshot published and read as `shared_ptr<const>`, `lock_misses`/`tick_ms` on `/api/debug/ui`), on top of `next` at 187b37e | 1,862,942 B (98.0 %) | 96,404 B |
 | The same `next` (187b37e) without it - the baseline that delta is measured against | 1,859,434 B (97.8 %) | 95,932 B |
 | 2026-09-16 release-candidate review fixes (the per-fetch liveness stamp, the transport-failure early exits, the OTA upload warm + guard + Host check, the row-scaled panel guard, `tryGetPollStatus()`, the `lvgl_pool` restart note), on top of `next` at ec0c1ab | 1,859,434 B (97.8 %) | 95,932 B |
@@ -102,6 +120,34 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 | Everything incl. weather, Indego, profiles, night page, 48 px font | 1,858,446 B (97.8 %) | 95,300 B (29.1 %) |
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
+
+The two-reboot-paths pass is **-1,200 B of flash and +56 B of static RAM** on the 3.5" board,
+leaving **38,802 B** of app slot - the first change in a while that gives flash back rather than
+spending it, and it is worth saying where from, because two of the three parts were expected to
+cost. Measured separately on the same tree: the watchdog half (`cpu_yield.*`, the yield in
+`streamLogLines()`, the stats jobs answering through `sendJsonStreamed()` instead of building a
+`String`, the `cpu_stretch_ms_max` field) is **-892 B**, because dropping the two
+`serializeJson(doc, String&)` call sites removes more than the new header and the yielder add. The
+middleware half (`HostGuardHandler`, `host_match.h`, the Host check and warming deleted from the OTA
+callback) is a further **-704 B**: nothing constructs an `AsyncMiddlewareFunction` any more, so
+`--gc-sections` drops `AsyncMiddlewareChain::addMiddleware`, `AsyncMiddlewareFunction::run` and its
+destructors out of the image entirely, and `hostAllowed()` in fixed buffers is smaller than the same
+work in `std::string`. The auth console lines are the only part that costs: **+396 B**, two format
+strings and a `Serial.printf` per wrong PIN, which is the price of the only evidence that a lockout
+happened (DESIGN.md §12.1).
+
+Every env gives flash back by about the same amount, measured against the same `next` (baf20a0)
+tree rather than against the table's older rows:
+
+| env | `next` baf20a0 | with this pass | delta | slot left |
+|---|---:|---:|---:|---:|
+| `cyd-3248S035R` | 1,862,942 B | 1,861,742 B | -1,200 B | 38,802 B |
+| `cyd-2432S024C` | 1,858,614 B | 1,857,538 B | -1,076 B | 43,006 B |
+| `cyd-2432S028R` | 1,847,522 B | 1,846,342 B | -1,180 B | 54,202 B |
+| `cyd-3248S035R-https` (§2.1, in no shipping image) | 1,881,530 B | 1,880,330 B | -1,200 B | 20,214 B |
+
+Static RAM is +56 B on the three shipping envs and +32 B on the HTTPS prototype: the `g_host_name`
+char array replacing a `std::string`, and one `volatile uint32_t` for the yield high-water.
 
 The release-candidate review fixes are **+1,580 B of flash and +64 B of static RAM** on the 3.5"
 board, leaving **41,110 B** of app slot. All six board envs build on the same tree:

@@ -78,6 +78,36 @@ their comments said.
 - Documentation: four memory thresholds in DESIGN.md still quoted the pre-release round numbers
   after the code had moved to exact ones, and two places disagreed about how many internal workers
   the device has. Both corrected, with a note that thresholds are quoted in bytes from now on.
+- **Asking for statistics could restart the display.** Reading a month of the display's own arrival
+  log off the SD card takes five to eight seconds, and the display did all of it in one go without
+  once pausing to let its own health check run. The chip watches for exactly that - a job that hogs
+  it for five seconds is treated as a hung program - and restarts the board. It only ever happened
+  under the test suite, which asks for statistics far faster than the web page does, but the margin
+  was thin enough that a slow SD card or a long month could have found it. The reading now pauses
+  for a millisecond every forty, which nobody can see and the health check can, and the answer is
+  sent as it is written rather than being assembled in memory first. That pause lives in the one
+  piece of code every kind of log reading goes through, so a future feature that reads the log gets
+  it without anyone having to remember. The display also now reports the longest it has gone
+  without pausing, so if this ever starts creeping back it shows up as a number instead of as a
+  restart.
+- **A web request could restart the display when memory was very tight.** Not one of ours - the web
+  server library copies a small piece of bookkeeping on its way into every request, and if the
+  display is too short of memory for even that copy, the copy fails in a way nothing is allowed to
+  catch, which ends the program. There is no hook anywhere on that path to catch it from, and
+  patching the library is not something this project does. What there is, though, is a way to make
+  the library skip that step entirely: it only does the copy when something has been registered on
+  that path, and this display had one thing registered there - the check that stops a hostile web
+  page from reaching it. That check has moved to a different, supported place that runs *earlier*,
+  before the request body is even read, so the risky step no longer happens at all. Two things fall
+  out of it: a rebound firmware upload is now stopped before a single byte is written rather than
+  after, and every request does two or three fewer small memory allocations, which is a small help
+  to the memory fragmentation that is still an open problem on long-running displays.
+- **The display now says on its serial console when someone has been locked out.** Five wrong PINs
+  in a row lock every setting-changing action for thirty seconds. That has always worked, but the
+  line that recorded it was switched off in release builds, so a display that locked out said
+  nothing about it - and a test run that hit the lockout with no wrong PIN anywhere in it had no
+  evidence to go on. The lockout now always prints, and each wrong PIN prints the page it was aimed
+  at, so the next time this happens it names the culprit instead of leaving a count.
 
 ## v0.3.0 - 2026-09-16
 
