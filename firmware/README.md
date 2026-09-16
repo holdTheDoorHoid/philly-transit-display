@@ -172,12 +172,19 @@ heap region that only 32-bit word access can reach, and `malloc()` never hands t
 | UI screens built | 35 KB | 68 KB | 31 KB |
 | steady state while polling (re-measured 2026-09-16) | ~39 KB | ~73 KB | ~20 KB |
 
-The gap between the two columns is **exactly 33,708 B at every stage** - not approximately. It was
-read directly from five paired measurements on the owner's cyd-3248S035R, spanning two firmware
-builds and every point from `display` to a poll in flight, and the difference was 33,708 B in all
-five. That region is sized once when the app's IRAM code is placed and is never allocated from, so
-the `free8` column above is the `free` column minus that constant, which is an exact restatement and
-not an estimate. The largest-block column was always `MALLOC_CAP_8BIT` and is unchanged.
+The gap between the two columns is **33,708 B**, and it is a fixed region rather than a moving
+figure: it is sized once when the app's IRAM code is placed and is never allocated from. Read from
+paired measurements on the owner's cyd-3248S035R across two firmware builds and every point from
+`display` to a poll in flight, and separately by a second agent across three boots, it comes back as
+33,708 B. So the `free8` column above is the `free` column minus that constant. The largest-block
+column was always `MALLOC_CAP_8BIT` and is unchanged.
+
+One caveat on reading it out of `/api/state`: `heap` and `heap_8bit` are two counters sampled a few
+microseconds apart inside one handler, `heap` first. An allocation landing between the two reads
+lowers `heap_8bit` only, so the subtraction reads a few bytes **high** - 38 of 39 consecutive
+samples gave 33,708 and one gave 33,736, at a mid-poll instant when another task was most likely
+allocating. Every deviation seen has been positive, which is that artefact's signature and not a
+region that varies. Treat a gap of 33,708 plus a few tens of bytes as the constant.
 
 The boot rows are the historical `[heap]` readings restated; only the last row was re-measured on
 2026-09-16, and it moved - it had said ~86 KB `free` with a ~43 KB block, which is higher than the

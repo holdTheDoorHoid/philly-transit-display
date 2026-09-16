@@ -240,12 +240,14 @@ INTERNAL number and keep working; a follow-up should restate them in 8-bit terms
 #### The follow-up: every gate re-derived in 8-bit terms (2026-09-16)
 
 Done, and two of the three gates turned out not to have been working at all. The IRAM share is not
-"about 34 KB", it is **exactly 33,708 B**: five paired `free`/`free8` readings on the owner's
-cyd-3248S035R, across two firmware builds and every point from `display` to a poll in flight, gave
-that same difference every time. The region is sized once when the app's IRAM code is placed and is
-never allocated from. That makes the restatement exact rather than approximate - and it makes the
-consequence exact too. `MALLOC_CAP_INTERNAL` free **never drops below 33,708 B**, so any gate whose
-floor sat under that number could not fire:
+"about 34 KB", it is **33,708 B**, and it is a fixed region rather than a moving figure - sized once
+when the app's IRAM code is placed, never allocated from. Paired `free`/`free8` readings on the
+owner's cyd-3248S035R, across two firmware builds and every point from `display` to a poll in
+flight, give that difference; a second agent independently got the same 33,708 B across three boots,
+against a map-derived upper bound of 34,561 B whose extra ~853 B is IRAM tail actually in use. That
+makes the restatement exact rather than approximate - and it makes the consequence exact too.
+`MALLOC_CAP_INTERNAL` free **never drops below 33,708 B**, so any gate whose floor sat under that
+number could not fire:
 
 | Gate | Was | In real (8-bit) terms | Could it fire? | Now |
 |---|---|---|---|---|
@@ -297,6 +299,37 @@ The alternative fix for the OTA case - having the handler wait for the poller's 
 rejected. `index == 0` runs on the AsyncTCP task, and blocking there stalls every other connection
 on the device, which is a worse failure than the one being repaired, while the client is already
 mid-upload with ~1.7 MB to push.
+
+**Verified on the owner's board, 2026-09-16.** Not inferred from the sample distribution: the gate
+was made to decide, on hardware, at the moments it used to refuse. A firmware image carrying valid
+ESP32 magic and no board marker exercises the admission gate at `index == 0` and is then refused by
+the board-marker check before `Update.end(true)`, so it never becomes bootable - which makes "would
+this upload have been let in?" a question you can ask a live device repeatedly and safely. `400`
+("firmware is for a different board") means the gate admitted it; `503` means the gate refused it.
+Four such probes, each fired 1-4 s after a poll completed - precisely the window that used to
+refuse - all came back `400`, with `free8` at 38,888-40,104 B and the largest block at 23,540 B.
+The full run: 14 of 15 checks passed, the fifteenth being the `heap`/`heap_8bit` sampling artefact
+described above, which was then characterised rather than dismissed. The owner's two stops stayed
+live with four arrivals each throughout, the panel stayed on the main page, and no config was
+written at any point.
+
+There is one failure mode this does **not** repair, and it is worth stating so the fix is not read
+as more than it is. A board running 3707f54 was found with a resting largest block of 11,764 B -
+its steady state, not a dip - which is below the old 16 KB requirement, so OTA was refused
+permanently and the web UI offered no way forward; five attempts over ten minutes all failed and a
+reboot lifted it to 23,540 B, after which the same upload succeeded instantly. The new 6 KB
+threshold admits that board, but a sufficiently long-lived device can always fragment past any
+floor. So every OTA refusal now names the way out (restart, then upload again straight away) rather
+than being a dead end. The restart is not taken automatically: this is a display on someone's wall,
+and a failed upload is not a reason to blank it. Whether a *shipped* v0.2.0 device fragments this
+way is unmeasured and must not be inferred from the 3707f54 result - 3707f54 already carries
+7e25f95's zero-copy `sendJsonStreamed`, and v0.2.0 predates it.
+
+Nor does any of this address a heap that is decaying toward zero. If `free8` runs down far enough,
+lwIP asserts on `MEMP_SYS_TIMEOUT` exhaustion before the poller's own failure counting reaches its
+wedge threshold, and no admission floor prevents that. What the change does do in that regime is
+shed optional work earlier than before, because the two gates that could not fire now can - a softer
+landing, not a cure.
 
 `/api/state` keeps `heap` as `ESP.getFreeHeap()` - clients parse it, and silently changing what a
 published field means is worse than an optimistic number - and gains `heap_8bit` and

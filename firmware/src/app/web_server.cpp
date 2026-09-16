@@ -767,16 +767,32 @@ void handleOtaUpload(AsyncWebServerRequest *request, const String &filename, siz
     // 2 a.m. with a device that will not take an image, and it has to name the same number they can
     // go and check in /api/state's heap_8bit. The thresholds are printed from the constants rather
     // than spelled out, so a future re-derivation cannot leave the message lying.
+    //
+    // Every refusal ends with the way out, because a refusal that does not is how a device gets
+    // stranded. Measured on a board running 3707f54 on 2026-09-16: its largest block rests at
+    // 11,764 B, under the 16 KB the old gate demanded - not a dip during a poll but its steady
+    // state - so five attempts over ten minutes were all refused, and the web UI offered no path
+    // forward. A reboot lifted it to 23,540 B and the same upload went straight through. Whether a
+    // shipped v0.2.0 device does the same is NOT known: 3707f54 already carries 7e25f95's zero-copy
+    // sendJsonStreamed, which removed the body-sized contiguous allocation from the two heavy
+    // endpoints, and v0.2.0 predates it, so its resting fragmentation is simply unmeasured and must
+    // not be inferred from this. The thresholds below are low
+    // enough that this should not recur, but "should not" is not "cannot": a long-lived device can
+    // always fragment past them, and at that point the only lever the owner has is a restart. It is
+    // not taken automatically - this is a display on someone's wall and a failed upload is not a
+    // reason to blank it - so the message says it and the owner decides.
+    const std::string kRetryHint = "; restart the device (Settings, or POST /api/reboot) and upload"
+                                   " again straight away - a freshly booted heap is unfragmented";
     size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     if (free8 < kMinOtaFree8) {
       otaFail(503, "refusing OTA: 8-bit free heap " + std::to_string(free8 / 1024) + " KB is below " +
-                     std::to_string(kMinOtaFree8 / 1024) + " KB");
+                     std::to_string(kMinOtaFree8 / 1024) + " KB" + kRetryHint);
       return;
     }
     if (largest < kMinOtaLargestBlock) {
       otaFail(503, "refusing OTA: largest 8-bit free block " + std::to_string(largest / 1024) + " KB is below " +
-                     std::to_string(kMinOtaLargestBlock / 1024) + " KB");
+                     std::to_string(kMinOtaLargestBlock / 1024) + " KB" + kRetryHint);
       return;
     }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
