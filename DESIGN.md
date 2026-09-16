@@ -2058,10 +2058,13 @@ against a scan that already takes seconds.
 
 **And it is measured, for the same reason `lock_misses` and `tick_ms_max` are.** `CpuYielder` keeps
 the longest gap between two yields since boot and `GET /api/debug/ui` reports it as
-`cpu_stretch_ms_max`, against the watchdog's 5,000. Measured on the owner's board after a suite run
-that included three 30-day stats scans, the overview scan and a full month's log download: **55 ms**
-- one budget plus the tail of the line that was in flight when it expired, against the 5,000 ms that
-panics the board and the 5,300-7,800 ms the same work used to run uninterrupted. A future loop that
+`cpu_stretch_ms_max`, against the watchdog's 5,000. Measured on the owner's board: a single
+`GET /api/stats?days=30` on a fresh boot takes **5.2 s** of wall time and leaves the high-water at
+**52 ms** - one budget plus the tail of the line that was in flight when it expired. That pair is
+the whole finding in two numbers: the job is exactly as long as it always was, and the longest the
+poller now holds core 0 is a hundredth of it, against a watchdog that panics at 5,000 ms and a job
+that used to run all 5,200 of them uninterrupted. A full suite run, which adds the overview scan,
+the per-stop summaries and a month's log download, reaches 53-55 ms. A future loop that
 does not yield shows up as a number climbing rather than as a panic on somebody's serial console,
 and the device suite can fail on it. A loop that is not routed through the yielder is still invisible to this - the measurement
 covers the rule's chokepoint, not the whole task - which is why the chokepoint matters more than
