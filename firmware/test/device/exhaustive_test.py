@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exhaustive on-device test of the Philly Transit Display firmware over its HTTP API.
 Backs up the owner's config first and restores it at the end (with invert_colors=false)."""
-import json, subprocess, sys, time, threading, re, copy, datetime, concurrent.futures, os
+import atexit, json, subprocess, sys, time, threading, re, copy, datetime, concurrent.futures, os
 B = 'http://192.168.1.181'
 S = os.path.dirname(os.path.abspath(__file__))
 
@@ -95,6 +95,14 @@ def config():
     code, d = get_json('/api/config')
     return d
 
+def device_name():
+    """config()['device']['name'], but never an exception. /api/config answers a 503 BODY - a
+    dict without 'device' - under memory pressure (DESIGN.md SS12.1), and indexing it killed the
+    whole run on 2026-09-16 before the restore section, leaving the owner's device on test
+    settings."""
+    c = config()
+    return (c or {}).get('device', {}).get('name')
+
 def serial_thread():
     try:
         import serial
@@ -128,10 +136,32 @@ t = threading.Thread(target=serial_thread, daemon=True); t.start()
 time.sleep(1)
 
 backup = config()
-assert backup, 'device not reachable'
+# Not just "truthy": /api/config answers a 503 BODY ({"error": "low memory, retry"}) when the heap
+# is tight, and taking that as the backup would mean restoring nothing at the end.
+assert isinstance(backup, dict) and 'device' in backup and 'stops' in backup, \
+    'device not reachable, or it answered %r instead of a config - wait a poll and try again' % (backup,)
 json.dump(backup, open(os.path.join(S, 'test_backup_config.json'), 'w'))
 base = copy.deepcopy(backup)
 base['device']['invert_colors'] = False
+
+# The owner's device must come back to the owner's settings even when this script dies half way
+# through. On 2026-09-16 a KeyError in section F ended the run before the restore at the bottom,
+# and the display was left with a test profile and the suite's stop list on it. atexit fires on a
+# normal exit, an unhandled exception and sys.exit alike; the restore section sets `restored` so
+# it does not run twice.
+restored = False
+def restore_owner_config():
+    if restored:
+        return
+    print('!! restoring the owner config from atexit - the run did not reach the restore section', flush=True)
+    for _ in range(6):
+        if put_cfg(base) == 200:
+            print('   restored', flush=True)
+            return
+        time.sleep(5)
+    print('   RESTORE FAILED. The device is still on test settings; PUT %s back by hand.'
+          % os.path.join(S, 'test_backup_config.json'), flush=True)
+atexit.register(restore_owner_config)
 s0 = state(); uptime0 = s0.get('uptime', 0); heap0 = s0.get('heap', 0)
 print('== start: uptime', uptime0, 'heap', heap0, 'stops', [x['key'] for x in backup['stops']])
 
@@ -249,7 +279,7 @@ sb = state().get('bike', {}); check('B state bike 3 stations with counts', ok3, 
 roundtrip('bike off', lambda c: c.update(bike={'enabled': False, 'stations': []}), lambda g: g['bike']['enabled'] is False, wait=4)
 check('B state bike disabled', wait_for(lambda: state().get('bike', {}).get('enabled') is False and state()['bike']['stations'] == [], 10, 1), state().get('bike'))
 put_cfg(copy.deepcopy(base)); time.sleep(3)
-check('B restore base', config()['device']['name'] == base['device']['name'])
+check('B restore base', device_name() == base['device']['name'])
 
 # ---------- C. validation ----------
 def invalid(name, mutate, path):
@@ -290,7 +320,7 @@ invalid('duplicate key', lambda c: c['stops'][1].update(key=c['stops'][0]['key']
 invalid('9 stops', lambda c: c.update(stops=[dict(c['stops'][0], key='k%d' % i) for i in range(9)]), 'stops')
 invalid('lat 91', lambda c: c['stops'][0].update(lat=91), 'stops[0].lat')
 r = curl(['-w', '%{http_code}', '-o', '/dev/null', '-X', 'PUT', '-H', 'Content-Type: application/json', '--data-binary', '{not json', B + '/api/config']); check('C malformed json rejected', r.stdout in (b'400', b'415'), r.stdout)
-check('C config unchanged after invalid PUTs', config()['device']['name'] == base['device']['name'])
+check('C config unchanged after invalid PUTs', device_name() == base['device']['name'])
 
 # ---------- C2. validation added by the hardening pass (review F07/F30) ----------
 invalid('brightness 256 (must not wrap to 0)', lambda c: c['device'].update(brightness=256), 'device.brightness')
@@ -536,7 +566,7 @@ while time.time() < deadline:
     if code == 200 and d: break
     time.sleep(3)
 check('F back after reboot', code == 200 and d and d.get('uptime', 999) < 90, (code, d and d.get('uptime')))
-check('F config intact after reboot', config() and config()['device']['name'] == base['device']['name'])
+check('F config intact after reboot', device_name() == base['device']['name'])
 
 # ---------- G. OTA with the running image ----------
 # The image of the TREE THIS SCRIPT LIVES IN (S is .../firmware/test/device), not a hardcoded
@@ -570,11 +600,12 @@ if os.path.exists(fw):
     back = wait_for(lambda: state().get('uptime', 999) < 120, 120, 4)
     check('G device back after OTA', back, state().get('uptime'))
     check('G firmware version unchanged after re-flash', state().get('firmware_version') == ver_before, (ver_before, state().get('firmware_version')))
-    check('G config intact after OTA', config() and config()['device']['name'] == base['device']['name'])
+    check('G config intact after OTA', device_name() == base['device']['name'])
     time.sleep(30)
 
 # ---------- restore ----------
 put_cfg(base); time.sleep(3)
+restored = True  # the atexit safety net above has nothing left to do
 final = config()
 check('Z restored owner config (invert off)', final and [x['key'] for x in final['stops']] == [x['key'] for x in backup['stops']] and final['device']['invert_colors'] is False)
 stop_serial = True; time.sleep(1.5)

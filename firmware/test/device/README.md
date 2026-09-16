@@ -27,3 +27,19 @@ setting is restored; a firmware without the block prints one `SKIP H` line and m
 It is not part of `pio test` (it needs the hardware and about 15 minutes). PlatformIO ignores this
 directory because it has no `test_main`. 2026-09-14: 119/122 with the three remaining items being
 test timing, fixed since; run it again after any change to the UI controller or the config schema.
+
+**Read this before running it on the owner's display.** The suite changes the live configuration and
+puts the device under deliberate memory pressure, and the owner's settings come back only at the
+end. Since 2026-09-16 an `atexit` handler restores them even if the run dies half way through (it
+did: a `KeyError` in section F ended a run early and left a test profile and the suite's stop list
+on the display), and `/api/config` answering its documented 503 body is no longer mistaken for a
+config. If you see `RESTORE FAILED`, `PUT test_backup_config.json` back by hand before walking away.
+
+The run of 2026-09-16 on `cyd-3248S035R` (this branch, `next` merged, no TLS in the image) is worth
+knowing about: sections A-C passed (132 checks, including the exception-pool proof
+`POST /api/debug/oom` answering `caught:true` with a 12 B largest block at the throw), section H
+printed its `SKIP` line as it should on a firmware without `-DTRANSIT_HTTPS`, and then sections D-F
+failed in a cluster once the device settled into the 503 "low memory, retry" state - the assertions
+were reading `{}`, and section E's concurrency burst rebooted it. That is the screen/web side under
+memory pressure, not anything in this branch's HTTPS work, which is not compiled into that image at
+all; it wants its own look with the UI rework that landed in `next`.
