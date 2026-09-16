@@ -442,6 +442,10 @@ function buildState(query) {
     auth: { pin_required: true },
     board: 'cyd-3248S035R',
     config_recovered: query.get('recovered') === '1',
+    // DESIGN.md §2.1: the transport block a firmware built with HTTPS reports. ?transport=http |
+    // https_failed | refused | none previews the other tiles; ?transport=off omits the block, which
+    // is what a firmware without HTTPS sends (the UI must then show no tile and no setting).
+    ...(query.get('transport') === 'off' ? {} : { transport: mockTransport(query.get('transport') || 'https') }),
     stops: stopsOut,
     alerts,
     weather: buildWeather(now),
@@ -507,6 +511,17 @@ function buildBike(now) {
 }
 
 // Mirrors firmware/src/app/weather_service.cpp: main location conditions plus six hourly slots.
+function mockTransport(last) {
+  const policy = last === 'refused' ? 'https' : 'https_preferred';
+  return {
+    policy, last: last === 'none' ? 'none' : last,
+    https_ok: 41, https_failed: last === 'https_failed' ? 1 : 0, cert_failed: last === 'https_failed' ? 1 : 0,
+    http_by_heap: 7, http_by_policy: last === 'http' ? 3 : 0,
+    refused_by_heap: last === 'refused' ? 1 : 0, last_tls_error: last === 'https_failed' ? -0x2700 : 0,
+    last_https_ms: 1450, heap_need: 68250, gate_free: 74120, gate_largest: 42356,
+  };
+}
+
 function buildWeather(now) {
   const w = config.weather || {};
   if (w.enabled === false) return { enabled: false, units: w.units || 'f', age_s: -1 };

@@ -52,7 +52,19 @@ constexpr uint32_t kOptionalFetchTimeoutMs = 8000;
 // Optional work is skipped entirely when the next transit poll is this close. Arrivals are the
 // product; a weather refresh that makes them late is a bad trade at any price.
 constexpr uint32_t kOptionalWorkReserveMs = 5000;
+#ifdef TRANSIT_HTTPS
+// A TLS handshake runs on this task: mbedTLS keeps ~1 KB of RSA-verify scratch, 512 B of
+// ssl_client's own buffer and ECP temporaries on the stack, 3-4 KB in all (DESIGN.md SS2.1).
+// The plain-http build's high-water mark is 4,556 B free of 10 KB (measured 2026-09-16), which
+// is exactly that margin and no more, so the HTTPS build gives the task 2 KB extra.
+// Caveat worth knowing before trusting this number: on the owner's board no handshake ever got
+// past mbedtls_ssl_setup() (the heap ran out first), so the 12 KB was measured at 6,328 B free
+// with plain fetches and the 3-4 KB of handshake stack has never actually been spent here. The
+// SDK-rebuild test pass has to re-measure it (DESIGN.md SS2.1 "Forced gate").
+constexpr uint32_t kTaskStackBytes = 12288;
+#else
 constexpr uint32_t kTaskStackBytes = 10240;
+#endif
 // Priority 1 (above IDLE0, below the ESP-IDF network/timer tasks) - the original value. It was
 // briefly dropped to 0 to stop HTTPClient's header busy-wait (Stream::timedRead, no yield to a
 // lower priority) from starving IDLE0 and tripping the 5 s task watchdog, but priority 0 made the
@@ -650,11 +662,32 @@ void logHeapHeartbeat() {
   // log_i()) because the flash-diet's CORE_DEBUG_LEVEL=2 (WARN) compiles log_i() out entirely
   // (firmware/README.md "Memory and flash budget") - this one line is deliberately always-on so
   // heap health stays visible over serial regardless of debug verbosity.
+  // Two "free" numbers on purpose (found 2026-09-16, DESIGN.md SS2.1): ESP.getFreeHeap() is
+  // heap_caps_get_free_size(MALLOC_CAP_INTERNAL), which on the classic ESP32 includes the IRAM heap
+  // region that is only 32-bit addressable - about 34 KB on this build that malloc() will never hand
+  // out for a buffer, a string or a TLS record. `free8` is what an ordinary allocation can actually
+  // get (MALLOC_CAP_8BIT), and `largest_block` was already measured in those terms.
   size_t free_heap = ESP.getFreeHeap();
+  size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  Serial.printf("[net_poller] free_heap=%u largest_block=%u stack_free=%u\n", (unsigned)free_heap, (unsigned)largest,
-                (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  Serial.printf("[net_poller] free_heap=%u free8=%u largest_block=%u stack_free=%u\n", (unsigned)free_heap, (unsigned)free8,
+                (unsigned)largest, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
+
+#ifdef TRANSIT_HEAP_TRACE
+// DESIGN.md SS2.1. One line per stage of pollOnce, so the question "is there a point in the poll
+// cycle where a TLS session would fit?" is answered by measurement instead of by moving fetches
+// around and hoping. The numbers are MALLOC_CAP_8BIT - what an allocation can really get - and are
+// directly comparable with `need` in the [https] gate lines and with tlsHeapNeed() in /api/state.
+// Compiled only when the env asks for it (the cyd-*-https prototype envs do); costs one
+// Serial.printf per stage per poll and nothing at all in a shipping image.
+void tracePoll(const char *stage) {
+  Serial.printf("[poll-heap] %-13s free8=%u largest=%u\n", stage, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
+#else
+inline void tracePoll(const char *) {}
+#endif
 
 // Publishes a Snapshot to every reader (UI, web server) and moves the LED with it. Called more
 // than once per cycle (F12): the arrivals go out the moment they exist, and again when the alerts
@@ -791,6 +824,7 @@ void evictUnconfiguredSummaries(const std::vector<StopConfig> &stops) {
 // so the header cheerfully reported them as fresh. The arrivals are the product; they are
 // published the instant they exist, and everything else runs afterwards on its own clock.
 uint32_t pollOnce(uint32_t &consecutive_failures) {
+  tracePoll("poll-start");
   Config cfg = getActiveConfig();
   transit::HttpGetEx http = makeHttpGetEx(kFetchTimeoutMs);
   transit::HttpGetEx http_opt = makeHttpGetEx(kOptionalFetchTimeoutMs);
@@ -820,6 +854,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // poll, reported per stop like any other outage, not a reset.
   Snapshot bus_snap, rail_snap;
   bool out_of_memory = false;
+  tracePoll("pre-transit");
   try {
     bus_snap = transit::pollBusStops(bus_like, now, http, sched_cache);
     rail_snap = transit::pollRailStops(rail_like, now, http);
@@ -855,6 +890,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // follows below if a fetch brings new ones.
   combined.alerts = cachedAlerts();
   publishSnapshot(combined);
+  tracePoll("post-transit");
 
   // From here on everything is optional. The next transit poll's deadline is fixed first, so each
   // piece of work can ask whether it still has room rather than finding out afterwards.
@@ -871,13 +907,20 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
 
   if (have_time()) {
     bool alerts_fetched = false;
+    tracePoll("pre-alerts");
     combined.alerts = collectAlerts(cfg.stops, cfg.alerts, http_opt, have_time, &alerts_fetched);
     // Only when something actually came back: a cycle where every alert feed was still fresh must
     // not re-publish an identical Snapshot and reset the header's "updated N s ago".
     if (alerts_fetched) publishSnapshot(combined);  // same stops, now with the alerts for them
   }
-  if (have_time()) refreshWeather(cfg, http_opt_plain);  // DESIGN.md SS4.8: 10 min per location
-  if (have_time()) refreshBikes(cfg, http_opt_plain);    // DESIGN.md SS4.9: 5 min, 400 KB streamed
+  if (have_time()) {
+    tracePoll("pre-weather");
+    refreshWeather(cfg, http_opt_plain);  // DESIGN.md SS4.8: 10 min per location
+  }
+  if (have_time()) {
+    tracePoll("pre-bikes");
+    refreshBikes(cfg, http_opt_plain);    // DESIGN.md SS4.9: 5 min, 400 KB streamed
+  }
 
   // DESIGN.md SS9: feed every StopSnapshot to the tracker and append any resulting LogEvents to
   // the current month's CSV. This runs on EVERY cycle regardless of the budget - it is not
@@ -887,6 +930,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // false, which suppresses a noshow rather than inventing one.
   if (cfg.device.logging) {
     syncTrackerRegistrations(cfg.stops);
+    tracePoll("pre-liveness");
     refreshRouteLiveness(bus_like, http_opt, have_time);
     std::vector<transit_stats::LogEvent> events;
     for (const auto &stop : combined.stops) {

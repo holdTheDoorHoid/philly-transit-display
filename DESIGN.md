@@ -37,10 +37,420 @@ proxy, mobile app, BLE provisioning, NJ Transit (needs an API key each user must
 | Config storage | LittleFS `/config.json`, mirrored by `GET/PUT /api/config` | Structured, easy to round-trip to the web UI. SD is for logs only so the device works without a card. |
 | Wi-Fi onboarding | Our own ~150-line captive portal (SoftAP + DNS hijack) on ESPAsyncWebServer; then always-on web UI + mDNS | WiFiManager was the first choice but cost ~120 KB of flash and spams `task_wdt` errors on core 3.x; replaced 2026-09-14. Captive portal is only for Wi-Fi; stop config lives in the permanent UI. |
 | Web server | ESP32Async/ESPAsyncWebServer (maintained fork) | Chunked/streamed responses for stats and proxied SEPTA calls without blocking LVGL. Keep concurrent handlers minimal. |
-| Transport | Plain HTTP only. The opt-in HTTPS mode (Amazon Trust CA bundle, `tls_verify`) shipped in v0.1.0-0.1.1 and was removed in v0.1.2 to free ~100 KB of flash; the board could not afford a TLS session's RAM anyway (section 2), and SEPTA, Open-Meteo and Bicycle Transit all serve plain http. |
+| Transport | Plain HTTP in every shipping env. The opt-in HTTPS mode (Amazon Trust CA bundle, `tls_verify`) shipped in v0.1.0-0.1.1 and was removed in v0.1.2 to free flash. Re-examined with measurements on 2026-09-16 (§2.1): a heap-gated "verified HTTPS when it fits, plain HTTP otherwise, never a downgrade after a TLS failure" prototype exists behind `-DTRANSIT_HTTPS` (envs `cyd-*-https`) with three pinned root CAs and a `device.transport` policy, and on the owner's board the gate never found room - the byte-addressable heap at the fetch point is 27-42 KB against a session's ~55 KB. It stays a prototype until the SDK is rebuilt with smaller TLS buffers; §2.1 has the numbers and the recipe. |
 | Log format | Append-only CSV, one file per month on SD, one event per line | Human-readable, spreadsheet-friendly, streamable with tiny RAM. |
 | Stats computation | On device, streaming over CSV with fixed-size histograms | 320 KB RAM, no PSRAM; never load a month of log into memory. |
 | Repo/License | `holdTheDoorHoid/philly-transit-display`, MIT | Owner's choice. |
+
+### 2.1 HTTPS to the data sources: measured on the board, and why it stays a prototype (2026-09-16)
+
+Review finding F04 wanted the device to fetch SEPTA, Open-Meteo and Indego over verified HTTPS and
+to stop silently rewriting `https://` to `http://`. The owner deferred it to its own release; this
+section is that work: what the servers offer, what TLS costs on this exact SDK (measured, not
+quoted), a heap-gated prototype behind `-DTRANSIT_HTTPS`, and what happened when it ran on the
+owner's board. Nothing here changes a shipping image: the prototype is compiled only by the
+`cyd-*-https` envs in `platformio.ini`.
+
+**In plain language.** An encrypted connection needs the board to set aside about 42 KB of memory
+for as long as the connection is open, in two pieces of 16.7 KB that each have to be one unbroken
+block, and about 12 KB more for a second or two while the connection is being set up. The board
+*reports* 70-80 KB free while it runs, but about 34 KB of that is a kind of memory the processor can
+only read in whole words, which no buffer, string or network record can use; the memory an ordinary
+allocation can actually get is about 46 KB free at idle and 27-42 KB at the moment a fetch starts.
+So on this board, with the software the ESP32 vendor ships, HTTPS does not fit - not sometimes,
+never: the prototype asked for it on every fetch for the whole test and was refused every time,
+while the arrivals kept flowing over plain HTTP exactly as before. The obvious cheap fix - do the
+encrypted fetch at a quieter moment of the poll instead - was measured rather than assumed, and
+there is no quieter moment: the whole poll cycle sits within 6 KB of itself, so the best instant in
+it is still about 27 KB short, and a run with the memory check stripped to the bare minimum proved
+it by trying anyway and failing. The honest design is therefore:
+keep the shipping firmware as it is (plain HTTP, no TLS code, the flash and stack it would cost
+left for the display), keep the prototype for the day the vendor library is rebuilt with smaller
+TLS buffers (the one change that would make HTTPS fit), and never let a certificate problem turn
+into a plain-HTTP fetch.
+
+#### What the three servers offer (probed with `openssl s_client`, 2026-09-16)
+
+| Host | Chain the server sends (leaf ← intermediate ← root) | Keys | TLS | Suite this SDK will get | MFL 4096 | `Connection: close` |
+|---|---|---|---|---|---|---|
+| `www3.septa.org` | `*.septa.org` ← Amazon RSA 2048 M01 ← **Amazon Root CA 1** (all three sent; the root copy is cross-signed by Starfield G2) | RSA-2048 ×3 | **1.2 only** | ECDHE-RSA-AES128-GCM-SHA256, P-256 | ignored | honoured (`Connection: Close`), Content-Length bodies (TripUpdates was 79 KB at 01:30, ~150 KB by day) |
+| `api.open-meteo.com` | `open-meteo.com` ← YR2 ← Root YR (cross-signed by **ISRG Root X1**) | RSA-2048, RSA-2048, RSA-4096 | 1.3; 1.2 offered | ECDHE-RSA-AES128-GCM-SHA256 (X25519 or P-256) | **honoured** (the only one) | honoured, chunked body |
+| `bts-status.bicycletransit.workers.dev` | ← GTS WE1 ← **GTS Root R4** (cross-signed copy by GlobalSign Root CA, which expires 2028-01-28; the self-signed root we pin runs to 2036) | ECDSA P-256, P-256, P-384 | 1.3; 1.2 offered | ECDHE-ECDSA-AES128-GCM-SHA256 (Cloudflare prefers ChaCha20-Poly1305, which this SDK does not compile) | ignored | honoured |
+
+All three still answer identically over plain `http://` (200s, same bodies), so nothing forces the
+change today. Only SEPTA is stuck on TLS 1.2, which happens to be all this SDK speaks (TLS 1.3 is
+compiled out - `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3` unset). SEPTA's chain is RSA end to end: three
+RSA-2048 signature checks per handshake, on the ESP32's bignum accelerator, plus one ECDHE P-256
+agreement in software. Indego's is ECDSA end to end, the cheapest of the three; ECDSA versus RSA
+changes handshake CPU time (hundreds of ms either way), not the memory that decides this question.
+
+**Pinned roots** (`firmware/src/app/tls_roots.cpp`, generated by `tools/gen_tls_roots.py`):
+Amazon Root CA 1 (1,188 B PEM, RSA-2048, valid to 2038-01-17), ISRG Root X1 (1,939 B, RSA-4096, to
+2035-06-04), GTS Root R4 (765 B, ECDSA P-384, to 2036-06-22): **3,892 B of flash** against the
+SDK's ~70 KB full bundle. Each served chain was verified against exactly its one root with the
+system store disabled (`openssl verify -no-CApath -no-CAfile -no-CAstore -CAfile <root> -untrusted
+<served intermediates> <leaf>`: all three OK; the SEPTA leaf against ISRG Root X1 fails, as it
+must). One root is handed to mbedTLS per host (`tls_roots.h`), so the pin is per source, not "any
+of these three".
+
+**Rotation risk, plainly.** The roots outlive the hardware; the risk is a source changing CA -
+SEPTA moving off AWS's CA, Open-Meteo leaving Let's Encrypt (its current Root YR is itself new in
+2026 and only reaches us cross-signed by ISRG Root X1), Bicycle Transit leaving Cloudflare. That
+day, TLS to that host fails *closed* with a certificate error, `/api/state`'s `transport.cert_failed`
+climbs, and the fix is a firmware update (`tools/gen_tls_roots.py <new root>.pem`, one line in
+`tls_roots.h`). Under `https_preferred` the display keeps working meanwhile only to the extent the
+heap gate was already sending that fetch over plain HTTP - a bad certificate is never a reason to
+downgrade. Under `https` the stop reads unavailable until the update. Two more limits of this SDK
+to state: certificate *dates* are not checked at all (`CONFIG_MBEDTLS_HAVE_TIME_DATE` unset, so an
+expired certificate that chains to the pinned root still verifies), and a revoked one is not either
+(no OCSP/CRL, as on every embedded client of this class). The review's acceptance test "an expired
+certificate fails closed" cannot be met without rebuilding the SDK.
+
+#### What one TLS session costs on this SDK (Arduino-ESP32 3.2.1 / ESP-IDF 5.4.2, mbedTLS 3.6.3)
+
+Read off the precompiled SDK's `sdkconfig` and `esp_config.h`, then confirmed with a `sizeof` probe
+compiled by the xtensa toolchain against those same headers:
+
+| Item | Value | Consequence |
+|---|---|---|
+| `CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN` | 16384, IN = OUT (`ASYMMETRIC_CONTENT_LEN` unset) | `MBEDTLS_SSL_IN_BUFFER_LEN` = `OUT` = **16,717 B**, calloc'd back to back by `mbedtls_ssl_setup()`, held for the whole session |
+| `CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH` | unset | the buffers are never resized after the handshake |
+| `MBEDTLS_SSL_MAX_FRAGMENT_LENGTH` | compiled in (unconditional in `esp_config.h`) | the client *could* negotiate MFL 4096 - but without the line above that only changes what the server sends per record, not what we allocate; and only Open-Meteo honours it anyway. `NetworkClientSecure` exposes no MFL call. |
+| `CONFIG_MBEDTLS_DYNAMIC_BUFFER` | absent | no "free the buffers between records" mode |
+| `CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE` | y | the peer's parsed chain (~6 KB for SEPTA's three RSA certificates) stays allocated for the session |
+| `CONFIG_MBEDTLS_HAVE_TIME_DATE` | unset | no validity-date checks (above) |
+| `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3` | unset | TLS 1.2 client; fine for all three hosts |
+| `CONFIG_MBEDTLS_ECP_RESTARTABLE` | unset | ECDHE cannot yield mid-computation; each step runs to completion on the poller task |
+| `CONFIG_MBEDTLS_HARDWARE_{MPI,SHA,AES}` | y | RSA verify and AES-GCM are accelerated; ECP point math is software with `ECP_NIST_OPTIM` |
+| `CONFIG_ESP_TASK_WDT_TIMEOUT_S` / `CHECK_IDLE_TASK_CPU0` | 5 / y | the same watchdog the plain path already works around |
+| sizeof: `mbedtls_ssl_context` / `ssl_config` / `entropy` / `ctr_drbg` / `x509_crt` / handshake params / transform / session | 552 / 196 / 420 / 76 / 408 / 944 / 220 / 144 B | `NetworkClientSecure`'s constructor `new`s ~2.1 KB before a byte is sent |
+
+**Peak-heap estimate for one handshake plus one streamed body**, from those numbers: 2.1 KB of
+contexts + 33.4 KB of record buffers + ~1.3 KB of handshake/transform/session structs, plus during
+the handshake ~2-2.5 KB for the parsed pinned root (freed by `ssl_client.cpp` right after
+verification), ~6 KB for SEPTA's parsed chain (kept), and ~3 KB of ECDHE/RSA bignum scratch: **~52-55
+KB at the peak, ~42 KB steady while the body streams**, on top of `HTTPClient`'s 1.4 KB read buffer
+and whatever the consumer allocates (the GTFS-RT decoder's entity buffer and `rt_updates`). The
+folklore "40 KB per TLS session" is right for this SDK, and it is not a number the Arduino API can
+lower: `NetworkClientSecure` lets us set the handshake timeout (default 120 s - the prototype uses
+8), the connect timeout (it reaches `select()` and `SO_RCVTIMEO`), and one root PEM; nothing else.
+
+**Watchdog and blocking.** `ssl_client.cpp` makes the socket non-blocking and never changes it
+back. The TCP connect waits in `select()` (a real block; IDLE0 runs). The handshake loop calls
+`mbedtls_ssl_handshake()` until it stops saying WANT_READ, with `vTaskDelay(2)` between rounds, so
+the idle task is fed; the compute-heavy rounds (ECDHE keygen and agreement, three RSA-2048
+verifications) run inline for well under a second each, inside the 5 s budget. Body reads go through
+the same `Stream::timedRead()` busy-wait the plain path already lives with, capped by the existing
+`kStreamReadTimeoutMs` (4 s). What a TLS handshake adds is **stack**: ~3-4 KB on the poller task
+(mbedTLS's RSA verify keeps a 1 KB buffer on the stack, `ssl_starttls_handshake` 512 B, ECP
+temporaries) - the poller has a 10 KB stack (`net_poller.cpp`), and the device test below reads
+its high-water mark first.
+
+#### Flash and RAM, measured (2026-09-16, this branch after merging `next`)
+
+| Build | `cyd-3248S035R` flash | Δ | static RAM | Δ |
+|---|---:|---:|---:|---:|
+| shipping env, flag off (`next` merged: exception pool, streamed `/api/state`, Settings blocks) | 1,841,390 B (96.9 %) | - | 95,652 B | - |
+| `cyd-3248S035R-https`: `-DTRANSIT_HTTPS` + pinned roots + `CORE_DEBUG_LEVEL=0` + the heap trace | 1,859,498 B (97.8 %) | +18,108 B | 96,172 B | +520 B |
+| `cyd-2432S024C` shipping, flag off | 1,836,966 B (96.7 %) | - | 95,788 B | - |
+| `cyd-2432S024C-https` | 1,854,338 B (97.6 %) | +17,372 B | 96,308 B | +520 B |
+
+All six board envs and both prototypes build. Flash headroom on this branch, for the record - it is
+what an SDK-rebuild attempt has to fit into, and it is not the same on every board:
+
+| env | flash | headroom |
+|---|---:|---:|
+| `cyd-2432S028Rv3` | 1,831,934 B | 68,610 B |
+| `cyd-2432S028R`, `cyd-2432S024R` | 1,832,998 B | 67,546 B |
+| `cyd-2432S024C` | 1,836,966 B | 63,578 B |
+| `cyd-3248S035R` (the owner's) | 1,841,390 B | 59,154 B |
+| `cyd-3248S035C` | 1,860,586 B | **39,958 B** |
+| `cyd-2432S024C-https` | 1,854,338 B | 46,206 B |
+| `cyd-3248S035R-https` | 1,859,498 B | 41,046 B |
+
+The shipping envs are ~1.1 KB larger than `next` and that is not TLS: the web app is one bundle for
+every firmware, so the "Data link" tile, `describeTransport()` and the "Data connection" field ship
+in the gzipped `web_assets.h` of every board and hide themselves at runtime when `/api/state` has
+no `transport` block. That is the right trade - one web app, no per-build variants - but it is the
+only thing in this section a shipping image pays for.
+
+The +18 KB is two things netted: TLS itself is about **+75 KB** (`libmbedtls.a`'s record and
+handshake layer, `libmbedx509.a`, `NetworkClientSecure`, the three roots at 3.9 KB, the gate) after
+the two link-time trims in `http_fetch.cpp` (mbedTLS's 16 KB error-string table and its 7.9 KB TLS
+*server* stepper are kept out of the image), and `CORE_DEBUG_LEVEL=0` is about **-57 KB** (level 1
+still compiles every `log_e()` format string and call site in the Arduino core - HAL, WiFi, Network,
+SD, AsyncTCP, Updater - plus libc's `strerror` table). `device.transport` is behind the flag down to
+the `DeviceConfig` member itself, so a shipping image carries no `std::string` (nor its literal,
+constructor, destructor and copies) that nothing in that build can read: the flag-off env is what
+`next` builds plus the `[poll-heap]` trace's empty inline function, which costs nothing.
+
+**What `CORE_DEBUG_LEVEL=0` silences, exactly.** Every `[tag]` line this project prints is a plain
+`Serial.printf` and is unaffected: `[heap]`, `[net_poller]`, `[https]`, `[auth]`, `[proxy]`,
+`[weather]`, `[bike]`, `[main]`, `[lvmem]`. What goes quiet is (a) the Arduino core's own
+`[E][file.cpp:line]` lines - Wi-Fi association failures, SD card and LittleFS errors, `Updater`
+errors, AsyncTCP and HTTPClient errors - and (b) this project's 17 `log_e()` sites, all already
+visible some other way: `config_store.cpp` (10: a config that fails to open, parse or validate at
+boot, and the save path's open/write/verify/rename failures - the boot case is reported as
+`config_recovered` in `/api/state`, the save case as the HTTP error the PUT returns), `sd_logger.cpp`
+(2: append/short-write failures, reported as `sd.write_ok` / `sd.error`), `main.cpp` (3: mDNS
+start failures, and the tracker allocation failure that disables logging), `auth.cpp` (1: NVS
+namespace unavailable, boot-only PIN) and `http_fetch.cpp` (1: `begin()` rejected the URL). The
+prototype envs pay that; a shipping env does not, because nothing in this section makes it worth
+paying.
+
+#### The heap, measured properly (the finding that decides this)
+
+Every heap number this project had written down - the README's stage table, `/api/state`'s `heap`,
+the 60 KB OTA gate, the 24 KB `/api/state` gate, the 40 KB idle-work gate, §12.1's "~75-80 KB free"
+- is `ESP.getFreeHeap()`, which is `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)`
+(`cores/esp32/Esp.cpp`). On the classic ESP32 that includes the IRAM heap region left over after
+the app's IRAM code, which is **32-bit-word addressable only**: `malloc()` never hands it out for a
+buffer, a `std::string`, a `JsonDocument` or a TLS record (those come from `MALLOC_CAP_8BIT`).
+Measured on the owner's board with both numbers printed side by side (the `[heap]` boot lines and
+the `[net_poller]` heartbeat now carry `free8=`):
+
+| Point | `ESP.getFreeHeap()` (INTERNAL) | `MALLOC_CAP_8BIT` free | largest 8-bit block |
+|---|---:|---:|---:|
+| after display init | 204,212 | 170,504 | 110,580 |
+| after tasks | 174,240 | 140,532 | 110,580 |
+| poller start, first poll (`poll-start` / `pre-fetch` probes) | 82,080 / 81,348 | - | 47,092 / 45,044 |
+| the TripUpdates gate of that first poll, ~9 KB of decoder later | - | 37,808 | 36,852 |
+| the TripUpdates gate, steady state (every later poll) | ~70,000 at the heartbeat | 26,600-29,000 | 13,300-18,400 |
+| the later fetches of a poll (TransitView, BusSchedules, Alerts, Open-Meteo, Indego) | - | 23,700-41,900 | 13,300-27,600 |
+| every gate decision of the 21-poll soak, second run, for comparison | - | 27,128-42,372 (median 29,748) | 18,420-29,684 |
+
+The IRAM-only share is ~34 KB throughout. So the byte-addressable heap at the moment a fetch begins
+is **27-42 KB with an 18-30 KB largest block**, against a TLS session's 33.4 KB of contiguous record
+buffers plus ~20 KB around them. The gate (`kTlsHeapNeed` = 68,250 B of 8-bit heap, and the two
+16,717 B blocks actually allocated and freed as the test) refused **every one of the 64
+fetches** that asked for `https://` during the test, and it was right to: forcing it (below) shows
+what happens when TLS is attempted anyway. This is not a fragmentation problem a reboot fixes - the
+first fetch after a fresh boot, with the cleanest heap the device ever has, was 37.8 KB short.
+
+The same number explains two things the project had put down to other causes: the "~54 KB minimum
+during a poll" of §12.1 is ~20 KB of real heap, which is why `/api/state` answers 503 during a plain
+HTTP fetch, and why the OTA gate ("largest free block 15 KB is below 16 KB") refused every upload
+attempt for ten minutes on 2026-09-16 while the device was polling every 15 s - a reboot followed by
+an immediate upload, or the serial cable, is the way in. The gates themselves are tuned to the
+INTERNAL number and keep working; a follow-up should restate them in 8-bit terms.
+
+#### Could the fetch simply run at a better moment? (measured 2026-09-16, and no)
+
+The obvious cheap lever, before reaching for an SDK rebuild: the transit poll is what eats the
+heap (the GTFS-RT stream buffer, the retained updates, the TransitView and BusSchedules JSON),
+while weather, Indego and alerts are small and run after it, so perhaps a TLS fetch placed at the
+poll cycle's high-water mark would be admitted where the same fetch is refused 20 seconds later.
+Note what is *already* true, because it bounds the idea: F12 put the transit fetch first in
+`pollOnce()` years ago, so the fetch that matters most already runs at the least-allocated point
+of the cycle. The only thing left to move is the optional work, from after the arrivals to before
+them. That is a question about a number, so it was measured rather than guessed: `-DTRANSIT_HEAP_TRACE`
+(compiled into the `cyd-*-https` envs, `net_poller.cpp`) prints one `[poll-heap]` line of 8-bit
+free and largest-block at every stage of `pollOnce()`. 21 consecutive polls on the owner's board,
+policy `https_preferred`, both stops live throughout:
+
+| Stage of `pollOnce()` | free8 min | median | max | largest block |
+|---|---:|---:|---:|---:|
+| `poll-start` (nothing allocated yet - the best moment there is) | 38,648 | **41,200** | 41,304 | 24,564 |
+| `pre-transit` | 37,020 | 39,576 | 39,680 | 24,564 |
+| `post-transit` (arrivals published, decoder freed) | 34,744 | 37,040 | 42,868 | 18,420-24,564 |
+| `pre-alerts` / `pre-weather` / `pre-bikes` / `pre-liveness` | 34,212 | 37,040-37,092 | 38,504 | 18,420-24,564 |
+| where the gate actually ran, all 64 fetches | 27,128 | 29,748 | 42,372 | 18,420-29,684 |
+
+The whole poll cycle is **flat to within ~6 KB**, and the best moment in it is `poll-start` at a
+median 41,200 B. So the entire prize for reordering is about **11 KB** (median 41,200 against the
+29,748 the gate sees today) against a **26,946 B shortfall** at that best moment (68,250 needed,
+41,304 free at the very best sample). Nothing in the cycle can be moved far enough.
+
+It is worse than that, and the second number is the one that closes the question, because it does
+not depend on the gate's margins at all. Strip `kTlsHeapNeed` down to the two record buffers alone
+- 33,434 B, the irreducible cost of `mbedtls_ssl_setup()`, no contexts, no peer chain, no handshake
+scratch, no margin for the rest of the device - and ask whether even *that* fits at `poll-start`:
+the largest block is 24,564, so the first 16,717 B buffer leaves 7,847 B in that hole, and the
+41,304 B of free8 minus that 24,564 B hole leaves 16,740 B spread across every *other* hole in the
+heap. One contiguous 16,717 B block would have to come out of those 16,740 scattered bytes. **Two
+16,717 B buffers cannot both be allocated at the most favourable instant of the poll cycle**, let
+alone the ~20 KB of contexts, kept peer chain and bignum scratch that must fit beside them. The
+forced-gate run below is that arithmetic confirmed on the hardware.
+
+The trace stays in the prototype envs: it is the measurement the SDK-rebuild question will be
+re-asked with, and it costs nothing in a shipping image (`tracePoll()` compiles to an empty inline
+function without the flag). Moving optional work ahead of the arrivals was never free either - F12
+exists precisely because a weather refresh between SEPTA's answer and the screen made arrivals
+12 s old - so the reorder would have cost the thing the device is for, to gain 11 KB of the 27 KB
+missing. It was not made.
+
+#### Design decision, as measured
+
+Of the four shapes considered - (i) prefer HTTPS, fall back to HTTP by heap; (ii) HTTPS required,
+report the stop unavailable otherwise; (iii) HTTPS for the small JSON fetches only; (iv) not feasible
+without changing something else - **the prototype implements (i) with (ii) as a runtime setting of
+the same code, and the measurement says the answer today is (iv)**:
+
+- The gate design is right and stays. It asks the allocator the exact question ("can I have two
+  16,717 B blocks right now, with 6 KB contiguous beside them and 68 KB free in all?") by allocating
+  and freeing them (`tlsAffordable()` in `http_fetch.cpp`), before any connection is opened, so
+  **the transport is chosen by the device's memory, never by the network**. On this board it says
+  no every time, and under `https_preferred` the fetch then goes over plain HTTP, counted and shown
+  (`transport.http_by_heap`, the "Data link" tile). Arrivals were unaffected for the whole test.
+- **Fail closed, tightened.** A TLS attempt that fails - certificate, handshake, timeout, *or the
+  heap running out inside mbedTLS after the gate said yes* - is reported as unreachable and is not
+  retried over HTTP. The prototype's first draft made one exception, "an allocation failure inside
+  mbedTLS is the answer the gate would have given a millisecond earlier, so continue over plain
+  http"; it was removed because the same error codes come out of mbedTLS while it parses the
+  *peer's* certificate chain (`MBEDTLS_ERR_X509_ALLOC_FAILED` for an oversized chain,
+  `SSL_ALLOC_FAILED` for a handshake message it cannot buffer), so whoever answers the connection
+  could have forced the downgrade. Once the gate has chosen TLS for a fetch, that fetch is TLS or
+  nothing; the next poll asks the gate again.
+- (iii) does not help: the record buffers are the same size for a 300-byte weather reply as for the
+  150 KB feed.
+- (ii) costs nothing extra and is there for an owner who would rather see "unavailable" than an
+  unverified time - on this board that is "unavailable" always, which the setting's own label says.
+- (iv), then, is the honest answer: what stands between this board and verified HTTPS is not flash
+  (18 KB net, affordable) and not the gate, but ~27 KB of byte-addressable heap at the best moment
+  of the poll cycle, which no ordering of the fetches can find.
+
+**Shipping decision.** HTTPS does **not** go into the shipping envs. The three conditions the owner
+set were: flash headroom on `cyd-3248S035R` stays at ~20 KB or better at `CORE_DEBUG_LEVEL=0`,
+steady-state heap with TLS in use stays within §12.1's exception-safety posture, and arrivals get no
+slower or less reliable. Measured:
+
+- **Flash: passes, with a caveat.** 41,046 B of headroom in the 3.5" prototype against 59,154 B in
+  the shipping env. But the six board envs are not alike: `cyd-3248S035C` already ships at
+  1,860,586 B (39,958 B headroom), so adding TLS to *every* env would leave it at about 22 KB -
+  inside the letter of the rule and uncomfortably close to the partition, on a board nobody has
+  measured HTTPS on.
+- **Heap: fails, in the strongest possible way.** Not "the margin is thin" but "the session never
+  opens": 0 admissions in 64 fetches at the shipping gate, 1 in 54 at a gate stripped to the two
+  record buffers, and that one died with `MBEDTLS_ERR_SSL_ALLOC_FAILED`. The §12.1 clause can never
+  even be evaluated, because there is no steady state with TLS in use to measure. On the day a
+  rebuilt SDK makes sessions open, this is the clause to re-measure first: §12.1's invariant is that
+  every allocating task can *catch* `std::bad_alloc`, and a live TLS session parks 42 KB in the same
+  heap the poller, the web handlers and the LVGL loop allocate from.
+- **Arrivals: unchanged, which is the one good result.** Over the 21-poll soak both stops stayed
+  `live`, `last_poll.ok` never went false, and the cadence matched the shipping build - because the
+  gate runs before any connection and costs two mallocs. The prototype is safe to run; it just never
+  does anything.
+
+So shipping it would cost ~18 KB of flash on every board, 2 KB of poller stack and the core's error
+lines (and on `cyd-3248S035C` most of the remaining headroom), to deliver a feature that reports "Plain HTTP this time (not enough free memory)" on every
+poll. The prototype envs stay (`cyd-3248S035R-https`, `cyd-2432S024C-https`), `device.transport`
+defaults to `http` in every build, and **`https_preferred` is the documented opt-in**: build a
+`-https` env, flash it, set *Settings → Data & weather → Data connection* to "Encrypted when memory
+allows", and read the "Data link" tile on the Now page. On today's hardware it will read "Plain
+HTTP this time"; on a board with the rebuilt SDK below it is the switch that turns HTTPS on.
+
+**What it would take**, in order of leverage:
+
+1. Rebuild `framework-arduinoespressif32-libs` (pioarduino's `esp32-arduino-lib-builder`) with
+   `CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y`, `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048` (a client
+   sends tiny requests), `CONFIG_MBEDTLS_DYNAMIC_BUFFER=y` and `CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y`
+   (free the input buffer and the peer chain between records), `CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n`,
+   `CONFIG_MBEDTLS_HAVE_TIME_DATE=y` (so an expired certificate fails closed, which the review asked
+   for and this SDK cannot do), `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=n`. That is 16.7 + 2.3 KB of buffers
+   plus ~4 KB of contexts - **~23 KB per session** with dates checked. Against 27-42 KB free at the
+   fetch point with a 13-37 KB largest block, that fits *often*, not always; the gate then does what
+   it was built for. The input buffer cannot go below 16 KB for SEPTA: only Open-Meteo honours
+   `max_fragment_length`. It is a build project of its own (a custom `platform_packages` entry,
+   reproducibility, keeping it in step with the pinned core), which is why it is a recommendation.
+2. Give the fetch point more 8-bit heap. The candidates are all trade-offs the owner would feel: the
+   LVGL pool (36 KB static, 74 % used), the 19 KB draw buffer (1/20 of the screen already), the
+   18 KB the SD mount takes, the arrival tracker (8 trips per stop). 10-15 KB is realistic; 35 KB is
+   not without dropping a feature.
+3. A board with PSRAM (the ESP32-S3 Sunton variants) makes the whole question go away; the
+   `platformio.ini` envs are per board already.
+
+#### What was verified on the owner's board (2026-09-16, `cyd-3248S035R`, firmware built from this branch)
+
+Flashed with the OTA path first (`-H "Expect:"` needed, README) and over serial after the OTA gate
+started refusing (above); serial console captured throughout; the owner's config (stops 21332 and
+21297) untouched, verified after every flash.
+
+- **Boot and stack.** `[heap] eh_pool arena=2048` (the `next` exception pool is in the image).
+  Poller stack high-water mark on the plain build: **4,556 B free of 10 KB**, which is the 3-4 KB a
+  TLS handshake needs on the stack and nothing over; the HTTPS builds give the poller 12 KB
+  (`net_poller.cpp`; 6,536 B free measured with plain fetches over 21 polls). Static RAM +448 B.
+- **`https_preferred` soak.** 21 consecutive polls (`cyd-3248S035R-https`, flashed over serial,
+  owner's config, both stops `17-21332` and `17-21297` `live` for the whole run, every
+  `last_poll.ok` true). 64 fetches asked for `https://`; the gate admitted **none** of them:
+  `https_ok` 0, `https_failed` 0, `cert_failed` 0, `refused_by_heap` 0, `http_by_heap` 68 (the
+  four extra are the boot-time BusSchedules retries before the first `poll-start` line). The gate
+  saw a median 29,748 B of 8-bit heap with a 19,444 B largest block against a need of 68,250 -
+  never closer than 25,878 B. `/api/state`'s `transport` block reported it live throughout
+  (`"last":"http"`, `gate_free` 29,304, `gate_largest` 19,444 at the end of the run), and the
+  web app's Now page read "Data link - Plain HTTP this time (not enough free memory for HTTPS)".
+  Arrival latency, poll cadence and stop health were indistinguishable from the shipping build.
+- **Poll-cycle heap trace** (`-DTRANSIT_HEAP_TRACE`, same run): the `[poll-heap]` table under
+  "Could the fetch simply run at a better moment?" above. The short version is that the cycle is
+  flat to within 6 KB, its best moment is 41,200 B of 8-bit heap with a 24,564 B largest block,
+  and two 16,717 B record buffers do not fit there even with every other TLS cost set to zero.
+- **Policy tests (device suite section H, added tonight; 9/9 passed).** The `transport` block is
+  well formed and `GET /api/config` echoes the policy. `https_preferred`: fetches kept being decided
+  (all refused by the gate), `refused_by_heap` never moved, and `last_poll.ok` stayed true with both
+  stops `live`. `http`: only `http_by_policy` moved across three polls and the TLS counters froze.
+  `https`: across three polls `http_by_heap` and `http_by_policy` did not move while
+  `refused_by_heap` climbed - every fetch was refused rather than sent in clear, and the stops read
+  unavailable, as the setting promises. `"transport": "bogus"` is a 400 at `device.transport`. The
+  owner's setting was restored afterwards. In the same run, section A's `POST /api/debug/oom` (the
+  `next` exception-pool proof) aborted the device instead of answering `caught:true` - see the note
+  after this list; it is independent of HTTPS.
+- **Forced gate** (`PLATFORMIO_BUILD_FLAGS=-DTRANSIT_HTTPS_GATE_TEST pio run -e cyd-3248S035R-https`
+  - the env var appends to `build_flags`, `BOARD_NAME` and the rest survive, checked in the
+  `https_env.py` line of the build log). The gate is stripped to the irreducible cost: `kTlsHeapNeed`
+  = 33,434 (the two record buffers, nothing else) and no contiguity margin; `/api/state` confirmed
+  `"heap_need": 33434`. Result: across the run 54 fetches asked for `https://` and the gate admitted
+  **exactly one** of them, the very first one after boot, at the cleanest heap the device ever has
+  (`poll-start` free8 49,852, largest 47,092 - a good 8 KB better than any steady-state moment; the
+  other 53 were refused), and **mbedTLS still could not open the
+  session**: all three attempts on SEPTA's TripUpdates failed in 38-76 ms with
+  `code -0x7f00` = `MBEDTLS_ERR_SSL_ALLOC_FAILED`, free8 34,264-34,920 at the failure. So the
+  ~20 KB of contexts, kept peer chain and handshake scratch beside the buffers is real, and 49 KB
+  of 8-bit heap with a 47 KB hole in it is *still* not enough for one session on this SDK.
+  **It failed closed**, which is the behaviour this section promises: the three attempts stayed on
+  TLS, the fetch was reported unreachable, `https_failed` went to 1 with `cert_failed` 0 and
+  `last_tls_error` -32512 while `http_by_heap` did not move for it, and not one byte of that URL
+  left the device over plain HTTP. The stops were back to `live` on the next poll. Switching
+  `device.transport` to `http` at the end of the run froze the TLS counters and moved only
+  `http_by_policy` (26 fetches), on the live device, which is section H's `http` case observed
+  outside the suite.
+  Every *later* fetch was refused even at the relaxed need, and one of them is the whole argument in
+  a single line: `TransitView … heap free=37076 largest=32756, need 33434`. Both scalar tests pass
+  (37,076 > 33,434; 32,756 > 16,717) and the gate still said no, because it does not trust scalars -
+  it asks the allocator. 32,756 - 16,717 leaves 16,039 B in that hole and only 4,320 B lies anywhere
+  else, so the second 16,717 B buffer has nowhere to go. That is the arithmetic of "Could the fetch
+  simply run at a better moment?" happening on the hardware.
+  One caveat to record honestly: the poller's stack high-water mark through this run was 6,328 B
+  free of 12 KB, only ~200 B worse than the plain-fetch soak, because the session died inside
+  `mbedtls_ssl_setup()` before any bignum work. **The 3-4 KB of handshake stack estimated above has
+  therefore never been exercised on this board** - the 12 KB stack the `-https` envs give the poller
+  is still a paper number, and the SDK-rebuild test pass has to re-measure it. No watchdog trip, no
+  `Guru`, no reset in either run.
+- **Not testable on this hardware:** a certificate that fails to chain to its pin (test hook
+  `-DTRANSIT_HTTPS_BADPIN_TEST` in `tls_roots.h`, SEPTA pinned to ISRG Root X1) and the handshake
+  time per host, because no handshake completes before the heap runs out. Both are what the rebuilt
+  SDK's test pass must cover first: expected `[https] … code -0x2700`, `transport.cert_failed` = 1,
+  `transport.last` = `https_failed`, the stop unavailable, and no plain-HTTP request for that URL
+  leaving the device (`tcpdump port 80` on the router).
+
+**Seen in passing, not HTTPS: the exception-pool proof can still abort.** On a fresh boot the
+first `POST /api/debug/oom` ended in `abort()` on core 1 - `__cxa_throw` → `__cxa_get_globals`
+(`eh_globals.cc:150`) → `std::terminate`. Decoded against the ELF and confirmed in the disassembly:
+a thread's *first* throw calls `pthread_getspecific`, finds nothing, `malloc`s its
+`__cxa_eh_globals` and terminates if that fails, and the endpoint exhausts the heap by design
+before throwing. The 2 KB emergency pool supplies the exception object, not this one-time
+per-thread block, so the proof passes only on a task that has thrown before (the full device
+suite provokes caught `bad_alloc`s on the async task in its earlier sections; a run that hits the
+endpoint first does not). The fix is to warm every throwing task's exception globals at start
+(`throw 0` caught, or `__cxa_get_globals()`) while the heap is plentiful; it is filed as its own
+task and belongs with §12.1, which should say so until it lands. Consistent with that diagnosis:
+the same endpoint, hit as the *fourth* check of the 2026-09-16 suite run on a device that had been
+up 75 s and polling, answered `caught:true` with a 12 B largest block at the throw. It is not
+flaky - it depends entirely on whether that task has thrown before, which is exactly the gap.
+
+The serial lines to read: `[https] plain http for <url>: heap free=… largest=…, need …` on every gate
+refusal (the numbers are 8-bit heap), `[https] <url>: 200 over TLS, headers in N ms; heap free=…
+largest=… min_free=…` on a success, `[https] <url> attempt i/3: no response over TLS after N ms,
+code -0x…` on a failure, `[https] refused …` under policy `https`, and `[net_poller] free_heap=…
+free8=… largest_block=… stack_free=…` once per poll.
 
 ## 3. Hardware
 
@@ -390,6 +800,14 @@ Fields added 2026-09-14 (all optional; absent means the default shown above):
   and amber at 1-2) or `words` (`5 bikes, 2 e-bikes, 7 docks`, same colour cue on the numbers).
   `stations[]` carry the BTS station `id` and a display `name`.
 
+`device.transport` (`http` | `https_preferred` | `https`, default `http`) is read, written and
+honoured only by a firmware built with `-DTRANSIT_HTTPS` (§2.1); a shipping build ignores the key
+exactly as it ignores v0.1.x's `use_https`/`tls_verify`, never emits it, and fetches everything over
+plain HTTP. In an HTTPS build `https_preferred` asks for verified TLS on every fetch and uses plain
+HTTP only when the heap gate says a session does not fit right now (never after a TLS failure),
+`https` uses TLS or reports the fetch unreachable, and `PUT /api/config` changes the policy for the
+very next fetch. The web app shows the field only when `/api/state` carries a `transport` block.
+
 `rotation` is 0, 90, 180, or 270 degrees; 0 is the panel's native portrait orientation (the owner's preference), 90 is landscape. The UI rebuilds its layout when it changes.
 `theme` is `light` (default) or `dark`; both palettes keep every text colour at WCAG AA contrast or
 better. `invert_colors` drives the panel controller's colour-inversion command; its default comes
@@ -482,7 +900,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | Method, path | Purpose |
 |---|---|
 | `GET /` , `/app.js`, `/app.css`, `/favicon.svg` | Web UI, served gzip with `Cache-Control: max-age=3600`, ETag = firmware build id |
-| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes, dropped_rows, write_ok, error} (§9.1), last_poll {ok, age_s, error}, `stops[]` each with `arrivals[]` (§8 shape), `ok`, `health`, `source_ts`, `source_age_s` (-1 when the feed carried no timestamp) and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, stale, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8; `age_s` is the main location's last successful fetch, `stale` once that is over an hour old), plus `board` (the PlatformIO env this image was built for, e.g. `cyd-3248S035R`), `auth {pin_required}` and `config_recovered` (§6) |
+| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes, dropped_rows, write_ok, error} (§9.1), last_poll {ok, age_s, error}, `stops[]` each with `arrivals[]` (§8 shape), `ok`, `health`, `source_ts`, `source_age_s` (-1 when the feed carried no timestamp) and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, stale, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8; `age_s` is the main location's last successful fetch, `stale` once that is over an hour old), plus `board` (the PlatformIO env this image was built for, e.g. `cyd-3248S035R`), `auth {pin_required}` and `config_recovered` (§6). A firmware built with `-DTRANSIT_HTTPS` (§2.1) adds `transport {policy, last, https_ok, https_failed, cert_failed, http_by_heap, http_by_policy, refused_by_heap, last_tls_error, last_https_ms, heap_need, gate_free, gate_largest}`: `last` is the transport of the most recent fetch that asked for `https://` (`https`, `http`, `https_failed`, `refused`, or `none`), the counters are per boot, and `gate_*` are the 8-bit heap numbers of the last gate decision against `heap_need`. Absent from shipping builds |
 | `GET /api/config` | Current config (§6) |
 | `PUT /api/config` | Replace config; validates; persists; triggers immediate re-poll. 400 on error |
 | `GET /api/proxy/stops?route=17` | Streams SEPTA `Stops` for a route to the browser (setup only) |
@@ -968,9 +1386,12 @@ upload runs at a time, a disconnect mid-image aborts the update, the image must 
 and the stream must contain this board's `PTD-BOARD:<env>;` marker or it is rejected with a 400.
 That last check is what stops a 2.4"-capacitive image from bricking a 3.5" resistive panel.
 
-**Residual risks, accepted for now.** HTTPS is deferred (§2 and `firmware/README.md`: a TLS
-session needs ~40 KB of heap with two 16 KB contiguous buffers this board cannot spare, and
-dropping mbedTLS freed ~100 KB of flash). So **the PIN travels over the LAN in clear text** — 
+**Residual risks, accepted for now.** HTTPS to the data sources stays out of the shipping envs
+(§2; §2.1 has the 2026-09-16 measurements and a heap-gated prototype behind `-DTRANSIT_HTTPS`: a
+TLS session on this SDK is two fixed 16,717 B record buffers plus ~20 KB around them, and the
+byte-addressable heap at the moment a fetch starts is 27-42 KB, so on the owner's board the gate
+never once found room; a rebuilt SDK with smaller buffers is what would change that). So **the PIN
+travels over the LAN in clear text** — 
 anyone who can passively sniff the owner's own network, or who already controls a device on it,
 can read it and then do anything the owner can. The PIN raises the bar from "any script that finds
 the device" to "an attacker already inside the network with packet capture"; it is not a defence
@@ -1016,7 +1437,10 @@ not used; the link map is the proof. Cost: one 2 KB `malloc` before `app_main()`
 boot log prints it as `[heap] eh_pool arena=2048`. `POST /api/debug/oom` (PIN-gated, §7) is the
 deterministic proof: it takes the heap away in shrinking blocks until even a 16-byte allocation
 fails, forces a `std::bad_alloc`, frees everything and answers `caught:true`; without the pool that
-request reboots the device. The device suite runs it. The heavy read handlers (`/api/state`,
+request reboots the device. The device suite runs it. Known gap (2026-09-16, §2.1 "seen in passing"): a task's
+*first* throw allocates its per-thread `__cxa_eh_globals` with a plain `malloc` and terminates if
+that fails, which the pool does not cover, so on a fresh boot the proof itself aborted the device;
+warming every throwing task's exception globals at start is the fix, filed as its own task. The heavy read handlers (`/api/state`,
 `/api/config`) still refuse up front with a fixed-literal 503 when free heap is under
 `kMinHeavyResponseHeap` (24 KB) or the largest block under 8 KB - no longer because the failure
 would be uncatchable, but because a build that is going to fail costs CPU and heap the poller wants,

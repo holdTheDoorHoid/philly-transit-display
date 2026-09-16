@@ -93,11 +93,58 @@ transit::FetchResult getEx(const char *url, std::function<bool(const uint8_t *, 
 // transfer is cut and the result is reported incomplete.
 uint32_t absoluteDeadlineMs(uint32_t timeout_ms);
 
-// Plain HTTP only. The optional TLS mode shipped in v0.1.0-0.1.1 and was removed in v0.1.2; HTTPS
-// is DEFERRED by the owner's decision (DESIGN.md SS2 "Transport"), not merely unimplemented, so an
-// https:// URL here is deliberately fetched over http:// rather than refused. The reasons stand:
-// TLS cost ~100 KB of flash, a session needs ~40 KB of heap with two 16 KB contiguous buffers that
-// the classic ESP32 (no PSRAM) running LVGL, Wi-Fi and a web server cannot spare, and SEPTA,
-// Open-Meteo and Bicycle Transit all serve plain http. Revisit only with DESIGN.md SS2.
+// Plain HTTP unless the firmware is built with -DTRANSIT_HTTPS. The optional TLS mode shipped in
+// v0.1.0-0.1.1 and was removed in v0.1.2; the shipping envs still fetch an https:// URL over
+// http:// rather than refusing it (DESIGN.md SS2 "Transport"), because a TLS session on this SDK
+// needs two 16,717 B contiguous record buffers plus ~20 KB around them - the precompiled mbedTLS
+// cannot shrink them (DESIGN.md SS2.1 has the measurements) - and SEPTA, Open-Meteo and Bicycle
+// Transit all serve plain http. The prototype below is the heap-gated answer to that.
+
+#ifdef TRANSIT_HTTPS
+// DESIGN.md SS2.1: how an https:// URL is fetched, config.device.transport.
+//   Http            plain http:// for every URL (what the shipping envs do unconditionally).
+//   HttpsPreferred  verified TLS when the heap gate says one session fits right now, else plain
+//                   http:// for THAT fetch. The transport is chosen by the device's memory, never
+//                   by the network: the gate runs BEFORE the connection, and a TLS attempt that
+//                   then fails - certificate, handshake, timeout, or memory running out inside
+//                   mbedTLS - is reported as unreachable and is NOT retried over http, so an
+//                   on-path attacker cannot force a downgrade by breaking TLS or by sending a
+//                   chain too big to parse (review finding F04). The next poll asks the gate again.
+//   HttpsRequired   verified TLS or nothing: when the gate refuses, the fetch is reported as
+//                   unreachable and the stop shows as such (DESIGN.md SS4.7 health).
+enum class Transport : uint8_t { Http = 0, HttpsPreferred = 1, HttpsRequired = 2 };
+
+// config_store.cpp pushes the active config's device.transport here from setActiveConfig(), so a
+// PUT /api/config changes the policy for the very next fetch without the poller knowing.
+void setTransportPolicy(Transport policy);
+Transport transportPolicy();
+const char *transportName(Transport policy);           // "http" | "https_preferred" | "https"
+bool parseTransport(const char *name, Transport &out);  // the inverse; false for anything else
+
+// What actually happened, for GET /api/state's "transport" block and the device test plan.
+// Counters are per boot. `last` is the transport of the most recent fetch that asked for https://:
+// "https" (verified TLS delivered a response), "http" (plain, by policy or by the heap gate),
+// "https_failed" (TLS attempted, no response, not downgraded), "refused" (policy https, gate said no).
+struct TransportStats {
+  uint32_t https_ok = 0;
+  uint32_t https_failed = 0;     // TLS attempted, no response: certificate, handshake, timeout
+  uint32_t cert_failed = 0;      // subset of https_failed: chain did not verify against the pinned root, or no root pinned
+  uint32_t http_by_policy = 0;   // policy http
+  uint32_t http_by_heap = 0;     // policy https_preferred, heap gate refused, fetched over plain http
+  uint32_t refused_by_heap = 0;  // policy https, heap gate refused, reported unreachable
+  const char *last = "none";
+  int last_tls_error = 0;        // mbedTLS code (negative) of the most recent TLS failure, 0 if none
+  // Both are MALLOC_CAP_8BIT - what an allocation can actually get - not ESP.getFreeHeap(), which
+  // on the classic ESP32 also counts ~34 KB of 32-bit-only IRAM heap no buffer can use (SS2.1).
+  size_t gate_free = 0;          // byte-addressable free heap when the last gate decision was taken
+  size_t gate_largest = 0;       // largest byte-addressable free block at that moment
+  uint32_t last_https_ms = 0;    // connect + handshake + headers of the last successful TLS fetch
+};
+TransportStats transportStats();
+
+// Bytes of free heap the gate requires before it lets a TLS session start (the measured session
+// plus margin, http_fetch.cpp). Exposed so /api/state can show it next to the live numbers.
+size_t tlsHeapNeed();
+#endif  // TRANSIT_HTTPS
 
 }  // namespace transit_app

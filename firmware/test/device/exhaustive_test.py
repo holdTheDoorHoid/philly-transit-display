@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exhaustive on-device test of the Philly Transit Display firmware over its HTTP API.
 Backs up the owner's config first and restores it at the end (with invert_colors=false)."""
-import json, subprocess, sys, time, threading, re, copy, datetime, concurrent.futures, os
+import atexit, json, subprocess, sys, time, threading, re, copy, datetime, concurrent.futures, os
 B = 'http://192.168.1.181'
 S = os.path.dirname(os.path.abspath(__file__))
 
@@ -13,6 +13,11 @@ if not PIN:
     sys.exit('CYD_PIN is not set. Read the PIN from the serial console at boot ("[auth] web PIN: ...")\n'
              'or from the device info screen on the panel, then run:  CYD_PIN=123456 %s' % sys.argv[0])
 PINH = ['-H', 'X-Pin: ' + PIN]
+# Suppress curl's "Expect: 100-continue" on the OTA uploads: ESPAsyncWebServer answers 100 Continue
+# and then drops the connection without reading the image, so the upload silently does nothing and
+# the device stays on its old build (found 2026-09-16; firmware/README.md says the same for the
+# documented curl line).
+EXPECT = ['-H', 'Expect:']
 results = []
 serial_lines = []
 stop_serial = False
@@ -90,6 +95,14 @@ def config():
     code, d = get_json('/api/config')
     return d
 
+def device_name():
+    """config()['device']['name'], but never an exception. /api/config answers a 503 BODY - a
+    dict without 'device' - under memory pressure (DESIGN.md SS12.1), and indexing it killed the
+    whole run on 2026-09-16 before the restore section, leaving the owner's device on test
+    settings."""
+    c = config()
+    return (c or {}).get('device', {}).get('name')
+
 def serial_thread():
     try:
         import serial
@@ -123,10 +136,32 @@ t = threading.Thread(target=serial_thread, daemon=True); t.start()
 time.sleep(1)
 
 backup = config()
-assert backup, 'device not reachable'
+# Not just "truthy": /api/config answers a 503 BODY ({"error": "low memory, retry"}) when the heap
+# is tight, and taking that as the backup would mean restoring nothing at the end.
+assert isinstance(backup, dict) and 'device' in backup and 'stops' in backup, \
+    'device not reachable, or it answered %r instead of a config - wait a poll and try again' % (backup,)
 json.dump(backup, open(os.path.join(S, 'test_backup_config.json'), 'w'))
 base = copy.deepcopy(backup)
 base['device']['invert_colors'] = False
+
+# The owner's device must come back to the owner's settings even when this script dies half way
+# through. On 2026-09-16 a KeyError in section F ended the run before the restore at the bottom,
+# and the display was left with a test profile and the suite's stop list on it. atexit fires on a
+# normal exit, an unhandled exception and sys.exit alike; the restore section sets `restored` so
+# it does not run twice.
+restored = False
+def restore_owner_config():
+    if restored:
+        return
+    print('!! restoring the owner config from atexit - the run did not reach the restore section', flush=True)
+    for _ in range(6):
+        if put_cfg(base) == 200:
+            print('   restored', flush=True)
+            return
+        time.sleep(5)
+    print('   RESTORE FAILED. The device is still on test settings; PUT %s back by hand.'
+          % os.path.join(S, 'test_backup_config.json'), flush=True)
+atexit.register(restore_owner_config)
 s0 = state(); uptime0 = s0.get('uptime', 0); heap0 = s0.get('heap', 0)
 print('== start: uptime', uptime0, 'heap', heap0, 'stops', [x['key'] for x in backup['stops']])
 
@@ -244,7 +279,7 @@ sb = state().get('bike', {}); check('B state bike 3 stations with counts', ok3, 
 roundtrip('bike off', lambda c: c.update(bike={'enabled': False, 'stations': []}), lambda g: g['bike']['enabled'] is False, wait=4)
 check('B state bike disabled', wait_for(lambda: state().get('bike', {}).get('enabled') is False and state()['bike']['stations'] == [], 10, 1), state().get('bike'))
 put_cfg(copy.deepcopy(base)); time.sleep(3)
-check('B restore base', config()['device']['name'] == base['device']['name'])
+check('B restore base', device_name() == base['device']['name'])
 
 # ---------- C. validation ----------
 def invalid(name, mutate, path):
@@ -285,7 +320,7 @@ invalid('duplicate key', lambda c: c['stops'][1].update(key=c['stops'][0]['key']
 invalid('9 stops', lambda c: c.update(stops=[dict(c['stops'][0], key='k%d' % i) for i in range(9)]), 'stops')
 invalid('lat 91', lambda c: c['stops'][0].update(lat=91), 'stops[0].lat')
 r = curl(['-w', '%{http_code}', '-o', '/dev/null', '-X', 'PUT', '-H', 'Content-Type: application/json', '--data-binary', '{not json', B + '/api/config']); check('C malformed json rejected', r.stdout in (b'400', b'415'), r.stdout)
-check('C config unchanged after invalid PUTs', config()['device']['name'] == base['device']['name'])
+check('C config unchanged after invalid PUTs', device_name() == base['device']['name'])
 
 # ---------- C2. validation added by the hardening pass (review F07/F30) ----------
 invalid('brightness 256 (must not wrap to 0)', lambda c: c['device'].update(brightness=256), 'device.brightness')
@@ -458,6 +493,56 @@ check('D weather age/stale fields', isinstance(wxj.get('age_s'), int) and isinst
 check('D state reports board and auth', st.get('board') == 'cyd-3248S035R' and st.get('auth', {}).get('pin_required') is True and 'config_recovered' in st, (st.get('board'), st.get('auth')))
 d = ui(); check('D LVGL pool has headroom', d.get('lv_free', 0) > 3000, (d.get('lv_used'), d.get('lv_free'), d.get('lv_max_used')))
 
+# ---------- H. transport (DESIGN.md SS2.1) ----------
+# Only a firmware built with -DTRANSIT_HTTPS reports a `transport` block in /api/state; a build
+# without it fetches everything over plain http and has nothing to check here, so it SKIPs.
+put_cfg(copy.deepcopy(base)); time.sleep(3)
+tr0 = state().get('transport')
+if not isinstance(tr0, dict):
+    print('SKIP H transport: this firmware reports no transport block (built without TRANSIT_HTTPS)')
+else:
+    POLICIES = ('http', 'https_preferred', 'https'); LASTS = ('none', 'https', 'http', 'https_failed', 'refused')
+    COUNTERS = ('https_ok', 'https_failed', 'cert_failed', 'http_by_heap', 'http_by_policy', 'refused_by_heap')
+    def tr_now(): return state().get('transport') or {}
+    def fetches(tr): return sum(int(tr.get(k, 0)) for k in COUNTERS if k != 'cert_failed')  # cert_failed is a subset of https_failed
+    def settled(pred, timeout=120): return wait_for(lambda: pred(tr_now()), timeout, 5)
+    def after_polls(n, timeout=150):
+        """Snapshot the block, wait until at least n more https:// fetches were decided, snapshot again."""
+        a = tr_now(); fa = fetches(a)
+        ok = settled(lambda t: fetches(t) >= fa + n, timeout)
+        return a, tr_now(), ok
+    check('H transport block is well formed', tr0.get('policy') in POLICIES and tr0.get('last') in LASTS and all(isinstance(tr0.get(k), int) and tr0[k] >= 0 for k in COUNTERS) and isinstance(tr0.get('heap_need'), int) and tr0['heap_need'] > 2 * 16717, tr0)
+    check('H cert_failed is a subset of https_failed', tr0['cert_failed'] <= tr0['https_failed'], tr0)
+    check('H config echoes device.transport', config().get('device', {}).get('transport') == tr0.get('policy'), (config().get('device', {}).get('transport'), tr0.get('policy')))
+    # https_preferred: the gate decides by memory; whatever it decides, arrivals keep flowing.
+    cfg = copy.deepcopy(base); cfg['device']['transport'] = 'https_preferred'; put_cfg(cfg)
+    settled(lambda t: t.get('policy') == 'https_preferred', 20)
+    a, b, ok = after_polls(4)
+    st = state()
+    check('H https_preferred: fetches keep being decided', ok, (fetches(a), fetches(b)))
+    check('H https_preferred: never refuses a fetch (that is the https policy)', b['refused_by_heap'] == a['refused_by_heap'], (a['refused_by_heap'], b['refused_by_heap']))
+    check('H https_preferred: arrivals still flow (last poll ok, every stop live or schedule_only)', st.get('last_poll', {}).get('ok') is True and all(x.get('health') in ('live', 'schedule_only') for x in st.get('stops', [])), (st.get('last_poll'), [(x['key'], x.get('health')) for x in st.get('stops', [])]))
+    print('     https_preferred since boot: https_ok=%s http_by_heap=%s https_failed=%s (cert %s) last=%s last_https_ms=%s gate free=%s largest=%s need=%s' % (b['https_ok'], b['http_by_heap'], b['https_failed'], b['cert_failed'], b.get('last'), b.get('last_https_ms'), b.get('gate_free'), b.get('gate_largest'), b.get('heap_need')))
+    # http: no TLS at all - the TLS counters freeze and only http_by_policy moves.
+    cfg['device']['transport'] = 'http'; put_cfg(cfg)
+    settled(lambda t: t.get('policy') == 'http' and t.get('last') == 'http', 90)
+    a, b, ok = after_polls(3)
+    check('H http: plain by policy, TLS counters frozen', ok and b['http_by_policy'] > a['http_by_policy'] and all(b[k] == a[k] for k in ('https_ok', 'https_failed', 'http_by_heap', 'refused_by_heap')) and b['last'] == 'http', (a, b))
+    # https: verified TLS or nothing - the plain-http counters freeze; a refusal reads as an unavailable fetch.
+    cfg['device']['transport'] = 'https'; put_cfg(cfg)
+    settled(lambda t: t.get('policy') == 'https' and t.get('last') in ('https', 'refused', 'https_failed'), 90)
+    a, b, ok = after_polls(3)
+    check('H https: never plain http', ok and b['http_by_heap'] == a['http_by_heap'] and b['http_by_policy'] == a['http_by_policy'] and (b['https_ok'] + b['refused_by_heap'] + b['https_failed']) > (a['https_ok'] + a['refused_by_heap'] + a['https_failed']), (a, b))
+    check('H https: no certificate failures against the pinned roots', b['cert_failed'] == tr0['cert_failed'], (tr0['cert_failed'], b['cert_failed'], b.get('last_tls_error')))
+    # validation and restore
+    cfgx = copy.deepcopy(base); cfgx['device']['transport'] = 'bogus'
+    code, body = put_cfg_body(cfgx)
+    check('H transport bogus is rejected', code == 400 and body and body.get('path') == 'device.transport', (code, body))
+    put_cfg(copy.deepcopy(base)); time.sleep(3)
+    check('H transport restored', config().get('device', {}).get('transport') == base['device'].get('transport', 'http'), config().get('device', {}).get('transport'))
+    tls_lines = [l for l in serial_lines if '[https]' in l]
+    print('     serial: %d [https] lines so far; sample: %s' % (len(tls_lines), [l[:110] for l in tls_lines[-3:]]))
+
 # ---------- E. concurrency ----------
 def hit(u):
     r = curl(['-o', '/dev/null', '-w', '%{http_code} %{size_download}', B + u], 40); return r.stdout.decode()
@@ -481,10 +566,15 @@ while time.time() < deadline:
     if code == 200 and d: break
     time.sleep(3)
 check('F back after reboot', code == 200 and d and d.get('uptime', 999) < 90, (code, d and d.get('uptime')))
-check('F config intact after reboot', config() and config()['device']['name'] == base['device']['name'])
+check('F config intact after reboot', device_name() == base['device']['name'])
 
 # ---------- G. OTA with the running image ----------
-fw = '/home/hoid/Desktop/philly-transit-display/firmware/.pio/build/cyd-3248S035R/firmware.bin'
+# The image of the TREE THIS SCRIPT LIVES IN (S is .../firmware/test/device), not a hardcoded
+# absolute path: with git worktrees the absolute form uploaded another branch's build to the device
+# - the suite then tested one firmware and left a different one running. CYD_FW overrides, and
+# CYD_ENV picks another board env.
+fw = os.environ.get('CYD_FW') or os.path.abspath(
+    os.path.join(S, '..', '..', '.pio', 'build', os.environ.get('CYD_ENV', 'cyd-3248S035R'), 'firmware.bin'))
 if os.path.exists(fw):
     ver_before = state().get('firmware_version')
     # The OTA handler refuses uploads below 60 KB free heap, and right after section F's reboot the
@@ -498,23 +588,24 @@ if os.path.exists(fw):
     fake = os.path.join(S, 'test_wrong_board.bin')
     with open(fake, 'wb') as fh:
         fh.write(b'\xe9\x04\x02\x20' + bytes(range(256)) * 16)  # ESP32 image magic, then filler; no board marker
-    r = curl(PINH + ['-w', '\n%{http_code}', '-F', 'firmware=@' + fake, B + '/api/ota'], 60)
+    r = curl(PINH + EXPECT + ['-w', '\n%{http_code}', '-F', 'firmware=@' + fake, B + '/api/ota'], 60)
     wbody, _, wcode = r.stdout.rpartition(b'\n')
     check('G OTA rejects an image for a different board', wcode == b'400' and b'different board' in wbody, (wcode, wbody[:160]))
     os.remove(fake)
     check('G device still up after the rejected uploads', state().get('uptime', 0) > 0)
-    r = curl(PINH + ['-w', '\n%{http_code}', '-F', 'firmware=@' + fw, B + '/api/ota'], 180)
+    r = curl(PINH + EXPECT + ['-w', '\n%{http_code}', '-F', 'firmware=@' + fw, B + '/api/ota'], 180)
     body, _, code = r.stdout.rpartition(b'\n')
     check('G OTA upload accepted', code in (b'200', b'202'), (code, body[:120]))
     time.sleep(8)
     back = wait_for(lambda: state().get('uptime', 999) < 120, 120, 4)
     check('G device back after OTA', back, state().get('uptime'))
     check('G firmware version unchanged after re-flash', state().get('firmware_version') == ver_before, (ver_before, state().get('firmware_version')))
-    check('G config intact after OTA', config() and config()['device']['name'] == base['device']['name'])
+    check('G config intact after OTA', device_name() == base['device']['name'])
     time.sleep(30)
 
 # ---------- restore ----------
 put_cfg(base); time.sleep(3)
+restored = True  # the atexit safety net above has nothing left to do
 final = config()
 check('Z restored owner config (invert off)', final and [x['key'] for x in final['stops']] == [x['key'] for x in backup['stops']] and final['device']['invert_colors'] is False)
 stop_serial = True; time.sleep(1.5)

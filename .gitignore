@@ -18,3 +18,4 @@ firmware/secrets.h
 firmware/test/device/exhaustive_results.json
 firmware/test/device/test_backup_config.json
 firmware/test/device/__pycache__/
+__pycache__/

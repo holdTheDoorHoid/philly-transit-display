@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- HTTPS to the data sources (SEPTA, Open-Meteo, Indego), measured on the owner's board and kept
+  as a prototype. A firmware built with `-DTRANSIT_HTTPS` (the `cyd-*-https` envs) asks for a
+  verified, encrypted connection on every fetch, with each source pinned to its one root
+  certificate, and falls back to plain HTTP only when the device's memory cannot hold an encrypted
+  session right now - never because a certificate failed to verify, which simply fails the fetch
+  and is retried on the next poll. The web app shows which one the latest arrivals came over
+  ("Data link" on the Now page) and offers the choice under Settings, Data & weather ("Data
+  connection"); both appear only on a firmware that actually has HTTPS in it.
+  **Shipping builds are unchanged and keep fetching over plain HTTP**, because over 21 polls on
+  the owner's board the encrypted connection was never once affordable: all 64 fetches that asked
+  for it were turned down, with about 29 KB of usable memory free against the 68 KB a session
+  needs. The memory the device *reports* as free overstates what a buffer can actually use by
+  about 34 KB - a region of the chip that only whole-word reads can reach - and the boot log and
+  the poller heartbeat now print both figures side by side. We also checked whether simply doing
+  the encrypted fetch at a quieter moment in the poll would help: the whole poll cycle is flat to
+  within 6 KB, so the best moment is still about 27 KB short, and at that moment the two 16.7 KB
+  buffers an encrypted session needs cannot both be found even with every other cost set to zero.
+  DESIGN.md 2.1 records the numbers and what it would take (a rebuilt vendor library with smaller
+  encryption buffers, or a board with extra memory). Nothing about the arrivals changed during the
+  test: both stops stayed live and the poll cadence was the same as the shipping build.
+  The Open-Meteo and Indego addresses are now written as `https://` like SEPTA's, which changes
+  nothing in a shipping build. The HTTPS build also gives the poller task 2 KB more stack and
+  prints a per-stage memory trace.
+- Firmware update over the web: the curl example needed `-H "Expect:"`; without it the upload is
+  dropped and the device stays on its old build (documented in firmware/README.md).
+
 - Memory: the firmware now gives the C++ runtime a 2 KB emergency exception pool, so an
   out-of-memory error can always be caught and answered with a 503 or a skipped frame instead
   of rebooting the device (this used to be the one uncatchable case, DESIGN.md 12.1). Done by

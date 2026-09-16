@@ -26,6 +26,9 @@
 #include "bike_service.h"
 #include "profiles.h"
 #include "proxy_worker.h"
+#ifdef TRANSIT_HTTPS
+#include "http_fetch.h"  // transport stats for /api/state (DESIGN.md SS2.1)
+#endif
 #include "sd_logger.h"
 #include "transit_core/rail_stations.h"
 
@@ -444,6 +447,25 @@ void handleGetState(AsyncWebServerRequest *request) {
   // SS6 safe-save: true when the last boot had to fall back to /config.prev.json because
   // /config.json was missing or unreadable. The UI surfaces it; nothing else changes.
   doc["config_recovered"] = configRecovered();
+#ifdef TRANSIT_HTTPS
+  {  // DESIGN.md SS2.1: which transport the poller is actually getting, so the UI can say so.
+    const TransportStats ts = transportStats();
+    JsonObject tr = doc["transport"].to<JsonObject>();
+    tr["policy"] = transportName(transportPolicy());
+    tr["last"] = ts.last;
+    tr["https_ok"] = ts.https_ok;
+    tr["https_failed"] = ts.https_failed;
+    tr["cert_failed"] = ts.cert_failed;
+    tr["http_by_heap"] = ts.http_by_heap;
+    tr["http_by_policy"] = ts.http_by_policy;
+    tr["refused_by_heap"] = ts.refused_by_heap;
+    tr["last_tls_error"] = ts.last_tls_error;
+    tr["last_https_ms"] = ts.last_https_ms;
+    tr["heap_need"] = (uint32_t)tlsHeapNeed();
+    tr["gate_free"] = (uint32_t)ts.gate_free;
+    tr["gate_largest"] = (uint32_t)ts.gate_largest;
+  }
+#endif
 
   // NB: doc.as<JsonObject>(), not .to<JsonObject>() - the latter clears the
   // document, which would wipe the time/uptime/heap/wifi/sd/last_poll
