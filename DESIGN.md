@@ -369,13 +369,29 @@ backing off *protects the upload*. Clients should expect it: the web app keeps i
 retries rather than blanking, and any script polling `/api/state` through an OTA must treat 503 as
 "retry", exactly as the low-memory contract has always said.
 
-There is a measurement trap here worth recording, because it caught this investigation. An earlier
-pass reported `free8` bottoming at 18,016 B during an upload - comfortably above the 12 KB floor,
-which made the 503s look unexplained. That number was survivorship-biased: `free8` is read *from*
-`/api/state`, and `/api/state` refuses precisely when `free8` is low, so the samples that came back
-were the ones taken when there was enough heap to build a reply. The endpoint cannot report the
-heap at the moment it is too low to report anything. Reading the status code rather than the body
-is what resolved it; for an unperturbed number, use the `[net_poller]` heartbeat over serial.
+**A gated endpoint cannot report the condition that gates it.** This caught the investigation above
+and it is general, so it belongs here rather than in a footnote. An earlier pass reported `free8`
+bottoming at 18,016 B during an upload - comfortably above the 12 KB floor, which made the 503s look
+unexplained. The number was survivorship-biased: `free8` is read *from* `/api/state`, and
+`/api/state` refuses precisely when `free8` is low, so only the samples taken when there was enough
+heap to build a reply ever came back. The endpoint cannot report the heap at the moment it is too
+low to report anything.
+
+The consequence generalises to any measurement campaign against this firmware: **every heap figure
+read from `/api/state` or `/api/config` is conditioned on `refuseIfLowHeap()` having passed**, so
+minima and low percentiles from those bodies are biased upward, and biased hardest at exactly the
+values a threshold decision turns on. Do not derive a gate threshold from them. Three sources do
+not have this failure mode:
+
+- `GET /api/debug/ui` - deliberately left outside the gate (see the comment on `refuseIfLowHeap`,
+  "the small handlers are deliberately not gated ... to observe the device precisely while it is
+  under pressure"). It carries `heap` and `largest_block`. Still an HTTP request, so it perturbs
+  what it measures, but it does not vanish when the answer gets interesting.
+- The `[net_poller]` serial heartbeat and the `[poll-heap]` trace - not requests at all, and the
+  only genuinely unperturbed source.
+- Recording the **status code** alongside every sample, so a refusal appears in the data as a
+  refusal rather than as a missing row. That is what turned "unexplained errors" into a
+  characterised behaviour in one pass.
 
 `/api/state` keeps `heap` as `ESP.getFreeHeap()` - clients parse it, and silently changing what a
 published field means is worse than an optimistic number - and gains `heap_8bit` and

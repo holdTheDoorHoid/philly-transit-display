@@ -19,7 +19,14 @@
   - **Two other safety checks had quietly not been running at all.** The ones protecting the
     status page and the background statistics work were set to thresholds that the miscounted
     figure could never fall below, so half of each check was dead. They now use the real number,
-    at levels worked out from what each job actually needs.
+    at levels worked out from what each job actually needs. One visible result: while a firmware
+    update is uploading, the web app's status data pauses for a few seconds and then resumes. That
+    is the repaired check doing its job - during an upload it steps back so the update gets the
+    memory it needs, because a failed update costs far more than a status reading arriving a few
+    seconds late. The old build carried on answering through an upload only because the check was
+    broken, so this is the bug going away rather than anything being taken out. The web app rides
+    it out and keeps showing the last reading; if you have your own script polling the device,
+    have it retry rather than treat it as an error.
   - **"Heap free" in the web app and on the device's own info page** now show the memory that can
     really be used. Expect this to read about 33 KB lower than before; nothing got worse, the old
     number was just counting memory that was never available. Anything reading the device's data
