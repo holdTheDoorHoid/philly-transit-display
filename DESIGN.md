@@ -1106,7 +1106,7 @@ Status codes beyond the per-route ones below:
 |---|---|---|
 | 401 | `{"error":"pin required"}` / `{"error":"wrong pin"}` | Protected route, `X-Pin` missing or wrong |
 | 429 | `{"error":"too many attempts","retry_s":N}` | Five consecutive wrong PINs; every protected route is locked for 30 s. A correct PIN resets the counter; a *missing* header never counts towards it |
-| 421 | `{"error":"this device is not reachable under that host name"}` | The `Host` header is not the device's IP, `<device name>` or `<device name>.local`, `192.168.4.1` or `localhost` (optional `:port`, case-insensitive). DNS-rebinding defence — checked before any handler runs, on every route |
+| 421 | `{"error":"this device is not reachable under that host name"}` | The `Host` header is not the device's IP, `<device name>` or `<device name>.local`, `192.168.4.1` or `localhost` (optional `:port`, case-insensitive). DNS-rebinding defence — checked before any handler runs, on every route, and additionally at the first byte of a `POST /api/ota` upload, whose callback runs before the middleware chain (§12) |
 | 409 | `{"error":"another firmware upload is in progress"}` | A second `POST /api/ota` while one is streaming |
 | 500 | `{"error":"..."}` | `PUT /api/config` could not write the file (the live config is unchanged, §6) |
 
@@ -1618,9 +1618,19 @@ current PIN. The owner learns the PIN from the serial console at boot (`[auth] w
 or the device info screen — both require physical possession of the display, which is the
 deliberate recovery path: there is no way to reset it over the network.
 
-**Cross-site and rebinding.** The `Host` header is checked on every request before any handler
+**Cross-site and rebinding.** The `Host` header is checked on every request before its handler
 runs and must name the device (its IP, `<device name>`, `<device name>.local`, `192.168.4.1` or
-`localhost`, optional port, case-insensitive); anything else is 421. That is what stops a page on
+`localhost`, optional port, case-insensitive); anything else is 421. "Before its handler" is the
+exact claim, corrected in the RC review: the middleware chain runs only once a request's **body**
+has been parsed (ESPAsyncWebServer 3.12.1 `WebRequest.cpp`, which switches to `PARSE_REQ_BODY` at
+end-of-headers and calls `_runMiddlewareChain()` afterwards), while `handleBody`/`handleUpload` run
+during the parse. So `POST /api/ota`'s upload callback used to reach `Update.begin()` and up to
+1.7 MB of `Update.write()` before the chain answered 421 - the response was refused, the flash
+writes were not. It now repeats the host check itself, at `index == 0`, before anything is written.
+Not a live bypass even before that (the route is PIN-gated, and see CORS below), but "the check
+gates the response" and "the check gates the side effect" are different properties. The JSON body
+handlers are unaffected: `AsyncCallbackJsonWebHandler::handleBody` only `calloc`s a buffer and
+copies into it, and the handler proper runs after the chain. That is what stops a page on
 the public internet from resolving its own domain to the device's LAN address and then talking to
 it with the attacker's origin. CORS is not enabled, so a cross-origin page cannot attach `X-Pin`
 without a preflight this server does not answer — a blind form POST therefore cannot carry the
@@ -1720,9 +1730,16 @@ calling task, while the heap is plentiful. It cannot be done once centrally - th
 per-task, so **every task that can throw must warm itself, on itself**, and any new one must too:
 `main.cpp setup()` for loopTask (which is also the LVGL display loop), `net_poller.cpp
 pollerTask()` (which covers the queued proxy and stats jobs, since they run on that task), and
-`web_server.cpp`'s first-thing middleware for the AsyncTCP task, which the library creates and we
+`web_server.cpp`'s first-in-chain middleware for the AsyncTCP task, which the library creates and we
 therefore cannot warm at its entry - it warms on request number one and costs one
-`pthread_getspecific` per request thereafter. Two details the implementation depends on and the
+`pthread_getspecific` per request thereafter. The middleware is not literally first on the request
+path, though, and for one route that matters: the chain does not run until a request's body has
+been parsed (§12, "Cross-site and rebinding"), so `handleOtaUpload()` warms on its own entry too.
+Without that, a device whose *first* request is a firmware upload ran `checkPin()`, the heap gates,
+`Update.begin()` and `otaFail()`'s `std::string` concatenations on a task that had never thrown -
+precisely the cold-first-throw shape above. Warming only makes the throw catchable, so the upload
+callback is also wrapped in its own `bad_alloc` guard: nothing in ESPAsyncWebServer catches what
+escapes one, and `guarded()` does not reach it. Two details the implementation depends on and the
 file documents: GCC folds a `try { throw 0; } catch (int) {}` whose handler it can see into a plain
 jump, so the throw lives behind a `noinline` call, and both ABI entry points are declared
 `__attribute__((const))` in `<cxxabi.h>`, so a call whose result goes unused is deleted - every

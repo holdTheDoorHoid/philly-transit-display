@@ -788,7 +788,9 @@ void otaScanForMarker(const uint8_t *data, size_t len) {
   g_ota.marker_match = m;
 }
 
-void handleOtaUpload(AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
+// The body of the upload callback. Never called directly - handleOtaUpload() wraps it, because
+// nothing in ESPAsyncWebServer catches what escapes from here.
+void otaUploadStep(AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
   if (index == 0) {
     if (g_ota.busy && g_ota.owner != request) {
       // Someone else is already flashing. Do not touch their state; handlePostOta() answers 409
@@ -801,6 +803,23 @@ void handleOtaUpload(AsyncWebServerRequest *request, const String &filename, siz
     // Fires on client disconnect, including the normal end of the request, so the transaction is
     // released on every path out of here.
     request->onDisconnect([request]() { otaRelease(request); });
+
+    // The same Host check the middleware applies to every other route, for the same reason it runs
+    // first there - and it has to be repeated here because the middleware has not run yet and will
+    // not until this whole upload has been parsed (handleOtaUpload() below has the mechanism).
+    // Without it a DNS-rebound request reached Update.begin() and up to 1.7 MB of
+    // Update.write() before the chain finally answered 421: the flash writes happened anyway. Not
+    // a live bypass - the route is PIN-gated and a browser cannot attach X-Pin cross-origin without
+    // a preflight this server does not answer - but "the check gates the response" and "the check
+    // gates the side effect" are different properties, and this is the one worth having.
+    if (!hostAllowed(request)) {
+      g_ota.ok = false;
+      g_ota.status = 421;
+      g_ota.error = "this device is not reachable under that host name";
+      g_ota.busy = false;
+      if (request->client() != nullptr) request->client()->close();
+      return;
+    }
 
     ApiFailure fail;
     if (!checkPin(request, fail)) {
@@ -903,6 +922,44 @@ void handleOtaUpload(AsyncWebServerRequest *request, const String &filename, siz
     }
     g_ota.writing = false;
     g_ota.busy = false;
+  }
+}
+
+// ESPAsyncWebServer's upload callback, and the two things every other route gets from the
+// middleware chain but this one cannot (DESIGN.md SS12.1).
+//
+// The chain does NOT run before a request's body. ESPAsyncWebServer 3.12.1's `_parseLine` switches
+// to PARSE_REQ_BODY at end-of-headers and calls `_runMiddlewareChain()` only once the body has been
+// fully parsed, while `handleUpload` runs *during* that parse - so the middleware's
+// warmExceptionGlobals() and its Host check both come too late for everything an upload does.
+// Hence:
+//
+//   1. Warm here, first. On a device whose very first request is a firmware upload, otaUploadStep()
+//      would otherwise run the std::function in onDisconnect(), checkPin() and otaFail()'s
+//      std::string concatenations on a task that has never thrown - the cold-first-throw shape
+//      cxx_exception_pool.cpp documents as fatal: the ~16 B malloc inside __cxa_get_globals()
+//      calls std::terminate() outright if it fails, past every try/catch and before the emergency
+//      pool is ever consulted. Idempotent and one pthread_getspecific once warm, so paying it per
+//      ~1.4 KB chunk of a 1.7 MB upload is free. (otaUploadStep() repeats the Host check itself.)
+//   2. Catch here. Warming only makes the throw *catchable*; nothing in the library catches what
+//      escapes an upload callback, so without this a bad_alloc anywhere in the step would still be
+//      std::terminate. guarded() does the same job for the ordinary handlers. The refusal text is
+//      short on purpose - 13 characters fits libstdc++'s small-string buffer, so recording it
+//      allocates nothing, which is the one property that matters in this catch block.
+void handleOtaUpload(AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
+  transit_app::warmExceptionGlobals("async_tcp");
+  try {
+    otaUploadStep(request, filename, index, data, len, final);
+  } catch (const std::bad_alloc &) {
+    if (g_ota.writing) {
+      Update.abort();
+      g_ota.writing = false;
+    }
+    g_ota.ok = false;
+    g_ota.status = 503;
+    g_ota.error = "out of memory";
+    g_ota.busy = false;
+    if (request->client() != nullptr) request->client()->close();
   }
 }
 
@@ -1153,16 +1210,26 @@ ArRequestHandlerFunction guarded(ArRequestHandlerFunction fn) {
 void startWebServer(std::function<void(bool)> onConfigChanged) {
   setHostName(getActiveConfig().device.name);
 
-  // Runs before any handler, for every route including the static assets and the 404 (review
-  // F05). Registered first so nothing can be reached without passing it.
+  // Runs before the HANDLER of every route, including the static assets and the 404 (review F05).
+  //
+  // Not, however, before everything: for a request with a BODY the middleware chain runs only once
+  // the body has been fully parsed. ESPAsyncWebServer 3.12.1's `_parseLine` switches to
+  // PARSE_REQ_BODY at end-of-headers and calls `_runMiddlewareChain()` afterwards, while
+  // `handleBody`/`handleUpload` run during the parse - so those callbacks see the request first.
+  // There are two on this server. The JSON body handlers (PUT /api/config, POST /api/pin) are
+  // safe by construction: AsyncCallbackJsonWebHandler::handleBody only calloc()s a buffer and
+  // memcpy()s into it, with no C++ allocation and nothing that can throw, and the handler proper
+  // runs after the chain. POST /api/ota's upload callback is not, so it repeats both of the things
+  // below itself - see handleOtaUpload().
   g_server.addMiddleware([](AsyncWebServerRequest *request, ArMiddlewareNext next) {
-    // First thing on the request path, ahead of even the host check, because the host check itself
+    // First thing in the chain, ahead of even the host check, because the host check itself
     // builds a std::string and can throw. DESIGN.md SS12.1: the AsyncTCP service task is created by
-    // the library, so this is the only place we get to run code ON that task early enough to pay its
-    // one-time __cxa_eh_globals allocation while the heap is healthy. Without it the task's FIRST
-    // throw - which on this task is a bad_alloc under exactly the pressure guarded() exists for -
-    // does a plain malloc inside __cxa_throw and terminates when it fails. Costs one
-    // pthread_getspecific per request once warm; the real work happens on request number one.
+    // the library, so this is the earliest place we get to run code ON that task for a request
+    // without a body - early enough to pay its one-time __cxa_eh_globals allocation while the heap
+    // is healthy. Without it the task's FIRST throw - which on this task is a bad_alloc under
+    // exactly the pressure guarded() exists for - does a plain malloc inside __cxa_throw and
+    // terminates when it fails. Costs one pthread_getspecific per request once warm; the real work
+    // happens on request number one, wherever that lands.
     transit_app::warmExceptionGlobals("async_tcp");
     if (!hostAllowed(request)) {
       sendError(request, 421, "this device is not reachable under that host name");
