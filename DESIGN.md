@@ -1509,8 +1509,15 @@ pool MEMP_SYS_TIMEOUT is empty)`. The C++ machinery worked; the C layer below it
 **Do not "fix" that by raising `MEMP_NUM_SYS_TIMEOUT` - there is no pool to raise.** The ESP32
 lwIP port sets `MEMP_MEM_MALLOC 1` and `MEM_LIBC_MALLOC 1` unconditionally
 (`framework-arduinoespressif32-libs/esp32/include/lwip/port/include/lwipopts.h:98,105`), so every
-`memp_malloc()` is a `mem_malloc()` and therefore a plain libc `malloc()`. "Pool ... is empty" is
-lwIP's wording for *malloc returned NULL*; the pool-size constants are vestigial here. So this is
+`memp_malloc()` is a `mem_malloc()` and therefore a plain libc `malloc()`. Stronger still: under
+`MEMP_MEM_MALLOC`, `LWIP_MEMPOOL_DECLARE(name, num, size, desc)` (`lwip/memp.h:69`) discards its
+`num` argument and emits a `memp_desc` carrying only the element size - **no static pool array is
+emitted at all**, so for `MEMP_SYS_TIMEOUT` there is no pool object in the image that could be
+empty. "Pool ... is empty" is a fixed string lwIP prints on a failed allocation that was a plain
+`malloc`. And there is no knob to turn even if you wanted one: `MEMP_NUM_SYS_TIMEOUT` is not
+defined anywhere in the esp32 port headers, so it already sits at lwIP's own default in `opt.h`.
+Anyone who goes looking will find nothing, conclude the header is missing it, and add one - the
+worst version of this dead end. So this is
 not a sizing bug and not an lwIP bug - it is the heap fragmentation arriving at whichever caller
 asks next, and lwIP asserts instead of failing soft. Every `MEMP_NUM_*` figure in this SDK reads as
 a limit and behaves as a formality; judge memory questions from `MALLOC_CAP_8BIT` free and largest
