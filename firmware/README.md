@@ -206,6 +206,16 @@ ceiling and the apparent admission rates. The `[heap]` boot lines and the `[net_
 print both numbers (`free=` and `free8=`), and `/api/state` carries `heap` (unchanged, INTERNAL)
 beside `heap_8bit` and `largest_block_8bit`.
 
+**Expect `/api/state` to answer 503 for a few seconds during a firmware upload.** Measured on the
+owner's board: fourteen `200`s then six `503 {"error":"low memory, retry"}` while a 1.85 MB image
+was uploading, then recovery. An OTA holds a large sustained allocation and pushes the
+byte-addressable heap under the 12 KB floor. This is new - the old gate's free half could not fire
+at all - and it is deliberate: during an upload the status handler is competing with `Update` for
+the last few KB, and a failed flash costs far more than a status reply that is briefly unavailable.
+Treat 503 as "retry", which is what the low-memory contract has always meant. Note also that you
+cannot measure the heap through `/api/state` at these moments - it refuses exactly when the number
+you want is lowest - so use the `[net_poller]` serial heartbeat for an unperturbed reading.
+
 Every heap gate in the firmware reads `MALLOC_CAP_8BIT` as of 2026-09-16, with thresholds re-derived
 from what each path actually allocates (DESIGN.md §2.1): OTA needs 16 KB free and a 6 KB block,
 because `Update.begin()` allocates exactly one 4,096 B sector buffer; `/api/state` and `/api/config`

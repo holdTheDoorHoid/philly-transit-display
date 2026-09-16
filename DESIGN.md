@@ -351,6 +351,32 @@ wedge threshold, and no admission floor prevents that. What the change does do i
 shed optional work earlier than before, because the two gates that could not fire now can - a softer
 landing, not a cure.
 
+#### One visible consequence: `/api/state` now answers 503 during an OTA (measured 2026-09-16)
+
+Waking a gate that could never fire means it fires. Sampling `/api/state` once a second through a
+full 1.85 MB upload on the owner's board: fourteen consecutive `200`s, then six consecutive
+`503 {"error":"low memory, retry"}`, then recovery. An in-flight OTA holds a large sustained
+allocation - the same sampling put `free8` at least 21 KB below its idle baseline - and it pushes
+the byte-addressable heap under the 12 KB floor for several seconds. The old gate could not see
+this: its free half was 24 KB of `INTERNAL`, which is *below zero* in 8-bit terms, and the largest
+block stayed at 10.7-13.8 KB, above the 8 KB half that did work. So `/api/state` used to keep
+answering here, and now it does not.
+
+That is the right behaviour, not a regression to tune away. During an upload the heavy read handler
+is competing with `Update` for the last few KB of usable heap, and a failed flash is far worse than
+a status endpoint that is briefly unavailable - a 503 is cheap, fixed-literal, and retried. The gate
+backing off *protects the upload*. Clients should expect it: the web app keeps its last data and
+retries rather than blanking, and any script polling `/api/state` through an OTA must treat 503 as
+"retry", exactly as the low-memory contract has always said.
+
+There is a measurement trap here worth recording, because it caught this investigation. An earlier
+pass reported `free8` bottoming at 18,016 B during an upload - comfortably above the 12 KB floor,
+which made the 503s look unexplained. That number was survivorship-biased: `free8` is read *from*
+`/api/state`, and `/api/state` refuses precisely when `free8` is low, so the samples that came back
+were the ones taken when there was enough heap to build a reply. The endpoint cannot report the
+heap at the moment it is too low to report anything. Reading the status code rather than the body
+is what resolved it; for an unperturbed number, use the `[net_poller]` heartbeat over serial.
+
 `/api/state` keeps `heap` as `ESP.getFreeHeap()` - clients parse it, and silently changing what a
 published field means is worse than an optimistic number - and gains `heap_8bit` and
 `largest_block_8bit` beside it. The web app's "Heap free" tile and the device page on the panel both
