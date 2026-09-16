@@ -948,6 +948,14 @@ from a few entries instead of reserving the cap; `pollOnce()`, queued proxy/stat
 errors, or a 503) rather than resetting. Measured after the fix: heap ~54 KB minimum during a
 poll, largest block ~32 KB median.
 
+Task watchdog (2026-09-15): `CONFIG_ESP_TASK_WDT_PANIC=y` in this SDK, and HTTPClient waits for
+response headers in `Stream::timedRead()`, a busy loop with no yield, for up to the 15 s fetch
+timeout. With the poller at priority 1 on core 0 a slow SEPTA answer starved IDLE0 and the watchdog
+rebooted the board. The poller therefore runs at priority 0 (round-robin with IDLE0 every tick);
+everything else on the device runs above it, so its share of the CPU is unchanged. Idle-slice work
+(stats summaries, queued proxy jobs) additionally waits for 40 KB free heap and a 12 KB largest
+block so it never collides with a config save on the web task.
+
 ## 13. Milestones
 
 - **M0** Repo, design, skeleton, CI that builds every env and runs host tests.
