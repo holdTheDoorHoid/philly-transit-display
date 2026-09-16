@@ -10,6 +10,9 @@
 #include <set>
 
 #include "transit_core/septa.h"
+#ifdef TRANSIT_HTTPS
+#include "http_fetch.h"  // Transport policy handoff from setActiveConfig() (DESIGN.md SS2.1)
+#endif
 
 using transit::Mode;
 using transit::StopConfig;
@@ -313,6 +316,15 @@ bool validateConfig(const Config &cfg, ConfigError &err) {
     err = {"crowding_icons must be seats or crowd", "device.crowding_icons"};
     return false;
   }
+#ifdef TRANSIT_HTTPS
+  {
+    Transport unused;
+    if (!parseTransport(cfg.device.transport.c_str(), unused)) {
+      err = {"transport must be http, https_preferred, or https", "device.transport"};
+      return false;
+    }
+  }
+#endif
   if (cfg.device.ticker_lines < 1 || cfg.device.ticker_lines > 8) {
     err = {"ticker_lines must be between 1 and 8", "device.ticker_lines"};
     return false;
@@ -465,6 +477,9 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
   device["large_text"] = cfg.device.large_text;
   device["crowding"] = cfg.device.crowding;
   device["crowding_icons"] = cfg.device.crowding_icons;
+#ifdef TRANSIT_HTTPS
+  device["transport"] = cfg.device.transport;  // DESIGN.md SS2.1; absent from shipping builds
+#endif
   JsonObject quiet = device["quiet"].to<JsonObject>();
   quiet["enabled"] = cfg.device.quiet.enabled;
   quiet["start"] = cfg.device.quiet.start;
@@ -564,6 +579,10 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   if (!readInt(device, "ticker_speed", 5, 200, 30, "device.ticker_speed", n, err)) return false;
   result.device.ticker_speed = (uint16_t)n;
   // use_https / tls_verify (v0.1.0-0.1.1) are accepted and ignored: the TLS mode is gone (http_fetch.h).
+#ifdef TRANSIT_HTTPS
+  // DESIGN.md SS2.1: the HTTPS prototype's policy; validateConfig() checks the enum.
+  if (!readStr(device, "transport", kMaxEnumLen, "http", "device.transport", result.device.transport, err)) return false;
+#endif
   result.device.logging = device["logging"] | true;
   JsonVariantConst header = device["header"];
   result.device.header.name = header["name"] | false;
@@ -963,6 +982,13 @@ void setActiveConfig(const Config &cfg) {
     g_active_config = cfg;
     xSemaphoreGive(mutex);
   }
+#ifdef TRANSIT_HTTPS
+  // DESIGN.md SS2.1: every way a config becomes active (boot, PUT /api/config, reset) passes
+  // through here, so this is the one place the fetch layer learns the transport policy - the
+  // poller never has to know the key exists. validateConfig() already rejected unknown names.
+  Transport policy;
+  if (parseTransport(cfg.device.transport.c_str(), policy)) setTransportPolicy(policy);
+#endif
 }
 
 }  // namespace transit_app

@@ -101,6 +101,15 @@ struct DeviceConfig {
   std::string ticker_show = "both";  // both | alerts | detours | off (DESIGN.md SS6)
   uint8_t ticker_lines = 3;     // alert ticker height in text lines, 1..8 (1 = horizontal marquee)
   uint16_t ticker_speed = 30;   // alert ticker scroll speed in pixels per second, 5..200
+#ifdef TRANSIT_HTTPS
+  // DESIGN.md SS2.1: "http" | "https_preferred" | "https". Read, written and honoured only in a
+  // -DTRANSIT_HTTPS build (http_fetch.h Transport); the shipping envs ignore the key exactly as
+  // they ignore v0.1.x's use_https/tls_verify, and never emit it. Default "http" even in the
+  // prototype build: HTTPS is an opt-in the owner switches on from Settings ("Data connection").
+  // The member itself is behind the flag too, so a shipping image does not carry a std::string
+  // (and its literal, ctor, dtor and copy) that nothing in that build can ever read.
+  std::string transport = "http";
+#endif
   bool logging = true;
   HeaderConfig header;
   bool large_text = false;     // two rows per stop, 48 px minutes (ui_common.cpp fontBig)

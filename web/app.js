@@ -565,8 +565,26 @@ function renderStatusStrip(strip, state) {
   if (wx.enabled && wx.main) {
     tiles.splice(0, 0, ['Weather', `${Math.round(wx.main.temp)}°${(wx.units || 'f').toUpperCase()} ${wx.main.text || ''}`.trim()]);
   }
+  // Which transport the arrivals actually came over (DESIGN.md §2.1). Only firmware built with
+  // HTTPS reports a `transport` block; an older build gets no tile rather than a wrong one.
+  if (state.transport) tiles.push(['Data link', describeTransport(state.transport)]);
   for (const [k, v] of tiles) {
     strip.append(h('div', { class: 'status-tile' }, h('div', { class: 'k' }, k), h('div', { class: 'v' }, v)));
+  }
+}
+
+// The `transport` block of /api/state in one short phrase. `last` is the most recent fetch that
+// asked for https://: the device chooses TLS or plain HTTP by its free memory (never because a
+// certificate looked wrong - a bad certificate is a failed fetch, not a downgrade), so the
+// answer can change from one poll to the next and the tile says which it was.
+function describeTransport(tr) {
+  const policy = tr.policy || 'http';
+  switch (tr.last) {
+    case 'https': return `Encrypted (HTTPS)${tr.last_https_ms ? `, ${(tr.last_https_ms / 1000).toFixed(1)} s to connect` : ''}`;
+    case 'http': return policy === 'http' ? 'Plain HTTP (by setting)' : 'Plain HTTP this time (not enough free memory for HTTPS)';
+    case 'https_failed': return tr.cert_failed ? 'HTTPS failed: certificate did not verify (not fetched over plain HTTP)' : 'HTTPS failed: could not connect (not fetched over plain HTTP)';
+    case 'refused': return 'Waiting for free memory (HTTPS required, plain HTTP not allowed)';
+    default: return policy === 'http' ? 'Plain HTTP (by setting)' : 'Not fetched yet';
   }
 }
 
@@ -2430,6 +2448,17 @@ function buildSettingsForm(cfg, state) {
   const pollInput = h('input', { type: 'number', id: 'set-poll', min: 15, max: 120, value: d.poll_seconds });
   const loggingInput = h('input', { type: 'checkbox', id: 'set-logging' });
   loggingInput.checked = d.logging;
+  // Data connection (DESIGN.md §2.1): only offered when this firmware reports a `transport`
+  // block in /api/state, i.e. was built with HTTPS. A build without it fetches over plain HTTP
+  // whatever the config says, so showing the choice there would be a lie.
+  const hasTransport = !!(state && state.transport);
+  const TRANSPORTS = [
+    ['http', 'Plain HTTP (default)'],
+    ['https_preferred', 'Encrypted when memory allows'],
+    ['https', 'Encrypted only - show "unavailable" rather than use plain HTTP'],
+  ];
+  const transportSelect = h('select', { id: 'set-transport' },
+    ...TRANSPORTS.map(([v, label]) => h('option', { value: v, selected: v === (d.transport || 'http') || undefined }, label)));
 
   // ---- Screen ----
   const ROTATIONS = [[0, 'Portrait (0°)'], [90, 'Landscape (90°)'], [180, 'Portrait, flipped (180°)'], [270, 'Landscape, flipped (270°)']];
@@ -2704,6 +2733,8 @@ function buildSettingsForm(cfg, state) {
         hint('How often the device asks SEPTA for fresh times. It speeds up to every 15 seconds by itself whenever a bus is less than 3 minutes away, so this setting only affects the quiet stretches.')),
       field(h('label', { class: 'inline' }, loggingInput, ' Log arrivals to SD card'),
         hint('Writes every arrival to the SD card so the Stats page has something to work from. Turn it off and the Stats page stays empty.')),
+      hasTransport ? field(h('label', { for: 'set-transport' }, 'Data connection'), transportSelect,
+        hint('How the device talks to SEPTA, the weather service and Indego. Encrypted (HTTPS) means nobody on your network can alter the times on the way in. Read this before switching it on: one encrypted connection needs about 50 KB of the device\u2019s memory all at once, and this board has closer to 30 KB free at the moment a fetch starts, so on today\u2019s hardware it never actually fits. \u201cEncrypted when memory allows\u201d asks for HTTPS on every fetch and uses plain HTTP only when memory is short - never because a certificate failed; that fetch simply fails and is retried next time. On this board that means it will keep reporting \u201cPlain HTTP this time\u201d on the Now page. \u201cEncrypted only\u201d never uses plain HTTP: a stop reads unavailable until the device can afford the encrypted connection, which here means always - it is here for the day the memory problem is fixed, not for today. \u201cPlain HTTP (default)\u201d never asks for HTTPS. The Now page\u2019s status strip shows which one the latest arrivals came over.')) : null,
       group(
         field(h('label', { class: 'inline toggle' }, wxEnabled, ' Show weather'),
           hint('Puts the current temperature and a condition icon in the top strip of the screen.')),
@@ -2736,6 +2767,7 @@ function buildSettingsForm(cfg, state) {
         ticker_lines: Number(tickerLinesSelect.value), ticker_speed: Number(tickerSpeedInput.value),
         ticker_show: tickerShowSelect.value,
         logging: loggingInput.checked,
+        ...(hasTransport ? { transport: transportSelect.value } : {}),
         header: Object.fromEntries(Object.entries(headerInputs).map(([k, cb]) => [k, cb.checked])),
         large_text: largeTextInput.checked,
         crowding: crowdingSelect.value,
