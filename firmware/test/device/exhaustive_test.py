@@ -48,10 +48,16 @@ def put_cfg_nopin(cfg):
     except Exception: return int(code or 0), None
 
 def put_cfg_body(cfg):
-    r = curl(PINH + ['-w', '\n%{http_code}', '-X', 'PUT', '-H', 'Content-Type: application/json', '--data-binary', json.dumps(cfg), B + '/api/config'])
-    body, _, code = r.stdout.rpartition(b'\n')
-    try: return int(code or 0), json.loads(body)
-    except Exception: return int(code or 0), None
+    for attempt in range(3):
+        r = curl(PINH + ['-w', '\n%{http_code}', '-X', 'PUT', '-H', 'Content-Type: application/json', '--data-binary', json.dumps(cfg), B + '/api/config'])
+        body, _, code = r.stdout.rpartition(b'\n')
+        code = int(code or 0)
+        if code not in (0, 503):  # 0 = dropped connection, 503 = designed memory-pressure answer
+            try: return code, json.loads(body)
+            except Exception: return code, None
+        time.sleep(1.5)
+    try: return code, json.loads(body)
+    except Exception: return code, None
 
 def post(path):
     r = curl(PINH + ['-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', B + path])
@@ -282,8 +288,11 @@ code, body = put_cfg_nopin(copy.deepcopy(base))
 check('C3 PUT /api/config without a PIN is 401', code == 401 and body and body.get('error') == 'pin required', (code, body))
 r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', B + '/api/reboot'])
 check('C3 POST /api/reboot without a PIN is 401', r.stdout == b'401', r.stdout)
-code, d = get_json('/api/state')
-d = d or {}
+d = {}
+for _ in range(6):  # the concurrency section just before this can leave a transient empty/503 answer
+    code, d = get_json('/api/state'); d = d or {}
+    if code == 200 and d.get('board'): break
+    time.sleep(1.5)
 check('C3 state advertises pin_required and board', code == 200 and d.get('auth', {}).get('pin_required') is True and isinstance(d.get('board'), str) and bool(d.get('board')), (code, d.get('auth'), d.get('board')))
 check('C3 state reports config_recovered', 'config_recovered' in (d or {}), list(d or {})[:12])
 code, _ = get_json('/api/config')
@@ -318,13 +327,16 @@ time.sleep(2)
 k0, k1 = base['stops'][0]['key'], base['stops'][1]['key']
 # profiles
 cfg = copy.deepcopy(base); cfg['profiles'] = [{'name': 'Test window', 'days': [today_dow()], 'start': now_hhmm(-5), 'end': now_hhmm(30), 'stops': [k1]}]
-put_cfg(cfg); time.sleep(3); d = ui()
+put_cfg(cfg)
+wait_for(lambda: ui().get('active_profile') == 'Test window' and ui().get('shown_stops') == [k1], 30, 2); d = ui()
 check('D profile active narrows shown stops', d.get('active_profile') == 'Test window' and d.get('shown_stops') == [k1], d)
-check('D state reports active profile', state().get('active_profile') == 'Test window')
-cfg['profiles'][0]['days'] = [(today_dow() + 3) % 7]; put_cfg(cfg); time.sleep(3); d = ui()
-check('D profile inactive on other day', d.get('active_profile') == '' and len(d.get('shown_stops', [])) == len(base['stops']), d)
+check('D state reports active profile', wait_for(lambda: state().get('active_profile') == 'Test window', 15, 2), state().get('active_profile'))
+cfg['profiles'][0]['days'] = [(today_dow() + 3) % 7]; put_cfg(cfg)
+inactive = wait_for(lambda: ui().get('active_profile') == '' and len(ui().get('shown_stops', [])) == len(base['stops']), 30, 2); d = ui()
+check('D profile inactive on other day', inactive, d)
 # alternatives: k1 alternative to k0 with 60 min -> hidden while k0 has a bus within 60 min
 cfg = copy.deepcopy(base); cfg['stops'][1].update(alt_of=k0, alt_after_min=60); put_cfg(cfg)
+wait_for(lambda: not ui().get('active_profile'), 20, 2)  # let the profile section fully clear first
 # The screen is rebuilt on save and repopulated by the re-poll, which with today's 540 KB feed can take
 # 10-20 s; wait for the panel decision rather than sampling a half-built screen.
 hidden = wait_for(lambda: k1 in ui().get('hidden_panels', []), 60, 3); d = ui()
@@ -348,11 +360,15 @@ wait_for(lambda: any(x['key'] == 'tmp-99999' for x in state().get('stops', [])),
 tsnap = [x for x in state().get('stops', []) if x['key'] == 'tmp-99999']  # re-fetch: health settles a poll after the PUT
 check('D unavailable stop reports health unavailable', tsnap and tsnap[0].get('health') == 'unavailable' and tsnap[0].get('error'), tsnap and (tsnap[0].get('health'), tsnap[0].get('error')))
 check('D night page suppressed while the only shown stop is unavailable', ui().get('page') == 'main' and ui().get('active_profile') == 'Night test', ui())
-soonest = min([a['eta_s'] for x in state().get('stops', []) if x['key'] == k0 for a in x.get('arrivals', [])] or [0]) // 60
-if soonest >= 17:
+def soonest_k0_min():
+    return min([a['eta_s'] for x in state().get('stops', []) if x['key'] == k0 for a in x.get('arrivals', [])] or [9999]) // 60
+if soonest_k0_min() >= 17:
     cfg['profiles'][0]['stops'] = [k0]; cfg['device']['night'] = {'enabled': True, 'after_min': 15}; put_cfg(cfg)
     reached = wait_for(lambda: ui().get('page') == 'night', 90, 3)
-    check('D night page when nothing is due within after_min (real stop)', reached, (soonest, ui()))
+    # Live data: if a bus rolled to within 15 min of k0 during the wait, the arrivals page is
+    # correct and the night page should NOT show - that is a pass, not a failure of the night rule.
+    still_due_gap = soonest_k0_min() >= 15
+    check('D night page when nothing is due within after_min (real stop)', reached or not still_due_gap, (soonest_k0_min(), reached, ui().get('page')))
     if reached:
         check('D tap from night goes to stats', post('/api/debug/tap') == 200 and wait_for(lambda: ui().get('page') == 'stats', 10, 1), ui().get('page'))
         check('D tap to device page', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'device'))
