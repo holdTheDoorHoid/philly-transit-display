@@ -225,9 +225,10 @@ button.linklike:hover { border-color: transparent; }
 #mainnav a.active { background: var(--accent); color: var(--accent-text); }
 
 main#view {
+  --pad: var(--gap);
   max-width: 900px;
   margin: 0 auto;
-  padding: var(--gap);
+  padding: var(--pad);
   display: flex;
   flex-direction: column;
   gap: var(--gap);
@@ -460,7 +461,78 @@ main#view {
 
 /* ---------- Settings view ---------- */
 
-.settings-grid { display: grid; grid-template-columns: 1fr; gap: 0; max-width: 480px; }
+/* Sticky strip under the top bar: block pills plus the filter box. It bleeds into
+   main#view's side padding so nothing peeks past its edges while content scrolls under
+   it. JS sets its `top` to the top bar's height and --sticky-h to top bar + strip. */
+.settings-nav {
+  position: sticky;
+  top: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: .4rem;
+  margin: 0 calc(-1 * var(--pad));
+  padding: .5rem var(--pad);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+.settings-nav .pills { display: flex; gap: .3rem; flex: 1 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.settings-nav .pills::-webkit-scrollbar { display: none; }
+.pill {
+  flex: 0 0 auto;
+  padding: .3rem .7rem;
+  border-radius: 999px;
+  font-size: .84rem;
+  color: var(--text-muted);
+}
+.pill.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.pill.empty { opacity: .4; }
+
+/* A block is a card; its controls keep a readable measure, the heading spans the card. */
+.settings-block { scroll-margin-top: calc(var(--sticky-h, 0px) + 8px); }
+.settings-block h2 { margin-bottom: .1rem; }
+.block-intro { margin: 0 0 .5rem; font-size: .88rem; color: var(--text-muted); max-width: 46em; }
+.settings-block .field, .settings-block .group, .settings-block .danger-zone { max-width: 520px; }
+
+/* Sub-groups: a divider between them, and a toggle-style heading when a checkbox is
+   the thing that turns the whole group on. */
+.group + .group, .field + .group { margin-top: .9rem; padding-top: .75rem; border-top: 1px solid var(--border); }
+.group h3 { margin: .1rem 0 .2rem; }
+label.inline.toggle { font-weight: 600; font-size: 1rem; margin-top: .1rem; }
+.checks { display: flex; flex-wrap: wrap; gap: 0 1rem; }
+.checks label { margin: .3rem 0 0; }
+
+/* Settings that only matter while their parent is on: indented under it, and dimmed
+   (plus disabled, from JS) while it is off. A dimmed box inside a dimmed box does not
+   dim twice. */
+.dependents { margin: .2rem 0 .3rem .3rem; padding-left: .8rem; border-left: 2px solid var(--border); }
+.dependents.is-off { opacity: .45; }
+.is-off .is-off, .is-off :disabled, .is-off input:disabled + span { opacity: 1; }
+
+.danger-zone { margin-top: 1rem; padding: .6rem .8rem .2rem; border: 1px solid var(--danger); border-radius: 8px; }
+.danger-zone h3 { color: var(--danger); margin: 0; }
+
+/* The one Save button, pinned to the bottom of the viewport while the page is taller
+   than the screen; sits in the flow at the very end otherwise. */
+.save-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 1000;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+  margin: 0 calc(-1 * var(--pad)) calc(-1 * var(--pad));
+  padding: .55rem var(--pad);
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--border);
+}
+.save-bar.dirty { border-top-color: var(--accent); }
+.save-bar .status { flex: 1 1 auto; font-size: .85rem; color: var(--text-muted); }
+.save-bar.dirty .status { color: var(--warn); font-weight: 600; }
+.save-bar .msg { flex-basis: 100%; }
+.save-bar .msg:empty { display: none; }
+
 .subcard { background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 8px; padding: .7rem; margin: .5rem 0; }
 .subcard h3 { margin: 0; }
 #progress-wrap { background: var(--bg-sunken); border-radius: 999px; height: 10px; overflow: hidden; margin-top: .4rem; }
@@ -469,8 +541,14 @@ main#view {
 footer.hint { text-align: center; color: var(--text-muted); font-size: .8rem; padding: 1rem; }
 
 @media (min-width: 640px) {
-  main#view { padding: 1.2rem; }
+  main#view { --pad: 1.2rem; }
   .arrival-minutes { font-size: 1.6rem; }
+  .settings-nav { flex-direction: row-reverse; align-items: center; }
+  .settings-nav input[type="search"] { width: 200px; flex: 0 0 auto; }
+}
+
+@media (max-width: 479px) {
+  .save-bar .long { display: none; }
 }
 
 @media (max-width: 359px) {
