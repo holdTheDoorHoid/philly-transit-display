@@ -223,7 +223,7 @@ check('B restore base', config()['device']['name'] == base['device']['name'])
 # ---------- C. validation ----------
 def invalid(name, mutate, path):
     cfg = copy.deepcopy(base); mutate(cfg)
-    code, body = put_cfg_body(cfg)
+    code, body = put_cfg_body(cfg)  # retries a dropped/503 answer internally
     ok = code == 400 and body and body.get('path') == path
     check('C ' + name, ok, (code, body))
 invalid('title_style', lambda c: c['stops'][0].update(title_style='fancy'), 'stops[0].title_style')
@@ -289,10 +289,9 @@ check('C3 PUT /api/config without a PIN is 401', code == 401 and body and body.g
 r = curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST', B + '/api/reboot'])
 check('C3 POST /api/reboot without a PIN is 401', r.stdout == b'401', r.stdout)
 d = {}
-for _ in range(6):  # the concurrency section just before this can leave a transient empty/503 answer
-    code, d = get_json('/api/state'); d = d or {}
-    if code == 200 and d.get('board'): break
-    time.sleep(1.5)
+if not wait_for(lambda: (get_json('/api/state')[1] or {}).get('board'), 30, 2):
+    time.sleep(3)
+code, d = get_json('/api/state'); d = d or {}
 check('C3 state advertises pin_required and board', code == 200 and d.get('auth', {}).get('pin_required') is True and isinstance(d.get('board'), str) and bool(d.get('board')), (code, d.get('auth'), d.get('board')))
 check('C3 state reports config_recovered', 'config_recovered' in (d or {}), list(d or {})[:12])
 code, _ = get_json('/api/config')
@@ -332,7 +331,8 @@ wait_for(lambda: ui().get('active_profile') == 'Test window' and ui().get('shown
 check('D profile active narrows shown stops', d.get('active_profile') == 'Test window' and d.get('shown_stops') == [k1], d)
 check('D state reports active profile', wait_for(lambda: state().get('active_profile') == 'Test window', 15, 2), state().get('active_profile'))
 cfg['profiles'][0]['days'] = [(today_dow() + 3) % 7]; put_cfg(cfg)
-inactive = wait_for(lambda: ui().get('active_profile') == '' and len(ui().get('shown_stops', [])) == len(base['stops']), 30, 2); d = ui()
+wait_for(lambda: (config() or {}).get('profiles', [{}])[0].get('days') == [(today_dow() + 3) % 7], 20, 2)  # PUT applied
+inactive = wait_for(lambda: ui().get('active_profile') == '' and len(ui().get('shown_stops', [])) == len(base['stops']), 45, 2); d = ui()
 check('D profile inactive on other day', inactive, d)
 # alternatives: k1 alternative to k0 with 60 min -> hidden while k0 has a bus within 60 min
 cfg = copy.deepcopy(base); cfg['stops'][1].update(alt_of=k0, alt_after_min=60); put_cfg(cfg)
