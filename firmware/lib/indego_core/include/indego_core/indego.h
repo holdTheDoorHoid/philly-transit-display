@@ -1,5 +1,5 @@
 // Indego bike share status (DESIGN.md 4.9): a streaming reader for Bicycle Transit's status
-// feed at http://bts-status.bicycletransit.workers.dev/phl. Arduino-independent: compiles on
+// feed at https://bts-status.bicycletransit.workers.dev/phl. Arduino-independent: compiles on
 // the host (native tests) and on ESP32.
 //
 // The feed is a ~400 KB GeoJSON FeatureCollection, one feature per station, each carrying a
@@ -114,7 +114,7 @@ class StatusStream {
   bool done_ = false;
 };
 
-// "http://bts-status.bicycletransit.workers.dev/phl"
+// "https://bts-status.bicycletransit.workers.dev/phl"
 std::string statusUrl();
 
 }  // namespace indego

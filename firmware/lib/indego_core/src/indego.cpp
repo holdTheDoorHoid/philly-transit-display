@@ -204,6 +204,8 @@ bool StatusStream::push(const uint8_t* data, size_t len) {
 
 void StatusStream::finish() { done_ = true; }
 
-std::string statusUrl() { return "http://bts-status.bicycletransit.workers.dev/phl"; }
+// https://, like every SEPTA URL (septa_source.cpp): the fetch layer decides per build and per
+// fetch whether that becomes verified TLS or plain http (http_fetch.h, DESIGN.md SS2.1).
+std::string statusUrl() { return "https://bts-status.bicycletransit.workers.dev/phl"; }
 
 }  // namespace indego

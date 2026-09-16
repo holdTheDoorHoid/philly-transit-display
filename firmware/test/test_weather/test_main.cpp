@@ -114,7 +114,7 @@ void test_notable_rules() {
 void test_url_builder() {
   std::string url = openMeteoUrl(39.927947, -75.177147, true, 6);
   TEST_ASSERT_EQUAL_STRING(
-      "http://api.open-meteo.com/v1/forecast?latitude=39.9279&longitude=-75.1771"
+      "https://api.open-meteo.com/v1/forecast?latitude=39.9279&longitude=-75.1771"
       "&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m"
       "&hourly=weather_code,precipitation_probability,temperature_2m"
       "&forecast_hours=6&timezone=auto&wind_speed_unit=mph&temperature_unit=fahrenheit",

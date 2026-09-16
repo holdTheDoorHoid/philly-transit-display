@@ -291,7 +291,7 @@ void test_braces_and_quotes_in_strings() {
 }
 
 void test_status_url() {
-  TEST_ASSERT_EQUAL_STRING("http://bts-status.bicycletransit.workers.dev/phl", statusUrl().c_str());
+  TEST_ASSERT_EQUAL_STRING("https://bts-status.bicycletransit.workers.dev/phl", statusUrl().c_str());
 }
 
 int main() {

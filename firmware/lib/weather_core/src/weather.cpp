@@ -70,7 +70,7 @@ std::string openMeteoUrl(double lat, double lng, bool fahrenheit, int forecast_h
   if (forecast_hours > 24) forecast_hours = 24;
   char buf[320];
   std::snprintf(buf, sizeof(buf),
-                "http://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+                "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
                 "&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m"
                 "&hourly=weather_code,precipitation_probability,temperature_2m"
                 "&forecast_hours=%d&timezone=auto&wind_speed_unit=mph%s",
