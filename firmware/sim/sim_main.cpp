@@ -243,12 +243,21 @@ std::string resName(const Canvas &c) {
 // One resolution, one theme: the four pages the device cycles through, from `cfg`.
 void renderPages(Job &job, Canvas &c, const Config &cfg, const std::string &suffix, bool with_night) {
   transit::Snapshot snap = transit_app::buildDemoSnapshot((transit::Epoch)time(nullptr));
+  // Pool cost per screen (host pointers: an over-estimate of the ESP32 by roughly 1/0.65). On the
+  // device only main + night are resident; stats and device are built when tapped to (ui.cpp).
+  uint32_t before = lvUsed();
   lv_obj_t *main = ui::createMainScreen(cfg);
+  uint32_t after_main = lvUsed();
   lv_obj_t *stats = ui::createStatsScreen(cfg);
+  uint32_t after_stats = lvUsed();
   lv_obj_t *device = ui::createDeviceInfoScreen(cfg);
+  uint32_t after_device = lvUsed();
   lv_obj_t *night = with_night ? ui::createNightScreen(cfg) : nullptr;
-  std::printf("[%s %s%s] lv_used after build = %u bytes (host pointers: an over-estimate of the ESP32)\n",
-              resName(c).c_str(), cfg.device.theme.c_str(), suffix.c_str(), (unsigned)lvUsed());
+  uint32_t after_night = lvUsed();
+  std::printf("[%s %s%s] lv pool, host bytes: main %u, stats %u, device %u, night %u\n", resName(c).c_str(),
+              cfg.device.theme.c_str(), suffix.c_str(), (unsigned)(after_main - before),
+              (unsigned)(after_stats - after_main), (unsigned)(after_device - after_stats),
+              (unsigned)(after_night - after_device));
 
   ui::refreshMainScreen(main, cfg, snap);
   job.shot(c, main, "main-" + resName(c) + "-" + cfg.device.theme + suffix);
@@ -282,15 +291,26 @@ void renderStale(Job &job, Canvas &c, const Config &cfg) {
   sim::wifi_rssi = rssi;
 }
 
-// Disconnected Wi-Fi on the device page (0 bars, no IP).
+// Everything wrong at once on the device page: Wi-Fi down (0 bars, no IP), the last SEPTA poll
+// failed, and the SD card has been dropping rows.
 void renderOffline(Job &job, Canvas &c, const Config &cfg) {
   sim::wifi_connected = false;
+  sim::poll_ok = false;
+  sim::poll_age_s = 4 * 60;
+  sim::poll_error = "connect failed";
+  sim::sd_dropped_rows = 3;
+  sim::sd_error = "write failed";
   lv_obj_t *device = ui::createDeviceInfoScreen(cfg);
   ui::refreshDeviceInfoScreen(device);
   job.shot(c, device, "device-" + resName(c) + "-" + cfg.device.theme + "-offline");
   lv_screen_load(c.blank);
   lv_obj_delete(device);
   sim::wifi_connected = true;
+  sim::poll_ok = true;
+  sim::poll_age_s = 12;
+  sim::poll_error.clear();
+  sim::sd_dropped_rows = 0;
+  sim::sd_error.clear();
 }
 
 struct Res {

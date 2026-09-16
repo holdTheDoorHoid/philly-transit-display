@@ -9,9 +9,8 @@
 #include <string>
 
 namespace sim {
-extern uint32_t millis_ms;    // advanced by the simulator's fake clock
+extern uint32_t millis_ms;    // advanced by the simulator's fake clock; starts days in so uptime reads like a device's
 extern uint32_t free_heap;    // what ESP.getFreeHeap() reports
-extern uint32_t uptime_s;     // what the device page's uptime line reports (millis()/1000 is too short in a sim run)
 }  // namespace sim
 
 inline uint32_t millis() { return sim::millis_ms; }

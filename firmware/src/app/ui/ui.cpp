@@ -78,18 +78,36 @@ lv_display_rotation_t rotationEnum(uint16_t degrees) {
   }
 }
 
+void attachTapHandlers(lv_obj_t *scr) {
+  lv_obj_add_event_cb(scr, onScreenPressed, LV_EVENT_PRESSED, nullptr);
+  lv_obj_add_event_cb(scr, onScreenTapped, LV_EVENT_CLICKED, nullptr);
+}
+
+// Deletes a page that may not exist. Async because the caller is usually the page's own
+// LV_EVENT_CLICKED handler (onScreenTapped): LVGL frees it on the next lv_timer_handler() pass,
+// after the event has fully unwound, instead of underneath it.
+void dropPage(lv_obj_t *&scr) {
+  if (scr == nullptr) return;
+  lv_obj_delete_async(scr);
+  scr = nullptr;
+}
+
+// Only the two pages that can be up without a tap are resident. The stats and device pages are
+// built when tapped to and freed when tapped away from: with stat tiles and the Network/Device
+// panels they are ~30 objects each, and LVGL's pool is 36 KB (lv_conf.h) of which the arrivals
+// page alone takes ~20 KB with the owner's two stops. Keeping all four resident left ~3 KB
+// for label text updates and the blank screen a rebuild loads; a config change with four stops
+// configured would not have fit at all. Building on demand costs a few ms on the tap.
 void buildScreens() {
   g_active_profile = activeProfileIndex(g_cfg, time(nullptr));
   g_shown_keys.clear();
   for (const transit::StopConfig &s : visibleStops(g_cfg, time(nullptr))) g_shown_keys.push_back(s.key);
   g_main_screen = createMainScreen(g_cfg);
   g_night_screen = createNightScreen(g_cfg);
-  g_stats_screen = createStatsScreen(g_cfg);
-  g_device_info_screen = createDeviceInfoScreen(g_cfg);
-  for (lv_obj_t *scr : {g_main_screen, g_night_screen, g_stats_screen, g_device_info_screen}) {
-    lv_obj_add_event_cb(scr, onScreenPressed, LV_EVENT_PRESSED, nullptr);
-    lv_obj_add_event_cb(scr, onScreenTapped, LV_EVENT_CLICKED, nullptr);
-  }
+  g_stats_screen = nullptr;
+  g_device_info_screen = nullptr;
+  attachTapHandlers(g_main_screen);
+  attachTapHandlers(g_night_screen);
 }
 
 // Loads the arrivals page or the night clock, whichever the data calls for (Page::Main only).
@@ -162,20 +180,28 @@ void onScreenTapped(lv_event_t *e) {
     g_swallow_click = false;
     return;
   }
+  // Each step builds the next page, loads it (lv_screen_load with no animation switches at once,
+  // so the page we came from is no longer active), then drops the page we came from.
   switch (g_page) {
     case Page::Main:
       g_page = Page::Stats;
+      g_stats_screen = createStatsScreen(g_cfg);
+      attachTapHandlers(g_stats_screen);
       lv_screen_load(g_stats_screen);
       refreshStatsScreen(g_stats_screen);
       break;
     case Page::Stats:
       g_page = Page::DeviceInfo;
+      g_device_info_screen = createDeviceInfoScreen(g_cfg);
+      attachTapHandlers(g_device_info_screen);
       lv_screen_load(g_device_info_screen);
       refreshDeviceInfoScreen(g_device_info_screen);
+      dropPage(g_stats_screen);
       break;
     case Page::DeviceInfo:
       g_page = Page::Main;
       showMainOrNight(currentSnapshot());
+      dropPage(g_device_info_screen);
       break;
   }
 }

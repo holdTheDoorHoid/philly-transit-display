@@ -21,6 +21,11 @@ transit_app::StopSummaryView summary(float pct, float mean_late, int worst_hour,
 
 extern bool bikes_enabled;
 extern bool sd_mounted;
+extern uint32_t sd_dropped_rows;   // SdStatus write health on the device page (F26)
+extern std::string sd_error;       // "" = last write ok
+extern bool poll_ok;               // the device page's "SEPTA ok / failed" line
+extern uint32_t poll_age_s;
+extern std::string poll_error;
 extern std::string weather_temp;   // "" hides the header weather
 extern std::string weather_text;
 extern int weather_icon;           // transit_app::WeatherIcon as an int

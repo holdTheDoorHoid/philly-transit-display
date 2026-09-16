@@ -289,4 +289,124 @@ const lv_font_t *fontSmall(int32_t /*h*/) {
   return &lv_font_montserrat_14;
 }
 
+// ---- Shared building blocks ----
+
+lv_obj_t *makeBox(lv_obj_t *parent) {
+  lv_obj_t *o = lv_obj_create(parent);
+  lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+  // border_width and radius are already 0 with no theme compiled in; setting them again would
+  // only cost a style slot per box (LVGL's 36 KB pool, lv_conf.h).
+  lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+  return o;
+}
+
+lv_obj_t *makeLabel(lv_obj_t *parent, const lv_font_t *font, lv_color_t color) {
+  lv_obj_t *l = lv_label_create(parent);
+  lv_obj_set_style_text_font(l, font, 0);
+  lv_obj_set_style_text_color(l, color, 0);
+  return l;
+}
+
+int32_t headerHeight(int32_t h) {
+  return h / 10 > 20 ? h / 10 : 20;
+}
+
+lv_obj_t *makeHeader(lv_obj_t *screen, int32_t h) {
+  lv_obj_t *header = makeBox(screen);
+  lv_obj_set_size(header, lv_pct(100), headerHeight(h));
+  lv_obj_set_style_bg_color(header, colorPanelBg(), 0);
+  lv_obj_set_style_pad_hor(header, 8, 0);
+  lv_obj_set_style_pad_ver(header, 2, 0);
+  lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  return header;
+}
+
+lv_obj_t *makePanelsArea(lv_obj_t *screen) {
+  lv_obj_t *area = makeBox(screen);
+  lv_obj_set_size(area, lv_pct(100), lv_pct(100));
+  lv_obj_set_flex_grow(area, 1);
+  lv_obj_set_style_bg_opa(area, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_pad_all(area, 4, 0);
+  lv_obj_set_style_pad_row(area, 4, 0);
+  lv_obj_set_flex_flow(area, LV_FLEX_FLOW_COLUMN);
+  return area;
+}
+
+lv_obj_t *makePanel(lv_obj_t *parent) {
+  lv_obj_t *panel = makeBox(parent);
+  lv_obj_set_size(panel, lv_pct(100), lv_pct(100));
+  lv_obj_set_flex_grow(panel, 1);
+  lv_obj_set_style_bg_color(panel, colorPanelBg(), 0);
+  lv_obj_set_style_pad_all(panel, 6, 0);
+  lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+  return panel;
+}
+
+lv_obj_t *makeRow(lv_obj_t *parent, int32_t gap) {
+  lv_obj_t *row = makeBox(parent);
+  lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_pad_column(row, gap, 0);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  return row;
+}
+
+lv_obj_t *makeRouteBadge(lv_obj_t *parent, const lv_font_t *font, const std::string &route) {
+  lv_obj_t *badge = makeLabel(parent, font, lv_color_white());
+  lv_obj_set_style_bg_color(badge, routeBadgeColor(), 0);
+  lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+  lv_obj_set_style_pad_hor(badge, 4, 0);
+  lv_label_set_text(badge, route.c_str());
+  return badge;
+}
+
+// ---- Wi-Fi bars ----
+
+int wifiBarCount(int rssi, bool connected) {
+  if (!connected) return 0;
+  if (rssi >= -55) return 4;
+  if (rssi >= -65) return 3;
+  if (rssi >= -75) return 2;
+  if (rssi >= -85) return 1;
+  return 0;
+}
+
+lv_obj_t *makeWifiBars(lv_obj_t *parent, int32_t header_h) {
+  // Sized like a phone's status-bar icon: the tallest bar is one line of the small font (16 px),
+  // so the icon sits next to "updated 12 s ago" at the height of its text instead of towering
+  // over it, and it is the same size on every board. Only a header shorter than that (the 20 px
+  // floor) shrinks it. Bars are 4 px with 2 px gaps at that height, 3 px and 1 px when shrunk.
+  int32_t col_h = lv_font_get_line_height(fontSmall(0));
+  if (col_h > header_h - 4) col_h = header_h - 4;
+  int32_t bar_w = col_h >= 14 ? 4 : 3;
+  int32_t gap = bar_w / 2;
+
+  lv_obj_t *bars = makeBox(parent);
+  lv_obj_set_style_bg_opa(bars, LV_OPA_TRANSP, 0);
+  lv_obj_set_size(bars, LV_SIZE_CONTENT, col_h);
+  lv_obj_set_style_pad_column(bars, gap, 0);
+  lv_obj_set_flex_flow(bars, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(bars, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);  // bottoms level
+  for (int i = 0; i < 4; ++i) {
+    lv_obj_t *bar = makeBox(bars);
+    int32_t bar_h = col_h * (i + 1) / 4;
+    if (bar_h < 2) bar_h = 2;
+    lv_obj_set_size(bar, bar_w, bar_h);
+  }
+  setWifiBars(bars, 0, colorText(), colorPanelBg());
+  return bars;
+}
+
+void setWifiBars(lv_obj_t *bars, int count, lv_color_t on, lv_color_t bg) {
+  lv_color_t off = lv_color_mix(on, bg, 64);  // a quarter of the way from the background to `on`
+  for (int i = 0; i < 4; ++i) {
+    lv_obj_t *bar = lv_obj_get_child(bars, i);
+    if (bar == nullptr) break;
+    lv_obj_set_style_bg_color(bar, i < count ? on : off, 0);
+  }
+}
+
 }  // namespace transit_app::ui
