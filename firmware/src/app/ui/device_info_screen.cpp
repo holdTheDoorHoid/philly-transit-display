@@ -375,9 +375,13 @@ void refreshDeviceInfoScreen(lv_obj_t *screen) {
   {
     // tryGetPollStatus(), not getPollStatus(): this runs on the LVGL task on every tick the device
     // page is shown, and getPollStatus() waits up to a second on the poller's mutex. DESIGN.md SS5
-    // says the display task must never block on the poller, and SS12.1 records the
-    // vTaskPriorityDisinheritAfterTimeout assert that exactly this 1 s wait produced. The 50 ms cap
-    // is getStopSummary()'s. `last` is function-static and touched only from this task: on a miss
+    // says the display task must NEVER BLOCK on another task's lock - not "waits briefly" - and
+    // SS12.1 records two vTaskPriorityDisinheritAfterTimeout asserts, the first from exactly this
+    // 1 s wait. This comment used to point at "the 50 ms cap" as the pattern to copy; it was not
+    // one. That assert is reached only from a take that blocked and then TIMED OUT, so a 50 ms cap
+    // times out more often than a 1 s wait, not less - it was a latency fix wearing a safety fix's
+    // clothes. The budget on this task is zero, and it is takeShared() (app/ui_lock.h) that applies
+    // it, not this call site. `last` is function-static and touched only from this task: on a miss
     // the line redraws with the value it last read - one tick of staleness on a page that is
     // already showing an age in seconds - rather than blanking to "no poll yet".
     static PollStatus last;

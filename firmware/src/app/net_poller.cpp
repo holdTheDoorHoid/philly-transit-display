@@ -151,9 +151,10 @@ volatile uint32_t g_cycle_interval_ms = 30000;
 // One 32-bit store, on the poller task, no allocation, cannot throw.
 inline void notePollerProgress() { g_progress_ms = millis(); }
 
-// How long a NON-display task may wait for g_mutex. The display task's wait is decided by
-// takeShared() (ui_lock.h) and is zero, whatever these say; DESIGN.md SS5 and SS12.1 carry the
-// reasoning and the assert that produced it.
+// How long a NON-DISPLAY task may wait for g_mutex, and nothing else. None of these is the display
+// task's budget: that one is zero, it is applied by takeShared() (ui_lock.h) rather than by any
+// call site, and no number here can change it. Do not read kSummaryWaitMs as "the UI waits 50 ms" -
+// that reading is the bug DESIGN.md SS12.1's second entry is about.
 constexpr uint32_t kSnapshotWaitMs = 1000;
 constexpr uint32_t kStatusWaitMs = 1000;
 constexpr uint32_t kSummaryWaitMs = 50;

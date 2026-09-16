@@ -893,8 +893,10 @@ stop per slice, at most every 10 minutes per stop or on request, evicting stops 
 configured. It used to stream a month of CSV per stop synchronously on whichever task asked, so
 opening the stats page froze touch and the clock for as long as the card took.
 
-**Nor may it wait on ANY other task's mutex, and its budget for doing so is zero** (2026-09-16).
-This rule had been kept at each call site, which is not a mechanism: a pass in the RC review capped
+**Nor may it wait on ANY other task's mutex. Not briefly: NOT AT ALL** (2026-09-16). The display
+task's budget for waiting on a lock another task can hold is zero ticks, and "a short cap" is not a
+weaker form of that rule - it is a different rule, and the wrong one (below). This had been kept at
+each call site, which is not a mechanism: a pass in the RC review capped
 `getStopSummary()` and `tryGetPollStatus()` at 50 ms and left every other accessor on its original
 500-1000 ms wait, and one of those - `getBikes()`, 500 ms, called from `refreshMainScreen()` on
 every tick the arrivals page is up - panicked a device in `vTaskPriorityDisinheritAfterTimeout`
@@ -903,7 +905,9 @@ accessor takes its lock through `takeShared()`, which picks the wait from **who 
 than from what the call site remembered to pass - a zero-tick try on the display task, the
 accessor's own wait on every other.
 
-Zero and not "short", because a short wait does not close the hole. That assert is reachable on
+**The two accessors that already looked fixed were not the pattern to copy** - they were a narrower
+version of the same bug, and both are now zero-budget like everything else. Zero and not "short",
+because a short wait does not close the hole. That assert is reachable on
 exactly one path: a take that blocks, times out, and donated priority on the way in. A shorter
 timeout makes a blocked take time out *more* often, not less - it narrows the window instead of
 closing it. With `xTicksToWait == 0` the take returns without ever blocking, so it never donates

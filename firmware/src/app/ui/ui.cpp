@@ -603,8 +603,9 @@ void tick() {
   // Apply a configuration handed over by the web server task (rotation, brightness, stops).
   bool apply = false;
   Config next;
-  // takeShared(): zero wait on this task, 50 ms anywhere else (ui_lock.h). A miss just means the
-  // new config is applied on the next tick, a second later - g_pending stays set.
+  // takeShared(): this task does not wait at all; 50 ms is what any OTHER task gets (ui_lock.h).
+  // A miss just means the new config is applied on the next tick, a second later - g_pending
+  // stays set.
   if (g_pending && takeShared(g_pending_mutex, 50)) {
     if (g_pending) {
       next = g_pending_cfg;

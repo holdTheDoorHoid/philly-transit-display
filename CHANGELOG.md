@@ -45,15 +45,20 @@ their comments said.
   the next panel actually wants, and the "N more stops will not fit" line at the bottom is now
   reserved up front rather than squeezed out of what is left.
 - **The display no longer waits on the fetching to draw itself - anywhere - and the crash that
-  caused is gone.** The entry below fixed one screen that did this. Testing the release candidate
-  found the same pattern in seven more places and crashed a display through one of them: the bike
+  caused is gone.** An earlier fix in this same release made the Device info screen stop waiting on
+  the fetcher, and was written up as if that were the whole problem. It was one instance of it.
+  Testing the release candidate found the same pattern in seven more places and crashed a display
+  through one of them: the bike
   counts on the arrivals page asked the fetcher for its numbers, waited half a second for an answer
   while the fetcher was busy, and the display restarted. The weather in the header, the weather note
   under each stop, the SD card line, the statistics and the arrivals themselves were all still
   written the same way; only two had been fixed. Now the screen never waits for the fetcher at all -
   it either gets an answer immediately or redraws the one it had a second ago. The most a busy
   moment can cost is one second of staleness on one line, and there is no wait left that could turn
-  into a restart.
+  into a restart. That includes the two places the earlier fix had already touched: shortening the
+  wait turned out to make this particular crash *more* likely rather than less, so "waits a
+  twentieth of a second" was not a smaller version of the fix, and they now wait not at all like
+  everything else.
 
   The other half of the same fix is that the fetcher stops making the screen wait in the first
   place. It used to copy the whole list of arrivals twice - once to hand it over, once for the
