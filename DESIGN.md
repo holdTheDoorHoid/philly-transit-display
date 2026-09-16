@@ -949,8 +949,9 @@ errors, or a 503) rather than resetting. Measured after the fix: heap ~54 KB min
 poll, largest block ~32 KB median. **Invariant:** every long-running task that does STL allocation catches
 `std::bad_alloc` at its top level, because an uncaught throw is `std::terminate` = reboot. There
 are three: the poller task (net_poller.cpp, inner per-stop + outer cycle), the AsyncTCP web
-handlers (web_server.cpp `guarded()` + the JSON-body handlers, answering 503), and the LVGL
-display loop (main.cpp `loop()`, skipping the frame). Any new task on either core must do the same.
+handlers (web_server.cpp `guarded()` + the JSON-body handlers, answering 503) and its chunked-response
+fillers (the log-export filler catches internally and truncates), and the LVGL display loop
+(main.cpp `loop()`, skipping the frame). Any new task, handler or filler on either core must do the same.
 
 Task watchdog (2026-09-15): `CONFIG_ESP_TASK_WDT_PANIC=y` in this SDK, and HTTPClient waits for the
 response line and each header in `Stream::timedRead()`, a busy loop that yields only to

@@ -808,7 +808,15 @@ bool handleLogDownload(AsyncWebServerRequest *request) {
     return true;
   }
   AsyncWebServerResponse *response = request->beginChunkedResponse(
-      "text/csv", [exp](uint8_t *buf, size_t maxLen, size_t /*index*/) -> size_t { return exp->fill(buf, maxLen); });
+      "text/csv", [exp](uint8_t *buf, size_t maxLen, size_t /*index*/) -> size_t {
+        // Runs on the AsyncTCP task, outside guarded(); LogExport::fill() catches its own
+        // bad_alloc, but wrap here too so no filler allocation can ever reach std::terminate.
+        try {
+          return exp->fill(buf, maxLen);
+        } catch (const std::bad_alloc &) {
+          return (size_t)0;  // ends the chunked response
+        }
+      });
   response->addHeader("Content-Disposition", (String("attachment; filename=\"") + filename.c_str() + "\"").c_str());
   request->onDisconnect([]() { releaseLogReader(); });
   request->send(response);

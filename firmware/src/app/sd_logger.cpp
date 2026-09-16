@@ -407,6 +407,12 @@ bool LogExport::nextLine() {
 size_t LogExport::fill(uint8_t *buf, size_t max) {
   if (!open_ || done_ || max == 0) return 0;
   size_t written = 0;
+  // This runs on the AsyncTCP event task as a chunked-response filler (web_server.cpp), NOT through
+  // a request handler, so it is outside handleGetState()'s guarded() wrapper. normalizeCsvLine()
+  // and the pending std::string allocate, and with -fexceptions on an uncaught bad_alloc here was
+  // std::terminate = reboot (device suite, 2026-09-15). Catch it: return the bytes already produced
+  // (the browser gets a short-but-valid prefix of the CSV) and end the stream on the next call.
+  try {
   while (written < max) {
     if (pending_pos_ < pending_.size()) {
       size_t take = std::min(max - written, pending_.size() - pending_pos_);
@@ -435,6 +441,10 @@ size_t LogExport::fill(uint8_t *buf, size_t max) {
     }
     pending_ = std::move(normalized);
     pending_ += '\n';
+  }
+  } catch (const std::bad_alloc &) {
+    Serial.printf("[sd_logger] out of memory during log export; truncating the download at %u bytes\n", (unsigned)written);
+    done_ = true;  // AsyncWebServer ends the chunked response when a fill returns 0 next time
   }
   return written;
 }
