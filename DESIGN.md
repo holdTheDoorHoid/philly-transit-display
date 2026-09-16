@@ -1011,7 +1011,12 @@ Main screen (portrait by default; every size derives from the runtime resolution
   `lv_obj_class.c` stores each new child straight after an unchecked `lv_realloc()`, so an
   exhausted pool is a wild pointer, and the `LV_ASSERT_MALLOC` sites that do check it reach
   `LV_ASSERT_HANDLER`. Either way the display reboots, on a tap, in the owner's living room. The
-  only defence is never to start a build that cannot fit.
+  only defence is never to start a build that cannot fit — there is no "handle the allocation
+  failure" answer available from outside LVGL, and it is worth being plain that `LV_ASSERT_HANDLER`
+  is **not** one: `lv_assert_hook.cpp` names the failing address and the pool's state over serial
+  and then restarts, because returning from it would hand LVGL the NULL it did not check. It is a
+  last resort that the two guards below exist to keep unreachable, and a `[lvmem] LVGL assert at
+  pc=…` line is the unambiguous sign that one of them was wrong.
   Measured on `cyd-3248S035R` 2026-09-16 (`GET /api/debug/ui`, bytes of pool per page):
 
   | stops | arrivals | night | stats | device | one page | all four at once |
