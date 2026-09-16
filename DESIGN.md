@@ -2016,13 +2016,28 @@ run, 2,932 B during the config round-trips to 8,692 B a section later, no restar
 "unreadable until you reboot it" would be an overstatement, and the earlier reboot that appeared to
 cure it was never tested against simply waiting.
 
-What is left after that hedging is still real, and is two things. The **resting** value drifts down
-with uptime: 5,108 B at 812 s on a board doing nothing but answering a probe every four seconds is
-already under the gate before any burst. And the shipping web UI is, by design, the *gentle* client
-here - `resilientRead()` backs off with jitter and shares one in-flight request per endpoint (§10.2)
-precisely so tabs cannot amplify this - so a browser sees "busy, try again" and then its page, which
-is the designed behaviour rather than a break. The device suite was harsher than the product, which
-is why it reported the condition as thirty-five unrelated failures.
+**A resting largest-block figure is meaningless without the client's request rate beside it**, and
+this is the correction that makes the two measurements of this comparable at all. Same board, same
+day, same firmware family:
+
+| largest block | uptime | what the client was doing |
+|---:|---:|---|
+| 16,372 B | 603 s | sampling every 45-60 s |
+| 5,108 B | 812 s | probing every 4 s |
+
+A tenfold difference, and the variable is not uptime and not the build - it is how often something
+asked. So "the resting value drifts down with uptime" is the wrong shape for this claim: the resting
+value is a function of *request rate*, with uptime a much weaker second term, and any figure quoted
+in this file, in an issue or in a commit message has to carry its polling rate or it cannot be
+compared with another one. The 5,108 B reading is not evidence about an idle device; it is evidence
+about a device being asked four times a minute.
+
+What survives is that at a high enough request rate the resting value sits under the gate before any
+burst at all. And the shipping web UI is, by design, the *gentle* client here - `resilientRead()`
+backs off with jitter and shares one in-flight request per endpoint (§10.2) precisely so tabs cannot
+amplify this - so a browser sees "busy, try again" and then its page, which is the designed
+behaviour rather than a break. The device suite was harsher than the product, which is why it
+reported the condition as thirty-five unrelated failures.
 
 This is open, and it is **not** claimed as cured by §5's lock work - which removes real churn from
 it (one whole-Snapshot allocate/free per second is gone, and `/api/state` no longer copies one per
