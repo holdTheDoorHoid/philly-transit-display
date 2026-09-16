@@ -338,7 +338,25 @@ void scheduleRestart() {
   );
 }
 
+// Admission floor for the heap-heavy read handlers (/api/state copies the whole Snapshot plus
+// weather and bike views into a JsonDocument; /api/config serializes the whole config). C++
+// exceptions in this SDK have a ZERO-byte emergency pool (CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0),
+// so when the heap is exhausted a std::bad_alloc cannot even allocate its own exception object and
+// __cxa_allocate_exception calls std::terminate directly - past every try/catch, a hard reboot
+// (device suite, 2026-09-15: bad_alloc in getBikes() <- handleGetState under load). The guarded()
+// wrappers only help while a throw can still be allocated. So refuse the heavy response up front,
+// with a fixed-literal 503 that needs almost no heap, whenever free memory is below what building
+// it would need. The small handlers (debug/ui, tap) are deliberately not gated: they cost little
+// and the test/UI use them to observe the device precisely while it is under pressure.
+constexpr size_t kMinHeavyResponseHeap = 22 * 1024;
+bool refuseIfLowHeap(AsyncWebServerRequest *request) {
+  if (ESP.getFreeHeap() >= kMinHeavyResponseHeap) return false;
+  request->send(503, "application/json", "{\"error\":\"low memory, retry\"}");
+  return true;
+}
+
 void handleGetState(AsyncWebServerRequest *request) {
+  if (refuseIfLowHeap(request)) return;
   JsonDocument doc;
   doc["time"] = (int64_t)time(nullptr);
   doc["uptime"] = (uint32_t)(millis() / 1000);
@@ -399,6 +417,7 @@ void handleGetState(AsyncWebServerRequest *request) {
 }
 
 void handleGetConfig(AsyncWebServerRequest *request) {
+  if (refuseIfLowHeap(request)) return;
   Config cfg = getActiveConfig();
   JsonDocument doc;
   configToJson(cfg, doc);

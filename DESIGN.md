@@ -951,7 +951,13 @@ poll, largest block ~32 KB median. **Invariant:** every long-running task that d
 are three: the poller task (net_poller.cpp, inner per-stop + outer cycle), the AsyncTCP web
 handlers (web_server.cpp `guarded()` + the JSON-body handlers, answering 503) and its chunked-response
 fillers (the log-export filler catches internally and truncates), and the LVGL display loop
-(main.cpp `loop()`, skipping the frame). Any new task, handler or filler on either core must do the same.
+(main.cpp `loop()`, skipping the frame). Any new task, handler or filler on either core must do the same. A hard case the wrappers cannot catch: when the heap is
+so exhausted that `std::bad_alloc` cannot allocate its own exception object, `__cxa_allocate_exception`
+calls `std::terminate` directly (this SDK builds with a zero-byte emergency exception pool,
+`CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0`). The heavy read handlers (`/api/state`,
+`/api/config`) therefore refuse up front with a fixed-literal 503 when free heap is below
+`kMinHeavyResponseHeap` (22 KB), so they never begin the large allocation that could reach that
+state; clients retry the 503 (§12.1).
 
 Task watchdog (2026-09-15): `CONFIG_ESP_TASK_WDT_PANIC=y` in this SDK, and HTTPClient waits for the
 response line and each header in `Stream::timedRead()`, a busy loop that yields only to
