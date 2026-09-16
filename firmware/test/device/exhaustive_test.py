@@ -31,11 +31,11 @@ def get_json(path):
     # client must retry - the data is there, the async send buffer momentarily was not. Retry a
     # handful of times before giving up so a state()-based assertion does not flake on that.
     code, body = 0, b''
-    for attempt in range(6):
+    for attempt in range(10):
         code, body = get(path)
         if not (code == 503 or (code == 200 and not body)):
             break
-        time.sleep(1.2)
+        time.sleep(1.5)
     try: return code, json.loads(body)
     except Exception: return code, None
 

@@ -348,9 +348,17 @@ void scheduleRestart() {
 // with a fixed-literal 503 that needs almost no heap, whenever free memory is below what building
 // it would need. The small handlers (debug/ui, tap) are deliberately not gated: they cost little
 // and the test/UI use them to observe the device precisely while it is under pressure.
-constexpr size_t kMinHeavyResponseHeap = 22 * 1024;
+constexpr size_t kMinHeavyResponseHeap = 28 * 1024;
+constexpr size_t kMinHeavyResponseBlock = 12 * 1024;  // the JsonDocument + serialized String need a
+                                                       // contiguous block; free heap alone lies when
+                                                       // the heap is fragmented (device suite: free
+                                                       // > 22 KB but largest block ~2 KB, so the build
+                                                       // still bad_alloc'd -> OOM-while-throwing).
 bool refuseIfLowHeap(AsyncWebServerRequest *request) {
-  if (ESP.getFreeHeap() >= kMinHeavyResponseHeap) return false;
+  if (ESP.getFreeHeap() >= kMinHeavyResponseHeap &&
+      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= kMinHeavyResponseBlock) {
+    return false;
+  }
   request->send(503, "application/json", "{\"error\":\"low memory, retry\"}");
   return true;
 }
