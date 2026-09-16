@@ -735,6 +735,63 @@ while time.time() < deadline:
 check('F back after reboot', code == 200 and d and d.get('uptime', 999) < 90, (code, d and d.get('uptime')))
 check('F config intact after reboot', device_name() == base['device']['name'])
 
+# ---------- F2. poller liveness reporting (DESIGN.md SS12.1) ----------
+# The liveness net keyed on WHEN a poll cycle last completed - as opposed to the heap-wedge
+# self-heal, which counts how many completed and FAILED and therefore cannot see a poller that has
+# stopped completing cycles at all. Two things are checked here, both of them on the reporting side:
+# the observable the net watches (last_poll.since_s) and the record it leaves behind when it fires
+# (last_restart). The firing itself cannot be provoked from here - it needs a poller wedged inside
+# lwIP - so what this section proves is that the fields exist, carry sane values, and say the RIGHT
+# thing after a reboot that was asked for rather than self-healed.
+#
+# Placed right after F because F's POST /api/reboot is a known, deliberate esp_restart(), which is
+# the one restart cause this suite can create on demand.
+#
+# Skips cleanly on a firmware that predates all this, so an older image is reported as "not built
+# in" rather than as a wall of failures.
+st = state()
+lr = st.get('last_restart')
+since = (st.get('last_poll') or {}).get('since_s')
+if not isinstance(lr, dict) or since is None:
+    print('== F2 skipped: /api/state carries no last_restart/last_poll.since_s '
+          '(firmware predates the DESIGN.md SS12.1 liveness net)', flush=True)
+else:
+    # POST /api/reboot is an ordinary esp_restart(): ESP_RST_SW == 3. A 4 here would be
+    # ESP_RST_PANIC and would mean the device came back by a route nobody asked for.
+    check('F2 last_restart.esp is a software restart (3), not a panic', lr.get('esp') == 3, lr)
+    # The reboot was requested, so nothing self-healed. Empty strings, not missing keys: the shape
+    # of last_restart is the same whether or not there is anything to report.
+    check('F2 last_restart.reason is empty after a requested reboot', lr.get('reason') == '', lr)
+    check('F2 last_restart.detail is empty after a requested reboot', lr.get('detail') == '', lr)
+    check('F2 last_restart carries uptime_s', isinstance(lr.get('uptime_s'), int), lr)
+
+    # since_s is seconds since a cycle last COMPLETED, whatever its outcome. It is deliberately NOT
+    # last_poll.age_s: age_s only moves when a poll REPORTS, so a poller stuck inside a fetch
+    # freezes it, which is exactly the blind spot this field closes. -1 until the first cycle of
+    # this boot has finished.
+    ready = wait_for(lambda: isinstance(((state().get('last_poll') or {}).get('since_s')), int)
+                             and ((state().get('last_poll') or {}).get('since_s')) >= 0, 150, 5)
+    since = (state().get('last_poll') or {}).get('since_s')
+    check('F2 last_poll.since_s goes non-negative once a cycle completes', ready, since)
+    if ready:
+        # Watch it over a couple of poll intervals. It must keep coming back down - a monotonically
+        # climbing since_s IS the stalled poller, and past main.cpp's window (5 min at the default
+        # cadence, kStallFloorMs in src/app/poller_liveness.h) the board would restart itself.
+        samples = []
+        for _ in range(6):
+            time.sleep(10)
+            samples.append((state().get('last_poll') or {}).get('since_s'))
+        numeric = [s for s in samples if isinstance(s, int)]
+        check('F2 since_s stays sampled over a minute', len(numeric) == len(samples), samples)
+        check('F2 since_s never approaches the stall window (300 s)', bool(numeric) and max(numeric) < 240, samples)
+        # It has to come back DOWN at least once over the minute. A since_s that only climbs is the
+        # stalled poller itself: the device is still up only because the window has not elapsed.
+        dropped = any(b < a for a, b in zip(numeric, numeric[1:]))
+        check('F2 since_s drops back at least once, so cycles really are completing', dropped, samples)
+    # Uptime and the liveness net must agree: a device that had self-healed would say so.
+    check('F2 device did not self-heal during the suite', (state().get('last_restart') or {}).get('reason') == '',
+          state().get('last_restart'))
+
 # ---------- G. OTA with the running image ----------
 # The image of the TREE THIS SCRIPT LIVES IN (S is .../firmware/test/device), not a hardcoded
 # absolute path: with git worktrees the absolute form uploaded another branch's build to the device

@@ -121,6 +121,48 @@ PollStatus g_status;
 uint32_t g_poll_seconds = 30;
 volatile bool g_invalidate_sched_cache = false;
 
+// ---- Liveness stamps (DESIGN.md SS12.1, net_poller.h "Liveness") -----------------------------
+// Written by the poller task at the end of every cycle whatever the outcome; read lock-free by
+// main.cpp's display loop, which is the only task that can notice this one has stopped. Aligned
+// 32-bit words and plain bools, like g_alerts_fetched_ms above: no mutex, because the reader is
+// the display task and it must never wait on the poller's lock (DESIGN.md SS5).
+volatile bool g_liveness_armed = false;
+volatile bool g_before_first_cycle = true;
+volatile uint32_t g_cycle_end_ms = 0;
+volatile uint32_t g_cycle_interval_ms = 30000;
+
+// ---- Self-heal restart note (DESIGN.md SS12.1) ------------------------------------------------
+// RTC slow memory: kept across ESP.restart() (and across a panic), not across a power cycle, which
+// is exactly the lifetime wanted - "the last boot rebooted itself, here is why". The magic word is
+// what distinguishes a real note from the garbage RTC RAM holds after power-on, and it is cleared
+// as soon as the note is read so a later unrelated reset cannot inherit a stale one.
+constexpr uint32_t kNoteMagic = 0x50544452;  // 'PTDR'
+struct RtcSelfHealNote {
+  uint32_t magic;
+  uint32_t reason;
+  uint32_t uptime_s;
+  uint32_t a;
+  uint32_t b;
+};
+RTC_NOINIT_ATTR RtcSelfHealNote g_rtc_note;
+RestartNote g_prev_note;
+
+// Reads the RTC note into g_prev_note once per boot and disarms it. Called from initNetPoller()
+// (early in setup(), before Wi-Fi) and lazily from getRestartNote() so the order cannot matter.
+void captureRestartNote() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  if (g_rtc_note.magic == kNoteMagic) {
+    uint32_t r = g_rtc_note.reason;
+    g_prev_note.reason = r <= (uint32_t)SelfHeal::PollStall ? (SelfHeal)r : SelfHeal::None;
+    g_prev_note.uptime_s = g_rtc_note.uptime_s;
+    g_prev_note.a = g_rtc_note.a;
+    g_prev_note.b = g_rtc_note.b;
+  }
+  g_rtc_note.magic = 0;
+}
+
 // ---- BusSchedules cache (DESIGN.md SS4.7: "cached 10 min", "also on config change") ----------
 // At most kMaxStops (8, config_store.h) distinct stop_ids, matching the config's own cap; a
 // linear scan over <=8 entries is cheaper than a map for this size.
@@ -909,6 +951,10 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   uint32_t interval_s = nextIntervalS(cfg, combined.last_poll_ok, urgent, consecutive_failures);
   if (g_last_poll_unsynced) interval_s = std::min<uint32_t>(interval_s, 10);  // re-poll soon once NTP lands
   const uint32_t deadline_ms = millis() + interval_s * 1000UL;
+  // The liveness window is a multiple of the interval the poller is ACTUALLY running at, backoff
+  // included (DESIGN.md SS12.1), so it is published from here - the one place that interval is
+  // decided - rather than re-derived from a deadline somewhere else.
+  g_cycle_interval_ms = interval_s * 1000UL;
   // std::function, not auto: it is handed to collectAlerts()/refreshRouteLiveness() by const
   // reference, and an `auto` lambda would be wrapped into a fresh std::function (a heap
   // allocation) at each call site.
@@ -1015,6 +1061,16 @@ void pollerTask(void * /*arg*/) {
   // ~50 KB is free but the largest block is ~2 KB, too small for any fetch buffer. Every poll then
   // fails with a caught bad_alloc (the board stays up and honest, but shows nothing new), and
   // nothing defragments a running heap. The one recovery is what a person would do: power-cycle.
+  //
+  // WHAT THIS DOES NOT COVER (established on hardware 2026-09-16, DESIGN.md SS12.1): it counts
+  // cycles that COMPLETE AND REPORT FAILURE. It sits after pollOnce() returns, so a poller that
+  // stops completing cycles at all never reaches it and the counter freezes rather than climbing;
+  // and the `else` below zeroes the tally whenever either condition lapses, so one cycle whose
+  // largest block bounced back over the threshold wipes fourteen. That gap is why the liveness
+  // stamp below exists and why main.cpp's display loop watches it. The two are independent nets:
+  // this one catches a heap that has wedged while the poller still runs, that one catches a
+  // poller that has stopped. Neither replaces the other.
+  //
   // Guard tightly so this only ever fires on a genuine wedge, never on an ordinary SEPTA outage:
   //   * largest block below kWedgeLargestBlock (a normal idle board sits ~20-30 KB) - a SEPTA
   //     outage leaves the heap healthy, so that case keeps its normal backoff and never reboots;
@@ -1040,14 +1096,26 @@ void pollerTask(void * /*arg*/) {
                     (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
       consecutive_failures = std::min<uint32_t>(consecutive_failures + 1, 4);
       deadline = millis() + 15000;
+      // pollOnce() threw before it set g_cycle_interval_ms, so the previous cycle's interval
+      // stands. Deliberate: it is the longer, safer number for the liveness window below.
     }
+
+    // The liveness stamp (DESIGN.md SS12.1). Written here, on the ONE path every cycle takes,
+    // whatever happened inside it - a good poll, a failed poll, a caught bad_alloc. It says "the
+    // poller is still going round", which is the thing the wedge counter below cannot say: that
+    // counter only advances on cycles that COMPLETE AND REPORT FAILURE, so a poller that stops
+    // completing cycles at all freezes it at whatever it was. Nothing here can throw or block.
+    g_cycle_end_ms = millis();
+    g_before_first_cycle = false;
 
     // Wedge detection (see above): a failed poll while the largest free block is critically small.
     // getPollStatus() reflects what pollOnce() just published.
     if (!getPollStatus().ok && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < kWedgeLargestBlock) {
       if (++wedged_polls >= kWedgePollsBeforeReboot) {
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
         Serial.printf("[net_poller] heap wedged: %u consecutive failed polls with largest block < %u B (free %u); rebooting to recover\n",
                       (unsigned)wedged_polls, (unsigned)kWedgeLargestBlock, (unsigned)ESP.getFreeHeap());
+        noteSelfHealRestart(SelfHeal::HeapWedge, wedged_polls, (uint32_t)largest);
         Serial.flush();
         vTaskDelay(pdMS_TO_TICKS(200));
         ESP.restart();
@@ -1080,6 +1148,7 @@ bool preallocateTracker() {
 }
 
 void initNetPoller() {
+  captureRestartNote();  // before Wi-Fi, before anything else can reset the board
   if (g_mutex == nullptr) {
     g_mutex = xSemaphoreCreateMutex();
   }
@@ -1095,8 +1164,42 @@ void startNetPoller(uint32_t poll_seconds) {
   g_poll_seconds = poll_seconds > 0 ? poll_seconds : 30;
   initNetPoller();
   syncTrackerRegistrations(getActiveConfig().stops);
+  // Arm the liveness net from HERE, not from boot: this is the moment polling is expected to
+  // happen. Everything before it - LittleFS, the Wi-Fi captive portal, a provisioned device
+  // retrying a router that is not there - is time the poller is deliberately not running, and
+  // connectWifiOrPortal() does not even return during the portal, so loop() is not yet running to
+  // ask. g_before_first_cycle keeps the extra boot grace on until a cycle has actually finished.
+  g_cycle_end_ms = millis();
+  g_cycle_interval_ms = g_poll_seconds * 1000UL;
+  g_before_first_cycle = true;
+  // Only if there IS a poller task. If xTaskCreatePinnedToCore() failed there is nothing to stamp
+  // the liveness clock and nothing a reboot would fix, so arming would be a guaranteed loop of
+  // "boot, wait out the window, restart" - the one failure mode this net must not create.
+  g_liveness_armed = g_task_created;
   g_enabled = true;
   xSemaphoreGive(g_wake_sem);
+}
+
+PollerLiveness getPollerLiveness() {
+  PollerLiveness lv;
+  lv.armed = g_liveness_armed;
+  lv.before_first_cycle = g_before_first_cycle;
+  lv.since_ms = millis() - g_cycle_end_ms;  // unsigned: correct across the 49-day millis() wrap
+  lv.interval_ms = g_cycle_interval_ms;
+  return lv;
+}
+
+RestartNote getRestartNote() {
+  captureRestartNote();
+  return g_prev_note;
+}
+
+void noteSelfHealRestart(SelfHeal reason, uint32_t a, uint32_t b) {
+  g_rtc_note.reason = (uint32_t)reason;
+  g_rtc_note.uptime_s = millis() / 1000UL;
+  g_rtc_note.a = a;
+  g_rtc_note.b = b;
+  g_rtc_note.magic = kNoteMagic;  // last, so a reset mid-write leaves no half-formed note
 }
 
 void requestRepoll(bool data_changed) {

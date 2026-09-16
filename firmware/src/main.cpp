@@ -22,6 +22,7 @@
 #include "app/http_fetch.h"
 #include "app/hw_probe.h"
 #include "app/net_poller.h"
+#include "app/poller_liveness.h"
 #include "app/proxy_worker.h"
 #include "app/sd_logger.h"
 #include "app/status_led.h"
@@ -79,6 +80,72 @@ void applyNetworkSettings() {
     log_i("main: timezone applied: %s", cfg.device.tz.c_str());
     g_applied_tz = cfg.device.tz;
   }
+}
+
+// DESIGN.md SS12.1: the poller-liveness net. The poller stamps net_poller.cpp's g_cycle_end_ms at
+// the end of every cycle whatever the outcome; this asks, once a second from the DISPLAY task,
+// whether that stamp has gone stale, and restarts the board if it has.
+//
+// Why here. A poller that has stopped cannot notice that it has stopped, so the check has to run
+// somewhere else. loopTask is the right somewhere: it is on the other core, it already runs at
+// ~1 Hz unconditionally, it has its own bad_alloc guard, and it needs no stack or task of its own
+// (a dedicated watchdog task would cost ~2 KB of a heap this file exists to husband). The two
+// alternatives were each worse: the AsyncTCP task only runs when someone makes a request, so a
+// display nobody is browsing would never be checked; and subscribing the poller to the ESP-IDF
+// task watchdog cannot work here, because that watchdog has ONE global timeout (5 s in this SDK)
+// and a poll interval is 5-600 s, so the poller could never feed it.
+//
+// The check is outside loop()'s try/catch and allocates nothing - volatile reads, a stack buffer,
+// Serial.println - because the moment it matters most is the moment the heap is gone and
+// ui::tick() is throwing. Serial.printf() would malloc for a line this long; snprintf into a
+// stack buffer cannot.
+void checkPollerLiveness() {
+  using transit_app::PollerLiveness;
+
+  static uint32_t last_check_ms = 0;
+  static uint32_t ota_seen_ms = 0;
+  uint32_t now = millis();
+  if (now - last_check_ms < 1000) return;
+  last_check_ms = now;
+
+  // HAZARD: a firmware upload. An OTA legitimately starves the poller (it is writing ~1.7 MB to
+  // flash on the other task and taking the heap while it does), and a reboot mid-write leaves a
+  // half-written partition. Never judge while one is running - and not for a full window after it
+  // ends either, so an upload that has just finished or just been aborted cannot be followed
+  // straight away by a reboot the stall timer had already earned during it.
+  if (transit_app::otaBusy()) {
+    ota_seen_ms = now;
+    if (ota_seen_ms == 0) ota_seen_ms = 1;  // 0 is the "never seen" sentinel
+    return;
+  }
+
+  PollerLiveness lv = transit_app::getPollerLiveness();
+  // HAZARD: setup and AP mode. `armed` is set by startNetPoller(), the last thing setup() does, so
+  // it is false for the whole captive-portal / no-credentials path - during which loop() is not
+  // running anyway, because connectWifiOrPortal() does not return until Wi-Fi is up.
+  if (!lv.armed) return;
+
+  const uint32_t window_ms = transit_app::pollerStallTimeoutMs(lv.interval_ms, lv.before_first_cycle);
+  if (ota_seen_ms != 0) {
+    if (now - ota_seen_ms < window_ms) return;
+    ota_seen_ms = 0;  // grace spent; forget it rather than carry it to the millis() wrap
+  }
+  if (!transit_app::pollerHasStalled(lv.since_ms, lv.interval_ms, lv.before_first_cycle)) return;
+
+  // A device whose network is simply down does NOT reach here: a failed fetch is still a completed
+  // cycle, so the stamp keeps moving and only the backoff changes. Getting here means the poller
+  // produced nothing at all - not even a failure - for several whole intervals.
+  char line[176];
+  snprintf(line, sizeof(line),
+           "[main] poller stalled: no poll cycle completed for %u s (interval %u s, window %u s, "
+           "free %u, largest %u); restarting",
+           (unsigned)(lv.since_ms / 1000U), (unsigned)(lv.interval_ms / 1000U), (unsigned)(window_ms / 1000U),
+           (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  Serial.println(line);
+  transit_app::noteSelfHealRestart(transit_app::SelfHeal::PollStall, lv.since_ms / 1000U, lv.interval_ms / 1000U);
+  Serial.flush();
+  delay(200);
+  ESP.restart();
 }
 
 std::string wifiApName() {
@@ -239,4 +306,9 @@ void loop() {
       last_oom_log_ms = now;
     }
   }
+
+  // Outside the guard on purpose (DESIGN.md SS12.1): the frame the display loop skips because it
+  // could not allocate is exactly the frame in which the poller is most likely to be stuck, so the
+  // liveness check must not be skipped with it. Nothing in it allocates.
+  checkPollerLiveness();
 }

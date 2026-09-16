@@ -440,9 +440,17 @@ function buildState(query) {
     largest_block_8bit: 46000 + Math.round(Math.cos(now / 53) * 6000),
     wifi: { ssid: 'MockWiFi-5G', rssi: -58, ip: '192.168.1.42', mdns: `${config.device.name}.local` },
     sd: { mounted: true, free_mb: 7423, log_bytes: 128933 },
+    // since_s is seconds since a poll cycle last COMPLETED, whatever its outcome (DESIGN.md
+    // §12.1) - not age_s, which only moves when a poll REPORTS. A failed poll is still a completed
+    // cycle, which is why the stale branch has a small since_s next to a large age_s.
     last_poll: stale
-      ? { ok: false, age_s: 420, error: 'SEPTA request timed out' }
-      : { ok: true, age_s: 5 + (now % 20), error: '' },
+      ? { ok: false, age_s: 420, error: 'SEPTA request timed out', since_s: 12 + (now % 20) }
+      : { ok: true, age_s: 5 + (now % 20), error: '', since_s: 5 + (now % 20) },
+    // Why the previous boot ended (DESIGN.md §7/§12.1). ?restart=stall shows what the device says
+    // after the poller-liveness net has fired; the default is a plain power-on with nothing to say.
+    last_restart: query.get('restart') === 'stall'
+      ? { esp: 3, reason: 'poll_stall', detail: 'no poll cycle completed for 318 s (interval 30 s)', uptime_s: 412 }
+      : { esp: 1, reason: '', detail: '', uptime_s: 0 },
     firmware_version: '0.1.0-mock',
     // Fields the web UI reads for the PIN flow and the Settings page's device facts.
     // ?recovered=1 shows the "restored its previous settings" notice.

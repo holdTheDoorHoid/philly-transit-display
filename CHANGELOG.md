@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **The display now notices when it has quietly stopped fetching arrivals, and restarts itself.**
+  It already restarted itself when its memory got so chopped up that every fetch failed — but that
+  safety net worked by counting *failed* fetches, so it could only see a display that was still
+  trying. If the fetching stopped dead instead (stuck deep inside the network code, which is what
+  happened on a test board on 16 September), nothing was counting, nothing complained, and the
+  screen sat there showing arrival times that were quietly getting older and older until the board
+  eventually fell over on its own. Now the part of the display that draws the screen keeps an eye
+  on the part that fetches, and if no fetch has finished — successfully *or* unsuccessfully — for
+  several times the normal gap between them, it restarts. It waits at least five minutes before
+  doing that, waits longer if you've set a slow refresh, holds off entirely while a firmware update
+  is uploading, and gives itself extra time just after switching on. A display that simply has no
+  internet is *not* affected: a fetch that fails is still a fetch that finished, so nothing
+  restarts and it keeps retrying as before. Your settings are saved on the device, so a restart
+  loses nothing. If it does happen, the display says so afterwards — the web page can now ask it
+  why it last restarted, and it answers in plain words with the numbers involved.
+
 - **Tapping through the screens no longer risks restarting the display.** The screen has its own
   small, fixed pot of drawing memory, separate from everything else, and the old way of switching
   pages built the next screen before letting go of the one it was leaving - so for a moment it was

@@ -1022,7 +1022,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | Method, path | Purpose |
 |---|---|
 | `GET /` , `/app.js`, `/app.css`, `/favicon.svg` | Web UI, served gzip with `Cache-Control: max-age=3600`, ETag = firmware build id |
-| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes, dropped_rows, write_ok, error} (§9.1), last_poll {ok, age_s, error}, `stops[]` each with `arrivals[]` (§8 shape), `ok`, `health`, `source_ts`, `source_age_s` (-1 when the feed carried no timestamp) and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, stale, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8; `age_s` is the main location's last successful fetch, `stale` once that is over an hour old), plus `board` (the PlatformIO env this image was built for, e.g. `cyd-3248S035R`), `auth {pin_required}` and `config_recovered` (§6). A firmware built with `-DTRANSIT_HTTPS` (§2.1) adds `transport {policy, last, https_ok, https_failed, cert_failed, http_by_heap, http_by_policy, refused_by_heap, last_tls_error, last_https_ms, heap_need, gate_free, gate_largest}`: `last` is the transport of the most recent fetch that asked for `https://` (`https`, `http`, `https_failed`, `refused`, or `none`), the counters are per boot, and `gate_*` are the 8-bit heap numbers of the last gate decision against `heap_need`. Absent from shipping builds |
+| `GET /api/state` | Current snapshot: time, uptime, heap, wifi {ssid, rssi, ip, mdns}, sd {mounted, free_mb, log_bytes, dropped_rows, write_ok, error} (§9.1), last_poll {ok, age_s, error, since_s}, `stops[]` each with `arrivals[]` (§8 shape), `ok`, `health`, `source_ts`, `source_age_s` (-1 when the feed carried no timestamp) and `weather_note`, `alerts[]`, `weather {enabled, units, age_s, stale, main {temp, feels_like, code, text, wind, hours[]}}` (§4.8; `age_s` is the main location's last successful fetch, `stale` once that is over an hour old), plus `board` (the PlatformIO env this image was built for, e.g. `cyd-3248S035R`), `auth {pin_required}`, `config_recovered` (§6) and `last_restart {esp, reason, detail, uptime_s}` (§12.1). `last_poll.since_s` is seconds since a poll cycle last *completed* — success or failure — and is `-1` until the first cycle of this boot; it is deliberately not `age_s`, which only moves when a poll *reports*, so a poller stuck inside a fetch freezes `age_s` while `since_s` keeps climbing. `last_restart.esp` is `esp_reset_reason()` (1 power-on, 3 software restart, 4 panic, …); `reason` is `poll_stall`, `heap_wedge` or `""`, and names only the restarts this firmware asked for itself; `detail` is the one-line plain-English version with the numbers that caused it. The note lives in RTC memory, survives `ESP.restart()` but not a power cycle, and is reported for exactly one boot. A firmware built with `-DTRANSIT_HTTPS` (§2.1) adds `transport {policy, last, https_ok, https_failed, cert_failed, http_by_heap, http_by_policy, refused_by_heap, last_tls_error, last_https_ms, heap_need, gate_free, gate_largest}`: `last` is the transport of the most recent fetch that asked for `https://` (`https`, `http`, `https_failed`, `refused`, or `none`), the counters are per boot, and `gate_*` are the 8-bit heap numbers of the last gate decision against `heap_need`. Absent from shipping builds |
 | `GET /api/config` | Current config (§6) |
 | `PUT /api/config` | Replace config; validates; persists; triggers immediate re-poll. 400 on error |
 | `GET /api/proxy/stops?route=17` | Streams SEPTA `Stops` for a route to the browser (setup only) |
@@ -1727,6 +1727,79 @@ healthy, so it keeps its normal backoff and never reboots; only a genuine wedge,
 would fix by power-cycling anyway, triggers the reboot. Config is durably saved (this §), so the
 reboot loses nothing. Observed cause was the on-device regression suite's stress section; normal
 use holds the heap stable (~74 KB free, ~22 KB largest).
+
+**What that self-heal does NOT cover, corrected 2026-09-16.** The paragraph above used to read as
+though it covered "the poller stops being useful". It does not, and the difference is the whole of
+the next paragraph. It counts cycles that **complete and report failure**: the check sits in
+`net_poller.cpp pollerTask()` *after* `pollOnce()` has returned, so a poller that stops completing
+cycles at all - blocked inside `pollOnce`, in `HTTPClient`, or under it in lwIP - never reaches the
+check, and the counter freezes at whatever it held rather than climbing. Its `else` branch is the
+second half of the gap: it zeroes the tally whenever *either* condition lapses, so one cycle whose
+largest block bounced back over 6 KB wipes fourteen, and fifteen *consecutive* is a demanding bar
+on an oscillating heap. The task watchdog does not close it either. `CONFIG_ESP_TASK_WDT_PANIC=y`
+watches IDLE0, and it fires when a task **busy-loops** and starves IDLE0 - which is exactly the
+`Stream::timedRead()` case the 4 s read cap above was added for. A poller blocked on a semaphore or
+a bounded socket read *yields*; IDLE0 runs, and nothing panics. So a poller that STOPS was
+invisible to both defences at once. Observed on hardware on 2026-09-16: the poll heartbeat stopped
+at t=68 s and never came back, the heap decayed over the next 60 s, `main.cpp loop()` caught its
+`bad_alloc` and skipped frames exactly as designed, and the board finally died on the lwIP
+`sys_timeout_abs` assert described above. Throughout, the self-heal counter was frozen, not
+counting.
+
+**Poller-liveness net (2026-09-16).** An additional, independent net keyed on *when a cycle last
+completed with any outcome*, rather than on how many failed. `pollerTask()` stamps a monotonic
+`millis()` at the end of every iteration - good poll, failed poll, caught `bad_alloc`, all the same
+- and something on another task watches that stamp go stale, because a stuck poller cannot check
+itself. The watcher is the LVGL display loop (`main.cpp loop()`): it is on the other core, it
+already runs at ~1 Hz unconditionally, it has its own `bad_alloc` guard, and it costs no stack or
+task of its own. The two alternatives were each worse - the AsyncTCP task only runs when someone
+makes a request, so a display nobody is browsing would never be checked; and subscribing the poller
+to the ESP-IDF task watchdog cannot work, because that watchdog has one *global* timeout (5 s here)
+while a poll interval is 5-600 s, so the poller could never feed it. The check sits *outside*
+`loop()`'s `try`/`catch` and allocates nothing (volatile reads, a stack buffer, `Serial.println`):
+the frame the display skips because it could not allocate is precisely the frame in which the
+poller is most likely to be stuck, and `Serial.printf` would `malloc` for a line this long.
+
+The threshold is `max(active interval x 6, 5 min)`, plus 2 min of extra grace until the first cycle
+of a boot has completed (`firmware/src/app/poller_liveness.h`, covered by `pio test -e native -f
+test_liveness`). It is a multiple of the **active** interval, not a constant, because
+`device.poll_seconds` is user-settable from 5 to 600 s (§6.1) and the failure backoff stretches the
+interval to 300 s (§4.7) - a fixed "no poll for two minutes" would reboot a device that was merely
+configured to poll slowly, or one backing off from a SEPTA outage. The 5-minute floor is what keeps
+a *short* interval from becoming a hair trigger: one cycle's own worst case is bounded by
+`http_fetch.cpp` rather than by the interval (three attempts per URL, each with an absolute
+deadline of 2x the 15 s fetch timeout, plus retry backoff - about 93 s for a single trickling URL),
+and the poller additionally runs one queued proxy or stats job between cycles. The floor clears all
+of that, so a genuinely slow network produces a late cycle, never a reboot. Detection latency at
+the default cadence is therefore five minutes, deliberately.
+
+Four things are exempted, each of which would otherwise be a device that reboots itself for no
+reason. **A firmware upload:** `web_server.cpp`'s `otaBusy()` is checked first, and the net also
+stands down for a full window *after* an upload ends, so a stall timer earned during an OTA cannot
+fire the moment the upload finishes or is aborted - a reboot mid-write leaves a half-written
+partition. **Setup and AP mode:** the net is armed by `startNetPoller()`, the last thing `setup()`
+does, so it is off for the whole unprovisioned / captive-portal path - during which `loop()` is not
+running anyway, because `connectWifiOrPortal()` does not return until Wi-Fi is up. **Boot:** the
+extra grace covers `pollerTask`'s 45 s NTP wait plus the first cycle. **A slow or absent network:**
+this one needs no exemption at all, and that is the point of stamping on *any* outcome - a failed
+fetch is still a completed cycle, so a device with no internet keeps the stamp moving and only its
+backoff changes. Verified in the code rather than assumed: `pollOnce()` publishes a snapshot with
+per-stop errors and returns a deadline on every path, including the out-of-memory one. There is
+therefore no boot loop available to a device whose router is down, and even a genuine repeated
+stall is bounded to roughly one restart per seven minutes by boot time plus the grace window.
+
+The reason is visible rather than inferred. There was no restart reporting in this firmware at all
+before this change, so `GET /api/state` gained `last_restart {esp, reason, detail, uptime_s}` (§7):
+`esp` is `esp_reset_reason()`, and `reason`/`detail` come from a 20-byte note in RTC memory, which
+survives `ESP.restart()` but not a power cycle - the right lifetime for "the last boot rebooted
+itself, here is why" - written immediately before the restart and cleared the first time it is
+read, so it is reported for exactly one boot and a later unrelated reset cannot inherit a stale
+one. Both self-heal paths write it (`poll_stall`, `heap_wedge`), and the numbers that caused the
+reboot go over serial first. `last_poll.since_s` exposes the live observable the same way.
+
+Residual risk, stated rather than hidden: if `loopTask` itself stops, nothing checks the poller -
+but a board whose display loop has stopped is dead to the user anyway, and that is the failure the
+LVGL assert handler and the `bad_alloc` guard above already address.
 
 ## 13. Milestones
 

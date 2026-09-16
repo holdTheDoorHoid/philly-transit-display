@@ -60,6 +60,53 @@ transit::Snapshot getSnapshot();
 // Returns a copy of the latest poll diagnostics, safe to call from any task.
 PollStatus getPollStatus();
 
+// ---------------------------------------------------------------------------------------------
+// Liveness: has the poller completed a cycle lately? (DESIGN.md SS12.1)
+//
+// The heap-wedge self-heal in pollerTask() counts *failed* cycles, which means it can only ever
+// see a poller that is still going round. A poller that STOPS - blocked inside pollOnce(), in
+// HTTPClient or under it in lwIP - never reaches that check, and the task watchdog does not cover
+// it either (CONFIG_ESP_TASK_WDT_PANIC watches IDLE0, and a task blocked on a semaphore or a
+// bounded socket read yields, so IDLE0 runs and nothing panics). So the poller is stamped here at
+// the end of EVERY cycle whatever the outcome, and something on another task - main.cpp's display
+// loop - watches the stamp go stale. A stuck poller cannot check itself.
+//
+// Lock-free on purpose: three aligned 32-bit/bool values written only by the poller task and read
+// by anyone. No mutex, because the reader is the display loop and it must never wait on the
+// poller's lock (DESIGN.md SS5), and because a torn read - a fresh stamp next to the previous
+// cycle's interval - is harmless: both fields only ever shift the verdict by one interval.
+struct PollerLiveness {
+  bool armed = false;              // startNetPoller() has run. False through setup and the Wi-Fi
+                                   // captive portal, when polling is deliberately not happening.
+  bool before_first_cycle = true;  // no cycle has finished yet, so the boot grace applies
+  uint32_t since_ms = 0;           // millis() since the last COMPLETED cycle, any outcome
+  uint32_t interval_ms = 30000;    // the interval that cycle picked for the next one (backoff included)
+};
+PollerLiveness getPollerLiveness();
+
+// Why the previous boot restarted itself, if it did. Both writers are in net_poller.cpp's own
+// reboot paths, which is why this lives here.
+enum class SelfHeal : uint8_t {
+  None = 0,
+  HeapWedge = 1,  // pollerTask's consecutive-failed-polls + tiny-largest-block reboot
+  PollStall = 2,  // main.cpp's liveness net: no cycle completed for pollerStallTimeoutMs()
+};
+
+struct RestartNote {
+  SelfHeal reason = SelfHeal::None;
+  uint32_t uptime_s = 0;  // how long that boot had been up
+  uint32_t a = 0;         // HeapWedge: consecutive failed polls. PollStall: seconds of silence.
+  uint32_t b = 0;         // HeapWedge: largest free block, bytes. PollStall: active interval, s.
+};
+
+// What the PREVIOUS boot recorded before restarting itself. Kept in RTC memory, which survives
+// ESP.restart() but not a power cycle, and cleared the first time it is read so it is reported for
+// exactly one boot. GET /api/state surfaces it (DESIGN.md SS7).
+RestartNote getRestartNote();
+
+// Records why THIS boot is about to restart itself. Call immediately before ESP.restart().
+void noteSelfHealRestart(SelfHeal reason, uint32_t a, uint32_t b);
+
 // When the service-alert feeds were last fetched (DESIGN.md SS4.7: 5 min cadence, only with
 // config.alerts), for the device page's "Data sources" card. fetched=false until the first fetch
 // and again after alerts are switched off. Lock-free: one aligned 32-bit millis() stamp.
