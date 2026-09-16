@@ -198,7 +198,13 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err);
 // copy without racing main's or each other's access. A PUT /api/config
 // that validates and saves successfully calls setActiveConfig() again with
 // the new value.
+// getActiveConfig() answers an empty Config when it could not read one - which is what it has
+// always done on a timeout, and is NOT distinguishable from a genuinely empty config. Any caller
+// that ACTS on the answer (renaming mDNS, setting the timezone) must use tryGetActiveConfig() and
+// do nothing at all on a false return, rather than act on the default. On the LVGL display task the
+// read never waits (ui_lock.h), so a false return there is ordinary and means "try next tick".
 Config getActiveConfig();
+bool tryGetActiveConfig(Config *out);
 void setActiveConfig(const Config &cfg);
 
 }  // namespace transit_app

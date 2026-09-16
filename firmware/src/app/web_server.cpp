@@ -535,10 +535,17 @@ void handleGetState(AsyncWebServerRequest *request) {
   // Kept behind a compile flag for screen work without live SEPTA data/hardware (DESIGN.md SS3);
   // default off - see firmware/README.md.
   Snapshot snap = buildDemoSnapshot((transit::Epoch)time(nullptr));
-#else
-  Snapshot snap = getSnapshot();
-#endif
   serializeSnapshot(snap, cfg, doc.as<JsonObject>());
+#else
+  // snapshotPtr(), not getSnapshot(): this handler only READS the Snapshot, and borrowing the
+  // poller's own costs neither a copy of every arrival in it nor a contiguous block to put that copy
+  // in. On a device whose largest free block sits at 5 KB between polls that difference is the
+  // difference between answering and answering 503 (DESIGN.md SS12.1), and it is also a whole
+  // Snapshot less peak heap when four of these arrive at once.
+  std::shared_ptr<const Snapshot> snap = snapshotPtr();
+  static const Snapshot kNoSnapshot;
+  serializeSnapshot(snap ? *snap : kNoSnapshot, cfg, doc.as<JsonObject>());
+#endif
 
   sendJsonStreamed(request, doc);
 }
@@ -1281,6 +1288,12 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["lv_frag_pct"] = d.lv_frag_pct;
     doc["lv_page_refusals"] = d.page_refusals;
     doc["lv_tight"] = d.pool_tight;  // the page that is up left under ~3 KB: it works, but only just
+    // DESIGN.md SS5/SS12.1: reads the display task made on another task's state that found the lock
+    // busy and redrew last frame's value. The display task never waits for a lock, so this is what
+    // that costs. It should creep, not climb.
+    doc["lock_misses"] = d.lock_misses;
+    doc["tick_ms"] = d.tick_ms;
+    doc["tick_ms_max"] = d.tick_ms_max;
     JsonObject costs = doc["lv_page_cost"].to<JsonObject>();
     costs["main"] = d.page_cost[0];
     costs["night"] = d.page_cost[1];

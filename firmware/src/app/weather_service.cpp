@@ -7,7 +7,10 @@
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <utility>
 #include <vector>
+
+#include "ui_lock.h"
 
 namespace transit_app {
 
@@ -73,10 +76,17 @@ SemaphoreHandle_t mutex() {
   return g_mutex;
 }
 
+// The wait goes through takeShared() (ui_lock.h), so it is 500 ms for the poller and the web task
+// and ZERO for the LVGL display task, which must never block on this lock: five of this file's
+// accessors are called from a screen refresh, all five used to wait 500 ms here, and a sibling
+// accessor waiting 500 ms on the bike lock is what panicked the board on 2026-09-16 (DESIGN.md
+// SS12.1). Every reader below pairs a miss with the value it last handed the display task.
+constexpr uint32_t kWeatherLockWaitMs = 500;
+
 struct Lock {
-  explicit Lock(uint32_t ms = 500) : held(xSemaphoreTake(mutex(), pdMS_TO_TICKS(ms)) == pdTRUE) {}
+  explicit Lock(uint32_t ms = kWeatherLockWaitMs) : held(takeShared(mutex(), ms)) {}
   ~Lock() {
-    if (held) xSemaphoreGive(mutex());
+    if (held) giveShared(mutex());
   }
   bool held;
 };
@@ -206,45 +216,90 @@ void refreshWeather(const Config &cfg, const transit::HttpGet &http) {
     fetchLocation(loc, cfg.weather.fahrenheit, http);
   }
 
-  Lock lock;
-  if (!lock.held) return;
-  g_enabled = true;
-  g_fahrenheit = cfg.weather.fahrenheit;
-  g_per_stop = cfg.weather.per_stop;
-  g_locations = std::move(locs);
-  g_stops = std::move(stops);
-  // MAIN location only (F29). This used to be bumped whenever ANY location fetched successfully
-  // while location 0 merely had `ok` still true from some earlier poll - so a second stop's
-  // forecast refreshing made the header's hours-old temperature report as seconds old, which is
-  // the one thing the timestamp exists to prevent.
-  g_fetched_epoch = g_locations.empty() ? 0 : g_locations[0].fetched_epoch;
+  // swap, not move-assign: a move-assign still runs the OLD vectors' destructors - freeing a
+  // Forecast per location and a string per stop - inside the critical section. After the swap the
+  // outgoing vectors live in `locs`/`stops` and are destroyed when this function returns, with the
+  // lock released. Same reasoning as publishSnapshot() in net_poller.cpp; what is under the lock is
+  // now only pointer-sized.
+  {
+    Lock lock;
+    if (!lock.held) return;
+    g_enabled = true;
+    g_fahrenheit = cfg.weather.fahrenheit;
+    g_per_stop = cfg.weather.per_stop;
+    g_locations.swap(locs);
+    g_stops.swap(stops);
+    // MAIN location only (F29). This used to be bumped whenever ANY location fetched successfully
+    // while location 0 merely had `ok` still true from some earlier poll - so a second stop's
+    // forecast refreshing made the header's hours-old temperature report as seconds old, which is
+    // the one thing the timestamp exists to prevent.
+    g_fetched_epoch = g_locations.empty() ? 0 : g_locations[0].fetched_epoch;
+  }
 }
 
 WeatherView getWeather() {
+  // Each of the four readers below keeps its own last-good for the display task (ui_lock.h). They
+  // are separate rather than one shared struct because they are called independently - the device
+  // page asks for the view, the arrivals header for the icon and the temperature - and a reader
+  // should only ever fall back on its own answer, never on a sibling's.
+  static LastGood<WeatherView> ui_last;
+  const bool ui = onDisplayTask();
   WeatherView v;
-  Lock lock;
-  if (!lock.held) return v;
-  v.enabled = g_enabled;
-  v.fahrenheit = g_fahrenheit;
-  v.fetched_epoch = g_fetched_epoch;
-  if (!g_locations.empty()) {
-    v.age_s = locationAgeS(g_locations[0]);
-    v.stale = v.age_s >= 0 && (uint32_t)v.age_s > kWeatherStaleAfterS;
-    // The forecast is handed over even when stale so the web UI can show it next to its own age
-    // and decide; only the DEVICE's header and notes go silent, because there is no room on a
-    // 480x320 panel to caption a number with how old it is (DESIGN.md SS8).
-    if (g_locations[0].ok) v.main = g_locations[0].forecast;
+  {
+    Lock lock;
+    if (!lock.held) {
+      if (ui) {
+        ui_last.miss();
+        return ui_last.value();
+      }
+      return v;
+    }
+    v.enabled = g_enabled;
+    v.fahrenheit = g_fahrenheit;
+    v.fetched_epoch = g_fetched_epoch;
+    if (!g_locations.empty()) {
+      v.age_s = locationAgeS(g_locations[0]);
+      v.stale = v.age_s >= 0 && (uint32_t)v.age_s > kWeatherStaleAfterS;
+      // The forecast is handed over even when stale so the web UI can show it next to its own age
+      // and decide; only the DEVICE's header and notes go silent, because there is no room on a
+      // 480x320 panel to caption a number with how old it is (DESIGN.md SS8).
+      if (g_locations[0].ok) v.main = g_locations[0].forecast;
+    }
+  }  // lock released before the copy below, which allocates
+  if (ui) {
+    ui_last.slot() = v;
+    ui_last.hit();
   }
   return v;
 }
 
 std::string headerWeatherText() {
-  Lock lock;
-  if (!lock.held || !g_enabled || g_locations.empty() || !locationFresh(g_locations[0])) return "";
-  const weather::Forecast &f = g_locations[0].forecast;
-  char buf[48];
-  snprintf(buf, sizeof(buf), "%d\xC2\xB0 %s", (int)lround(f.temp), weather::codeText(f.code));
-  return buf;
+  static LastGood<std::string> ui_last;
+  const bool ui = onDisplayTask();
+  std::string out;
+  {
+    Lock lock;
+    if (!lock.held) {
+      if (ui) {
+        ui_last.miss();
+        return ui_last.value();
+      }
+      return out;
+    }
+    if (g_enabled && !g_locations.empty() && locationFresh(g_locations[0])) {
+      const weather::Forecast &f = g_locations[0].forecast;
+      char buf[48];
+      snprintf(buf, sizeof(buf), "%d\xC2\xB0 %s", (int)lround(f.temp), weather::codeText(f.code));
+      out = buf;
+    }
+    // An empty string here is an ANSWER - no forecast, or a stale one (F29) - so it is recorded as
+    // the last good value like any other. Only a refused lock falls back.
+  }
+  if (ui) {
+    ui_last.slot() = out;
+    ui_last.hit();
+  }
+  return out;
 }
 
 static WeatherIcon iconForCode(int code, bool night) {
@@ -261,50 +316,115 @@ static WeatherIcon iconForCode(int code, bool night) {
 }
 
 WeatherIcon headerWeatherIcon() {
-  Lock lock;
-  if (!lock.held || !g_enabled || g_locations.empty() || !locationFresh(g_locations[0])) return WeatherIcon::None;
-  time_t now = time(nullptr);
-  struct tm lt;
-  localtime_r(&now, &lt);
-  bool night = lt.tm_hour < 6 || lt.tm_hour >= 20;
-  return iconForCode(g_locations[0].forecast.code, night);
+  static LastGood<WeatherIcon> ui_last;
+  const bool ui = onDisplayTask();
+  WeatherIcon out = WeatherIcon::None;
+  {
+    Lock lock;
+    if (!lock.held) {
+      if (ui) {
+        ui_last.miss();
+        return ui_last.value();
+      }
+      return out;
+    }
+    if (g_enabled && !g_locations.empty() && locationFresh(g_locations[0])) {
+      time_t now = time(nullptr);
+      struct tm lt;
+      localtime_r(&now, &lt);
+      bool night = lt.tm_hour < 6 || lt.tm_hour >= 20;
+      out = iconForCode(g_locations[0].forecast.code, night);
+    }
+  }
+  if (ui) {
+    ui_last.slot() = out;
+    ui_last.hit();
+  }
+  return out;
 }
 
 std::string headerWeatherTemp() {
-  Lock lock;
-  if (!lock.held || !g_enabled || g_locations.empty() || !locationFresh(g_locations[0])) return "";
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%d\xC2\xB0", (int)lround(g_locations[0].forecast.temp));
-  return buf;
+  static LastGood<std::string> ui_last;
+  const bool ui = onDisplayTask();
+  std::string out;
+  {
+    Lock lock;
+    if (!lock.held) {
+      if (ui) {
+        ui_last.miss();
+        return ui_last.value();
+      }
+      return out;
+    }
+    if (g_enabled && !g_locations.empty() && locationFresh(g_locations[0])) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d\xC2\xB0", (int)lround(g_locations[0].forecast.temp));
+      out = buf;
+    }
+  }
+  if (ui) {
+    ui_last.slot() = out;
+    ui_last.hit();
+  }
+  return out;
 }
 
 std::string stopWeatherNote(const std::string &stop_key, int64_t first_arrival_epoch) {
-  Lock lock;
-  if (!lock.held || !g_enabled || !g_per_stop || first_arrival_epoch <= 0) return "";
-  // The note is judged AGAINST the header's conditions, so a stale main forecast makes the whole
-  // comparison meaningless, not just the header (F29).
-  if (g_locations.empty() || !locationFresh(g_locations[0])) return "";
-  int idx = 0;
-  for (const StopLocation &s : g_stops) {
-    if (s.key == stop_key) {
-      idx = s.location >= 0 ? s.location : 0;
+  // Keyed by stop, unlike the header readers: the note is per panel, and falling back on another
+  // stop's note would be worse than falling back on nothing. Bounded by kMaxStops (config_store.h,
+  // DESIGN.md SS6), and only ever touched from the display task.
+  static std::vector<std::pair<std::string, std::string>> ui_last;
+  const bool ui = onDisplayTask();
+  std::string out;
+  {
+    Lock lock;
+    if (!lock.held) {
+      if (ui) {
+        for (const auto &e : ui_last) {
+          if (e.first == stop_key) return e.second;
+        }
+      }
+      return out;
+    }
+    do {
+      if (!g_enabled || !g_per_stop || first_arrival_epoch <= 0) break;
+      // The note is judged AGAINST the header's conditions, so a stale main forecast makes the
+      // whole comparison meaningless, not just the header (F29).
+      if (g_locations.empty() || !locationFresh(g_locations[0])) break;
+      int idx = 0;
+      for (const StopLocation &s : g_stops) {
+        if (s.key == stop_key) {
+          idx = s.location >= 0 ? s.location : 0;
+          break;
+        }
+      }
+      if ((size_t)idx >= g_locations.size() || !locationFresh(g_locations[(size_t)idx])) idx = 0;
+      const weather::Hour *h = g_locations[(size_t)idx].forecast.at(first_arrival_epoch);
+      if (h == nullptr) break;
+      if (!weather::notable(*h, g_locations[0].forecast.code)) break;
+
+      char buf[64];
+      if (weather::isWet(weather::kindForCode(h->code))) {
+        snprintf(buf, sizeof(buf), "%s at %s, %d\xC2\xB0", weather::codeText(h->code), clockText(first_arrival_epoch).c_str(), (int)lround(h->temp));
+      } else if (h->precip_prob >= 40) {
+        snprintf(buf, sizeof(buf), "rain likely (%d%%) at %s", h->precip_prob, clockText(first_arrival_epoch).c_str());
+      } else {
+        snprintf(buf, sizeof(buf), "%s at %s, %d\xC2\xB0", weather::codeText(h->code), clockText(first_arrival_epoch).c_str(), (int)lround(h->temp));
+      }
+      out = buf;
+    } while (false);
+  }
+  if (ui) {
+    bool stored = false;
+    for (auto &e : ui_last) {
+      if (e.first != stop_key) continue;
+      e.second = out;
+      stored = true;
       break;
     }
+    if (!stored && ui_last.size() < kMaxStops) ui_last.emplace_back(stop_key, out);
   }
-  if ((size_t)idx >= g_locations.size() || !locationFresh(g_locations[(size_t)idx])) idx = 0;
-  const weather::Hour *h = g_locations[(size_t)idx].forecast.at(first_arrival_epoch);
-  if (h == nullptr) return "";
-  if (!weather::notable(*h, g_locations[0].forecast.code)) return "";
-
-  char buf[64];
-  if (weather::isWet(weather::kindForCode(h->code))) {
-    snprintf(buf, sizeof(buf), "%s at %s, %d\xC2\xB0", weather::codeText(h->code), clockText(first_arrival_epoch).c_str(), (int)lround(h->temp));
-  } else if (h->precip_prob >= 40) {
-    snprintf(buf, sizeof(buf), "rain likely (%d%%) at %s", h->precip_prob, clockText(first_arrival_epoch).c_str());
-  } else {
-    snprintf(buf, sizeof(buf), "%s at %s, %d\xC2\xB0", weather::codeText(h->code), clockText(first_arrival_epoch).c_str(), (int)lround(h->temp));
-  }
-  return buf;
+  return out;
 }
 
 }  // namespace transit_app

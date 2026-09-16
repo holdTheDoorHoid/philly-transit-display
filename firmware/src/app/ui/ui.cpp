@@ -7,11 +7,13 @@
 
 #include <algorithm>
 #include <ctime>
+#include <memory>
 
 #include "../demo_data.h"
 #include "../due_alert.h"
 #include "../net_poller.h"
 #include "../profiles.h"
+#include "../ui_lock.h"
 #include "../weather_service.h"
 #include "daypart_core/daypart.h"
 #include "device_info_screen.h"
@@ -28,13 +30,25 @@ enum class Page { Main, Stats, DeviceInfo };  // Main is either the arrivals pag
 
 // DESIGN.md SS3: the demo Snapshot is kept for screen work with no Wi-Fi/SEPTA reachable
 // (-DDEMO_DATA, off by default - see web_server.cpp's GET /api/state, which gates the same way).
-transit::Snapshot currentSnapshot() {
+//
+// A POINTER, not a copy (2026-09-16). This ran once a second and copied the whole live Snapshot -
+// every arrival, every string - out from under the poller's mutex, which is both the allocation
+// that aborted the board on 2026-09-15 (main.cpp loop()) and, with the lock held for its whole
+// duration, a large part of why anyone waiting on that lock waited long enough to matter. The
+// poller now publishes an immutable shared_ptr and this borrows it: no copy, no allocation, and
+// the time under the lock is one refcount bump.
+std::shared_ptr<const transit::Snapshot> currentSnapshot() {
 #ifdef DEMO_DATA
-  return buildDemoSnapshot((transit::Epoch)time(nullptr));
+  return std::make_shared<const transit::Snapshot>(buildDemoSnapshot((transit::Epoch)time(nullptr)));
 #else
-  return getSnapshot();
+  return snapshotPtr();
 #endif
 }
+
+// What the screens render before the first poll has published anything, or if the display task has
+// never once got the lock. A file-scope const with empty vectors: no heap, and every screen already
+// renders an empty Snapshot as "no arrivals" rather than as a fault.
+const transit::Snapshot kNoSnapshot;
 
 // The four pages, of which exactly one is ever built (see the pool note above buildSlot()).
 lv_obj_t *g_main_screen = nullptr;
@@ -72,6 +86,7 @@ volatile bool g_tap_requested = false;
 // event, is a crash either way.
 volatile int g_pending_page = -1;
 uint32_t g_page_refusals = 0;  // builds the pool could not take (GET /api/debug/ui)
+uint32_t g_tick_ms_max = 0;    // worst tick() duration since boot (GET /api/debug/ui)
 bool g_pool_tight = false;     // the page that is up left under kPageRuntimeHeadroom free
 bool g_stalled = false;        // parked on the message screen; only a tap or a config change retries
 UiDebug g_debug;  // written at the end of tick() under g_pending_mutex, read by the web task
@@ -328,7 +343,9 @@ bool showCurrentPage(const transit::Snapshot &snap) {
 // deletes the screen that event belongs to, which is a use-after-free. onScreenTapped() defers it
 // through lv_async_call() and the web hook leaves it to tick(); both run after the event unwound.
 void loadPage(Page target) {
-  transit::Snapshot snap = currentSnapshot();
+  // The pointer is kept in a local so the Snapshot outlives every use of `snap` below.
+  std::shared_ptr<const transit::Snapshot> snap_ptr = currentSnapshot();
+  const transit::Snapshot &snap = snap_ptr ? *snap_ptr : kNoSnapshot;
   parkAndDropPages();
   hidePoolMessage();
   g_page = target;
@@ -387,7 +404,10 @@ void rebuildScreens() {
   applyParkingStyle();
   refreshShownKeys();
   g_page = Page::Main;
-  if (!showCurrentPage(currentSnapshot())) showPoolMessage();
+  {
+    std::shared_ptr<const transit::Snapshot> p = currentSnapshot();
+    if (!showCurrentPage(p ? *p : kNoSnapshot)) showPoolMessage();
+  }
 }
 
 void onScreenPressed(lv_event_t *e) {
@@ -448,7 +468,10 @@ void init(const Config &cfg) {
   buildParkingScreen();
   refreshShownKeys();
   g_page = Page::Main;
-  if (!showCurrentPage(currentSnapshot())) showPoolMessage();
+  {
+    std::shared_ptr<const transit::Snapshot> p = currentSnapshot();
+    if (!showCurrentPage(p ? *p : kNoSnapshot)) showPoolMessage();
+  }
   g_initialized = true;
 }
 
@@ -570,16 +593,25 @@ void tick() {
   if (!g_initialized) {
     return;
   }
+  // How long this whole refresh took, and the worst since boot (GET /api/debug/ui). The central
+  // policy in ui_lock.h is what KEEPS the display task from blocking; this is what would make it
+  // obvious if something ever slipped past it. A tick is tens of milliseconds - a page build is the
+  // expensive one - so a reading in the hundreds means this task waited for something, and the only
+  // things it can wait for are the locks it is not allowed to wait for. Two 32-bit words and a
+  // subtraction.
+  const uint32_t tick_start_ms = millis();
   // Apply a configuration handed over by the web server task (rotation, brightness, stops).
   bool apply = false;
   Config next;
-  if (g_pending && g_pending_mutex && xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+  // takeShared(): zero wait on this task, 50 ms anywhere else (ui_lock.h). A miss just means the
+  // new config is applied on the next tick, a second later - g_pending stays set.
+  if (g_pending && takeShared(g_pending_mutex, 50)) {
     if (g_pending) {
       next = g_pending_cfg;
       g_pending = false;
       apply = true;
     }
-    xSemaphoreGive(g_pending_mutex);
+    giveShared(g_pending_mutex);
   }
   if (apply) {
     bool rotate = next.device.rotation != g_cfg.device.rotation;
@@ -609,7 +641,11 @@ void tick() {
   applyPendingPage();
 
   bool dimmed = applyQuietHours();
-  transit::Snapshot snap = currentSnapshot();
+  // The pointer is held for the whole tick so the Snapshot cannot be freed under the screens while
+  // they read it; the poller may publish a new one meanwhile, and this frame simply finishes with
+  // the one it started on.
+  std::shared_ptr<const transit::Snapshot> snap_ptr = currentSnapshot();
+  const transit::Snapshot &snap = snap_ptr ? *snap_ptr : kNoSnapshot;
   g_due_active = dueAlertTick(g_cfg, snap, g_shown_keys, dimmed, (transit::Epoch)time(nullptr));
 
   // Parked on the message screen: a build was refused and nothing has changed since. Retrying it
@@ -669,13 +705,19 @@ void tick() {
   d.lv_frag_pct = m.frag_pct;
   d.page_refusals = g_page_refusals;
   d.pool_tight = g_pool_tight;
+  d.lock_misses = uiLockMisses();
+  d.tick_ms = millis() - tick_start_ms;
+  if (d.tick_ms > g_tick_ms_max) g_tick_ms_max = d.tick_ms;
+  d.tick_ms_max = g_tick_ms_max;
   for (int i = 0; i < kSlotCount; i++) d.page_cost[i] = g_page_cost[i];
   lv_display_t *disp = lv_display_get_default();
   d.hor_res = lv_display_get_horizontal_resolution(disp);
   d.ver_res = lv_display_get_vertical_resolution(disp);
-  if (g_pending_mutex && xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+  // Same policy: a miss leaves GET /api/debug/ui reading the previous tick's snapshot of the UI,
+  // which is a 1 Hz sample of a 1 Hz value.
+  if (takeShared(g_pending_mutex, 20)) {
     g_debug = d;
-    xSemaphoreGive(g_pending_mutex);
+    giveShared(g_pending_mutex);
   }
 }
 

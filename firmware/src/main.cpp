@@ -27,6 +27,7 @@
 #include "app/sd_logger.h"
 #include "app/status_led.h"
 #include "app/ui/ui.h"
+#include "app/ui_lock.h"
 #include "app/web_server.h"
 #include "app/wifi_portal.h"
 
@@ -62,7 +63,14 @@ std::string g_applied_tz;
 // new name while the device was still answering on the old one, and a timezone change left the
 // clock, the quiet-hours window and the profile windows an hour out until someone power-cycled.
 void applyNetworkSettings() {
-  Config cfg = transit_app::getActiveConfig();
+  // tryGetActiveConfig(), not getActiveConfig(): this runs on the display task, where the read does
+  // not wait (app/ui_lock.h), and an empty Config on a miss would rename mDNS to "" and set an empty
+  // timezone. On a miss the flag stays raised and loop() tries again on its next pass.
+  Config cfg;
+  if (!transit_app::tryGetActiveConfig(&cfg)) {
+    g_apply_network_settings = true;
+    return;
+  }
   if (cfg.device.name != g_applied_name) {
     MDNS.end();
     if (MDNS.begin(cfg.device.name.c_str())) {
@@ -280,6 +288,10 @@ void setup() {
   transit_app::ui::applyBrightness(cfg.device.brightness);
   heapStage("ui");
   transit_app::ui::logMemory();
+  // From here on this task is THE display task, and every shared accessor it calls stops waiting on
+  // other tasks' locks (app/ui_lock.h, DESIGN.md SS5). Deliberately the last thing before the poller
+  // exists: everything above ran with nothing to contend with, and wanted its answers.
+  transit_app::noteDisplayTask();
   transit_app::startNetPoller(cfg.device.poll_seconds);
   heapStage("poller");
 

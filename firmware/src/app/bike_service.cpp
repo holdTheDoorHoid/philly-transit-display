@@ -5,12 +5,21 @@
 #include <freertos/semphr.h>
 
 #include <ctime>
+#include <new>
+#include <utility>
+
+#include "ui_lock.h"
 
 namespace transit_app {
 
 namespace {
 
 constexpr uint32_t kRefreshMs = 5 * 60 * 1000;
+// What a NON-display task waits for the view. The display task's wait is zero, decided by
+// takeShared() (ui_lock.h): getBikes() at 500 ms, called from refreshMainScreen() on every tick the
+// arrivals page is up, is the accessor that panicked the board on 2026-09-16 in
+// vTaskPriorityDisinheritAfterTimeout (DESIGN.md SS12.1).
+constexpr uint32_t kBikeLockWaitMs = 500;
 
 SemaphoreHandle_t g_mutex = nullptr;
 BikeView g_view;
@@ -31,8 +40,11 @@ void invalidateBikes() {
 
 void refreshBikes(const Config &cfg, const transit::HttpGet &http) {
   if (!cfg.bike.enabled || cfg.bike.stations.empty()) {
-    if (xSemaphoreTake(mutex(), pdMS_TO_TICKS(500)) == pdTRUE) {
-      g_view = BikeView{};
+    BikeView empty;  // swapped out and destroyed below, with the lock released
+    if (xSemaphoreTake(mutex(), pdMS_TO_TICKS(kBikeLockWaitMs)) == pdTRUE) {
+      g_view.stations.swap(empty.stations);
+      g_view.enabled = false;
+      g_view.fetched_epoch = 0;
       xSemaphoreGive(mutex());
     }
     return;
@@ -67,22 +79,43 @@ void refreshBikes(const Config &cfg, const transit::HttpGet &http) {
   Serial.printf("[bike] HTTP %d, %u features scanned, %u of %u stations found\n", status, (unsigned)stream.featuresSeen(),
                 (unsigned)stream.stations().size(), (unsigned)ids.size());
   g_fetched_ms = millis();  // even on failure: the feed is 400 KB, don't retry every 30 s
-  if (xSemaphoreTake(mutex(), pdMS_TO_TICKS(500)) == pdTRUE) {
+  // The 400 KB feed was scanned and `next` was built with NOTHING held - that was already true, and
+  // it is the shape the rest of this pass copies. What is under the lock is a swap: even a
+  // move-assign would run the outgoing stations' destructors inside the critical section, and the
+  // reader that waits on this lock is the one that must never wait (DESIGN.md SS5).
+  if (xSemaphoreTake(mutex(), pdMS_TO_TICKS(kBikeLockWaitMs)) == pdTRUE) {
     if (any) {
       next.fetched_epoch = (uint32_t)time(nullptr);
-      g_view = std::move(next);
+      std::swap(g_view, next);
     } else if (!g_view.enabled) {
-      g_view = std::move(next);  // first fetch failed: show the names with unknown counts
+      std::swap(g_view, next);  // first fetch failed: show the names with unknown counts
     }
     xSemaphoreGive(mutex());
   }
+  // `next` now holds the outgoing view and is destroyed here, outside the lock.
 }
 
 BikeView getBikes() {
+  static LastGood<BikeView> ui_last;  // display task only (ui_lock.h)
+  const bool ui = onDisplayTask();
   BikeView v;
-  if (xSemaphoreTake(mutex(), pdMS_TO_TICKS(500)) == pdTRUE) {
-    v = g_view;
-    xSemaphoreGive(mutex());
+  if (!takeShared(mutex(), kBikeLockWaitMs)) {
+    if (ui) {
+      ui_last.miss();
+      return ui_last.value();  // last frame's counts, not an empty strip that hides the panel
+    }
+    return v;
+  }
+  try {
+    v = g_view;  // copies a string per station: small, but it allocates, so it can throw
+  } catch (const std::bad_alloc &) {
+    giveShared(mutex());
+    throw;  // loop()'s guard in main.cpp skips the frame; guarded() answers 503 on the web task
+  }
+  giveShared(mutex());
+  if (ui) {
+    ui_last.slot() = v;
+    ui_last.hit();
   }
   return v;
 }
