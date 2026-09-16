@@ -18,7 +18,11 @@ is unset. It also exercises the hardening itself: 401 without a PIN, the 429 loc
 recovery, the 421 `Host` check, an OTA with no file, and an OTA image built for a different board.
 On firmware that has it, `POST /api/debug/oom` (DESIGN.md §12.1) is run too: the heap is exhausted
 on purpose and the resulting `std::bad_alloc` must be caught instead of rebooting the device; older
-builds that answer 404 get a `SKIP` line.
+builds that answer 404 get a `SKIP` line. Section H checks the HTTPS transport policy (DESIGN.md
+§2.1) on a firmware built with `-DTRANSIT_HTTPS`: the `transport` block of `/api/state` is well
+formed, `https_preferred` keeps the arrivals flowing whatever the heap gate decides, `http` freezes
+the TLS counters, `https` never fetches over plain HTTP, a bogus value is rejected, and the owner's
+setting is restored; a firmware without the block prints one `SKIP H` line and moves on.
 
 It is not part of `pio test` (it needs the hardware and about 15 minutes). PlatformIO ignores this
 directory because it has no `test_main`. 2026-09-14: 119/122 with the three remaining items being
