@@ -190,8 +190,28 @@ while time.time() < deadline:
     time.sleep(3)
 check('A0 back after reboot', bcode == 200 and bd and bd.get('uptime', 999) < 90, (bcode, bd and bd.get('uptime')))
 print('== cold boot: uptime', (bd or {}).get('uptime'), 'heap', (bd or {}).get('heap'), flush=True)
-# That /api/state does not throw, so it leaves the AsyncTCP task's exception state exactly as the
-# firmware left it: warmed by web_server.cpp's middleware on this first request (with the fix), or
+# Wait for a poll to have JUST finished before firing, so the whole poll interval sits between the
+# starvation and the next fetch. /api/debug/oom takes the entire heap away for the length of the
+# request, and during the first poll after a boot the schedule, weather and bike fetches are all in
+# flight - where two C subsystems assert instead of failing soft when malloc returns NULL: newlib's
+# dtoa ("REENT malloc succeeded", reached from the snprintf("%f") in refreshWeather) and lwIP's
+# tcp_receive. Both panic the board, neither is a C++ exception, and both are SS12.1's "uncatchable
+# by design" class - nothing to do with what this section proves. Measured 2026-09-16 on
+# cyd-3248S035R: firing as soon as the device answered panicked it 2 times out of 2, firing right
+# after a poll completed was clean 3 times out of 3.
+poll_ready = False
+for _ in range(45):
+    _c, _d = get_json('/api/state')
+    _lp = (_d or {}).get('last_poll') or {}
+    if _lp.get('ok') and isinstance(_lp.get('age_s'), int) and _lp['age_s'] <= 3:
+        print('== poll just finished (age_s=%s); firing the proof now' % _lp['age_s'], flush=True)
+        poll_ready = True
+        break
+    time.sleep(2)
+if not poll_ready:
+    print('== no quiet window found after 90 s; firing anyway', flush=True)
+# None of those /api/state calls throws, so they leave the AsyncTCP task's exception state exactly
+# as the firmware left it: warmed by web_server.cpp's middleware on this first request (with the fix), or
 # still unallocated (without it, where the next line reboots the board instead of answering).
 # 'largest' under ~100 B at the throw proves the exception object came from the pool and not from a
 # hole another task opened meanwhile. A 404 is a firmware from before the endpoint.

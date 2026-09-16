@@ -1488,7 +1488,18 @@ streamed filler serialises through a `Print&` and `saveConfig()`'s two sinks now
 three share one instantiation and the streamed path costs about 0.8 KB of flash instead of 4.5.
 What remains uncatchable, by design: C code that gets NULL from `malloc` and does not check it (no
 throw, so no pool helps), a catch block that itself allocates with nothing left (building the 503
-response object; it rethrows out of the handler), and the pool being finite. The convergence that
+response object; it rethrows out of the handler), and the pool being finite. Two instances of the
+first are no longer hypothetical - both seen on 2026-09-16 while `/api/debug/oom` held the heap and
+the poller was mid-fetch, and both `assert`-and-panic rather than failing soft: newlib's `_dtoa_r`
+(`assert failed: dtoa.c:239 (REENT malloc succeeded)`, reached from the `snprintf("%f")` in
+`refreshWeather`, on the poller task) and lwIP's `tcp_receive` (`tcp_in.c:1450`, on `tcpip_thread`).
+Neither is a C++ exception and no pool or catch block can reach either; the only defence is not to
+exhaust the heap while a fetch is in flight. That is a real constraint on the *test hook*, not on
+normal operation - nothing else takes the whole heap on purpose - so the device suite fires
+`/api/debug/oom` only in the quiet window just after a poll completes (section A0). Firing it as
+soon as a freshly booted device answered, with the first schedule/weather/bike fetches still in
+flight, panicked the board 2 times out of 2; firing it right after a poll finished was clean 3
+times out of 3. The convergence that
 used to reboot the device - an invalid-stop configuration whose failed fetches depress the heap,
 rapid repeated configuration saves (each parses a 16 KB body and rebuilds the screen), and
 simultaneous `/api/state` reads - now ends in caught `bad_alloc`s (503s, a failed poll, a skipped
