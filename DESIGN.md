@@ -913,8 +913,9 @@ the Stops page loads Leaflet from a CDN (§10).
 | `POST /api/ota` | multipart `firmware` field; reboots on success. One at a time. No file → 400 `no firmware file`; too little heap or a fragmented one → 503 naming which check failed; an image built for a different board → 400 `firmware is for a different board (expected <board>)`; larger than the OTA slot → 413. Answers 200 only after the final chunk arrived *and* `Update.end()` succeeded |
 | `POST /api/reboot`, `POST /api/wifi/reset` | Maintenance |
 | `POST /api/pin` | Body `{"pin":"new"}`, authenticated with the **current** PIN in `X-Pin`. New PIN: 4–32 printable ASCII, no whitespace. → `{"ok":true}`, or 400 with the rule that was broken. No reset-by-network path: recovery is the serial console or the device info screen (§12) |
-| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, LVGL pool use, resolution, heap |
+| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB |
 | `POST /api/debug/tap` | Test hook (PIN-protected: it changes what the screen shows): simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
+| `POST /api/debug/page` | Test hook (PIN-protected, same reason): go straight to `main` \| `night` \| `stats` \| `device`, named in `?page=`, a `page=` form field or the raw body. Performs exactly the transition a tap does, queued for the LVGL task like `/api/debug/tap` — nothing builds an `lv_obj` on the web server task. It exists because LVGL pool exhaustion cannot be reproduced in the simulator's 512 KB pool (§8) and measuring it wants thirty cycles, not thirty taps |
 | `POST /api/debug/oom` | Test hook (PIN-protected: it starves every other task for under a millisecond): exhausts the heap on purpose, forces a `std::bad_alloc`, frees everything and answers `{"caught":true,"blocks":N,"largest":B,"free_before":X,"free_after":Y}` - the deterministic proof of the emergency exception pool (§12.1). `largest` under ~100 means the exception object could only have come from the pool; without the pool the request reboots the device |
 
 Arrival object in `/api/state`:
@@ -1001,9 +1002,43 @@ Main screen (portrait by default; every size derives from the runtime resolution
 - Tap anywhere cycles Main → Stats → Device info → Main. The three pages are built from the same
   pieces (`ui_common.cpp`: the header strip, the padded column of panels, the stop-style panel,
   the route badge, the fonts and palette) so they match by construction rather than by copying
-  numbers around. The stats and device pages are built when tapped to and freed when tapped away
-  from: LVGL's 36 KB pool holds the arrivals page (~20 KB with two stops) plus the night page,
-  and keeping all four resident left no room for a four-stop configuration.
+  numbers around.
+- **Exactly one page is resident at a time.** Every transition parks on a permanent empty screen,
+  deletes the page it is leaving, and only then builds the next one; the night page replaces the
+  arrivals page rather than sitting beside it. This is a correctness rule, not an optimisation.
+  LVGL draws every widget from a fixed 36 KB static pool (`LV_MEM_SIZE`, `.bss`, nothing to do with
+  the ESP heap) and **LVGL 9.5 cannot survive `lv_malloc()` returning NULL mid-build** -
+  `lv_obj_class.c` stores each new child straight after an unchecked `lv_realloc()`, so an
+  exhausted pool is a wild pointer, and the `LV_ASSERT_MALLOC` sites that do check it reach
+  `LV_ASSERT_HANDLER`. Either way the display reboots, on a tap, in the owner's living room. The
+  only defence is never to start a build that cannot fit.
+  Measured on `cyd-3248S035R` 2026-09-16 (`GET /api/debug/ui`, bytes of pool per page):
+
+  | stops | arrivals | night | stats | device | one page | all four at once |
+  |---|---:|---:|---:|---:|---:|---:|
+  | 2 (the owner's) | 19,280 | ~1,740 | 8,220 | 10,336 | 19,280 | 39,706 |
+  | 4 | 31,656 | ~2,260 | 12,860 | 10,288 | 31,656 | 57,404 |
+
+  The pool is 36,864 B, so the "all four" column is what the old switch (build the next page, then
+  drop the previous one) asked for and could not have: on the owner's own two stops, the second
+  tap — Stats → Device info — needed 10,336 B from a pool with 4,392 B left. One page at a time
+  fits every configuration the panel guard allows, with 17.6 KB spare at two stops and 2.5 KB at
+  four.
+- Two guards sit under that rule. A page is **refused** if the pool no longer holds what that page
+  cost the last time it was built (creep: a leak, or a page that grew), and a refused page returns
+  to the arrivals page — never to the page the tap came from, so a tap can never strand the display
+  somewhere secondary. And `createMainScreen()` **stops adding stop panels while the pool still has
+  room**, showing `2 more stops will not fit in this display's memory` instead: the arrivals page is
+  the first thing built at boot, before anything has measured it, so a stop list bigger than the
+  board can draw would otherwise be a boot loop with the offending config still on disk. A stop
+  panel costs ~6.2 KB on a 320-wide board and ~4.4 KB on a 240-tall one, which puts the ceiling at
+  four stops and six respectively — under §6's maximum of eight.
+- Pool exhaustion has its own simulator environment, because the normal one cannot show it:
+  `pio run -e ui-sim` builds with a 512 KB pool for 64-bit host pointers. `ui-sim-pool` scales
+  `LV_MEM_SIZE` to the board's by the measured host/board ratio (0.66, fitted against six figures
+  from the owner's board and accurate to ~1.5 %), and `program <dir> pool` sweeps 2–8 stops across
+  all four panel sizes. It reproduces the four-stop arrivals page at 31,664 B against 31,656 B
+  measured. `POST /api/debug/page` (§7) drives the cycle on real hardware.
 - Stats page: header `Statistics  last 30 days` with `tap for device info` on the right (hidden
   at 240 wide); one stop-style panel per configured stop, titled with the route badge and the
   main page's title for that stop. Per stop, last 30 days (§9.2): the **on-time %** in the big

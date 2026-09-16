@@ -1065,6 +1065,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["lv_total"] = d.lv_total;
     doc["lv_frag_pct"] = d.lv_frag_pct;
     doc["lv_page_refusals"] = d.page_refusals;
+    doc["lv_tight"] = d.pool_tight;  // the page that is up left under ~3 KB: it works, but only just
     JsonObject costs = doc["lv_page_cost"].to<JsonObject>();
     costs["main"] = d.page_cost[0];
     costs["night"] = d.page_cost[1];
