@@ -447,9 +447,13 @@ function buildState(query) {
       ? { ok: false, age_s: 420, error: 'SEPTA request timed out', since_s: 12 + (now % 20) }
       : { ok: true, age_s: 5 + (now % 20), error: '', since_s: 5 + (now % 20) },
     // Why the previous boot ended (DESIGN.md §7/§12.1). ?restart=stall shows what the device says
-    // after the poller-liveness net has fired; the default is a plain power-on with nothing to say.
+    // after the poller-liveness net has fired and ?restart=lvgl after the LVGL pool ran out (the
+    // one that repeats on every boot until the stop list changes); the default is a plain power-on
+    // with nothing to say.
     last_restart: query.get('restart') === 'stall'
-      ? { esp: 3, reason: 'poll_stall', detail: 'no poll cycle completed for 318 s (interval 30 s)', uptime_s: 412 }
+      ? { esp: 3, reason: 'poll_stall', detail: 'nothing for 318 s (interval 30 s)', uptime_s: 412 }
+      : query.get('restart') === 'lvgl'
+      ? { esp: 3, reason: 'lvgl_pool', detail: 'LVGL pool exhausted: 312 B free, 36552 B high-water', uptime_s: 9 }
       : { esp: 1, reason: '', detail: '', uptime_s: 0 },
     firmware_version: '0.1.0-mock',
     // Fields the web UI reads for the PIN flow and the Settings page's device facts.

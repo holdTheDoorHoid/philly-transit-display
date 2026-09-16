@@ -31,6 +31,7 @@
 #include "transit_stats/tracker.h"
 #include "weather_service.h"
 #include "bike_service.h"
+#include "web_server.h"  // otaBusy(): the wedge counter stands down during a firmware upload
 
 using transit::Alert;
 using transit::Mode;
@@ -168,7 +169,7 @@ void captureRestartNote() {
   done = true;
   if (g_rtc_note.magic == kNoteMagic) {
     uint32_t r = g_rtc_note.reason;
-    g_prev_note.reason = r <= (uint32_t)SelfHeal::PollStall ? (SelfHeal)r : SelfHeal::None;
+    g_prev_note.reason = r <= (uint32_t)kSelfHealMax ? (SelfHeal)r : SelfHeal::None;
     g_prev_note.uptime_s = g_rtc_note.uptime_s;
     g_prev_note.a = g_rtc_note.a;
     g_prev_note.b = g_rtc_note.b;
@@ -1134,6 +1135,7 @@ void pollerTask(void * /*arg*/) {
     // still going round", which is the thing the wedge counter below cannot say: that counter only
     // advances on cycles that COMPLETE AND REPORT FAILURE, so a poller that stops completing cycles
     // at all freezes it at whatever it was. Nothing here can throw or block.
+    //
     // g_progress_ms is reset with it, so the two are equal between cycles and notePollerProgress()
     // only ever moves it forward from here. The net judges the later of the two: a cycle can
     // legitimately take minutes on a blackholing network, so "a cycle completed" cannot be the only
@@ -1142,9 +1144,20 @@ void pollerTask(void * /*arg*/) {
     g_progress_ms = g_cycle_end_ms;
     g_before_first_cycle = false;
 
-    // Wedge detection (see above): a failed poll while the largest free block is critically small.
-    // getPollStatus() reflects what pollOnce() just published.
-    if (!getPollStatus().ok && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < kWedgeLargestBlock) {
+    // HAZARD: a firmware upload, exactly as in main.cpp's liveness net. An OTA takes the heap for
+    // the length of a ~1.7 MB write, which is precisely the condition this counter looks for, and
+    // `wedged_polls` carries across an upload, so a device already near the threshold could restart
+    // itself mid-Update.write(). That is not a brick - the boot partition only switches at
+    // Update.end(true), so a half-written inactive slot is inert and the device comes back on the
+    // image it already had - but it throws away the owner's upload at the worst moment and looks
+    // like a crash. Stand down while one is running, and forget the count rather than resume it:
+    // whatever the heap was doing before the upload is not evidence about what it is doing after.
+    //
+    // Wedge detection otherwise (see above): a failed poll while the largest free block is
+    // critically small. getPollStatus() reflects what pollOnce() just published.
+    if (otaBusy()) {
+      wedged_polls = 0;
+    } else if (!getPollStatus().ok && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < kWedgeLargestBlock) {
       if (++wedged_polls >= kWedgePollsBeforeReboot) {
         size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
         Serial.printf("[net_poller] heap wedged: %u consecutive failed polls with largest block < %u B (free %u); rebooting to recover\n",

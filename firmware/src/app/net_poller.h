@@ -106,14 +106,19 @@ PollerLiveness getPollerLiveness();
 enum class SelfHeal : uint8_t {
   None = 0,
   HeapWedge = 1,  // pollerTask's consecutive-failed-polls + tiny-largest-block reboot
-  PollStall = 2,  // main.cpp's liveness net: no cycle completed for pollerStallTimeoutMs()
+  PollStall = 2,  // main.cpp's liveness net: the poller did nothing for pollerStallTimeoutMs()
+  LvglPool = 3,   // ui/lv_assert_hook.cpp: LVGL's pool ran out and there is no safe way to continue
 };
+// captureRestartNote() validates the stored value against this; keep it equal to the last entry.
+constexpr SelfHeal kSelfHealMax = SelfHeal::LvglPool;
 
 struct RestartNote {
   SelfHeal reason = SelfHeal::None;
   uint32_t uptime_s = 0;  // how long that boot had been up
   uint32_t a = 0;         // HeapWedge: consecutive failed polls. PollStall: seconds of silence.
+                          // LvglPool: LVGL pool bytes free when the assert fired.
   uint32_t b = 0;         // HeapWedge: largest free block, bytes. PollStall: active interval, s.
+                          // LvglPool: the pool's high-water mark, bytes.
 };
 
 // What the PREVIOUS boot recorded before restarting itself. Kept in RTC memory, which survives

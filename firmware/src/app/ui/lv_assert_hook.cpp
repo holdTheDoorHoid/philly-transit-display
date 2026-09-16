@@ -15,9 +15,19 @@
 //
 // So: say precisely what ran out, flush it, and stop. A reboot returns the device to the arrivals
 // page with its config intact, which is the best outcome available once LVGL's pool is gone.
+//
+// And NAME it on the way out. Until 2026-09-16 this path called esp_restart() without a restart
+// note, so a pool exhaustion was indistinguishable in /api/state.last_restart from a deliberate
+// reboot or an OTA - the owner saw ESP_RST_SW and nothing else. That matters most for exactly the
+// failure this handler catches: an arrivals page whose config does not fit reproduces the same
+// crash on every boot, so what the owner has is a boot loop, and the note is the only thing that
+// says which loop it is. The two figures recorded are the pool's free size and its high-water
+// mark, which together say whether it was exhausted or merely fragmented.
 #include <Arduino.h>
 #include <esp_system.h>
 #include <lvgl.h>
+
+#include "../net_poller.h"  // noteSelfHealRestart(): RTC-backed, allocation-free, cannot throw
 
 extern "C" void transitLvglAssertFailed(void) {
   // The caller's address, not its name: LV_ASSERT_HANDLER expands at ~400 sites inside LVGL and
@@ -30,6 +40,7 @@ extern "C" void transitLvglAssertFailed(void) {
                 pc, (unsigned)m.total_size, (unsigned)m.free_size,
                 (unsigned)m.used_pct, (unsigned)m.frag_pct, (unsigned)m.max_used);
   Serial.println("[lvmem] out of LVGL pool with no safe way to continue - restarting (DESIGN.md SS8)");
+  transit_app::noteSelfHealRestart(transit_app::SelfHeal::LvglPool, (uint32_t)m.free_size, (uint32_t)m.max_used);
   Serial.flush();
   delay(50);  // the UART FIFO drains at 115200 before the reset takes the chip
   esp_restart();

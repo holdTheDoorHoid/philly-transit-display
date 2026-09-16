@@ -489,6 +489,9 @@ void handleGetState(AsyncWebServerRequest *request) {
     } else if (note.reason == SelfHeal::HeapWedge) {
       reason = "heap_wedge";
       snprintf(detail, sizeof(detail), "%u failed polls, largest free block %u B", (unsigned)note.a, (unsigned)note.b);
+    } else if (note.reason == SelfHeal::LvglPool) {
+      reason = "lvgl_pool";
+      snprintf(detail, sizeof(detail), "LVGL pool exhausted: %u B free, %u B high-water", (unsigned)note.a, (unsigned)note.b);
     }
     lr["reason"] = reason;
     lr["detail"] = detail;
