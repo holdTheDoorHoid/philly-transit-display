@@ -107,6 +107,36 @@ PIN on this browser" button, puts you back to the first-save prompt.
 \* `node:zlib` is only used by `build.mjs`; the mock server itself doesn't gzip
 anything (see above).
 
+### Fault injection
+
+DESIGN.md §12.1: `GET /api/state` and `GET /api/config` refuse with a `503` when the
+device is short on heap mid-poll, and `/api/state` can additionally come back as a
+genuine empty `200` (a send-buffer artifact, not an application error). The mock can
+reproduce both — plus a slow response and a dropped connection — on a chosen fraction of
+requests, off by default, so the web UI's retry/backoff/never-blank behavior (see
+DESIGN.md §12.1 and the web changelog) can be exercised without hardware:
+
+```
+MOCK_FAULT_RATE=0.4 node web/mock-server.mjs      # env vars, fixed for the process
+MOCK_FAULT_MODES=503,empty node web/mock-server.mjs   # default: 503,empty,slow,reset
+
+curl http://localhost:8080/__test__/faults                                # read it live
+curl -X POST http://localhost:8080/__test__/faults \
+  -d '{"rate":0.4,"modes":["503","empty","slow","reset"]}'                # change it live,
+                                                    # no restart -- so a page that's
+                                                    # already loaded and polling can be
+                                                    # driven through "busy" and back to
+                                                    # "recovered" in the same session
+
+curl 'http://localhost:8080/api/state?fault=503'    # force just this one request
+```
+
+`paths` (default `/api/state,/api/config`) and `slowMs` (default `6000`) are settable
+the same two ways. `modes`: `503` (the documented refusal), `empty` (the documented
+empty `200`), `slow` (delays `slowMs` then answers normally — under the web UI's 8 s
+client-side timeout it just looks slow; over it, it looks like a hung connection), and
+`reset`/`network` (destroys the socket, like a device that dropped off Wi-Fi mid-request).
+
 ## Rebuilding `firmware/src/generated/web_assets.h`
 
 ```
@@ -133,13 +163,13 @@ DESIGN.md §10 caps the four assets at **60 KB gzipped total**. Current sizes
 
 | Asset | On disk | Embedded | Gzip |
 |---|---:|---:|---:|
-| `index.html` | 848 B | 886 B | 455 B |
-| `app.js` | ~137 KB | ~122 KB | ~32.3 KB |
-| `app.css` | ~14.8 KB | ~13.2 KB | ~3.3 KB |
+| `index.html` | 912 B | 950 B | 476 B |
+| `app.js` | ~160 KB | ~136 KB | ~36.6 KB |
+| `app.css` | ~18.7 KB | ~15.9 KB | ~3.9 KB |
 | `favicon.svg` | 410 B | 410 B | 202 B |
-| **Total** | **~153 KB** | **~137 KB** | **~36.2 KB** |
+| **Total** | **~179 KB** | **~153 KB** | **~41.1 KB** |
 
-That leaves roughly 22 KB of headroom under the budget. `build.mjs` prints a warning
+That leaves roughly 18 KB of headroom under the budget. `build.mjs` prints a warning
 (without failing) if the total ever exceeds 60,000 bytes gzip.
 
 **"Embedded" is smaller than "on disk" because `build.mjs` strips whole-line comments

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Web page: it used to go completely blank if you opened it (or it was already open and
+  quietly refreshing in the background) at the moment the display was too busy to answer -
+  something that happens on purpose several times a minute, by design (see the HTTPS/memory
+  note below), and isn't a sign anything is wrong. Now the page always keeps showing whatever
+  it last knew, quietly tries again a few times over the next several seconds, and shows a
+  small "the display is busy right now, retrying..." note at the top instead of going blank or
+  showing a scary red error. The very first time you open the page, if the display happens to
+  be busy right then, you get a calm "Connecting to the display..." message instead of nothing.
+  On the Settings page specifically: anything you've typed is never thrown away by this, and if
+  Save happens to land at a busy moment you're told to just press it again rather than the
+  change silently vanishing.
 - HTTPS to the data sources (SEPTA, Open-Meteo, Indego), measured on the owner's board and kept
   as a prototype. A firmware built with `-DTRANSIT_HTTPS` (the `cyd-*-https` envs) asks for a
   verified, encrypted connection on every fetch, with each source pinned to its one root

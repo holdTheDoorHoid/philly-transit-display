@@ -199,6 +199,7 @@ button.linklike:hover { border-color: transparent; }
   top: 0;
   z-index: 1100;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--gap);
   padding: .6rem .8rem;
@@ -206,6 +207,19 @@ button.linklike:hover { border-color: transparent; }
   border-bottom: 1px solid var(--border);
 }
 #topbar h1 { flex: 0 0 auto; white-space: nowrap; }
+
+/* Always in the layout (never inserted/removed) so it never shifts anything below the
+   topbar when it appears or disappears — only its own visibility changes. Amber, not
+   red: a refused request that's about to retry itself is normal, not an alarm. */
+#conn-status {
+  flex: 1 1 100%;
+  font-size: .78rem;
+  line-height: 1.2em;
+  min-height: 1.2em;
+  color: var(--warn);
+  visibility: hidden;
+}
+#conn-status.show { visibility: visible; }
 
 #mainnav {
   display: flex;
