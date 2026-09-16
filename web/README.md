@@ -28,7 +28,8 @@ DESIGN.md §7 using Node built-ins only (`node:http`, `node:fs`, `node:path`,
   row each, plus a Regional Rail (30th Street, northbound) panel from
   `arrivals_30th.json`. Add `?stale=1` to simulate a failed poll (amber "stale" banner
   in the Now view), `?recovered=1` to set `config_recovered` (the Settings page's
-  "restored its previous settings" notice). One alert (from `alerts_bus_17.json`) is
+  "restored its previous settings" notice), `?restart=stall` to make `last_restart` say the
+  poller-liveness net fired on the previous boot (`DESIGN.md` §12.1). One alert (from `alerts_bus_17.json`) is
   included with its HTML advisory text stripped to plain text. Also carries
   `auth: { pin_required: true }`, `board: "cyd-3248S035R"` and `config_recovered`.
   Each stop carries `health` (`live` | `schedule_only` | `stale` | `unavailable`) and
