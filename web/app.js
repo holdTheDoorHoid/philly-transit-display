@@ -2340,7 +2340,7 @@ function buildPinBlock(state) {
       ? h('p', { class: 'small muted' }, 'This device is not asking for a PIN at the moment.') : null,
     field(h('label', { for: 'pin-new' }, 'New PIN'), newInput,
       hint('4 to 32 characters, no spaces. Write it down somewhere — the device also shows it '
-        + 'on its own screen if you tap the top of the display.')),
+        + 'on its own Device page (tap the screen twice to get there).')),
     field(h('label', { for: 'pin-confirm' }, 'Confirm new PIN'), confirmInput,
       h('div', { class: 'row', style: 'margin-top:.6rem' }, saveBtn), msg),
     group(field(h('h3', {}, 'This browser'), forgetState,

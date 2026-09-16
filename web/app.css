@@ -551,6 +551,12 @@ footer.hint { text-align: center; color: var(--text-muted); font-size: .8rem; pa
   .save-bar .long { display: none; }
 }
 
+/* Phone widths: shrink the brand and the tab padding so all four tabs fit without the nav
+   having to scroll ("Settings" was clipped at 375 px). */
+@media (max-width: 480px) {
+  #topbar h1 { font-size: 1rem; }
+  #mainnav a { padding: .4rem .45rem; font-size: .85rem; }
+}
 @media (max-width: 359px) {
   #topbar h1 { display: none; }
   .arrival-row { gap: .35rem; }
