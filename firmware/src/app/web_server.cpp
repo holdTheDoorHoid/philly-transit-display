@@ -769,30 +769,44 @@ void handleOtaUpload(AsyncWebServerRequest *request, const String &filename, siz
     // than spelled out, so a future re-derivation cannot leave the message lying.
     //
     // Every refusal ends with the way out, because a refusal that does not is how a device gets
-    // stranded. Measured on a board running 3707f54 on 2026-09-16: its largest block rests at
-    // 11,764 B, under the 16 KB the old gate demanded - not a dip during a poll but its steady
-    // state - so five attempts over ten minutes were all refused, and the web UI offered no path
-    // forward. A reboot lifted it to 23,540 B and the same upload went straight through. Whether a
-    // shipped v0.2.0 device does the same is NOT known: 3707f54 already carries 7e25f95's zero-copy
-    // sendJsonStreamed, which removed the body-sized contiguous allocation from the two heavy
-    // endpoints, and v0.2.0 predates it, so its resting fragmentation is simply unmeasured and must
-    // not be inferred from this. The thresholds below are low
-    // enough that this should not recur, but "should not" is not "cannot": a long-lived device can
-    // always fragment past them, and at that point the only lever the owner has is a restart. It is
-    // not taken automatically - this is a display on someone's wall and a failed upload is not a
-    // reason to blank it - so the message says it and the owner decides.
+    // stranded - and the old 16 KB block threshold stranded real builds, both measured 2026-09-16
+    // on the owner's two-stop config:
+    //
+    //   3707f54          resting largest block 11,764 B   5 attempts over 10 min, all refused
+    //   released v0.2.0  resting largest block 16,372 B   3 attempts, all refused
+    //
+    // Neither is a dip during a poll; both are the steady state. v0.2.0 is the more unsettling of
+    // the two because it misses the old 16,384 B threshold by **twelve bytes** - 0.07% - which is
+    // not a build that sits comfortably under the line but one that happens to land on the wrong
+    // side of it. Do not read that as "v0.2.0 devices are lockable" in general: a different stop
+    // list or feed selection moves resting fragmentation either way, and over-widening a measured
+    // result to a whole population is the same mistake this comment already had to correct once.
+    //
+    // The thresholds below are low enough that neither build would be refused now, but "would not"
+    // is not "cannot": a long-lived device can always fragment past any floor, and at that point
+    // the only lever the owner has is a restart. It is not taken automatically - this is a display
+    // on someone's wall and a failed upload is not a reason to blank it - so the message says it
+    // and the owner decides. The message says "within the first minute" because the escape window
+    // is build-dependent and can be short: 3707f54 reboots to 23,540 B and stays there, but v0.2.0
+    // returns to its resting 16,372 B about 45 s after boot (an upload at uptime 13 s returned 200).
     const std::string kRetryHint = "; restart the device (Settings, or POST /api/reboot) and upload"
-                                   " again straight away - a freshly booted heap is unfragmented";
+                                   " again within the first minute - a freshly booted heap is"
+                                   " unfragmented and does not stay that way";
+    // Bytes, not rounded kilobytes. The old message said "largest free block 15 KB is below 16 KB"
+    // on a v0.2.0 device that was actually 16,372 B against 16,384 - twelve bytes short. Integer
+    // division turned a knife edge into what read like a comfortable kilobyte, and anyone debugging
+    // it would go hunting for what was eating 1 KB. A number a human is expected to act on gets
+    // reported exactly (found by desktop-c8's v0.2.0 measurement, 2026-09-16).
     size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     if (free8 < kMinOtaFree8) {
-      otaFail(503, "refusing OTA: 8-bit free heap " + std::to_string(free8 / 1024) + " KB is below " +
-                     std::to_string(kMinOtaFree8 / 1024) + " KB" + kRetryHint);
+      otaFail(503, "refusing OTA: 8-bit free heap " + std::to_string(free8) + " B is below " +
+                     std::to_string(kMinOtaFree8) + " B" + kRetryHint);
       return;
     }
     if (largest < kMinOtaLargestBlock) {
-      otaFail(503, "refusing OTA: largest 8-bit free block " + std::to_string(largest / 1024) + " KB is below " +
-                     std::to_string(kMinOtaLargestBlock / 1024) + " KB" + kRetryHint);
+      otaFail(503, "refusing OTA: largest 8-bit free block " + std::to_string(largest) + " B is below " +
+                     std::to_string(kMinOtaLargestBlock) + " B" + kRetryHint);
       return;
     }
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {

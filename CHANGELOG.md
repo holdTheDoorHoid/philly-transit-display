@@ -24,6 +24,20 @@
     really be used. Expect this to read about 33 KB lower than before; nothing got worse, the old
     number was just counting memory that was never available. Anything reading the device's data
     feed sees the original figure unchanged, with the honest one added alongside it.
+  - **If an update is ever refused, the message now tells you what to do about it** - restart the
+    display and upload again within the first minute - and reports exact byte counts instead of
+    rounding to the nearest kilobyte. The rounding mattered: a v0.2.0 device that was twelve bytes
+    short of the old limit reported itself as "15 KB below 16 KB", which reads like something is
+    using up a whole kilobyte rather than like a coin toss.
+
+  **If you are running the released v0.2.0 on another device, read this.** On the owner's stop
+  configuration, v0.2.0 settles twelve bytes below the old update limit and then refuses every
+  update over the web, indefinitely. Restarting it clears the way, but only for about 45 seconds
+  before it settles back, so the upload has to follow the restart immediately. Updating over the
+  USB cable always works and is the reliable escape. Devices updated to this release are not
+  affected - the new limit has real room in it rather than twelve bytes. Whether any particular
+  v0.2.0 device hits this depends on its stops and which feeds it has switched on; it was measured
+  on one configuration, not predicted for all of them.
 - HTTPS to the data sources (SEPTA, Open-Meteo, Indego), measured on the owner's board and kept
   as a prototype. A firmware built with `-DTRANSIT_HTTPS` (the `cyd-*-https` envs) asks for a
   verified, encrypted connection on every fetch, with each source pinned to its one root

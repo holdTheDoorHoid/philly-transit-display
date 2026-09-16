@@ -314,16 +314,36 @@ live with four arrivals each throughout, the panel stayed on the main page, and 
 written at any point.
 
 There is one failure mode this does **not** repair, and it is worth stating so the fix is not read
-as more than it is. A board running 3707f54 was found with a resting largest block of 11,764 B -
-its steady state, not a dip - which is below the old 16 KB requirement, so OTA was refused
-permanently and the web UI offered no way forward; five attempts over ten minutes all failed and a
-reboot lifted it to 23,540 B, after which the same upload succeeded instantly. The new 6 KB
-threshold admits that board, but a sufficiently long-lived device can always fragment past any
-floor. So every OTA refusal now names the way out (restart, then upload again straight away) rather
-than being a dead end. The restart is not taken automatically: this is a display on someone's wall,
-and a failed upload is not a reason to blank it. Whether a *shipped* v0.2.0 device fragments this
-way is unmeasured and must not be inferred from the 3707f54 result - 3707f54 already carries
-7e25f95's zero-copy `sendJsonStreamed`, and v0.2.0 predates it.
+as more than it is. Two builds were found unable to take an OTA *at rest* - not a dip during a
+poll, their steady state - both measured on the owner's two-stop config on 2026-09-16:
+
+| Build | Resting largest block | Against the old 16,384 B gate | Attempts |
+|---|---:|---|---|
+| `3707f54` | 11,764 B | 4,620 B short | 5 over 10 min, all refused |
+| released **v0.2.0** | 16,372 B | **12 B short** | 3, all refused |
+
+The v0.2.0 row is the alarming one. It misses by twelve bytes - 0.07% - which is not a build that
+sits safely under the threshold but one that happens to land on the wrong side of it. That cuts
+both ways and neither direction should be over-read: it is not evidence that shipped devices are
+generally lockable (a different stop list or feed selection moves resting fragmentation either way),
+and it is not evidence that they are safe. It is one configuration, measured.
+
+The new 6 KB threshold admits both boards with real headroom, because it comes from the single
+4,096 B buffer the update path allocates rather than from a round number. But a sufficiently
+long-lived device can always fragment past any floor, so every OTA refusal now names the way out
+instead of being a dead end. The restart is not taken automatically: this is a display on someone's
+wall, and a failed upload is not a reason to blank it.
+
+The escape window is build-dependent and can be short, which is why the message says "within the
+first minute" rather than just "reboot": `3707f54` reboots to 23,540 B and stays there, so the retry
+can happen at leisure, but v0.2.0 returns to its resting 16,372 B about 45 s after boot once the
+poller runs. An upload at uptime 13 s returned 200. USB flashing always works and is the answer for
+anyone already stranded.
+
+One reporting lesson from the same measurement, applied to these messages: the old refusal read
+"largest free block 15 KB is below 16 KB" on the device that was twelve bytes short. Integer
+division turned a knife edge into what sounds like a comfortable kilobyte, and sent the reader
+hunting for what was eating 1 KB. **Any number a human is expected to act on is reported in bytes.**
 
 Nor does any of this address a heap that is decaying toward zero. If `free8` runs down far enough,
 lwIP asserts on `MEMP_SYS_TIMEOUT` exhaustion before the poller's own failure counting reaches its
