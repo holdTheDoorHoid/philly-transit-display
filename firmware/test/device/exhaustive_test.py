@@ -126,7 +126,7 @@ s0 = state(); uptime0 = s0.get('uptime', 0); heap0 = s0.get('heap', 0)
 print('== start: uptime', uptime0, 'heap', heap0, 'stops', [x['key'] for x in backup['stops']])
 
 # ---------- A. endpoints ----------
-code, body = get('/api/state'); check('A state 200 json', code == 200 and body.startswith(b'{'))
+code, sd_ = get_json('/api/state'); check('A state 200 json', code == 200 and isinstance(sd_, dict) and 'time' in sd_, (code, list(sd_ or {})[:5]))
 code, d = get_json('/api/config'); check('A config has all sections', code == 200 and all(k in d for k in ('device', 'stops', 'alerts', 'weather', 'due', 'profiles', 'bike')), d and list(d.keys()))
 code, d = get_json('/api/debug/ui'); check('A debug/ui', code == 200 and d.get('page') in ('main', 'night', 'stats', 'device'), d)
 code, d = get_json('/api/stats?stop=%s&days=30' % backup['stops'][0]['key']); check('A stats', code == 200 and isinstance(d, dict), (code, str(d)[:80]))
@@ -377,8 +377,8 @@ if soonest_k0_min() >= 17:
     check('D night page when nothing is due within after_min (real stop)', reached or not still_due_gap, (soonest_k0_min(), reached, ui().get('page')))
     if reached:
         check('D tap from night goes to stats', post('/api/debug/tap') == 200 and wait_for(lambda: ui().get('page') == 'stats', 10, 1), ui().get('page'))
-        check('D tap to device page', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'device'))
-        check('D tap back to night', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'night'))
+        check('D tap to device page', post('/api/debug/tap') == 200 and wait_for(lambda: ui().get('page') == 'device', 10, 1), ui().get('page'))
+        check('D tap back to night', post('/api/debug/tap') == 200 and wait_for(lambda: ui().get('page') == 'night', 10, 1), ui().get('page'))
     cfg['device']['night']['enabled'] = False; put_cfg(cfg); time.sleep(3)
     check('D night disabled -> main page', ui().get('page') == 'main', ui())
 else:
