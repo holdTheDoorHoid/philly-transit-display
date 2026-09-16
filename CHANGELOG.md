@@ -33,8 +33,13 @@
   of rebooting the device (this used to be the one uncatchable case, DESIGN.md 12.1). Done by
   supplying the pool-size hook from the firmware itself - no SDK rebuild. `POST /api/debug/oom`
   (PIN) proves it on the device: it drains the heap, forces the failure, and reports
-  `caught:true`. `/api/state` and `/api/config` are streamed straight into the network buffers
-  instead of being built as a second copy first, lowering the peak memory of the busiest request.
+  `caught:true`. One gap in that turned up the same day and is fixed too: the very first
+  out-of-memory error on each background task needed a scrap of memory of its own, which is not
+  there by definition at that moment, so on a freshly booted device the first failure still
+  rebooted it. Each task now claims that scrap at startup while memory is plentiful, and the
+  on-device check runs right after a reboot so it actually tests the first-failure case.
+  `/api/state` and `/api/config` are streamed straight into the network buffers instead of being
+  built as a second copy first, lowering the peak memory of the busiest request.
 - Screen: the Wi-Fi signal in the top strip is four bars filled in solid, like a phone's status
   bar, instead of a symbol with a number beside it. The same bars appear on the device page.
 - Screen: the statistics page now looks like part of the arrivals page - the same top strip, one

@@ -166,14 +166,35 @@ s0 = state(); uptime0 = s0.get('uptime', 0); heap0 = s0.get('heap', 0)
 print('== start: uptime', uptime0, 'heap', heap0, 'stops', [x['key'] for x in backup['stops']])
 
 # ---------- A. endpoints ----------
-code, sd_ = get_json('/api/state'); check('A state 200 json', code == 200 and isinstance(sd_, dict) and 'time' in sd_, (code, list(sd_ or {})[:5]))
-code, d = get_json('/api/config'); check('A config has all sections', code == 200 and all(k in d for k in ('device', 'stops', 'alerts', 'weather', 'due', 'profiles', 'bike')), d and list(d.keys()))
-code, d = get_json('/api/debug/ui'); check('A debug/ui', code == 200 and d.get('page') in ('main', 'night', 'stats', 'device'), d)
-# DESIGN.md SS12.1: the C++ emergency exception pool. POST /api/debug/oom exhausts the heap on the
-# device, forces a std::bad_alloc with nothing left for the exception object, frees everything and
-# reports whether the catch ran; without the pool that request reboots the device (the Z serial
-# check would then also count the rst line). 'largest' under ~100 B at the throw proves the
-# exception object could only have come from the pool. A 404 is a firmware from before the endpoint.
+# A0. DESIGN.md SS12.1 - the C++ exception machinery, proved on a COLD device, before anything else
+# in the suite has made it throw.
+#
+# Both halves of SS12.1 are one-shot, which is what makes the ORDER here part of the test:
+#   * the emergency pool supplies the exception OBJECT once the heap is gone, and
+#   * a task's FIRST throw additionally allocates its per-task __cxa_eh_globals with a plain malloc
+#     inside __cxa_throw and calls std::terminate if that fails - which the pool does NOT cover.
+# Any earlier request that provoked a caught bad_alloc on the AsyncTCP task pays that second cost
+# while the heap is still healthy, after which /api/debug/oom answers caught:true whether the
+# first-throw path was ever fixed or not. That is exactly how the gap survived to 2026-09-16: the
+# full suite passed, while a trimmed run that hit this endpoint first thing on a fresh boot aborted
+# the device (__cxa_get_globals <- __cxa_throw <- operator new[] <- handleDebugOom, on
+# _async_service_task). So: reboot, then make this the first request that throws.
+print('== A0: rebooting so the exception-pool proof runs on a cold device', flush=True)
+check('A0 reboot for a cold exception state', post('/api/reboot') == 200)
+time.sleep(6)
+deadline = time.time() + 90
+bcode, bd = 0, None
+while time.time() < deadline:
+    bcode, bd = get_json('/api/state')
+    if bcode == 200 and bd: break
+    time.sleep(3)
+check('A0 back after reboot', bcode == 200 and bd and bd.get('uptime', 999) < 90, (bcode, bd and bd.get('uptime')))
+print('== cold boot: uptime', (bd or {}).get('uptime'), 'heap', (bd or {}).get('heap'), flush=True)
+# That /api/state does not throw, so it leaves the AsyncTCP task's exception state exactly as the
+# firmware left it: warmed by web_server.cpp's middleware on this first request (with the fix), or
+# still unallocated (without it, where the next line reboots the board instead of answering).
+# 'largest' under ~100 B at the throw proves the exception object came from the pool and not from a
+# hole another task opened meanwhile. A 404 is a firmware from before the endpoint.
 r = curl(PINH + ['-w', '\n%{http_code}', '-X', 'POST', B + '/api/debug/oom'], 30)
 obody, _, ocode = r.stdout.rpartition(b'\n')
 if ocode == b'404':
@@ -181,9 +202,29 @@ if ocode == b'404':
 else:
     try: oj = json.loads(obody)
     except Exception: oj = {}
-    check('A debug/oom bad_alloc caught with the heap exhausted', ocode == b'200' and oj.get('caught') is True, (ocode, obody[:120]))
+    # A dropped connection (code 0, empty body) is the failure this ordering exists to catch: the
+    # device aborted mid-request instead of answering. Section Z sees the Backtrace on serial too.
+    check('A debug/oom bad_alloc caught on a task that had never thrown (cold boot)',
+          ocode == b'200' and oj.get('caught') is True, (ocode, obody[:120]))
     print('     debug/oom: largest block at the throw %s B, %s blocks taken, heap %s -> %s' % (oj.get('largest'), oj.get('blocks'), oj.get('free_before'), oj.get('free_after')))
     time.sleep(2)  # let the poller / display loop finish whatever the momentary starvation interrupted
+# cxx_exception_pool.cpp logs one line per task as it warms. loopTask and net_poller warm at their
+# own start, async_tcp on the first request (the /api/state above), so by now all three are in the
+# boot log. Gated on having actually captured a boot: serial is optional for the rest of the suite.
+time.sleep(1)
+if any('[heap] eh_pool' in l for l in serial_lines):
+    warm_lines = [l for l in serial_lines if 'eh_globals warmed' in l]
+    warmed = sorted({t for t in ('loopTask', 'net_poller', 'async_tcp')
+                     if any(' on ' + t + ' ' in l for l in warm_lines)})
+    check('A0 every throwing task warmed its exception globals',
+          warmed == ['async_tcp', 'loopTask', 'net_poller'], (warmed, warm_lines[:4]))
+    check('A0 no warmed task reported a MISSING throw path',
+          not [l for l in warm_lines if 'MISSING' in l], warm_lines[:4])
+else:
+    print('SKIP A0 warm-line checks: no boot log captured on serial')
+code, sd_ = get_json('/api/state'); check('A state 200 json', code == 200 and isinstance(sd_, dict) and 'time' in sd_, (code, list(sd_ or {})[:5]))
+code, d = get_json('/api/config'); check('A config has all sections', code == 200 and all(k in d for k in ('device', 'stops', 'alerts', 'weather', 'due', 'profiles', 'bike')), d and list(d.keys()))
+code, d = get_json('/api/debug/ui'); check('A debug/ui', code == 200 and d.get('page') in ('main', 'night', 'stats', 'device'), d)
 code, d = get_json('/api/stats?stop=%s&days=30' % backup['stops'][0]['key']); check('A stats', code == 200 and isinstance(d, dict), (code, str(d)[:80]))
 code, d = get_json('/api/log/index'); check('A log index', code == 200 and isinstance(d, list), (code, d))
 if isinstance(d, list) and d:
@@ -612,7 +653,9 @@ stop_serial = True; time.sleep(1.5)
 crashes = [l for l in serial_lines if re.search(r'Guru|abort\(\)|Backtrace|rst:0x', l)]
 warns = sum(1 for l in serial_lines if '[Warn]' in l)
 errs = [l for l in serial_lines if re.search(r'\bE \(|error', l, re.I)][:5]
-check('Z serial: no crash lines except the requested reboot and the OTA reboot', len([l for l in crashes if 'rst:0x' in l]) <= 2 and not [l for l in crashes if 'Guru' in l or 'Backtrace' in l or 'abort' in l], crashes[:5])
+# Three resets are expected and asked for: A0's cold-boot reboot, F's reboot endpoint, and G's
+# reboot after the OTA. Anything else - and any Guru/Backtrace/abort() at all - is a real crash.
+check('Z serial: no crash lines except the three requested reboots (A0, F, OTA)', len([l for l in crashes if 'rst:0x' in l]) <= 3 and not [l for l in crashes if 'Guru' in l or 'Backtrace' in l or 'abort' in l], crashes[:5])
 check('Z serial: no LVGL warnings', warns == 0, warns)
 print('== serial lines captured', len(serial_lines), 'errors sample', errs)
 passed = sum(1 for r in results if r[1]); print('\n== %d/%d checks passed' % (passed, len(results)))

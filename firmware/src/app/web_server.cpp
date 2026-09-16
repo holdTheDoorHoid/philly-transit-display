@@ -17,6 +17,7 @@
 
 #include "auth.h"
 #include "config_store.h"
+#include "cxx_exception_pool.h"
 #include "demo_data.h"
 #include "net_poller.h"
 #include "weather_service.h"
@@ -1019,6 +1020,14 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
   // Runs before any handler, for every route including the static assets and the 404 (review
   // F05). Registered first so nothing can be reached without passing it.
   g_server.addMiddleware([](AsyncWebServerRequest *request, ArMiddlewareNext next) {
+    // First thing on the request path, ahead of even the host check, because the host check itself
+    // builds a std::string and can throw. DESIGN.md SS12.1: the AsyncTCP service task is created by
+    // the library, so this is the only place we get to run code ON that task early enough to pay its
+    // one-time __cxa_eh_globals allocation while the heap is healthy. Without it the task's FIRST
+    // throw - which on this task is a bad_alloc under exactly the pressure guarded() exists for -
+    // does a plain malloc inside __cxa_throw and terminates when it fails. Costs one
+    // pthread_getspecific per request once warm; the real work happens on request number one.
+    transit_app::warmExceptionGlobals("async_tcp");
     if (!hostAllowed(request)) {
       sendError(request, 421, "this device is not reachable under that host name");
       return;

@@ -114,6 +114,13 @@ void setup() {
   // SDK's. Whether the pool then really catches an OOM-while-throwing is what POST /api/debug/oom
   // proves; this line only shows the request was made. Always-on, like the [heap] stages above.
   Serial.printf("[heap] eh_pool    arena=%u\n", (unsigned)__cxx_eh_arena_size_get());
+  // DESIGN.md SS12.1, second half: the pool covers the exception OBJECT, not the per-task
+  // __cxa_eh_globals that __cxa_throw allocates with a plain malloc on a task's FIRST throw - which
+  // terminates outright if the heap is gone by then. Warm it here, on loopTask, while the heap is
+  // untouched; this is the same task loop() runs on, so the LVGL display loop's catch below is
+  // covered by it. The poller and the AsyncTCP task each warm their own (they are other tasks, and
+  // the storage is per-task).
+  transit_app::warmExceptionGlobals("loopTask");
 
   if (!LittleFS.begin(false)) {
     log_w("main: LittleFS mount failed, formatting");

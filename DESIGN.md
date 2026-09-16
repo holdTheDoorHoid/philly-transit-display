@@ -439,9 +439,8 @@ a thread's *first* throw calls `pthread_getspecific`, finds nothing, `malloc`s i
 before throwing. The 2 KB emergency pool supplies the exception object, not this one-time
 per-thread block, so the proof passes only on a task that has thrown before (the full device
 suite provokes caught `bad_alloc`s on the async task in its earlier sections; a run that hits the
-endpoint first does not). The fix is to warm every throwing task's exception globals at start
-(`throw 0` caught, or `__cxa_get_globals()`) while the heap is plentiful; it is filed as its own
-task and belongs with §12.1, which should say so until it lands. Consistent with that diagnosis:
+endpoint first does not). The fix - warming every throwing task's exception globals at start, while the
+heap is plentiful - landed on 2026-09-16 as `warmExceptionGlobals()`; §12.1 has it. Consistent with that diagnosis:
 the same endpoint, hit as the *fourth* check of the 2026-09-16 suite run on a device that had been
 up 75 s and polling, answered `caught:true` with a 12 B largest block at the throw. It is not
 flaky - it depends entirely on whether that task has thrown before, which is exactly the gap.
@@ -915,7 +914,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | `POST /api/pin` | Body `{"pin":"new"}`, authenticated with the **current** PIN in `X-Pin`. New PIN: 4–32 printable ASCII, no whitespace. → `{"ok":true}`, or 400 with the rule that was broken. No reset-by-network path: recovery is the serial console or the device info screen (§12) |
 | `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, LVGL pool use, resolution, heap |
 | `POST /api/debug/tap` | Test hook (PIN-protected: it changes what the screen shows): simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
-| `POST /api/debug/oom` | Test hook (PIN-protected: it starves every other task for under a millisecond): exhausts the heap on purpose, forces a `std::bad_alloc`, frees everything and answers `{"caught":true,"blocks":N,"largest":B,"free_before":X,"free_after":Y}` - the deterministic proof of the emergency exception pool (§12.1). `largest` under ~100 means the exception object could only have come from the pool; without the pool the request reboots the device |
+| `POST /api/debug/oom` | Test hook (PIN-protected: it starves every other task for under a millisecond): exhausts the heap on purpose, forces a `std::bad_alloc`, frees everything and answers `{"caught":true,"blocks":N,"largest":B,"free_before":X,"free_after":Y}` - the deterministic proof of the emergency exception pool (§12.1). `largest` under ~100 means the exception object could only have come from the pool; without the pool the request reboots the device. Run it on a **fresh boot**: it then also proves the first-throw path (§12.1), which on a task that has already thrown answers `caught:true` either way |
 
 Arrival object in `/api/state`:
 ```json
@@ -1437,10 +1436,39 @@ not used; the link map is the proof. Cost: one 2 KB `malloc` before `app_main()`
 boot log prints it as `[heap] eh_pool arena=2048`. `POST /api/debug/oom` (PIN-gated, §7) is the
 deterministic proof: it takes the heap away in shrinking blocks until even a 16-byte allocation
 fails, forces a `std::bad_alloc`, frees everything and answers `caught:true`; without the pool that
-request reboots the device. The device suite runs it. Known gap (2026-09-16, §2.1 "seen in passing"): a task's
-*first* throw allocates its per-thread `__cxa_eh_globals` with a plain `malloc` and terminates if
-that fails, which the pool does not cover, so on a fresh boot the proof itself aborted the device;
-warming every throwing task's exception globals at start is the fix, filed as its own task. The heavy read handlers (`/api/state`,
+request reboots the device. The device suite runs it, on a fresh boot, for the reason that follows.
+
+The pool alone was not enough (found and fixed 2026-09-16). `__cxa_throw`'s first act is
+`__cxa_get_globals()`, which keeps the per-task "exception in flight" bookkeeping
+(`__cxa_eh_globals` - the caught/uncaught counters every catch block and the unwinder read) in
+thread-local storage. On a task's *first* throw that storage does not exist yet, so libstdc++
+(`eh_globals.cc`) does a plain `malloc` of it and calls `std::terminate()` outright if it fails -
+past every `try`/`catch`, and before `__cxa_allocate_exception` is ever reached, so the emergency
+pool is never even consulted. It is ~16 bytes, but a task's first throw is overwhelmingly a
+`bad_alloc`, i.e. precisely the moment the heap is gone. Observed exactly so: on a fresh boot, with
+`POST /api/debug/oom` - the pool's own proof - as the first request, the device aborted
+(`abort <- __terminate <- __cxa_get_globals (eh_globals.cc:150) <- __cxa_throw <- operator new[] <-
+handleDebugOom <- ... <- _async_service_task`), while the full suite passed, because by then an
+earlier section had already made the AsyncTCP task throw and pay the allocation with the heap
+healthy. The fix is to pay it deliberately and early: `warmExceptionGlobals()`
+(`cxx_exception_pool.cpp`) calls `__cxa_get_globals()` and then throws and catches once, on the
+calling task, while the heap is plentiful. It cannot be done once centrally - the storage is
+per-task, so **every task that can throw must warm itself, on itself**, and any new one must too:
+`main.cpp setup()` for loopTask (which is also the LVGL display loop), `net_poller.cpp
+pollerTask()` (which covers the queued proxy and stats jobs, since they run on that task), and
+`web_server.cpp`'s first-thing middleware for the AsyncTCP task, which the library creates and we
+therefore cannot warm at its entry - it warms on request number one and costs one
+`pthread_getspecific` per request thereafter. Two details the implementation depends on and the
+file documents: GCC folds a `try { throw 0; } catch (int) {}` whose handler it can see into a plain
+jump, so the throw lives behind a `noinline` call, and both ABI entry points are declared
+`__attribute__((const))` in `<cxxabi.h>`, so a call whose result goes unused is deleted - every
+result is consumed. The built image is the proof (`objdump -d`: `__cxa_get_globals_fast`,
+`__cxa_get_globals`, `__cxa_begin_catch`/`__cxa_end_catch` in `warmExceptionGlobals`,
+`__cxa_allocate_exception` + `__cxa_throw` in `throwOnce`). The boot log prints
+`[heap] eh_globals warmed on <task> (globals=…, throw path ok, free …)` once per task. Because
+both halves are one-shot per task, the ORDER of the on-device proof is part of the test: section A
+of the device suite reboots first and makes `/api/debug/oom` the first request that throws, since
+run any later it answers `caught:true` whether the first-throw path works or not. The heavy read handlers (`/api/state`,
 `/api/config`) still refuse up front with a fixed-literal 503 when free heap is under
 `kMinHeavyResponseHeap` (24 KB) or the largest block under 8 KB - no longer because the failure
 would be uncatchable, but because a build that is going to fail costs CPU and heap the poller wants,

@@ -8,6 +8,15 @@ namespace transit_app {
 // std::bad_alloc; cxx_exception_pool.cpp has the arithmetic behind the number.
 constexpr size_t kCxxExceptionPoolBytes = 2048;
 
+// Does, on the CALLING task and while the heap is still plentiful, the one-time allocation that
+// libstdc++ would otherwise do inside the task's *first* throw - where it is unconditionally fatal.
+// Must be called from each task that can throw, early: the pool above does not cover this one
+// (cxx_exception_pool.cpp has the whole story). Cheap and idempotent - a task that is already warm
+// pays one pthread_getspecific - so it is safe on a hot path like the web middleware.
+// Returns true if THIS call did the warming, false if the task was already warm; logs one line
+// when it warms, tagged with task_name.
+bool warmExceptionGlobals(const char *task_name);
+
 }  // namespace transit_app
 
 // The hook libstdc++'s eh_alloc.o calls once, before app_main(), to size that pool. Declared here so
