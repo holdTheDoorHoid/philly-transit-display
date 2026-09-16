@@ -157,7 +157,15 @@ Check check(const char *provided) {
     if (g_locked_until_ms == 0) g_locked_until_ms = 1;  // millis() wrap: 0 means "not locked"
     out.result = Result::Locked;
     out.retry_s = kLockoutSeconds;
-    log_w("auth: %d wrong PINs in a row; locked for %u s", g_wrong_streak, (unsigned)kLockoutSeconds);
+    // Plain Serial.printf, not log_w, for the same reason as the PIN line above: CORE_DEBUG_LEVEL
+    // is 1 (platformio.ini) and log_w() compiles to nothing at that level. This is the only record
+    // that a security-relevant state change happened - every protected route on the device just
+    // became unavailable to everyone for 30 seconds - and it was invisible on the console exactly
+    // when it mattered. Found 2026-09-16: a device-suite run reported eleven `PUT 429`s in a
+    // section that sends no wrong PIN at all, and there was nothing on serial to say where the
+    // five wrong PINs had come from. web_server.cpp's checkPin() now names the route for each one.
+    Serial.printf("[auth] %d wrong PINs in a row; every protected route is locked for %u s\n",
+                  g_wrong_streak, (unsigned)kLockoutSeconds);
     return out;
   }
   out.result = Result::Wrong;
@@ -190,7 +198,7 @@ bool setPin(const std::string &next, std::string &error) {
   g_pin = next;
   g_wrong_streak = 0;
   g_locked_until_ms = 0;
-  log_w("auth: web PIN changed");
+  Serial.println("[auth] web PIN changed");  // same class, and same reason, as the lockout line
   return true;
 }
 

@@ -272,6 +272,14 @@ bool checkPin(AsyncWebServerRequest *request, ApiFailure &fail) {
       fail = {401, "pin required", 0};
       return false;
     case auth::Result::Wrong:
+      // The only record that a wrong PIN was presented, and the only thing that says WHICH route
+      // presented it. auth.cpp logs the lockout itself, but by then five attempts have already
+      // happened and the interesting question - who sent them - is unanswerable. A device-suite
+      // run on 2026-09-16 produced eleven `PUT 429`s with nothing in the suite sending a wrong
+      // PIN, and there was no evidence on the console to say otherwise because this line did not
+      // exist and auth.cpp's was compiled out (CORE_DEBUG_LEVEL=1). Plain Serial.printf for that
+      // reason; see auth.cpp.
+      Serial.printf("[auth] wrong PIN on %s %s\n", request->methodToString(), request->url().c_str());
       fail = {401, "wrong pin", 0};
       return false;
     case auth::Result::Locked:
