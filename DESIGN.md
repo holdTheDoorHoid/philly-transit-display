@@ -526,7 +526,12 @@ failing must not condemn the others (`transit::StopSnapshot`, `lib/transit_core/
 
 Main screen (portrait by default; every size derives from the runtime resolution so rotation just re-flows it):
 - Header (10 % height): device name (off by default), clock (12 h), current weather (a 24 px colour condition icon from `src/icons/` and `69°`, sun/moon by local hour; SS4.8; was `69° mostly
-  clear`), Wi-Fi bars, "updated 12 s ago" - each switchable via `device.header`.
+  clear`), Wi-Fi bars, "updated 12 s ago" - each switchable via `device.header`. The Wi-Fi
+  signal is four bars filled solid like a phone's status bar - no glyph, no number - at the
+  height of the small font's line: RSSI ≥ −55 dBm lights 4, ≥ −65 3, ≥ −75 2, ≥ −85 1, weaker
+  or disconnected 0, and the unlit bars stay faintly visible so "one bar" and "no signal" both
+  still read as the icon (`ui_common.cpp` `makeWifiBars`/`setWifiBars`; on the amber stale
+  header they take its dark-on-amber colours like every other header item).
 - One panel per stop the active profile shows (§6 `profiles`; all stops otherwise), stacked; each
   has a title row per `title_style` (`17 Southbound → 20th-Johnston` by default; bullet, not middle
   dot, in the route form - the built-in font lacks U+00B7), an optional weather note about the hour
@@ -575,11 +580,45 @@ Main screen (portrait by default; every size derives from the runtime resolution
   showing. `Unavailable` is the one state that shows the reason and no rows. A `Skipped` row with
   no prediction renders from its scheduled time with the orange `skip` badge; a row with neither
   time shows `--`.
-- Tap anywhere cycles Main → Stats → Device info → Main. Stats page: per stop, last 30 days:
-  on-time %, mean late, worst hour, ghost count, sample count, and how many of those arrivals were
-  inferred (§9.2). On-time % is a **dash**, never `0%`, when no arrival's lateness was ever known;
-  a stop whose summary has not been computed yet reads `loading…`, never zeroes. Device page: IP,
-  mDNS URL, SSID, RSSI, SD status, free heap, firmware version, "reset Wi-Fi: hold 5 s".
+- Tap anywhere cycles Main → Stats → Device info → Main. The three pages are built from the same
+  pieces (`ui_common.cpp`: the header strip, the padded column of panels, the stop-style panel,
+  the route badge, the fonts and palette) so they match by construction rather than by copying
+  numbers around. The stats and device pages are built when tapped to and freed when tapped away
+  from: LVGL's 36 KB pool holds the arrivals page (~20 KB with two stops) plus the night page,
+  and keeping all four resident left no room for a four-stop configuration.
+- Stats page: header `Statistics  last 30 days` with `tap for device info` on the right (hidden
+  at 240 wide); one stop-style panel per configured stop, titled with the route badge and the
+  main page's title for that stop. Per stop, last 30 days (§9.2): the **on-time %** in the big
+  minutes font, green from 80 %, amber from 60 %, red below (the web Stats page's thresholds),
+  over an **on-time meter** - a full-width track with the on-time share filled from the left in
+  the same colour, the glanceable form of the number; the **mean lateness** in the arrival badge
+  colours (green inside SEPTA's −1..+5 min window, red late, blue early); the **worst hour**; the
+  **ghost count**; and a footer `123 arrivals • 40 inferred`. Each panel picks one of three
+  layouts from the height it will get (the area below the header shared equally, like the
+  arrivals page), never from the board name: *Tiles* (two stops on a 320-tall board: title /
+  `87% on time` with a 6 px meter under it / three captioned tiles / footer, spread top to
+  bottom), *Compact* (two stops on a 240-tall board, four on a 320-tall one: the footer rides on
+  the title row as `n=123 • 40 inferred` beside the stop's short label, a 3 px meter rules under
+  the title, four two-line tiles along the bottom; captions shorten to `avg`/`worst` at 240
+  wide), *Line* (four stops on a 240-tall board, ~49 px each: the title row and rule, then
+  `87% on time • +1.3 min late • 3 ghosts` - the worst hour is the fact that does not fit).
+  On-time % is a **dash** over an empty meter, never `0%`, when no arrival's lateness was ever
+  known; a stop whose summary has not been computed yet reads `loading…` and one with no samples
+  `no data yet`, with the numbers and the meter hidden - never zeroes. The labels are only
+  rewritten when the cached summary actually changes (every ~10 min), not on every 1 Hz tick.
+- Device info page: header `Device info  v0.2.0` with `tap for arrivals`. A *Network* panel: the
+  Wi-Fi bars and SSID on its title row, the mDNS URL in link blue and the body font (the one line
+  the owner has to be able to find), the IP with the RSSI in dBm on the right, and
+  `SEPTA  ok, 12 s ago` or `SEPTA  failed 4 min ago: <error>` from the poller's last attempt
+  (`getPollStatus()`; the arrivals header only ever says "stale"). A panel titled with the
+  device name (`device.name`), `up 2d 5h` on its title row: the web PIN in the big minutes font
+  with `web PIN` beside it (on a ≥ 320-tall board and up to 8 characters; a longer custom PIN
+  takes the body font and wraps, never ellipsizes - a PIN the owner cannot read off the screen
+  is a PIN they have lost), `SD  mounted, 3720 MB free` - or `N rows dropped: <error>` in red
+  while writes are failing and amber once they land again (sd_logger.h, F26) - and
+  `heap  75 KB free`. Both panels are content-height (a mostly-empty card looks like a fault);
+  `reset Wi-Fi: hold 5 s` is a bordered button along the bottom edge, the only clickable child on
+  any page.
 - Sizes derive from `lv_display_get_horizontal_resolution()` so 320x240 gets 2 rows per stop
   and smaller fonts; 480x320 gets 3 rows. That is the per-panel **capacity**; each stop actually
   gets its own `show` (1..4, §6) clamped to it, so a stop asking for one row gets one.

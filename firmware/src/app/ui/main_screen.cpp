@@ -57,7 +57,8 @@ struct MainScreenCtx {
   lv_obj_t *clock_label;
   lv_obj_t *weather_icon;   // lv_image of the colour condition icon (src/icons), hidden with weather_label
   lv_obj_t *weather_label;  // temperature ("69°"), or the words when no glyph fits
-  lv_obj_t *wifi_label;
+  lv_obj_t *wifi_bars;      // ui_common.h makeWifiBars(): four bars, no glyph, no number
+  int wifi_bars_shown = -1;  // last count drawn, so the four bars are only restyled on a change
   lv_obj_t *updated_label;
   bool header_stale = false;
   // Alert ticker (DESIGN.md SS8): a clipping box with one label inside, moved by an lv_anim at
@@ -91,26 +92,8 @@ const StopSnapshot *findStopSnapshot(const Snapshot &snap, const std::string &ke
   return nullptr;
 }
 
-lv_obj_t *makeLabel(lv_obj_t *parent, const lv_font_t *font, lv_color_t color) {
-  lv_obj_t *l = lv_label_create(parent);
-  lv_obj_set_style_text_font(l, font, 0);
-  lv_obj_set_style_text_color(l, color, 0);
-  return l;
-}
-
-// Plain container: no theme chrome, and not clickable so a tap on it reaches the screen's
-// tap-to-cycle handler (DESIGN.md SS8 "tap anywhere") instead of stopping at the child.
-lv_obj_t *makeBox(lv_obj_t *parent) {
-  lv_obj_t *o = lv_obj_create(parent);
-  // LVGL's default bg_opa is 0 (no theme is compiled in): a bg_color alone paints nothing.
-  // The first builds set colours without this, which is why the "background" never changed.
-  lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(o, 0, 0);
-  lv_obj_set_style_radius(o, 0, 0);
-  lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
-  return o;
-}
+// makeBox()/makeLabel() and the header/panel builders live in ui_common.cpp now that the stats
+// and device pages are built from the same pieces (DESIGN.md SS8).
 
 void animSetX(void *obj, int32_t v) {
   lv_obj_set_x(static_cast<lv_obj_t *>(obj), v);
@@ -211,15 +194,9 @@ lv_obj_t *createMainScreen(const Config &cfg) {
 
   auto *ctx = new MainScreenCtx();
 
-  // ---- Header (10% height) ----
-  int32_t header_h = h / 10 > 20 ? h / 10 : 20;
-  lv_obj_t *header = makeBox(screen);
-  lv_obj_set_size(header, lv_pct(100), header_h);
-  lv_obj_set_style_bg_color(header, colorPanelBg(), 0);
-  lv_obj_set_style_pad_hor(header, 8, 0);
-  lv_obj_set_style_pad_ver(header, 2, 0);
-  lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  // ---- Header (10% height; ui_common.h makeHeader, shared with the stats and device pages) ----
+  int32_t header_h = headerHeight(h);
+  lv_obj_t *header = makeHeader(screen, h);
   ctx->header = header;
 
   ctx->device_label = makeLabel(header, fontSmall(h), colorText());
@@ -241,8 +218,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   lv_obj_set_flex_align(right_group, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(right_group, 8, 0);
 
-  ctx->wifi_label = makeLabel(right_group, fontSmall(h), colorSubtext());
-  lv_label_set_text(ctx->wifi_label, LV_SYMBOL_WIFI);
+  ctx->wifi_bars = makeWifiBars(right_group, header_h);
 
   ctx->updated_label = makeLabel(right_group, fontSmall(h), colorSubtext());
   lv_label_set_text(ctx->updated_label, "updated -- ago");
@@ -256,17 +232,11 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_obj_add_flag(ctx->weather_icon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ctx->weather_label, LV_OBJ_FLAG_HIDDEN);
   }
-  if (!hc.wifi) lv_obj_add_flag(ctx->wifi_label, LV_OBJ_FLAG_HIDDEN);
+  if (!hc.wifi) lv_obj_add_flag(ctx->wifi_bars, LV_OBJ_FLAG_HIDDEN);
   if (!hc.updated) lv_obj_add_flag(ctx->updated_label, LV_OBJ_FLAG_HIDDEN);
 
-  // ---- Stop panels ----
-  lv_obj_t *panels_area = makeBox(screen);
-  lv_obj_set_size(panels_area, lv_pct(100), lv_pct(100));
-  lv_obj_set_flex_grow(panels_area, 1);
-  lv_obj_set_style_bg_opa(panels_area, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_pad_all(panels_area, 4, 0);
-  lv_obj_set_style_pad_row(panels_area, 4, 0);
-  lv_obj_set_flex_flow(panels_area, LV_FLEX_FLOW_COLUMN);
+  // ---- Stop panels (ui_common.h makePanelsArea/makePanel: the stats page uses the same) ----
+  lv_obj_t *panels_area = makePanelsArea(screen);
 
   for (const StopConfig &s : visibleStops(cfg, time(nullptr))) {
     PanelWidgets pw;
@@ -275,20 +245,16 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     pw.alt_of = s.alt_of;
     pw.alt_after_min = s.alt_after_min;
 
-    lv_obj_t *panel = makeBox(panels_area);
+    lv_obj_t *panel = makePanel(panels_area);
     pw.panel = panel;
     if (!s.alt_of.empty()) lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);  // until the primary runs late
-    lv_obj_set_size(panel, lv_pct(100), lv_pct(100));
-    lv_obj_set_flex_grow(panel, 1);
-    lv_obj_set_style_bg_color(panel, colorPanelBg(), 0);
-    // Square corners: LV_DRAW_SW_COMPLEX is 0 (lv_conf.h, flash budget) and LVGL then skips a
-    // rounded rectangle entirely rather than drawing it square.
-    lv_obj_set_style_pad_all(panel, 6, 0);
-    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
 
     pw.title = makeLabel(panel, fontBody(h), colorText());
     lv_label_set_text(pw.title, panelTitle(s).c_str());
-    lv_obj_set_width(pw.title, lv_pct(100));
+    // Both sizes fixed: LONG_DOT only ellipsizes a label whose height is not content-sized -
+    // with a content height a long title wrapped onto a second line instead (DESIGN.md SS8 says
+    // ellipsized), which on a 240-tall board pushed the last arrival row out of the panel.
+    lv_obj_set_size(pw.title, lv_pct(100), lv_font_get_line_height(fontBody(h)));
     lv_label_set_long_mode(pw.title, LV_LABEL_LONG_DOT);
 
     pw.weather_note = makeLabel(panel, fontSmall(h), colorEarly());
@@ -317,13 +283,13 @@ lv_obj_t *createMainScreen(const Config &cfg) {
       lv_obj_set_style_pad_column(row, 6, 0);
 
       RowWidgets rw;
-      rw.route_badge = makeLabel(row, fontSmall(h), lv_color_white());
-      lv_obj_set_style_bg_color(rw.route_badge, routeBadgeColor(), 0);
-      lv_obj_set_style_bg_opa(rw.route_badge, LV_OPA_COVER, 0);
-      lv_obj_set_style_pad_hor(rw.route_badge, 4, 0);
+      rw.route_badge = makeRouteBadge(row, fontSmall(h), s.route);
 
       rw.destination = makeLabel(row, fontBody(h), colorText());
       lv_obj_set_flex_grow(rw.destination, 1);
+      // Fixed to one line for the same reason as the title: with crowding words and icons on the
+      // row, "20th-Johnston" wrapped onto two lines and the row grew instead of ellipsizing.
+      lv_obj_set_height(rw.destination, lv_font_get_line_height(fontBody(h)));
       lv_label_set_long_mode(rw.destination, LV_LABEL_LONG_DOT);
 
       rw.crowd_icons = makeLabel(row, fontIcons(), colorSubtext());
@@ -506,11 +472,6 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
     }
   }
 
-  // Wi-Fi bars: fold RSSI into a rough 0-3 "bars" count next to the symbol.
-  int32_t rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -100;
-  const char *bars = rssi > -60 ? "3" : rssi > -75 ? "2" : rssi > -90 ? "1" : "0";
-  lv_label_set_text_fmt(ctx->wifi_label, "%s %s", LV_SYMBOL_WIFI, bars);
-
   int32_t age_s = snap.generated > 0 ? (int32_t)((int64_t)now - snap.generated) : -1;
   bool stale = age_s > 90;  // DESIGN.md SS8: header turns amber when stale
   if (age_s < 0) {
@@ -521,7 +482,8 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
   } else {
     lv_label_set_text_fmt(ctx->updated_label, "updated %ld s ago", (long)age_s);
   }
-  if (stale != ctx->header_stale) {
+  bool stale_changed = stale != ctx->header_stale;
+  if (stale_changed) {
     ctx->header_stale = stale;
     lv_obj_set_style_bg_color(ctx->header, stale ? colorStale() : colorPanelBg(), 0);
     lv_color_t fg = stale ? colorOnStale() : colorText();
@@ -529,8 +491,15 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
     lv_obj_set_style_text_color(ctx->device_label, fg, 0);
     lv_obj_set_style_text_color(ctx->clock_label, fg, 0);
     lv_obj_set_style_text_color(ctx->weather_label, fg, 0);
-    lv_obj_set_style_text_color(ctx->wifi_label, sub, 0);
     lv_obj_set_style_text_color(ctx->updated_label, sub, 0);
+  }
+
+  // Wi-Fi bars (ui_common.h): lit bars in the header text colour, the rest dim; on the amber
+  // stale header they take its dark-on-amber colours like every other header item.
+  int bars = wifiBarCount(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -100, WiFi.status() == WL_CONNECTED);
+  if (bars != ctx->wifi_bars_shown || stale_changed) {
+    ctx->wifi_bars_shown = bars;
+    setWifiBars(ctx->wifi_bars, bars, stale ? colorOnStale() : colorText(), stale ? colorStale() : colorPanelBg());
   }
 
   ctx->blink_phase = !ctx->blink_phase;

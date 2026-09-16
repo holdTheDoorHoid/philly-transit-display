@@ -9,8 +9,9 @@
 
 namespace transit_app::ui {
 
-// Builds all three screens and shows Main. Call once, after
-// smartdisplay_init()/lv_display_set_rotation() have run.
+// Builds the arrivals and night screens and shows Main. The stats and device pages are built
+// when tapped to and freed when tapped away from (ui.cpp buildScreens() says why: LVGL's pool).
+// Call once, after smartdisplay_init()/lv_display_set_rotation() have run.
 void init(const Config &cfg);
 
 // Full-screen "join this network, then open http://192.168.4.1" message, shown while the setup

@@ -79,6 +79,8 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 
 | Build (`cyd-3248S035R`) | Flash | Static RAM |
 |---|---:|---:|
+| 2026-09-16 screen pass (phone-style Wi-Fi bars, stats page with the on-time meter in three layouts, device page with SEPTA/SD health, stats+device built on demand) on top of the exception pool and streamed `/api/state` | 1,838,846 B (96.8 %) | 95,652 B |
+| Same tree without the screen pass (`next`, 2026-09-16) | 1,832,302 B (96.4 %) | 95,652 B |
 | v0.2.0: the 2026-09-15 review fixes combined (PIN, Host check, OTA board check, WPA2 setup AP + QR, transport completeness, transit-first polling, per-stop health on the panels, checked SD writes, log export) | 1,828,384 B (96.2 %) | 95,644 B (29.2 %) |
 | Hardening pass alone, with the QR widget compiled out | 1,767,926 B (93.0 %) | 95,580 B |
 | Before the review fixes (v0.1.2) | 1,741,770 B (91.6 %) | 95,268 B |
@@ -86,8 +88,14 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
 
-The tightest board tracks it closely: `cyd-2432S024C` is 1,781,266 B (93.7 %) / 95,716 B, up from
+The tightest board tracks it closely: `cyd-2432S024C` is 1,834,478 B (96.5 %) / 95,788 B after the
+screen pass (1,828,134 B before it, same day); it was 1,781,266 B (93.7 %) / 95,716 B at v0.2.0 and
 1,737,634 B (91.4 %) / 95,404 B before the hardening pass.
+
+The screen pass is +6.5 KB on both boards. Its text is composed with `snprintf` and LVGL inline
+recolor commands (`ui_common.h colorHex`) rather than `std::string` concatenation, which was
+measured at ~1 KB per page in string template instantiations; what remains is the layout code
+itself (the `lv_obj_set_style_*` calls in the two `create*Screen()` functions).
 
 The hardening pass cost 43,600 B on the 3.5" board, of which **~17.4 KB is the QR code** on the
 Wi-Fi setup screen — `LV_USE_QRCODE` pulls in `qrcodegen.c` and `lv_qrcode.c`, which need

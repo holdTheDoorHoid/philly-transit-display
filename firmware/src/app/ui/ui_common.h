@@ -85,4 +85,57 @@ std::string clockLabel(transit::Epoch when);
 // one) - this is the "default" every route badge uses for now.
 lv_color_t routeBadgeColor();
 
+// ---- Shared building blocks (DESIGN.md SS8: the pages share one visual language) ----
+//
+// Every page is: a header strip, then panels in a padded column. The main page defined the look
+// first; the stats and device pages are built from the same pieces so they match by construction
+// rather than by copying numbers around.
+
+// Plain container: paints its background (LVGL's default bg_opa is 0 with no theme compiled in,
+// so a bg_color alone paints nothing - the first builds learned this), never scrolls, and is NOT
+// clickable, so a tap on it reaches the screen's tap-to-cycle handler instead of stopping at the
+// child. Square corners are the default: LV_DRAW_SW_COMPLEX is 0 (lv_conf.h, flash budget) and
+// LVGL then skips a rounded rectangle entirely rather than drawing it square, so nothing here
+// ever sets a radius.
+lv_obj_t *makeBox(lv_obj_t *parent);
+lv_obj_t *makeLabel(lv_obj_t *parent, const lv_font_t *font, lv_color_t color);
+
+// The header strip every page starts with: 10 % of the height (never under 20 px), panel colour,
+// a flex row with its items spread from edge to edge and centred vertically.
+int32_t headerHeight(int32_t h);
+lv_obj_t *makeHeader(lv_obj_t *screen, int32_t h);
+// The area under the header: transparent, 4 px padding and row gap, a flex column that takes the
+// rest of the screen.
+lv_obj_t *makePanelsArea(lv_obj_t *screen);
+// A stop-style panel inside it: panel colour, 6 px padding, flex column, and flex_grow so sibling
+// panels share the height equally (the main page's stop panels).
+lv_obj_t *makePanel(lv_obj_t *parent);
+// A transparent flex row of `gap`-spaced, vertically centred items, as wide as its parent.
+lv_obj_t *makeRow(lv_obj_t *parent, int32_t gap);
+// White text on routeBadgeColor() with 4 px side padding - the route badge on every arrival row.
+lv_obj_t *makeRouteBadge(lv_obj_t *parent, const lv_font_t *font, const std::string &route);
+
+// The 24-bit value of a colour for LVGL's inline recolor command in a label with
+// lv_label_set_recolor(true): snprintf(buf, n, "#%06x %s#", colorHex(c), text). Commands must
+// not span a line break; close one before a '\n' and open another after it. The pages compose
+// their text this way rather than with std::string concatenation, which cost ~1 KB of flash per
+// page in string template instantiations (measured 2026-09-16).
+inline uint32_t colorHex(lv_color_t c) {
+  return lv_color_to_u32(c) & 0xFFFFFFu;
+}
+
+// ---- Wi-Fi signal, drawn like a phone's status bar ----
+//
+// Four bars of increasing height instead of the old "wifi 3" glyph-plus-digit: RSSI >= -55 dBm
+// lights 4, >= -65 3, >= -75 2, >= -85 1, weaker or not connected 0. No glyph, no number.
+int wifiBarCount(int rssi, bool connected);
+// Builds the widget at the height of one line of the small font (a phone status-bar icon sits at
+// the height of the text beside it), shrunk only inside a header shorter than that. All bars
+// start dim.
+lv_obj_t *makeWifiBars(lv_obj_t *parent, int32_t header_h);
+// Lights `count` bars solid in `on`; the others stay visible as a 1:3 blend of `on` into `bg`
+// (lv_color_mix(on, bg, 64)), so "one bar" and "no signal" both still read as a signal icon.
+// Pass the header's stale colours while it is amber so the icon recolours with the rest.
+void setWifiBars(lv_obj_t *bars, int count, lv_color_t on, lv_color_t bg);
+
 }  // namespace transit_app::ui
