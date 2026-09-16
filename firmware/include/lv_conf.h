@@ -72,7 +72,11 @@
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
     /*Size of the memory available for `lv_malloc()` in bytes (>= 2kB)*/
+    /* Overridable only so the host screenshot simulator (firmware/sim, 64-bit pointers) can run
+     * the same screens in a bigger pool; no board build defines it. */
+    #ifndef LV_MEM_SIZE
     #define LV_MEM_SIZE (36 * 1024U)   /* static .bss; every KB here is a KB less heap for Wi-Fi/TLS. 32 KB was 93 % used at boot once the night page, bike strip and crowding labels existed. */          /*[bytes]*/
+    #endif
 
     /*Size of the memory expand for `lv_malloc()` in bytes*/
     #define LV_MEM_POOL_EXPAND_SIZE 0

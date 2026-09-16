@@ -259,12 +259,20 @@ std::string crowdingIcons(const std::string &seats, const std::string &style) {
   return out;
 }
 
+#ifdef UI_SIM
+// firmware/sim only: both fonts are linked on the host, and the simulator flips this per render
+// to show the 240-tall boards' layout with their font. Never defined in a board build.
+bool g_sim_small_board = false;
+#endif
+
 const lv_font_t *fontBig(int32_t /*h*/) {
   // Compile-time per board, not per rotation: the 320x240 boards (2.4"/2.8", which define
   // LV_FONT_MONTSERRAT_20) use 20 px in both orientations. Choosing 28 for portrait at runtime
   // kept both fonts linked and pushed the 2.4" capacitive build 2 KB past its 1.9 MB slot;
   // Montserrat 28 alone is ~32 KB of flash (firmware/README.md).
-#if LV_FONT_MONTSERRAT_20
+#if defined(UI_SIM)
+  return g_sim_small_board ? &lv_font_montserrat_20 : &lv_font_montserrat_28;
+#elif LV_FONT_MONTSERRAT_20
   return &lv_font_montserrat_20;
 #else
   return &lv_font_montserrat_28;
