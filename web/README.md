@@ -280,25 +280,52 @@ seen — "if you arrive at random, the typical wait is about half the mean gap")
 bar for hours/weekdays with no samples (`n === 0`) rather than drawing a zero-height
 one.
 
-The alert ticker section of Settings has a **Show** select (`device.ticker_show`:
-`both` (default), `alerts`, `detours`, or `off`) that picks what the ticker displays.
-Choosing `off` greys out the Height and Scroll speed controls above it, since there's
-nothing left to size or scroll. This is independent of the "Show service alerts"
-checkbox further down in Settings, which controls whether alerts are fetched from
-SEPTA at all — a muted note under the select says so.
+### Settings page layout
 
-The Settings view additionally covers, in order after the alert ticker section: large
-text, quiet hours (backlight dims on a schedule, touch wakes it), the night clock, "time
-to leave" LED/screen/chime alerts, and up to 4 schedule-based **profiles** (each with a
-name, days, a time window, and its own ordered stop list — checkboxes plus ↑/↓
-reordering, built from the configured stops).
+Settings is one config form arranged as blocks of things that affect each other, in
+this order: **Screen & appearance** (theme, brightness, rotation, invert, large text,
+crowding and its icon scheme, the top-strip items), **Schedules** (quiet hours, night
+clock, commute profiles — the three that decide what the screen shows *when*),
+**Alerts & reminders** (service alerts → ticker contents → ticker height/speed; time to
+leave), **Data & weather** (poll interval, SD logging, weather with its per-stop note
+and units), **Device & network** (name, timezone), **Web PIN**, and **Firmware &
+maintenance** (OTA upload, then reboot and Wi-Fi reset boxed off in a red "Restart and
+reset" area). Each block is a `block()` card with a one-line intro; each control is a
+`field()` (label + control + hint) so the filter can show or hide it as a unit.
 
-Also in that section, a **Crowding** select (`device.crowding`: `off`, `words`, `icons`,
-or `both` (default `words`)) picks how SEPTA's per-bus seat estimate shows up next to
-each arrival on the Now page — nothing, a word (open / few seats / standing / packed /
-full), a three-slot icon meter, or icons followed by the word. A second **Crowding
-icons** select (`device.crowding_icons`: `seats` (default) or `crowd`) picks the icon
-scheme and is disabled except when Crowding is Icons or Icons + word. Old firmware that
+A setting that only matters while another one is on sits in a `deps()` box under its
+parent — indented behind a left rule — and `setDeps()` dims the box and disables
+everything in it while the parent is off: the quiet-hours times, brightness and wake
+time under the **Quiet hours** switch; the night-clock threshold under **Night clock**;
+minutes, LED, screen and chime under **Time to leave**; the per-stop weather note and
+units under **Show weather**; **Crowding icons** under a Crowding mode that shows icons;
+and the ticker as two nested levels — the **Show service alerts** switch (`alerts`,
+whether alerts are fetched from SEPTA at all) encloses the ticker **Show** select
+(`device.ticker_show`: `both` (default), `alerts`, `detours`, or `off`), which in turn
+encloses Height and Scroll speed, since `off` leaves nothing to size or scroll. Disabled
+values are still collected and sent on save, so switching a parent off and on again
+loses nothing.
+
+Two sticky strips make the page navigable. At the top: one pill per block (jump links,
+built as buttons rather than `#` anchors so they never fight the hash router, with the
+block currently on screen highlighted) and a **Filter settings** box that hides every
+field whose text — label, hint, option labels — does not contain what was typed
+(case-insensitive), dims the pills of blocks with no match, and says "No settings match"
+when nothing does. At the bottom: the one **Save settings** button and **Undo changes**,
+both disabled until the form differs from what was loaded (a `JSON.stringify` compare of
+`collect()` against the loaded config, run on every input/change/click under the form),
+an "Unsaved changes" label while it does, and the saved/error banner shown in the bar
+itself so it is visible where the click happened. Undo rebuilds the form from the last
+loaded or saved config without a round trip; closing the tab with edits pending gets the
+browser's own leave-page prompt. The PIN block and the Firmware block are not part of
+the form — they talk to their own endpoints and keep their own buttons.
+
+The **Crowding** select (`device.crowding`: `off`, `words`, `icons`, or `both` (default
+`words`)) picks how SEPTA's per-bus seat estimate shows up next to each arrival on the
+Now page — nothing, a word (open / few seats / standing / packed / full), a three-slot
+icon meter, or icons followed by the word. The **Crowding icons** select
+(`device.crowding_icons`: `seats` (default) or `crowd`) picks the icon scheme and is
+dimmed and disabled except when Crowding is Icons or Icons + word. Old firmware that
 only knows the boolean `device.show_crowding` still works: the UI reads `crowding` when
 present and otherwise treats `show_crowding === false` as `off`, anything else as
 `words`; it never sends `show_crowding` back. On the Now page, an arrival with no
@@ -373,7 +400,9 @@ if you flip it. They exist because the owner is not a programmer and an unexplai
 setting is one nobody dares touch. The shared ones (rows to show, title style,
 alternative-of, rail line, bus/trolley) live in `HINT_*` constants near the top of
 `app.js` so the add wizard and the edit form cannot drift apart. The CSS selector is
-`p.hint`, deliberately not `.hint`, so it does not also catch `footer.hint`.
+`p.hint`, deliberately not `.hint`, so it does not also catch `footer.hint`. On Settings
+the hint travels inside the same `field()` wrapper as its control, which is what lets the
+filter box match on the plain-language text as well as the label.
 
 ## Assumptions made (DESIGN.md §7/§9.3 didn't fully pin these down)
 
