@@ -74,3 +74,30 @@ the simulator must not live in `src/` where every ESP32 environment would compil
 `env.BuildSources()` adds `sim/*.cpp`. The library include paths are added there by hand because
 the dependency finder only puts them on the project-source environment, not the one
 `BuildSources` uses.
+
+## Measuring the LVGL pool (`ui-sim-pool`)
+
+`pio run -e ui-sim` builds with `LV_MEM_SIZE` at 512 KB, because 64-bit host pointers make every
+`lv_obj` about 1/0.66 of its size on the ESP32 and the board's 36 KB pool overflows immediately.
+That is fine for looking at layouts and useless for the question DESIGN.md §8 is really about:
+whether a page fits.
+
+`pio run -e ui-sim-pool` is the same simulator with the pool scaled back — 56 KB here is 36,864 B
+there — so a page that does not fit the board does not fit this either, and both guards
+(`main_screen.cpp`'s panel loop, `ui.cpp`'s build refusal) fire exactly as they would on the panel.
+
+```sh
+pio run -e ui-sim-pool
+.pio/build/ui-sim-pool/program /tmp/x pool     # 2..8 stops on all four panel sizes, no PNGs
+```
+
+The `pool` mode prints each page's cost in board bytes, whether the largest single page fits, what
+the pre-2026-09-16 "all four pages resident" switch would have cost, the arrivals page's object
+count (it stops growing when the panel guard starts leaving stops off) and what the arrivals page
+leaves free. `ui-sim` accepts `pool` too, and is the right one for relative comparisons across
+board sizes where the absolute ceiling does not matter.
+
+The scaling factor is `kHostToBoard` in `sim_main.cpp`, fitted against six figures measured on
+`cyd-3248S035R` through `GET /api/debug/ui`; the comment there has the table. It predicts that
+board to about 1.5 % — the four-stop arrivals page comes out at 31,664 B against 31,656 B
+measured — and has **not** been checked against a 240-tall board.

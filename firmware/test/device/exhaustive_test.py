@@ -574,7 +574,91 @@ check('D sd dropped no rows', sdj.get('dropped_rows') == 0 or not sdj.get('mount
 wxj = st.get('weather', {})
 check('D weather age/stale fields', isinstance(wxj.get('age_s'), int) and isinstance(wxj.get('stale'), bool), wxj.get('age_s'))
 check('D state reports board and auth', st.get('board') == 'cyd-3248S035R' and st.get('auth', {}).get('pin_required') is True and 'config_recovered' in st, (st.get('board'), st.get('auth')))
+# The owner's two stops leave ~13 KB of the 36 KB pool. A four-stop configuration legitimately
+# leaves ~2.5 KB and reports lv_tight, so this floor is about the OWNER's config, not a universal
+# rule - section I is the one that checks the pool across a page cycle (DESIGN.md SS8).
 d = ui(); check('D LVGL pool has headroom', d.get('lv_free', 0) > 3000, (d.get('lv_used'), d.get('lv_free'), d.get('lv_max_used')))
+
+# ---------- I. LVGL pool across the page cycle (DESIGN.md SS8) ----------
+# LVGL's widgets come out of a fixed 36 KB static pool (lv_conf.h LV_MEM_SIZE), not the ESP heap,
+# and LVGL 9.5 does not survive running it out: lv_obj_class.c stores a new child straight after an
+# unchecked lv_realloc(), so a page that does not fit is a crash or a reboot, not a missing widget.
+# ui.cpp therefore keeps exactly ONE page resident - every transition frees the page it is leaving
+# before building the next one. This section drives the cycle from here and checks that the pool
+# comes back to the same place every time.
+#
+# It changes no configuration, so there is nothing for it to restore. Firmware without the endpoint
+# prints one SKIP line.
+POOL_CYCLES = int(os.environ.get('CYD_POOL_CYCLES', '20'))
+
+def post_page(name):
+    r = curl(PINH + ['-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
+                     B + '/api/debug/page?page=' + name])
+    return int(r.stdout or 0)
+
+def ui_settled(tries=8):
+    """ui(), but never the all-zero UiDebug that debugSnapshot() answers when its mutex read times
+    out - that reads as a pool of 0 bytes and would fail every assertion below for the wrong
+    reason."""
+    for _ in range(tries):
+        d = ui()
+        if d.get('page'):
+            return d
+        time.sleep(1.0)
+    return {}
+
+if post_page('stats') == 404:
+    print('SKIP I: this firmware has no POST /api/debug/page')
+else:
+    check('I page endpoint needs the PIN',
+          int((curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
+                     B + '/api/debug/page?page=stats']).stdout or 0)) == 401)
+    check('I page endpoint rejects an unknown page', post_page('nope') == 400)
+    uptime_before = state().get('uptime', 0)
+    samples = []
+    mismatches = []
+    for i in range(POOL_CYCLES):
+        for want in ('stats', 'device', 'main'):
+            code = post_page(want)
+            time.sleep(2.0)
+            d = ui_settled()
+            if not d:
+                mismatches.append((i, want, 'no reading'))
+                continue
+            samples.append((i, want, d))
+            # "main" may legitimately come up as the night clock (DESIGN.md SS8 night).
+            got = d.get('page')
+            if got != want and not (want == 'main' and got == 'night'):
+                mismatches.append((i, want, got))
+    check('I every page came up when asked for', not mismatches, mismatches[:6])
+    check('I %d cycles produced readings' % POOL_CYCLES,
+          len(samples) >= POOL_CYCLES * 3 - 2, len(samples))
+    if samples:
+        frees = [d['lv_free'] for _, _, d in samples]
+        peaks = [d['lv_max_used'] for _, _, d in samples]
+        last = samples[-1][2]
+        pool = last.get('lv_total', 36 * 1024)
+        # Never exhausted. 1 KB is not "comfortable" - a four-stop arrivals page really does sit
+        # near there - it is "the next lv_label_set_text did not have to fail".
+        check('I the pool never ran out', min(frees) > 1024, (min(frees), pool))
+        check('I no page build was refused', last.get('lv_page_refusals') == 0,
+              last.get('lv_page_refusals'))
+        # Creep: the high-water mark settles in the first few cycles (the first build of each page
+        # is the biggest) and must not climb after that. A leak shows here and nowhere else.
+        early = max(peaks[:6])
+        late = max(peaks[-6:])
+        check('I high-water mark does not creep across cycles', late - early <= 512,
+              (early, late, peaks[0], peaks[-1]))
+        # The arrivals page must rebuild to the same size every time it is returned to.
+        mains = [d['lv_used'] for _, w, d in samples if w == 'main']
+        check('I the arrivals page rebuilds to the same size',
+              not mains or max(mains) - min(mains) <= 1024, (min(mains), max(mains)) if mains else None)
+        check('I no reboot during the page cycling', state().get('uptime', 0) > uptime_before,
+              (uptime_before, state().get('uptime')))
+        print('     pool: total %s, free %s..%s, high-water %s, page costs %s, tight=%s'
+              % (pool, min(frees), max(frees), max(peaks), last.get('lv_page_cost'),
+                 last.get('lv_tight')))
+    post_page('main'); time.sleep(2)
 
 # ---------- H. transport (DESIGN.md SS2.1) ----------
 # Only a firmware built with -DTRANSIT_HTTPS reports a `transport` block in /api/state; a build

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Tapping through the screens no longer risks restarting the display.** The screen has its own
+  small, fixed pot of drawing memory, separate from everything else, and the old way of switching
+  pages built the next screen before letting go of the one it was leaving - so for a moment it was
+  holding two or three at once. On the owner's own two stops, the second tap (from Statistics to
+  Device info) asked for more than was left. Each page is now let go of before the next one is
+  built, so only one is ever held, and there is room to spare on every configuration. The arrivals
+  page also comes back to the front by itself if a page ever cannot be drawn, so a tap can never
+  leave the display stuck on Statistics or Device info.
+- The display can hold about four stops on the 3.5" screens and six on the 2.4"/2.8" ones. Asking
+  for more used to be accepted and then fail; the arrivals page now shows as many as fit and says
+  `2 more stops will not fit in this display's memory` at the bottom, so nothing disappears
+  silently and the display keeps working.
 - Web page: it used to go completely blank if you opened it (or it was already open and
   quietly refreshing in the background) at the moment the display was too busy to answer -
   something that happens on purpose several times a minute, by design (see the HTTPS/memory

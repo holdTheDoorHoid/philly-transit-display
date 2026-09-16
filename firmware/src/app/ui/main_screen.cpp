@@ -6,6 +6,7 @@
 // stale or fabricated numbers (DESIGN.md SS8).
 #include "main_screen.h"
 
+#include <Arduino.h>
 #include <WiFi.h>
 
 #include <algorithm>
@@ -29,6 +30,29 @@ using transit::StopSnapshot;
 namespace transit_app::ui {
 
 namespace {
+
+// What the stop-panel loop has to leave in the LVGL pool when it stops adding panels. Everything
+// else on the page - the header, the Indego strip, the ticker - is already built by the time the
+// loop runs (see the note where they are created), so this is NOT a page tail to be predicted; it
+// is only a margin on the "will the next panel fit" question.
+//
+// Small on purpose, and it was 3 KB first. `pio run -e ui-sim-pool` (the simulator with its pool
+// scaled to the board's) showed 3 KB dropping the FOURTH stop panel on a 320x480 board - a
+// configuration that measurably works on hardware, 31,656 B with 2,472 B left. Dropping a stop the
+// owner asked for is the failure this guard exists to avoid being worse than.
+//
+// The value barely matters for the case it is really for. Free when the loop considers a fifth
+// panel on that board is ~1.1 KB against a panel costing ~10.1 KB (host bytes, ui-sim-pool), so a
+// fifth stop is refused by a factor of nine whatever this is; and the reading is taken mid-build
+// with LVGL's layout transients still outstanding, so it errs low - toward dropping a panel rather
+// than toward running the pool out.
+constexpr uint32_t kPanelTailReserve = 512;
+
+uint32_t lvglPoolFree() {
+  lv_mem_monitor_t m;
+  lv_mem_monitor(&m);
+  return m.free_size;
+}
 
 struct RowWidgets {
   lv_obj_t *route_badge;
@@ -238,81 +262,14 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   // ---- Stop panels (ui_common.h makePanelsArea/makePanel: the stats page uses the same) ----
   lv_obj_t *panels_area = makePanelsArea(screen);
 
-  for (const StopConfig &s : visibleStops(cfg, time(nullptr))) {
-    PanelWidgets pw;
-    pw.stop_key = s.key;
-    pw.route = s.route;
-    pw.alt_of = s.alt_of;
-    pw.alt_after_min = s.alt_after_min;
-
-    lv_obj_t *panel = makePanel(panels_area);
-    pw.panel = panel;
-    if (!s.alt_of.empty()) lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);  // until the primary runs late
-
-    pw.title = makeLabel(panel, fontBody(h), colorText());
-    lv_label_set_text(pw.title, panelTitle(s).c_str());
-    // Both sizes fixed: LONG_DOT only ellipsizes a label whose height is not content-sized -
-    // with a content height a long title wrapped onto a second line instead (DESIGN.md SS8 says
-    // ellipsized), which on a 240-tall board pushed the last arrival row out of the panel.
-    lv_obj_set_size(pw.title, lv_pct(100), lv_font_get_line_height(fontBody(h)));
-    lv_label_set_long_mode(pw.title, LV_LABEL_LONG_DOT);
-
-    pw.weather_note = makeLabel(panel, fontSmall(h), colorEarly());
-    lv_obj_set_width(pw.weather_note, lv_pct(100));
-    lv_label_set_long_mode(pw.weather_note, LV_LABEL_LONG_DOT);
-    lv_label_set_text(pw.weather_note, "");
-    lv_obj_add_flag(pw.weather_note, LV_OBJ_FLAG_HIDDEN);
-
-    pw.no_data_label = makeLabel(panel, fontSmall(h), colorSubtext());
-    lv_label_set_text(pw.no_data_label, "no data yet");
-    lv_obj_add_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
-
-    // DESIGN.md SS6/SS8: each stop shows `show` arrival rows (1..4). F31 - this loop used to run to
-    // the screen's capacity for every panel, so the per-stop setting was accepted by the config
-    // schema, echoed back by GET /api/config, and then ignored by the only thing that could act on
-    // it: a stop asking for 1 row still got 3. Capacity is still the ceiling - four 48 px rows do
-    // not fit a 240 px panel however politely they are requested.
-    int panel_rows = std::min<int>(row_capacity, std::max<int>(1, (int)s.show));
-    for (int r = 0; r < panel_rows; ++r) {
-      lv_obj_t *row = makeBox(panel);
-      lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-      lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-      lv_obj_set_style_pad_all(row, 2, 0);
-      lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-      lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-      lv_obj_set_style_pad_column(row, 6, 0);
-
-      RowWidgets rw;
-      rw.route_badge = makeRouteBadge(row, fontSmall(h), s.route);
-
-      rw.destination = makeLabel(row, fontBody(h), colorText());
-      lv_obj_set_flex_grow(rw.destination, 1);
-      // Fixed to one line for the same reason as the title: with crowding words and icons on the
-      // row, "20th-Johnston" wrapped onto two lines and the row grew instead of ellipsizing.
-      lv_obj_set_height(rw.destination, lv_font_get_line_height(fontBody(h)));
-      lv_label_set_long_mode(rw.destination, LV_LABEL_LONG_DOT);
-
-      rw.crowd_icons = makeLabel(row, fontIcons(), colorSubtext());
-      lv_label_set_recolor(rw.crowd_icons, true);  // crowdingIcons() colours each slot inline
-      lv_obj_set_style_text_letter_space(rw.crowd_icons, 2, 0);
-      lv_label_set_text(rw.crowd_icons, "");
-      lv_obj_add_flag(rw.crowd_icons, LV_OBJ_FLAG_HIDDEN);
-
-      rw.crowding = makeLabel(row, fontSmall(h), colorSubtext());
-      lv_label_set_text(rw.crowding, "");
-      lv_obj_add_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
-
-      rw.minutes = makeLabel(row, minutes_font, colorText());
-      lv_obj_set_style_text_align(rw.minutes, LV_TEXT_ALIGN_RIGHT, 0);
-
-      rw.status_badge = makeLabel(row, fontSmall(h), colorSubtext());
-
-      pw.rows.push_back(rw);
-    }
-
-    ctx->panels.push_back(pw);
-  }
-
+  // The Indego strip and the alert ticker are built HERE, before the stop panels, even though they
+  // sit below them on screen. Child order on `screen` is unchanged - they still follow
+  // panels_area, and the panels go inside panels_area - so the layout is identical (verified by
+  // re-rendering every simulator PNG and comparing checksums). What changes is who gets the pool
+  // first: both of these are fixed-size (the bike strip always builds kMaxBikeStations rows,
+  // shown or not, and the ticker is one box and one label), while the panel loop below is the
+  // part that scales with the stop list. Building the fixed part first means the panel guard only
+  // has to leave room for label text, not for a page tail it would otherwise have to predict.
   // ---- Indego section (only shown when bike_service has stations) ----
   // A panel like the stop panels: "[bicycle] Indego" header with a stale-age note on the right,
   // then one row per station: name (ellipsized) and the counts meter right-aligned.
@@ -385,6 +342,116 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_obj_set_width(ctx->ticker_label, lv_pct(100));
   }
   lv_label_set_text(ctx->ticker_label, "");
+
+  // LVGL pool guard (ui.cpp's "LVGL pool safety" note, DESIGN.md SS8). DESIGN.md SS6 allows eight
+  // stops (config_store.h kMaxStops) and eight of these panels do not fit LVGL's 36 KB pool: on
+  // cyd-3248S035R a three-row panel measured ~6.2 KB and the whole four-stop arrivals page 31,656 B
+  // of a 36,864 B pool, so the fifth stop is already over. This page is the FIRST thing built, at
+  // boot, before anything has measured what it costs, so ui.cpp's remembered-cost check has nothing
+  // to check against - and LVGL 9.5 dereferences the result of a failed lv_realloc() rather than
+  // returning, so running the pool out here is a crash on power-up with the offending config still
+  // on disk: a boot loop the owner cannot get out of over the network. The guard therefore has to
+  // live inside the loop, where the pool can simply be looked at between panels. Stop while there
+  // is room, and say on the panel how many stops did not fit.
+  int dropped_panels = 0;
+  uint32_t panel_cost = 0;  // the largest panel built so far - measured on this board, not guessed
+
+  for (const StopConfig &s : visibleStops(cfg, time(nullptr))) {
+    lv_mem_monitor_t pool;
+    lv_mem_monitor(&pool);
+    if (panel_cost != 0 && pool.free_size < panel_cost + kPanelTailReserve) {
+      dropped_panels++;  // keep counting: the caption below says how many
+      continue;
+    }
+    uint32_t pool_before = pool.free_size;
+
+    PanelWidgets pw;
+    pw.stop_key = s.key;
+    pw.route = s.route;
+    pw.alt_of = s.alt_of;
+    pw.alt_after_min = s.alt_after_min;
+
+    lv_obj_t *panel = makePanel(panels_area);
+    pw.panel = panel;
+    if (!s.alt_of.empty()) lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);  // until the primary runs late
+
+    pw.title = makeLabel(panel, fontBody(h), colorText());
+    lv_label_set_text(pw.title, panelTitle(s).c_str());
+    // Both sizes fixed: LONG_DOT only ellipsizes a label whose height is not content-sized -
+    // with a content height a long title wrapped onto a second line instead (DESIGN.md SS8 says
+    // ellipsized), which on a 240-tall board pushed the last arrival row out of the panel.
+    lv_obj_set_size(pw.title, lv_pct(100), lv_font_get_line_height(fontBody(h)));
+    lv_label_set_long_mode(pw.title, LV_LABEL_LONG_DOT);
+
+    pw.weather_note = makeLabel(panel, fontSmall(h), colorEarly());
+    lv_obj_set_width(pw.weather_note, lv_pct(100));
+    lv_label_set_long_mode(pw.weather_note, LV_LABEL_LONG_DOT);
+    lv_label_set_text(pw.weather_note, "");
+    lv_obj_add_flag(pw.weather_note, LV_OBJ_FLAG_HIDDEN);
+
+    pw.no_data_label = makeLabel(panel, fontSmall(h), colorSubtext());
+    lv_label_set_text(pw.no_data_label, "no data yet");
+    lv_obj_add_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
+
+    // DESIGN.md SS6/SS8: each stop shows `show` arrival rows (1..4). F31 - this loop used to run to
+    // the screen's capacity for every panel, so the per-stop setting was accepted by the config
+    // schema, echoed back by GET /api/config, and then ignored by the only thing that could act on
+    // it: a stop asking for 1 row still got 3. Capacity is still the ceiling - four 48 px rows do
+    // not fit a 240 px panel however politely they are requested.
+    int panel_rows = std::min<int>(row_capacity, std::max<int>(1, (int)s.show));
+    for (int r = 0; r < panel_rows; ++r) {
+      lv_obj_t *row = makeBox(panel);
+      lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+      lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+      lv_obj_set_style_pad_all(row, 2, 0);
+      lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+      lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+      lv_obj_set_style_pad_column(row, 6, 0);
+
+      RowWidgets rw;
+      rw.route_badge = makeRouteBadge(row, fontSmall(h), s.route);
+
+      rw.destination = makeLabel(row, fontBody(h), colorText());
+      lv_obj_set_flex_grow(rw.destination, 1);
+      // Fixed to one line for the same reason as the title: with crowding words and icons on the
+      // row, "20th-Johnston" wrapped onto two lines and the row grew instead of ellipsizing.
+      lv_obj_set_height(rw.destination, lv_font_get_line_height(fontBody(h)));
+      lv_label_set_long_mode(rw.destination, LV_LABEL_LONG_DOT);
+
+      rw.crowd_icons = makeLabel(row, fontIcons(), colorSubtext());
+      lv_label_set_recolor(rw.crowd_icons, true);  // crowdingIcons() colours each slot inline
+      lv_obj_set_style_text_letter_space(rw.crowd_icons, 2, 0);
+      lv_label_set_text(rw.crowd_icons, "");
+      lv_obj_add_flag(rw.crowd_icons, LV_OBJ_FLAG_HIDDEN);
+
+      rw.crowding = makeLabel(row, fontSmall(h), colorSubtext());
+      lv_label_set_text(rw.crowding, "");
+      lv_obj_add_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
+
+      rw.minutes = makeLabel(row, minutes_font, colorText());
+      lv_obj_set_style_text_align(rw.minutes, LV_TEXT_ALIGN_RIGHT, 0);
+
+      rw.status_badge = makeLabel(row, fontSmall(h), colorSubtext());
+
+      pw.rows.push_back(rw);
+    }
+
+    ctx->panels.push_back(pw);
+
+    lv_mem_monitor(&pool);
+    uint32_t cost = pool_before > pool.free_size ? pool_before - pool.free_size : 0;
+    if (cost > panel_cost) panel_cost = cost;
+    Serial.printf("[lvmem] panel %s: %u B, pool free %u\n", s.key.c_str(), (unsigned)cost,
+                  (unsigned)pool.free_size);
+  }
+  if (dropped_panels > 0) {
+    Serial.printf("[lvmem] %d stop panel(s) left off the arrivals page: %u B free, a panel costs %u B\n",
+                  dropped_panels, (unsigned)lvglPoolFree(), (unsigned)panel_cost);
+    lv_obj_t *note = makeLabel(panels_area, fontSmall(h), colorLate());
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_text_fmt(note, "%d more stop%s will not fit in this display's memory",
+                          dropped_panels, dropped_panels == 1 ? "" : "s");
+  }
 
   lv_obj_set_user_data(screen, ctx);
   // Freed with the screen (ui.cpp rebuildScreens() deletes and recreates screens on a config

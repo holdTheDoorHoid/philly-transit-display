@@ -303,8 +303,38 @@
 #define LV_USE_ASSERT_OBJ           0   /*Check the object's type and existence (e.g. not deleted). (Slow)*/
 
 /*Add a custom handler when assert happens e.g. to restart the MCU*/
-#define LV_ASSERT_HANDLER_INCLUDE <stdlib.h>
-#define LV_ASSERT_HANDLER abort();   /*abort() prints a backtrace on ESP32 instead of hanging silently*/
+/* LV_USE_ASSERT_MALLOC above is what catches an exhausted LV_MEM_SIZE pool, and a bare abort() is
+ * a backtrace nobody is watching. transitLvglAssertFailed() (src/app/ui/lv_assert_hook.cpp) prints
+ * which LVGL function ran out and what the pool looked like, then restarts cleanly. It cannot
+ * return: LVGL 9.5 dereferences the result of a failed lv_realloc() a few instructions later, so
+ * continuing is a wild pointer, not a degraded page. The defence that actually keeps this handler
+ * unreachable is ui.cpp's one-page-at-a-time rule (DESIGN.md SS8). */
+#ifdef UI_SIM
+    /* The host simulator does not link lv_assert_hook.cpp (platformio.ini build_src_filter), and
+     * its pool is 512 KB - it cannot reach this path. */
+    #define LV_ASSERT_HANDLER_INCLUDE <stdlib.h>
+    #define LV_ASSERT_HANDLER abort();
+#else
+    /* Declared here rather than in a header of its own: LVGL's own C sources include this file
+     * through an absolute LV_CONF_PATH (platformio.ini), and the project's include/ directory is
+     * not on their search path, so a `#include "transit_lv_assert.h"` from lv_assert.h would not
+     * resolve. LV_ASSERT_HANDLER_INCLUDE still has to name a real header, so it keeps <stdlib.h>. */
+    #define LV_ASSERT_HANDLER_INCLUDE <stdlib.h>
+    /* LVGL's .S sources include this file too, and the assembler has no use for a prototype. */
+    #ifndef __ASSEMBLER__
+        #ifdef __cplusplus
+extern "C" {
+        #endif
+        void transitLvglAssertFailed(void);
+        #ifdef __cplusplus
+}
+        #endif
+    #endif
+    /* No __func__: passing one would give every LVGL function with an assert in it a static name
+     * string, which measured +1,256 B of flash on a board already at 97 %. The handler prints its
+     * own return address instead, which addr2line turns back into the exact call site. */
+    #define LV_ASSERT_HANDLER transitLvglAssertFailed();
+#endif
 
 /*-------------
  * Debug

@@ -24,6 +24,14 @@ formed, `https_preferred` keeps the arrivals flowing whatever the heap gate deci
 the TLS counters, `https` never fetches over plain HTTP, a bogus value is rejected, and the owner's
 setting is restored; a firmware without the block prints one `SKIP H` line and moves on.
 
+Section I drives the page cycle through `POST /api/debug/page` (DESIGN.md §7) and watches LVGL's
+36 KB widget pool across it: every page must actually come up, `lv_free` must never approach zero,
+no build may be refused, the arrivals page must rebuild to the same size each time, and
+`lv_max_used` must stop climbing after the first few cycles — a leak shows there and nowhere else.
+It changes no configuration, so it has nothing to restore, and it prints one `SKIP I` line on
+firmware without the endpoint. `CYD_POOL_CYCLES` sets the number of full cycles (default 20;
+32 cycles were run by hand on 2026-09-16 and the high-water mark was flat from cycle 15 on).
+
 It is not part of `pio test` (it needs the hardware and about 15 minutes). PlatformIO ignores this
 directory because it has no `test_main`. 2026-09-14: 119/122 with the three remaining items being
 test timing, fixed since; run it again after any change to the UI controller or the config schema.

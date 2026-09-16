@@ -16,6 +16,17 @@ extern uint32_t free_heap;    // what ESP.getFreeHeap() reports
 inline uint32_t millis() { return sim::millis_ms; }
 inline void delay(uint32_t ms) { sim::millis_ms += ms; }
 
+// Enough of HardwareSerial for the screens' own diagnostic lines (the LVGL pool guard in
+// main_screen.cpp logs which stop panels it had to leave off). Straight to stdout, so the pool
+// sweep shows them inline.
+struct SimSerial {
+  template <typename... A> void printf(const char *fmt, A... a) { std::printf(fmt, a...); }
+  void println(const char *s) { std::printf("%s\n", s); }
+  void print(const char *s) { std::printf("%s", s); }
+  void flush() { std::fflush(stdout); }
+};
+extern SimSerial Serial;
+
 struct SimEsp {
   void restart() { std::printf("[sim] ESP.restart() called (ignored)\n"); }
   uint32_t getFreeHeap() { return sim::free_heap; }

@@ -175,3 +175,5 @@ bool dueAlertTick(const Config &, const transit::Snapshot &, const std::vector<s
 }
 
 }  // namespace transit_app
+
+SimSerial Serial;

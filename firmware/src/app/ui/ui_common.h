@@ -12,7 +12,7 @@ namespace transit_app::ui {
 
 // Selects the palette every colour*() below returns: "dark", or anything else for the light
 // default (config.device.theme, DESIGN.md SS6). Screens pick colours up when they are built, so
-// ui.cpp calls this before buildScreens()/rebuildScreens().
+// ui.cpp calls this before the first page build and again from rebuildScreens().
 void setTheme(const std::string &name);
 bool isDarkTheme();
 

@@ -12,7 +12,9 @@ export PATH="$HOME/.platformio/penv/bin:$PATH"
 cd firmware
 pio run -e cyd-3248S035R        # the owner's board; see platformio.ini for the other envs
 pio run -e cyd-3248S035R-https  # the same board with the HTTPS prototype compiled in (DESIGN.md §2.1)
-pio test -e native              # transit_core + transit_stats host tests (64 cases)
+pio test -e native              # transit_core + transit_stats host tests (173 cases)
+pio run -e ui-sim               # host screenshot simulator (sim/README.md)
+pio run -e ui-sim-pool          # the same, with LVGL's pool scaled to the board's (DESIGN.md §8)
 ```
 
 A brand-new build directory may need `pio run` twice - see `platformio.ini`'s comment on
@@ -85,6 +87,7 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 
 | Build (`cyd-3248S035R`) | Flash | Static RAM |
 |---|---:|---:|
+| 2026-09-16 LVGL pool safety (one page resident at a time, the panel guard, the `/api/debug/page` hook and the pool fields on `/api/debug/ui`, the logged assert handler) | 1,847,562 B (97.2 %) | 95,732 B |
 | 2026-09-16 screen pass (phone-style Wi-Fi bars, stats page with the on-time meter in three layouts, device page with SEPTA/SD health and the Data sources card, stats+device built on demand) on top of the exception pool and streamed `/api/state` | 1,840,258 B (96.8 %) | 95,652 B |
 | Same tree without the screen pass (`next`, 2026-09-16) | 1,832,302 B (96.4 %) | 95,652 B |
 | v0.2.0: the 2026-09-15 review fixes combined (PIN, Host check, OTA board check, WPA2 setup AP + QR, transport completeness, transit-first polling, per-stop health on the panels, checked SD writes, log export) | 1,828,384 B (96.2 %) | 95,644 B (29.2 %) |
@@ -94,7 +97,15 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 | Same, before the second round of trims | 1,889,518 B (99.4 %) | |
 | Weather only, before the first round | 1,897,974 B (99.9 %) | |
 
-The tightest board tracks it closely: `cyd-2432S024C` is 1,835,858 B (96.6 %) / 95,788 B after the
+The pool-safety pass is +6,172 B on the 3.5" board and +7,460 B on the 2.4" capacitive one, which
+leaves 52,982 B and 57,226 B of app slot respectively. It would have been 1,256 B more: passing
+`__func__` to `LV_ASSERT_HANDLER` gave a static name string to each of the ~400 LVGL functions the
+macro expands in, so the handler prints its own return address instead and `addr2line` names it.
+Every env still builds - `cyd-2432S028R` is 1,832,146 B and the HTTPS prototype
+`cyd-3248S035R-https` 1,871,934 B (98.5 %, the tightest of the four).
+
+The tightest board tracks it closely: `cyd-2432S024C` is 1,843,318 B (97.0 %) / 95,852 B after the
+pool-safety pass, 1,835,858 B (96.6 %) / 95,788 B after the
 screen pass (1,828,134 B before it, same day; the Data sources card never appears on its 240-tall
 layouts but its code is linked); it was 1,781,266 B (93.7 %) / 95,716 B at v0.2.0 and
 1,737,634 B (91.4 %) / 95,404 B before the hardening pass.
@@ -113,7 +124,7 @@ again, that is the single biggest item that can go: turning the three flags off 
 `lv_qrcode_*` calls in `ui.cpp` leaves the setup screen showing the network name and password as
 text, which still works — it is just ten characters to type.
 
-Flash headroom is about 112 KB on the 3.5" boards and 116 KB on the 2.4" capacitive one.
+Flash headroom is about 52 KB on the 3.5" boards and 56 KB on the 2.4" capacitive one.
 `platformio.ini`'s comment and `include/lv_conf.h` list the
 knobs (fonts, LVGL features, debug level); do not grow the app slots without dropping OTA.
 Trims made 2026-09-14, first when the weather feature pushed the image to 99.9 % and again when
@@ -203,8 +214,20 @@ Rules that fell out of this, all learned the hard way (each one was a boot loop 
   (`acquireLogReader()` in `sd_logger.h`) and a second concurrent one is refused with a 503.
 - Nothing on the LVGL task touches SD or the network. The stats page's `getStopSummary()` returns
   a cached value plus its age; the poller recomputes one stop per idle slice.
-- LVGL's static pool is 32 KB (`LV_MEM_SIZE`); the draw buffer is 1/16 of the screen in RGB565
-  (`LVGL_BUFFER_PIXELS` in `boards/*.json`). The `[lvmem]` boot line shows pool usage.
+- LVGL's static pool is 36 KB (`LV_MEM_SIZE`); the draw buffer is 1/20 of the screen in RGB565 on
+  the 3.5" boards (`LVGL_BUFFER_PIXELS` in `boards/*.json`). The `[lvmem]` lines show pool usage —
+  at boot, and one per page built.
+- **One page is resident at a time** (DESIGN.md §8). LVGL 9.5 does not survive running that pool
+  out: `lv_obj_class.c` writes each new child straight after an unchecked `lv_realloc()`. So every
+  page transition frees the page it is leaving before it builds the next one, the night page
+  replaces the arrivals page rather than sitting beside it, and `createMainScreen()` stops adding
+  stop panels while there is still room. Measured on the owner's board: the arrivals page is
+  19,280 B with two stops and 31,656 B with four, of 36,864 B; stats 8,220 B, device info
+  10,336 B, night ~1,740 B. A stop panel is ~6.2 KB on a 320-wide board and ~4.4 KB on a 240-tall
+  one, so four stops is the ceiling on the 3.5" boards and six on the 2.4"/2.8" ones — the panel
+  guard truncates the page and says so rather than crashing at boot on a config §6 accepts.
+  `GET /api/debug/ui` reports `lv_free`, `lv_max_used`, `lv_page_cost` and `lv_page_refusals`;
+  `POST /api/debug/page` (PIN-gated) drives the cycle so the pool can be watched under it.
 - The ESP32's static `.bss` budget is separate from, and much smaller than, the heap: a ~14 KB
   object declared at file scope fails to link ("DRAM segment data does not fit").
 
