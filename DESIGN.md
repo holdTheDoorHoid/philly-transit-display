@@ -1496,7 +1496,26 @@ the poller was mid-fetch, and both `assert`-and-panic rather than failing soft: 
 Neither is a C++ exception and no pool or catch block can reach either; the only defence is not to
 exhaust the heap while a fetch is in flight. That is a real constraint on the *test hook*, not on
 normal operation - nothing else takes the whole heap on purpose - so the device suite fires
-`/api/debug/oom` only in the quiet window just after a poll completes (section A0). Firing it as
+`/api/debug/oom` only in the quiet window just after a poll completes (section A0).
+
+A **third instance, and the one that matters for normal operation**, turned up on 2026-09-16 on a
+clean `dcb6353` image with `/api/debug/oom` never fired once (the capture was grepped: the only
+`oom` matches are the bootloader's `ho 8 tail 4 room 4` line matching inside the word "room"). Free
+heap decayed to ~34.5 KB with the largest block down to 164 B under light polling, `main.cpp
+loop()` caught its `bad_alloc` and skipped frames exactly as designed, and lwIP then panicked
+underneath it: `assert failed: sys_timeout_abs ... timeouts.c:194 (sys_timeout: timeout != NULL,
+pool MEMP_SYS_TIMEOUT is empty)`. The C++ machinery worked; the C layer below it did not have to.
+
+**Do not "fix" that by raising `MEMP_NUM_SYS_TIMEOUT` - there is no pool to raise.** The ESP32
+lwIP port sets `MEMP_MEM_MALLOC 1` and `MEM_LIBC_MALLOC 1` unconditionally
+(`framework-arduinoespressif32-libs/esp32/include/lwip/port/include/lwipopts.h:98,105`), so every
+`memp_malloc()` is a `mem_malloc()` and therefore a plain libc `malloc()`. "Pool ... is empty" is
+lwIP's wording for *malloc returned NULL*; the pool-size constants are vestigial here. So this is
+not a sizing bug and not an lwIP bug - it is the heap fragmentation arriving at whichever caller
+asks next, and lwIP asserts instead of failing soft. Every `MEMP_NUM_*` figure in this SDK reads as
+a limit and behaves as a formality; judge memory questions from `MALLOC_CAP_8BIT` free and largest
+block, never from those.
+ Firing it as
 soon as a freshly booted device answered, with the first schedule/weather/bike fetches still in
 flight, panicked the board 2 times out of 2; firing it right after a poll finished was clean 3
 times out of 3. The convergence that
