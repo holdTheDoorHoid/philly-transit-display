@@ -944,6 +944,23 @@ took, worst since boot). A tick is single-digit milliseconds; a reading in the h
 display task that waited for something looks like, and the only things it can wait for are the locks
 it is not allowed to wait for. That is the check a future screen would fail.
 
+**What the audit found and deliberately did NOT change**, so the next reader does not have to
+rediscover it: the display path still calls into the Wi-Fi driver. `WiFi.status()`, `WiFi.RSSI()`,
+`WiFi.SSID()` and `WiFi.localIP()` are read from `refreshDeviceInfoScreen()`, and
+`refreshMainScreen()` reads `status()`/`RSSI()` for the header's signal bars on every 1 Hz refresh
+(`main_screen.cpp`, twice each - a free cleanup for whoever is next in that function). `RSSI()`
+reaches `esp_wifi_sta_get_ap_info()` and takes the SDK's Wi-Fi API lock, so this is, strictly, the
+display task waiting on a lock another task can hold.
+
+It is left alone on purpose, and the reason is the same fact that makes the rest of this section
+work: that lock is taken with `portMAX_DELAY`. A take that never times out can never reach
+`vTaskPriorityDisinheritAfterTimeout()` - the assert needs a *timeout* - so these calls cannot
+produce the panic in §12.1, first or second occurrence. What they can cost is latency, and that is
+measured rather than assumed: `tick_ms_max` sat at 168 ms across a full device-suite run whose page
+rebuilds are the expensive part, so they are not costing anything now. Caching RSSI off the poller
+would remove the theoretical stall and add a staleness question to a number that is already only a
+four-bar icon; if it is ever done, do it for a measurement, not for this paragraph.
+
 **The idle loop runs one deferred job per slice** and re-checks the poll deadline afterwards.
 Draining the whole queue back to back (a 400 KB stop-list proxy and a 30-day stats scan are each
 seconds of work) pushed the next transit poll well past its deadline with nothing noticing.
