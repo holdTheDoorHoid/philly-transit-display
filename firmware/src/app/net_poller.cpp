@@ -934,11 +934,39 @@ void pollerTask(void * /*arg*/) {
     Serial.println("[net_poller] clock not synced after 45 s; polling anyway, schedules are not cached and logging waits for a sane clock");
   }
   uint32_t consecutive_failures = 0;
+  // Self-heal for a wedged heap (found 2026-09-15). A no-PSRAM ESP32 whose heap has been
+  // fragmented into tiny pieces - e.g. by a long burst of rapid config saves, each of which
+  // rebuilds the whole LVGL screen, interleaved with active polling - can reach a state where
+  // ~50 KB is free but the largest block is ~2 KB, too small for any fetch buffer. Every poll then
+  // fails with a caught bad_alloc (the board stays up and honest, but shows nothing new), and
+  // nothing defragments a running heap. The one recovery is what a person would do: power-cycle.
+  // Guard tightly so this only ever fires on a genuine wedge, never on an ordinary SEPTA outage:
+  //   * largest block below kWedgeLargestBlock (a normal idle board sits ~20-30 KB) - a SEPTA
+  //     outage leaves the heap healthy, so that case keeps its normal backoff and never reboots;
+  //   * AND that condition held across kWedgePollsBeforeReboot consecutive failed polls, which
+  //     with the failure backoff is several minutes, so a brief blip cannot trigger it.
+  constexpr size_t kWedgeLargestBlock = 6 * 1024;
+  constexpr uint32_t kWedgePollsBeforeReboot = 15;
+  uint32_t wedged_polls = 0;
   for (;;) {
     // pollOnce() publishes the arrivals as soon as it has them and returns the deadline it set
     // for the next cycle (F12), so the interval is derived once, in the place that also budgets
     // the optional work against it.
     uint32_t deadline = pollOnce(consecutive_failures);
+
+    // Wedge detection (see above): a failed poll while the largest free block is critically small.
+    // getPollStatus() reflects what pollOnce() just published.
+    if (!getPollStatus().ok && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < kWedgeLargestBlock) {
+      if (++wedged_polls >= kWedgePollsBeforeReboot) {
+        Serial.printf("[net_poller] heap wedged: %u consecutive failed polls with largest block < %u B (free %u); rebooting to recover\n",
+                      (unsigned)wedged_polls, (unsigned)kWedgeLargestBlock, (unsigned)ESP.getFreeHeap());
+        Serial.flush();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        ESP.restart();
+      }
+    } else {
+      wedged_polls = 0;
+    }
 
     // Blocks until the deadline, but wakes immediately if requestRepoll() gives the semaphore
     // (DESIGN.md SS7: PUT /api/config "triggers immediate re-poll").

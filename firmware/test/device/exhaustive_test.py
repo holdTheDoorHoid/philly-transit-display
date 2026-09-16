@@ -384,15 +384,17 @@ check('D tap main->stats', post('/api/debug/tap') == 200 and (time.sleep(2) or u
 check('D tap stats->device', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'device'), ui().get('page'))
 check('D tap device->main', post('/api/debug/tap') == 200 and (time.sleep(2) or ui().get('page') == 'main'), ui().get('page'))
 # weather notes + crowding presence in state
-st = state(); seats = [a.get('seats') for x in st.get('stops', []) for a in x.get('arrivals', []) if a.get('status') == 'live']
+wait_for(lambda: len(state().get('stops', [])) == len(base['stops']), 30, 3)  # let the re-poll repopulate after the D churn
+st = state(); stops = st.get('stops', [])
+seats = [a.get('seats') for x in stops for a in x.get('arrivals', []) if a.get('status') == 'live']
 check('D live rows carry seat data', any(seats) or not seats, seats[:3])
-check('D weather_note field present on stops', all('weather_note' in x for x in st['stops']))
+check('D weather_note field present on stops', stops and all('weather_note' in x for x in stops), [list(x) for x in stops])
 # Review F13/F15/F26/F29 fields (DESIGN.md SS7): per-stop health, data age, matched schedule trip,
 # SD write health and weather staleness must all be present and well-formed.
-check('D stop health is one of the four tokens', all(x.get('health') in ('live', 'schedule_only', 'stale', 'unavailable') for x in st['stops']), [(x['key'], x.get('health')) for x in st['stops']])
-check('D stop source_age_s present', all(isinstance(x.get('source_age_s'), int) for x in st['stops']), [x.get('source_age_s') for x in st['stops']])
-check('D arrivals carry sched_trip', all('sched_trip' in a for x in st['stops'] for a in x['arrivals']))
-check('D live stops are not stale right after a poll', all(x.get('health') != 'stale' for x in st['stops'] if x.get('ok')), [(x['key'], x.get('health'), x.get('source_age_s')) for x in st['stops']])
+check('D stop health is one of the four tokens', stops and all(x.get('health') in ('live', 'schedule_only', 'stale', 'unavailable') for x in stops), [(x.get('key'), x.get('health')) for x in stops])
+check('D stop source_age_s present', stops and all(isinstance(x.get('source_age_s'), int) for x in stops), [x.get('source_age_s') for x in stops])
+check('D arrivals carry sched_trip', all('sched_trip' in a for x in stops for a in x.get('arrivals', [])))
+check('D live stops are not stale right after a poll', all(x.get('health') != 'stale' for x in stops if x.get('ok')), [(x.get('key'), x.get('health'), x.get('source_age_s')) for x in stops])
 sdj = st.get('sd', {})
 check('D sd write health fields', isinstance(sdj.get('dropped_rows'), int) and isinstance(sdj.get('write_ok'), bool) and 'error' in sdj, sdj)
 check('D sd dropped no rows', sdj.get('dropped_rows') == 0 or not sdj.get('mounted'), sdj)
