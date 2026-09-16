@@ -1,8 +1,11 @@
 // Device page in the main page's visual language (DESIGN.md SS8): the header strip with the
 // firmware version, a "Network" panel (Wi-Fi bars, SSID, the mDNS URL - how the owner reaches
-// the web app - the IP, and whether the last SEPTA poll worked), a panel named after the device
-// (the web PIN in the big font, SD status and write health, heap, uptime), and the
-// hold-5-seconds Wi-Fi reset as a bordered button along the bottom.
+// the web app - and the IP), a panel named after the device (the web PIN in the big font, SD
+// status and write health, heap, uptime), a "Data sources" panel when the height allows it (one
+// line per feed the config has on - SEPTA, weather, Indego, alerts - with a status word in the
+// arrival colours and how long ago it was fetched; on a board where it does not fit, the SEPTA
+// line stays in the Network panel), and the hold-5-seconds Wi-Fi reset as a bordered button
+// along the bottom.
 #include "device_info_screen.h"
 
 #include <Arduino.h>
@@ -13,8 +16,10 @@
 #include <string>
 
 #include "../auth.h"
+#include "../bike_service.h"
 #include "../net_poller.h"
 #include "../sd_logger.h"
+#include "../weather_service.h"
 #include "ui_common.h"
 
 #ifndef FIRMWARE_VERSION
@@ -36,7 +41,12 @@ struct DeviceInfoCtx {
   lv_obj_t *url_label;
   lv_obj_t *ip_label;
   lv_obj_t *rssi_label;
-  lv_obj_t *septa_label;
+  lv_obj_t *septa_label;               // in the Data sources panel, or in Network when that does not fit
+  bool septa_inline = false;           // ...in which case the line carries its own "SEPTA" caption
+  lv_obj_t *weather_label = nullptr;   // Data sources rows; nullptr when the panel is absent or the feed is off
+  lv_obj_t *bike_label = nullptr;
+  lv_obj_t *alerts_label = nullptr;
+  uint16_t poll_seconds = 30;          // device.poll_seconds: "stale" for SEPTA is measured against it
   lv_obj_t *uptime_label;
   lv_obj_t *pin_label;
   lv_obj_t *sd_label;
@@ -105,6 +115,24 @@ lv_obj_t *captionedLine(lv_obj_t *panel, int32_t h) {
   return l;
 }
 
+// One Data sources row: a fixed-width caption so the status words line up in a column, then a
+// recolor-enabled value that clips. `half` makes the row half the panel wide for the two-column
+// form on a 480-wide board.
+lv_obj_t *sourceRow(lv_obj_t *parent, int32_t h, const char *caption, bool half) {
+  lv_obj_t *row = makeRow(parent, 6);
+  if (half) lv_obj_set_width(row, lv_pct(50));
+  lv_obj_t *cap = makeLabel(row, fontSmall(h), colorSubtext());
+  lv_obj_set_width(cap, 64);
+  lv_label_set_text(cap, caption);
+  lv_obj_t *val = makeLabel(row, fontSmall(h), colorText());
+  lv_label_set_recolor(val, true);
+  lv_obj_set_flex_grow(val, 1);
+  lv_obj_set_height(val, lv_font_get_line_height(fontSmall(h)));
+  lv_label_set_long_mode(val, LV_LABEL_LONG_CLIP);
+  lv_label_set_text(val, "");
+  return val;
+}
+
 void uptimeText(uint32_t s, char *out, size_t n) {
   unsigned d = s / 86400, hr = (s / 3600) % 24, m = (s / 60) % 60;
   if (d > 0) {
@@ -127,6 +155,22 @@ void agoText(uint32_t s, char *out, size_t n) {
   }
 }
 
+// "ok, 12 s ago" / "stale, 2 h ago" / "failed, 4 min ago: connect failed" / "no data yet": the
+// status word in the arrival colours (green ok, amber stale, red failed, grey nothing yet), the
+// age when there is one (age_s < 0: none), the feed's own reason when it has one. A Data sources
+// row has its caption in a column of its own; the SEPTA line that falls back into the Network
+// panel carries "SEPTA  " inline (`caption`), like the SD and heap lines.
+void setSource(lv_obj_t *label, const char *caption, const char *word, lv_color_t color, int32_t age_s,
+               const char *detail) {
+  char age[16] = "";
+  if (age_s >= 0) agoText((uint32_t)age_s, age, sizeof age);
+  char buf[112];
+  int n = caption ? snprintf(buf, sizeof buf, "#%06x %s#  ", (unsigned)colorHex(colorSubtext()), caption) : 0;
+  snprintf(buf + n, sizeof buf - (size_t)n, "#%06x %s#%s%s%s%s", (unsigned)colorHex(color), word, age[0] ? ", " : "",
+           age, detail && detail[0] ? ": " : "", detail ? detail : "");
+  lv_label_set_text(label, buf);
+}
+
 }  // namespace
 
 lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
@@ -144,6 +188,27 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
 
   auto *ctx = new DeviceInfoCtx();
   ctx->mdns_host = cfg.device.name + ".local";
+  ctx->poll_seconds = cfg.device.poll_seconds;
+
+  // ---- Does the Data sources panel fit? Decided from the heights, like the stats page's layouts ----
+  // Network (three lines once SEPTA moves out), the device panel (its PIN line in the big font on
+  // a 320-tall board), the reset button, four 4 px gaps, and the panel itself: title plus one
+  // line per feed the config has on, two feeds per line on a 480-wide board. 240-tall boards never
+  // get it (the coordinator's brief: their layout stays as it is); 480x320 gets the two-column
+  // form with a few px to spare; 320x480 has room for everything.
+  int32_t lh = lv_font_get_line_height(fontSmall(h));
+  bool big_pin = h >= 320 && auth::pin().size() <= 8;
+  int32_t lh_pin = big_pin ? lv_font_get_line_height(fontBig(h)) : lh;
+  int sources = 1 + (cfg.weather.enabled ? 1 : 0) + (cfg.bike.enabled ? 1 : 0) + (cfg.alerts ? 1 : 0);
+  bool two_cols = w >= 400;
+  int source_lines = two_cols ? (sources + 1) / 2 : sources;
+  int32_t reset_pad = h >= 320 ? 8 : 6;
+  int32_t net_h = 12 + 3 * lh + 2 * 2;
+  int32_t dev_h = 12 + lh + lh_pin + 2 * lh + 3 * 2;
+  int32_t reset_h = lh + 2 * reset_pad + 2;
+  int32_t card_h = 12 + lh + source_lines * (lh + 2);
+  int32_t area_h = h - headerHeight(h) - 8;
+  bool sources_card = h >= 320 && area_h - net_h - dev_h - reset_h - 4 * 4 >= card_h;
 
   // ---- Header ----
   lv_obj_t *header = makeHeader(screen, h);
@@ -182,7 +247,11 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
   }
   // Whether the data behind the arrivals page is actually arriving: the last poll's outcome and
   // age, with net_poller's own error text when it failed. The arrivals header only says "stale".
-  ctx->septa_label = captionedLine(net, h);
+  // Lives in the Data sources panel below when that fits, here otherwise.
+  if (!sources_card) {
+    ctx->septa_label = captionedLine(net, h);
+    ctx->septa_inline = true;
+  }
 
   // ---- This device, by name ----
   lv_obj_t *dev = infoPanel(area);
@@ -206,17 +275,34 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
     // they have lost.
     lv_obj_t *row = makeRow(dev, 8);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-    bool big = h >= 320 && auth::pin().size() <= 8;
-    ctx->pin_label = makeLabel(row, big ? fontBig(h) : fontBody(h), colorText());
+    ctx->pin_label = makeLabel(row, big_pin ? fontBig(h) : fontBody(h), colorText());
     lv_label_set_long_mode(ctx->pin_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_max_width(ctx->pin_label, lv_pct(75), 0);
     lv_label_set_text(ctx->pin_label, "");
     lv_obj_t *cap = makeLabel(row, fontSmall(h), colorSubtext());
-    if (big) lv_obj_set_style_pad_bottom(cap, (lv_font_get_line_height(fontBig(h)) - lv_font_get_line_height(fontSmall(h))) / 6, 0);
+    if (big_pin) lv_obj_set_style_pad_bottom(cap, (lh_pin - lh) / 6, 0);
     lv_label_set_text(cap, "web PIN");
   }
   ctx->sd_label = captionedLine(dev, h);
   ctx->heap_label = captionedLine(dev, h);
+
+  // ---- Data sources: one line per feed the config has on ----
+  if (sources_card) {
+    lv_obj_t *card = infoPanel(area);
+    titleRow(card, h, "Data sources");
+    lv_obj_t *rows = card;
+    if (two_cols) {
+      rows = makeBox(card);
+      lv_obj_set_style_bg_opa(rows, LV_OPA_TRANSP, 0);
+      lv_obj_set_size(rows, lv_pct(100), LV_SIZE_CONTENT);
+      lv_obj_set_style_pad_row(rows, 2, 0);
+      lv_obj_set_flex_flow(rows, LV_FLEX_FLOW_ROW_WRAP);
+    }
+    ctx->septa_label = sourceRow(rows, h, "SEPTA", two_cols);
+    if (cfg.weather.enabled) ctx->weather_label = sourceRow(rows, h, "Weather", two_cols);
+    if (cfg.bike.enabled) ctx->bike_label = sourceRow(rows, h, "Indego", two_cols);
+    if (cfg.alerts) ctx->alerts_label = sourceRow(rows, h, "Alerts", two_cols);
+  }
 
   lv_obj_t *spacer = makeBox(area);  // takes whatever height the two panels leave
   lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
@@ -233,7 +319,7 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
   lv_obj_set_style_border_width(reset_target, 1, 0);
   lv_obj_set_style_border_color(reset_target, colorSubtext(), 0);
   lv_obj_set_style_border_color(reset_target, colorLate(), LV_STATE_PRESSED);  // LVGL applies it while pressed
-  lv_obj_set_style_pad_all(reset_target, h >= 320 ? 8 : 6, 0);
+  lv_obj_set_style_pad_all(reset_target, reset_pad, 0);
   lv_obj_remove_flag(reset_target, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(reset_target, LV_OBJ_FLAG_CLICKABLE);
   ctx->reset_label = makeLabel(reset_target, fontSmall(h), colorSubtext());
@@ -274,25 +360,60 @@ void refreshDeviceInfoScreen(lv_obj_t *screen) {
     lv_label_set_text(ctx->rssi_label, "");
   }
 
-  // "SEPTA  ok, 12 s ago" / "SEPTA  failed 4 min ago: HTTP 503". The age is left off until the
-  // clock has been set (an epoch before 2023 is the boot default, not a time). Every line here is
-  // composed with snprintf and inline recolor commands (ui_common.h colorHex), not std::string.
+  // Every line here is composed with snprintf and inline recolor commands (ui_common.h
+  // colorHex), not std::string.
   char buf[96];
   unsigned sub = (unsigned)colorHex(colorSubtext());
+  uint32_t now = (uint32_t)time(nullptr);
+  bool clock_set = now > 1700000000u;  // an epoch before 2023 is the boot default, not a time
+
+  // SEPTA: the last poll's outcome and age. "stale" when the last success is older than two poll
+  // intervals plus 30 s (90 s at the default 30 s, the arrivals header's own threshold) - the
+  // poller has stopped getting through even though nothing has reported a failure yet. The age
+  // is left off until the clock has been set.
   {
     PollStatus ps = getPollStatus();
-    uint32_t now = (uint32_t)time(nullptr);
-    char age[16] = "";
-    if (ps.has_polled && now > 1700000000u && now >= ps.last_poll_epoch) agoText(now - ps.last_poll_epoch, age, sizeof age);
+    int32_t age = ps.has_polled && clock_set && now >= ps.last_poll_epoch ? (int32_t)(now - ps.last_poll_epoch) : -1;
+    const char *cap = ctx->septa_inline ? "SEPTA" : nullptr;
     if (!ps.has_polled) {
-      snprintf(buf, sizeof buf, "#%06x SEPTA#  no poll yet", sub);
-    } else if (ps.ok) {
-      snprintf(buf, sizeof buf, "#%06x SEPTA#  #%06x ok#%s%s", sub, (unsigned)colorHex(colorOnTime()), age[0] ? ", " : "", age);
+      setSource(ctx->septa_label, cap, "no poll yet", colorScheduled(), -1, nullptr);
+    } else if (!ps.ok) {
+      setSource(ctx->septa_label, cap, "failed", colorLate(), age, ps.last_error.c_str());
+    } else if (age > 2 * (int32_t)ctx->poll_seconds + 30) {
+      setSource(ctx->septa_label, cap, "stale", colorSkipped(), age, nullptr);
     } else {
-      snprintf(buf, sizeof buf, "#%06x SEPTA#  #%06x failed#%s%s%s%s", sub, (unsigned)colorHex(colorLate()),
-               age[0] ? " " : "", age, ps.last_error.empty() ? "" : ": ", ps.last_error.c_str());
+      setSource(ctx->septa_label, cap, "ok", colorOnTime(), age, nullptr);
     }
-    lv_label_set_text(ctx->septa_label, buf);
+  }
+  // Weather: age_s is millis-based and -1 until the first success; stale past an hour (F29).
+  if (ctx->weather_label != nullptr) {
+    WeatherView wv = getWeather();
+    if (wv.age_s < 0) {
+      setSource(ctx->weather_label, nullptr, "no data yet", colorScheduled(), -1, nullptr);
+    } else {
+      setSource(ctx->weather_label, nullptr, wv.stale ? "stale" : "ok", wv.stale ? colorSkipped() : colorOnTime(), wv.age_s, nullptr);
+    }
+  }
+  // Indego: 5 min cadence; the arrivals page's own strip turns amber past 10 min.
+  if (ctx->bike_label != nullptr) {
+    BikeView bv = getBikes();
+    int32_t age = bv.fetched_epoch > 0 && clock_set && now >= bv.fetched_epoch ? (int32_t)(now - bv.fetched_epoch) : -1;
+    if (bv.fetched_epoch == 0) {
+      setSource(ctx->bike_label, nullptr, "no data yet", colorScheduled(), -1, nullptr);
+    } else {
+      bool stale = age > 10 * 60;
+      setSource(ctx->bike_label, nullptr, stale ? "stale" : "ok", stale ? colorSkipped() : colorOnTime(), age, nullptr);
+    }
+  }
+  // Alerts: 5 min cadence per route; stale once three of those have passed with no fetch.
+  if (ctx->alerts_label != nullptr) {
+    AlertsStatus as = getAlertsStatus();
+    if (!as.fetched) {
+      setSource(ctx->alerts_label, nullptr, "no data yet", colorScheduled(), -1, nullptr);
+    } else {
+      bool stale = as.age_s > 15 * 60;
+      setSource(ctx->alerts_label, nullptr, stale ? "stale" : "ok", stale ? colorSkipped() : colorOnTime(), (int32_t)as.age_s, nullptr);
+    }
   }
 
   uptimeText(millis() / 1000, buf, sizeof buf);

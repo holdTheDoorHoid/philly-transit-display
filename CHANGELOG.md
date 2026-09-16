@@ -21,7 +21,10 @@
   address, IP address, and whether the last SEPTA update worked) and a card named after the
   device (the web PIN in large digits, SD card status - with a warning when log rows are not
   being written - free memory and uptime), with the hold-to-reset-Wi-Fi button along the bottom.
-  These two pages are now built when you tap to them and freed when you leave, so a four-stop
+  Where the screen is tall enough (the 3.5" board in either orientation) a third card, Data
+  sources, lists each feed that is switched on - SEPTA, weather, Indego, service alerts - with
+  ok / stale / failed in the arrival colours and how long ago it was last fetched, so "is it
+  working?" has a one-glance answer. These two pages are now built when you tap to them and freed when you leave, so a four-stop
   setup fits in the display's memory.
 - Web: the Settings page is arranged into blocks of settings that affect each other (Screen &
   appearance, Schedules, Alerts & reminders, Data & weather, Device & network, Web PIN,

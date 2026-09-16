@@ -220,6 +220,10 @@ struct AlertCacheEntry {
   uint32_t fetched_ms = 0;
 };
 std::vector<AlertCacheEntry> g_alerts_cache;
+// millis() of the newest alerts fetch, 0 = none; read by getAlertsStatus() from the LVGL task. A
+// single aligned 32-bit store/load is atomic on the ESP32, so no mutex, and the cache itself
+// (which the poller task mutates freely) is never touched from outside this task.
+volatile uint32_t g_alerts_fetched_ms = 0;
 
 AlertCacheEntry &findOrCreateAlertsEntry(const std::string &url) {
   for (auto &e : g_alerts_cache) {
@@ -378,6 +382,7 @@ std::vector<Alert> collectAlerts(const std::vector<StopConfig> &stops, bool aler
   if (!alerts_enabled) {
     bool had = !g_alerts_cache.empty();
     g_alerts_cache.clear();
+    g_alerts_fetched_ms = 0;
     if (fetched_any != nullptr) *fetched_any = had;  // clearing the ticker is a change worth publishing
     return {};
   }
@@ -401,6 +406,7 @@ std::vector<Alert> collectAlerts(const std::vector<StopConfig> &stops, bool aler
     src.fetchAlertsEx(s.mode, s.route, &fetched, http);
     if (fetched_any != nullptr) *fetched_any = true;
     entry.fetched_ms = millis();
+    g_alerts_fetched_ms = entry.fetched_ms;
     entry.alerts = std::move(fetched);  // replaces even with an empty result - matches SEPTA's
                                          // own "no current alerts" being indistinguishable from a
                                          // transient miss (NOTES.md SS4/7b); the alerts ticker is
@@ -1066,6 +1072,16 @@ PollStatus getPollStatus() {
     xSemaphoreGive(g_mutex);
   }
   return copy;
+}
+
+AlertsStatus getAlertsStatus() {
+  AlertsStatus s;
+  uint32_t t = g_alerts_fetched_ms;
+  if (t != 0) {
+    s.fetched = true;
+    s.age_s = (millis() - t) / 1000;  // unsigned: correct across the 49-day millis() wrap
+  }
+  return s;
 }
 
 StopSummaryView getStopSummary(const std::string &stop_key) {
