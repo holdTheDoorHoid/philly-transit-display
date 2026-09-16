@@ -67,11 +67,18 @@ PollStatus getPollStatus();
 // see a poller that is still going round. A poller that STOPS - blocked inside pollOnce(), in
 // HTTPClient or under it in lwIP - never reaches that check, and the task watchdog does not cover
 // it either (CONFIG_ESP_TASK_WDT_PANIC watches IDLE0, and a task blocked on a semaphore or a
-// bounded socket read yields, so IDLE0 runs and nothing panics). So the poller is stamped here at
-// the end of EVERY cycle whatever the outcome, and something on another task - main.cpp's display
-// loop - watches the stamp go stale. A stuck poller cannot check itself.
+// bounded socket read yields, so IDLE0 runs and nothing panics). So the poller stamps itself and
+// something on another task - main.cpp's display loop - watches the stamp go stale. A stuck poller
+// cannot check itself.
 //
-// Lock-free on purpose: three aligned 32-bit/bool values written only by the poller task and read
+// TWO stamps, not one (2026-09-16). "A cycle completed" is too coarse to be the only evidence: a
+// legitimate cycle on a blackholing network can run for many minutes (poller_liveness.h has the
+// arithmetic), so a window wide enough to cover one would be far too wide to catch a freeze. The
+// poller therefore also stamps every fetch it starts, and the net measures the LATER of the two.
+// `since_ms` keeps its old meaning - seconds since a cycle completed, which is what
+// /api/state.last_poll.since_s reports - and `idle_ms` is what the net judges.
+//
+// Lock-free on purpose: four aligned 32-bit/bool values written only by the poller task and read
 // by anyone. No mutex, because the reader is the display loop and it must never wait on the
 // poller's lock (DESIGN.md SS5), and because a torn read - a fresh stamp next to the previous
 // cycle's interval - is harmless: both fields only ever shift the verdict by one interval.
@@ -80,6 +87,8 @@ struct PollerLiveness {
                                    // captive portal, when polling is deliberately not happening.
   bool before_first_cycle = true;  // no cycle has finished yet, so the boot grace applies
   uint32_t since_ms = 0;           // millis() since the last COMPLETED cycle, any outcome
+  uint32_t idle_ms = 0;            // millis() since the poller last did ANYTHING: completed a
+                                   // cycle or started a fetch. Never greater than since_ms.
   uint32_t interval_ms = 30000;    // the interval that cycle picked for the next one (backoff included)
 };
 PollerLiveness getPollerLiveness();

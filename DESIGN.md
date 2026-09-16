@@ -1860,25 +1860,65 @@ of a boot has completed (`firmware/src/app/poller_liveness.h`, covered by `pio t
 test_liveness`). It is a multiple of the **active** interval, not a constant, because
 `device.poll_seconds` is user-settable from 5 to 600 s (§6.1) and the failure backoff stretches the
 interval to 300 s (§4.7) - a fixed "no poll for two minutes" would reboot a device that was merely
-configured to poll slowly, or one backing off from a SEPTA outage. The 5-minute floor is what keeps
-a *short* interval from becoming a hair trigger: one cycle's own worst case is bounded by
-`http_fetch.cpp` rather than by the interval (three attempts per URL, each with an absolute
-deadline of 2x the 15 s fetch timeout, plus retry backoff - about 93 s for a single trickling URL),
-and the poller additionally runs one queued proxy or stats job between cycles. The floor clears all
-of that, so a genuinely slow network produces a late cycle, never a reboot. Detection latency at
-the default cadence is therefore five minutes, deliberately.
+configured to poll slowly, or one backing off from a SEPTA outage.
+
+**What the clock measures, and why it is not "a cycle completed" (corrected 2026-09-16).** The
+first version of this net stamped only at the end of a cycle and justified its 5-minute floor as
+"comfortably above one worst-case cycle, about 93 s". That 93 s was a *per-URL* figure used as a
+per-cycle one, and a cycle fetches one TripUpdates feed, one TransitView per route and one schedule
+per stop. On a network that silently **drops** packets - an ISP outage with DHCP still up, a
+captive portal, heavy loss; a network that *refuses* fails in milliseconds and never gets near this
+- a cycle's real cost was minutes per stop, so a device with several configured stops could take
+longer than the window to finish a perfectly legitimate cycle, and the net would restart it
+mid-cycle, over and over, with nothing wrong but the Wi-Fi. `config_store.h` allows eight stops and
+the poller polls `cfg.stops`, not the visible subset, so the worst case was about an hour.
+
+No window derived from the stop count can both cover that and still restart a frozen board soon
+enough to matter, so the fix was to measure the right thing and to stop the cost compounding:
+
+1. **Two stamps.** `net_poller.cpp` stamps liveness at every **fetch** the poller starts as well as
+   at the end of every cycle, and the net judges the later of the two (`PollerLiveness::idle_ms`).
+   A fetch in flight is evidence the poller is going round, which is the only question this net
+   asks. `last_poll.since_s` in `/api/state` keeps its old meaning - seconds since a cycle
+   *completed* - so nothing the owner sees changed.
+2. **The retry layers no longer multiply.** `http_fetch.cpp` already spends three attempts and
+   0.5 s + 1 s of backoff on a URL. Above it, `septa_source.cpp`'s `fetchPlausibleSchedule` and
+   `net_poller.cpp`'s BusSchedules wrapper each retried again - and both existed for a backend that
+   *answers* with the wrong service day (§4.4, NOTES.md 9), which always comes back with a real
+   HTTP status. Both now stop on a transport-level failure (`FetchResult::status <= 0`, "could not
+   be made at all"), which takes one stop's schedule from up to twelve URL fetches per cycle to
+   one. Nothing about the wrong-service-day behaviour changed; host tests cover both halves.
+
+The floor therefore has to clear **one fetch**, not one cycle, and one fetch is bounded:
+3 attempts x (DNS + 4 s connect) + 1.5 s of backoff. The DNS term is not bounded by this firmware
+and is worth naming: `HTTPClient::connect()` resolves through `NetworkClient::connect(host, ...)`,
+whose `Network.hostByName()` takes no timeout at all and runs *before* `setConnectTimeout()` applies
+to the socket. What bounds it is lwIP's own schedule - `DNS_MAX_RETRIES` 4 on a 1 s timer with
+1/1/2/3 s between sends is ~7 s per configured server, and `DNS_MAX_SERVERS` is 3 - so ~21 s worst
+case, read off lwIP's configuration rather than measured on the board. One fetch is then 76.5 s,
+and the 5-minute floor is 3.9x it; `poller_liveness.h` `static_assert`s that ratio and
+`test_liveness` checks it, so a future change to the retry policy breaks the build rather than
+someone's wall. Detection latency at the default cadence stays five minutes, at any stop count,
+deliberately. Resolving names ourselves and connecting by `IPAddress` would put the DNS bound back
+under our control, and was rejected: it would send `Host: <ip>`, which SEPTA's CDN and Cloudflare
+both need the real name in.
 
 Four things are exempted, each of which would otherwise be a device that reboots itself for no
 reason. **A firmware upload:** `web_server.cpp`'s `otaBusy()` is checked first, and the net also
 stands down for a full window *after* an upload ends, so a stall timer earned during an OTA cannot
-fire the moment the upload finishes or is aborted - a reboot mid-write leaves a half-written
-partition. **Setup and AP mode:** the net is armed by `startNetPoller()`, the last thing `setup()`
+fire the moment the upload finishes or is aborted. A reboot mid-write is not a brick and never was
+- `esp_ota_set_boot_partition()` runs inside `Update.end(true)`, so an interrupted upload leaves a
+half-written *inactive* slot and the device comes back on the image it is already running - but it
+throws the owner's upload away at the worst moment and looks exactly like a crash. The heap-wedge
+counter in `pollerTask()` takes the same exemption for the same reason (added 2026-09-16; it had
+none, and `wedged_polls` carries across an upload, so a device already near the threshold could
+restart itself mid-`Update.write()`). **Setup and AP mode:** the net is armed by `startNetPoller()`, the last thing `setup()`
 does, so it is off for the whole unprovisioned / captive-portal path - during which `loop()` is not
 running anyway, because `connectWifiOrPortal()` does not return until Wi-Fi is up. **Boot:** the
 extra grace covers `pollerTask`'s 45 s NTP wait plus the first cycle. **A slow or absent network:**
-this one needs no exemption at all, and that is the point of stamping on *any* outcome - a failed
-fetch is still a completed cycle, so a device with no internet keeps the stamp moving and only its
-backoff changes. Verified in the code rather than assumed: `pollOnce()` publishes a snapshot with
+this one needs no exemption at all, and that is the point of stamping on *any* outcome and at every
+fetch - a failed fetch is still a completed cycle, and a fetch still in flight is still a stamp, so
+a device with no internet keeps the clock moving and only its backoff changes. Verified in the code rather than assumed: `pollOnce()` publishes a snapshot with
 per-stop errors and returns a deadline on every path, including the out-of-memory one. There is
 therefore no boot loop available to a device whose router is down, and even a genuine repeated
 stall is bounded to roughly one restart per seven minutes by boot time plus the grace window.

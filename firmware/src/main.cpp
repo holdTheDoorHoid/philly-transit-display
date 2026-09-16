@@ -83,8 +83,9 @@ void applyNetworkSettings() {
 }
 
 // DESIGN.md SS12.1: the poller-liveness net. The poller stamps net_poller.cpp's g_cycle_end_ms at
-// the end of every cycle whatever the outcome; this asks, once a second from the DISPLAY task,
-// whether that stamp has gone stale, and restarts the board if it has.
+// the end of every cycle whatever the outcome, and g_progress_ms at the start of every fetch it
+// makes; this asks, once a second from the DISPLAY task, whether the later of the two has gone
+// stale, and restarts the board if it has.
 //
 // Why here. A poller that has stopped cannot notice that it has stopped, so the check has to run
 // somewhere else. loopTask is the right somewhere: it is on the other core, it already runs at
@@ -109,10 +110,14 @@ void checkPollerLiveness() {
   last_check_ms = now;
 
   // HAZARD: a firmware upload. An OTA legitimately starves the poller (it is writing ~1.7 MB to
-  // flash on the other task and taking the heap while it does), and a reboot mid-write leaves a
-  // half-written partition. Never judge while one is running - and not for a full window after it
-  // ends either, so an upload that has just finished or just been aborted cannot be followed
-  // straight away by a reboot the stall timer had already earned during it.
+  // flash on the other task and taking the heap while it does). A reboot mid-write is not a brick
+  // and never was - esp_ota_set_boot_partition() runs inside Update.end(true), so an interrupted
+  // upload leaves a half-written INACTIVE slot and the device comes back on the image it is
+  // already running - but it throws the owner's upload away at the worst possible moment and looks
+  // exactly like a crash to whoever is watching the progress bar. So: never judge while one is
+  // running - and not for a full window after it ends either, so an upload that has just finished
+  // or just been aborted cannot be followed straight away by a reboot the stall timer had already
+  // earned during it. net_poller.cpp's heap-wedge counter stands down for the same reason.
   if (transit_app::otaBusy()) {
     ota_seen_ms = now;
     if (ota_seen_ms == 0) ota_seen_ms = 1;  // 0 is the "never seen" sentinel
@@ -130,19 +135,25 @@ void checkPollerLiveness() {
     if (now - ota_seen_ms < window_ms) return;
     ota_seen_ms = 0;  // grace spent; forget it rather than carry it to the millis() wrap
   }
-  if (!transit_app::pollerHasStalled(lv.since_ms, lv.interval_ms, lv.before_first_cycle)) return;
+  // idle_ms, not since_ms (poller_liveness.h): the poller stamps every fetch it starts as well as
+  // every cycle it finishes, so a cycle that is legitimately taking minutes on a blackholing
+  // network keeps the clock moving. Judging on cycle completion alone is what let a device with
+  // several configured stops reboot itself mid-cycle, over and over.
+  if (!transit_app::pollerHasStalled(lv.idle_ms, lv.interval_ms, lv.before_first_cycle)) return;
 
   // A device whose network is simply down does NOT reach here: a failed fetch is still a completed
-  // cycle, so the stamp keeps moving and only the backoff changes. Getting here means the poller
-  // produced nothing at all - not even a failure - for several whole intervals.
-  char line[176];
+  // cycle, and a fetch still in flight is still a stamp, so the clock keeps moving and only the
+  // backoff changes. Getting here means the poller did nothing at all - no cycle, no fetch, not
+  // even a failure - for several whole intervals.
+  char line[192];
   snprintf(line, sizeof(line),
-           "[main] poller stalled: no poll cycle completed for %u s (interval %u s, window %u s, "
+           "[main] poller stalled: nothing for %u s (last cycle %u s ago, interval %u s, window %u s, "
            "free %u, largest %u); restarting",
-           (unsigned)(lv.since_ms / 1000U), (unsigned)(lv.interval_ms / 1000U), (unsigned)(window_ms / 1000U),
+           (unsigned)(lv.idle_ms / 1000U), (unsigned)(lv.since_ms / 1000U),
+           (unsigned)(lv.interval_ms / 1000U), (unsigned)(window_ms / 1000U),
            (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   Serial.println(line);
-  transit_app::noteSelfHealRestart(transit_app::SelfHeal::PollStall, lv.since_ms / 1000U, lv.interval_ms / 1000U);
+  transit_app::noteSelfHealRestart(transit_app::SelfHeal::PollStall, lv.idle_ms / 1000U, lv.interval_ms / 1000U);
   Serial.flush();
   delay(200);
   ESP.restart();
