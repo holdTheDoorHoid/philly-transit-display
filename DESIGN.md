@@ -2008,13 +2008,21 @@ keep *succeeding* (their buffers are small enough to fit the gaps), so the conse
 never climbs and the reboot never fires. What is refusing is the heavy read handlers, which are not
 what the tally counts.
 
-**It is a band, not a latch** - and this is the part that is easy to get wrong in both directions.
+**It is a band, not a latch - but the recovery time is not bounded by anything we know.** This is the
+part that is easy to get wrong in both directions.
 The largest block oscillates around the 7,924 B gate under load, and an eager client holds it below:
 both observations above came from clients retrying every 1.5-4 s, which is itself the allocation
 pressure they were waiting out. It recovers WITHOUT a reboot once that eases - measured in the same
 run, 2,932 B during the config round-trips to 8,692 B a section later, no restart in between. So
 "unreadable until you reboot it" would be an overstatement, and the earlier reboot that appeared to
 cure it was never tested against simply waiting.
+
+Equally, do not read "it recovers" as "it recovers promptly". In the 2026-09-16 paced run the suite
+deliberately idled for **150 s** before the config round-trips and the largest block was still
+5,108 B - the same figure as the session's first observation, and under the gate - so that settle
+check failed. It had come back by the next section. Nothing here defragments on demand: the
+recovery is real, its timing is not predictable, and any future fix has to be judged against that
+rather than against a single lucky sample.
 
 **A resting largest-block figure is meaningless without the client's request rate beside it**, and
 this is the correction that makes the two measurements of this comparable at all. Same board, same
