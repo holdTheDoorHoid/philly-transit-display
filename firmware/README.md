@@ -11,6 +11,7 @@ firmware-specific build notes not already in `platformio.ini`'s own comments or
 export PATH="$HOME/.platformio/penv/bin:$PATH"
 cd firmware
 pio run -e cyd-3248S035R        # the owner's board; see platformio.ini for the other envs
+pio run -e cyd-3248S035R-https  # the same board with the HTTPS prototype compiled in (DESIGN.md §2.1)
 pio test -e native              # transit_core + transit_stats host tests (64 cases)
 ```
 
@@ -42,13 +43,18 @@ six digits, generated with the hardware RNG on first boot and kept in NVS (`ptd`
 **Using it**
 
 ```sh
-curl -H "X-Pin: 123456" -F firmware=@.pio/build/cyd-3248S035R/firmware.bin \
+curl -H "X-Pin: 123456" -H "Expect:" -F firmware=@.pio/build/cyd-3248S035R/firmware.bin \
      http://transit-display.local/api/ota
 curl -H "X-Pin: 123456" -X POST http://transit-display.local/api/reboot
 curl -H "X-Pin: 123456" -H 'Content-Type: application/json' \
      -X PUT --data-binary @config.json http://transit-display.local/api/config
 curl -H "X-Pin: 123456" -O http://transit-display.local/api/log/2026-09.csv
 ```
+
+`-H "Expect:"` matters for the upload: curl sends `Expect: 100-continue` for a body this size, the
+async server answers `100 Continue` and then drops the connection without reading the image, and
+curl reports an empty reply (seen 2026-09-16; the device is untouched and stays on its old build).
+With the header suppressed the same command answers `{"ok":true,...}` in about 25 s and reboots.
 
 **Changing it** — 4 to 32 printable ASCII characters, no whitespace; the current PIN authenticates
 the change:
@@ -161,14 +167,30 @@ so a config edit can look like it had no effect. Run `pio run -t clean` (or dele
 | UI screens built | 68 KB | 31 KB |
 | steady state while polling | ~86 KB | ~43 KB |
 
+**The "free" column overstates what a buffer can get, by about 34 KB** (found 2026-09-16 while
+measuring HTTPS, DESIGN.md §2.1). `ESP.getFreeHeap()` - the number in the table, in `/api/state`'s
+`heap`, and behind the 60 KB OTA gate, the 24 KB `/api/state` gate and the 40 KB idle-work gate - is
+`heap_caps_get_free_size(MALLOC_CAP_INTERNAL)`, and on the classic ESP32 that includes the IRAM heap
+region that only 32-bit word access can use. `malloc()` never hands that region out for a string, a
+body buffer or a TLS record. The byte-addressable heap (`MALLOC_CAP_8BIT`) on the owner's board is
+**~46 KB free at idle and ~27-42 KB at the moment a fetch starts**, with the largest block already
+measured in those terms. Since 2026-09-16 the `[heap]` boot lines and the `[net_poller]` heartbeat
+print both (`free=` and `free8=`); the gates above still use the INTERNAL number and their thresholds
+were tuned against it, so they are not wrong, but anyone sizing a new allocation should read `free8`.
+
 Rules that fell out of this, all learned the hard way (each one was a boot loop first):
 
 - Anything large and long-lived (the tracker, task stacks) is allocated before Wi-Fi starts,
   while the heap is one contiguous block. Every `new` of a big object is `nothrow` and checked:
   with exceptions disabled a failed plain `new` calls `std::terminate()`.
-- No TLS at all (v0.1.2 removed the opt-in HTTPS mode): a TLS session needs ~40 KB with two 16 KB
-  contiguous buffers this board cannot spare, every service the firmware uses serves plain http,
-  and dropping mbedTLS/x509/the CA bundle freed ~100 KB of flash.
+- No TLS in the shipping envs (v0.1.2 removed the opt-in HTTPS mode; dropping mbedTLS/x509/the CA
+  bundle freed ~100 KB of flash): a TLS session on this SDK is two fixed 16,717 B contiguous record
+  buffers plus ~20 KB around them, ~55 KB at the handshake peak, and the byte-addressable heap at
+  the moment a fetch starts is 27-42 KB (above). The 2026-09-16 prototype (`cyd-*-https` envs,
+  DESIGN.md §2.1) keeps a heap gate in front of every fetch and was measured on the owner's board:
+  the gate never once found room, so the prototype behaves exactly like the shipping build while
+  saying so in the UI. What HTTPS actually needs is a rebuilt SDK with smaller TLS buffers
+  (§2.1 "what it would take"), not a bigger gate.
 - No second worker task: the poller drains the web job queue between polls. The AsyncTCP task
   stack is capped at 8 KB (`CONFIG_ASYNC_TCP_STACK_SIZE`; the library default is 16 KB).
 - Proxied SEPTA bodies (stop lists up to ~18 KB) stream into a LittleFS temp file and are served
