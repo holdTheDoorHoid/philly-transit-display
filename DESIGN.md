@@ -956,6 +956,17 @@ everything else on the device runs above it, so its share of the CPU is unchange
 (stats summaries, queued proxy jobs) additionally waits for 40 KB free heap and a 12 KB largest
 block so it never collides with a config save on the web task.
 
+Heap-wedge self-heal (2026-09-15): a long burst of rapid config saves (each rebuilds the whole
+LVGL screen) interleaved with active polling can fragment the heap to ~2 KB largest block while
+~50 KB is still free - too small for any fetch buffer, so every poll fails with a caught
+`bad_alloc` and the board shows nothing new without crashing. Nothing defragments a running heap,
+so the poller reboots itself after 15 consecutive failed polls while the largest block is under
+6 KB. The largest-block guard is what makes this safe: an ordinary SEPTA outage leaves the heap
+healthy, so it keeps its normal backoff and never reboots; only a genuine wedge, which a person
+would fix by power-cycling anyway, triggers the reboot. Config is durably saved (this §), so the
+reboot loses nothing. Observed cause was the on-device regression suite's stress section; normal
+use holds the heap stable (~74 KB free, ~22 KB largest).
+
 ## 13. Milestones
 
 - **M0** Repo, design, skeleton, CI that builds every env and runs host tests.

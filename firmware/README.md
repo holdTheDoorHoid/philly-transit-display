@@ -79,7 +79,7 @@ The app partition (`firmware/partitions.csv`) is 1,900,544 bytes (`0x1D0000`) pe
 
 | Build (`cyd-3248S035R`) | Flash | Static RAM |
 |---|---:|---:|
-| Current: the 2026-09-15 review fixes combined (PIN, Host check, OTA board check, WPA2 setup AP + QR, transport completeness, transit-first polling, per-stop health on the panels, checked SD writes, log export) | 1,825,478 B (96.1 %) | 95,644 B (29.2 %) |
+| Current: the 2026-09-15 review fixes combined (PIN, Host check, OTA board check, WPA2 setup AP + QR, transport completeness, transit-first polling, per-stop health on the panels, checked SD writes, log export) | 1,826,826 B (96.1 %) | 95,644 B (29.2 %) |
 | Hardening pass alone, with the QR widget compiled out | 1,767,926 B (93.0 %) | 95,580 B |
 | Before the review fixes (v0.1.2) | 1,741,770 B (91.6 %) | 95,268 B |
 | Everything incl. weather, Indego, profiles, night page, 48 px font | 1,858,446 B (97.8 %) | 95,300 B (29.1 %) |
