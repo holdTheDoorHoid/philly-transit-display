@@ -24,6 +24,7 @@
 #include "ui/ui.h"
 #include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
+#include <esp_system.h>  // esp_reset_reason() for /api/state's last_restart (DESIGN.md SS12.1)
 #include "bike_service.h"
 #include "profiles.h"
 #include "proxy_worker.h"
@@ -437,6 +438,37 @@ void handleGetState(AsyncWebServerRequest *request) {
   // -1 (never polled yet) vs. a real, non-negative age in seconds.
   last_poll["age_s"] = poll.has_polled ? (int32_t)((uint32_t)time(nullptr) - poll.last_poll_epoch) : (int32_t)-1;
   last_poll["error"] = poll.last_error;
+  // DESIGN.md SS12.1: seconds since a cycle last COMPLETED, whatever its outcome - which is what
+  // the liveness net watches, and is NOT age_s (that one only moves on a poll that reported).
+  // -1 before the first cycle of this boot.
+  {
+    PollerLiveness lv = getPollerLiveness();
+    last_poll["since_s"] = (lv.armed && !lv.before_first_cycle) ? (int32_t)(lv.since_ms / 1000U) : (int32_t)-1;
+  }
+
+  // DESIGN.md SS12.1: why the previous boot ended. `esp` is esp_reset_reason() - 1 ESP_RST_POWERON,
+  // 2 ESP_RST_EXT, 3 ESP_RST_SW (what ESP.restart() produces), 4 ESP_RST_PANIC, 5/6 the interrupt
+  // and task watchdogs, 9 ESP_RST_BROWNOUT - which is what distinguishes a panic from a clean
+  // restart. `reason` is set only when THIS firmware restarted itself on purpose, and is ""
+  // otherwise. `detail` is formatted here rather than stored, so the strings cost flash once.
+  {
+    JsonObject lr = doc["last_restart"].to<JsonObject>();
+    lr["esp"] = (int)esp_reset_reason();
+    RestartNote note = getRestartNote();
+    char detail[96];
+    detail[0] = '\0';
+    const char *reason = "";
+    if (note.reason == SelfHeal::PollStall) {
+      reason = "poll_stall";
+      snprintf(detail, sizeof(detail), "no poll cycle completed for %u s (interval %u s)", (unsigned)note.a, (unsigned)note.b);
+    } else if (note.reason == SelfHeal::HeapWedge) {
+      reason = "heap_wedge";
+      snprintf(detail, sizeof(detail), "%u failed polls, largest free block %u B", (unsigned)note.a, (unsigned)note.b);
+    }
+    lr["reason"] = reason;
+    lr["detail"] = detail;
+    lr["uptime_s"] = note.uptime_s;
+  }
 
   doc["firmware_version"] = FIRMWARE_VERSION;
   // The board this image was built for (DESIGN.md SS7). Also what POST /api/ota refuses a
@@ -1168,5 +1200,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
   g_server.begin();
   log_i("web_server: listening on port 80");
 }
+
+bool otaBusy() { return g_ota.busy; }
 
 }  // namespace transit_app

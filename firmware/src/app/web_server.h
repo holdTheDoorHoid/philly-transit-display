@@ -25,4 +25,12 @@ namespace transit_app {
 // auth::begin() must have run first: the PIN guard on the state-changing routes reads from it.
 void startWebServer(std::function<void(bool)> onConfigChanged = nullptr);
 
+// True while a POST /api/ota upload is streaming into the flash partition. Read from loopTask by
+// main.cpp's poller-liveness check (DESIGN.md SS12.1): an OTA legitimately starves the poller for
+// the length of the upload, and rebooting mid-write would leave a half-written partition, so the
+// liveness net stands down while this is true. Not synchronised - it is a bool written once at the
+// start of an upload and once at its end, and the reader only cares about a state that lasts for
+// the whole upload.
+bool otaBusy();
+
 }  // namespace transit_app
