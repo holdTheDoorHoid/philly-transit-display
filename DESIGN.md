@@ -952,20 +952,48 @@ poll, largest block ~32 KB median. **Invariant:** every long-running task that d
 are three: the poller task (net_poller.cpp, inner per-stop + outer cycle), the AsyncTCP web
 handlers (web_server.cpp `guarded()` + the JSON-body handlers, answering 503) and its chunked-response
 fillers (the log-export filler catches internally and truncates), and the LVGL display loop
-(main.cpp `loop()`, skipping the frame). Any new task, handler or filler on either core must do the same. A hard case the wrappers cannot catch: when the heap is
-so exhausted that `std::bad_alloc` cannot allocate its own exception object, `__cxa_allocate_exception`
-calls `std::terminate` directly (this SDK builds with a zero-byte emergency exception pool,
-`CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0`). The heavy read handlers (`/api/state`,
-`/api/config`) therefore refuse up front with a fixed-literal 503 when free heap is below
-`kMinHeavyResponseHeap` (22 KB), so they never begin the large allocation that could reach that
-state; clients retry the 503 (§12.1). A residual limit remains: under the rare convergence of an
-invalid-stop configuration (whose continuous failed fetches depress the heap), rapid repeated
-configuration saves (each parses a 16 KB body and rebuilds the screen), and simultaneous `/api/state`
-reads, the classic ESP32's heap can still be exhausted mid-build faster than an entry check can see,
-and the device reboots to recover (configuration is durably saved, so nothing is lost). No entry gate
-closes this fully because the poller shares the heap across cores; only an SDK rebuilt with a nonzero
-emergency exception pool, or a zero-copy `/api/state`, would. It does not occur under normal use
-(single spaced reads, valid stops, occasional saves), where the heap sits near 74 KB.
+(main.cpp `loop()`, skipping the frame). Any new task, handler or filler on either core must do the same. There was a hard case the wrappers could not catch
+until 2026-09-16: when the heap is so exhausted that `std::bad_alloc` cannot allocate its own
+exception object, `__cxa_allocate_exception` falls back to libstdc++'s emergency pool and, finding
+none, calls `std::terminate` directly - and this SDK is built with a zero-byte pool
+(`CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0`). The firmware now supplies the pool itself, without
+rebuilding the SDK: libstdc++ sizes it at static-init by calling the weak hook
+`__cxx_eh_arena_size_get()`, and `firmware/src/app/cxx_exception_pool.cpp` defines that hook (2 KB =
+16 in-flight `std::bad_alloc`s at 128 B each, twice what the four allocating tasks can have
+mid-throw at once) together with `__cxx_init_dummy`, so the SDK's `-u __cxx_init_dummy` is satisfied
+by our object and `libcxx.a(cxx_init.cpp.obj)`, which carries the SDK's zero-returning definition, is
+never linked. The file explains why `--wrap` cannot do this and why `--allow-multiple-definition` was
+not used; the link map is the proof. Cost: one 2 KB `malloc` before `app_main()`, never freed; the
+boot log prints it as `[heap] eh_pool arena=2048`. `POST /api/debug/oom` (PIN-gated, §7) is the
+deterministic proof: it takes the heap away in shrinking blocks until even a 16-byte allocation
+fails, forces a `std::bad_alloc`, frees everything and answers `caught:true`; without the pool that
+request reboots the device. The device suite runs it. The heavy read handlers (`/api/state`,
+`/api/config`) still refuse up front with a fixed-literal 503 when free heap is under
+`kMinHeavyResponseHeap` (24 KB) or the largest block under 8 KB - no longer because the failure
+would be uncatchable, but because a build that is going to fail costs CPU and heap the poller wants,
+and a 503 the client retries is the cheaper answer. The same handlers are zero-copy since the same
+date (`sendJsonStreamed()`): the finished document is moved into a holder a chunked response owns
+and serialised straight into each TCP send chunk as the socket drains (the filler re-walks it per
+chunk through ESPAsyncWebServer's `ChunkPrint`), instead of into a `String` that
+`AsyncBasicResponse` then copied a second time. Peak heap per request drops from document + 2 x
+body (plus `String` growth slack, and a body-sized contiguous block needed twice) to document + one
+2 x MSS (2.9 KB) send buffer: roughly 6-13 KB less for a 5-8 KB `/api/state`, a wash for the
+1.5-4 KB `/api/config`, and in both cases no body-sized contiguous block any more. Chunked transfer
+encoding (no `Content-Length`) is the price; the small responses keep `sendJson()`'s `String`,
+because for them the 2.9 KB send buffer would be the bigger allocation. ESPAsyncWebServer's own
+`AsyncJsonResponse` was tried first and rejected for flash: it brings two more ArduinoJson
+serializer instantiations (its typed fill and `measureJson`'s counting pass, +4.5 KB in all); the
+streamed filler serialises through a `Print&` and `saveConfig()`'s two sinks now do too, so the
+three share one instantiation and the streamed path costs about 0.8 KB of flash instead of 4.5.
+What remains uncatchable, by design: C code that gets NULL from `malloc` and does not check it (no
+throw, so no pool helps), a catch block that itself allocates with nothing left (building the 503
+response object; it rethrows out of the handler), and the pool being finite. The convergence that
+used to reboot the device - an invalid-stop configuration whose failed fetches depress the heap,
+rapid repeated configuration saves (each parses a 16 KB body and rebuilds the screen), and
+simultaneous `/api/state` reads - now ends in caught `bad_alloc`s (503s, a failed poll, a skipped
+frame) and, if the heap stays wedged, the poller's self-heal reboot below; configuration is durably
+saved either way. None of it occurs under normal use (single spaced reads, valid stops, occasional
+saves), where the heap sits near 74 KB.
 
 Task watchdog (2026-09-15): `CONFIG_ESP_TASK_WDT_PANIC=y` in this SDK, and HTTPClient waits for the
 response line and each header in `Stream::timedRead()`, a busy loop that yields only to
