@@ -26,6 +26,9 @@ extern std::string sd_error;       // "" = last write ok
 extern bool poll_ok;               // the device page's "SEPTA ok / failed" line
 extern uint32_t poll_age_s;
 extern std::string poll_error;
+extern int32_t weather_age_s;      // the Data sources card: -1 = nothing fetched yet, > 3600 = stale
+extern int32_t bike_age_s;         // -1 = nothing fetched yet, > 600 = stale
+extern int32_t alerts_age_s;       // -1 = nothing fetched yet, > 900 = stale
 extern std::string weather_temp;   // "" hides the header weather
 extern std::string weather_text;
 extern int weather_icon;           // transit_app::WeatherIcon as an int

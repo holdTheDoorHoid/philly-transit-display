@@ -610,15 +610,25 @@ Main screen (portrait by default; every size derives from the runtime resolution
   Wi-Fi bars and SSID on its title row, the mDNS URL in link blue and the body font (the one line
   the owner has to be able to find), the IP with the RSSI in dBm on the right, and
   `SEPTA  ok, 12 s ago` or `SEPTA  failed 4 min ago: <error>` from the poller's last attempt
-  (`getPollStatus()`; the arrivals header only ever says "stale"). A panel titled with the
+  (`getPollStatus()`; the arrivals header only ever says "stale") - on the boards where the Data
+  sources panel below fits, that line moves into it. A panel titled with the
   device name (`device.name`), `up 2d 5h` on its title row: the web PIN in the big minutes font
   with `web PIN` beside it (on a ≥ 320-tall board and up to 8 characters; a longer custom PIN
   takes the body font and wraps, never ellipsizes - a PIN the owner cannot read off the screen
   is a PIN they have lost), `SD  mounted, 3720 MB free` - or `N rows dropped: <error>` in red
   while writes are failing and amber once they land again (sd_logger.h, F26) - and
-  `heap  75 KB free`. Both panels are content-height (a mostly-empty card looks like a fault);
-  `reset Wi-Fi: hold 5 s` is a bordered button along the bottom edge, the only clickable child on
-  any page.
+  `heap  75 KB free`. A *Data sources* panel when the height allows it - decided from the
+  heights, like the stats layouts: one line per feed the config has on (`SEPTA`, `Weather`,
+  `Indego`, `Alerts`; a feed that is off has no row), each a status word in the arrival colours -
+  green `ok`, amber `stale`, red `failed`, grey `no data yet` - and `, 12 s ago` from the
+  poller/weather/bike/alerts timestamps `/api/state` exposes (SEPTA is stale past two poll
+  intervals + 30 s, weather past an hour (F29), Indego past 10 min like the bike strip, alerts
+  past 15 min; a failed SEPTA poll carries the poller's reason). Two feeds per line on a
+  480-wide board, so 480x320 fits it with a few px to spare; 320x480 has room for everything;
+  on a board where it does not fit (every 240-tall layout, 240x320 with three or more feeds) the
+  SEPTA line stays in the Network panel and the page is exactly as before. All panels are
+  content-height (a mostly-empty card looks like a fault); `reset Wi-Fi: hold 5 s` is a bordered
+  button along the bottom edge, the only clickable child on any page.
 - Sizes derive from `lv_display_get_horizontal_resolution()` so 320x240 gets 2 rows per stop
   and smaller fonts; 480x320 gets 3 rows. That is the per-panel **capacity**; each stop actually
   gets its own `show` (1..4, §6) clamped to it, so a stop asking for one row gets one.

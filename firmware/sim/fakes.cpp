@@ -31,6 +31,9 @@ std::string sd_error;
 bool poll_ok = true;
 uint32_t poll_age_s = 12;
 std::string poll_error;
+int32_t weather_age_s = 4 * 60;
+int32_t bike_age_s = 90;
+int32_t alerts_age_s = 3 * 60;
 std::string weather_temp = "63\xC2\xB0";
 std::string weather_text = "63\xC2\xB0 clear";
 int weather_icon = 1;  // Sun
@@ -97,6 +100,14 @@ PollStatus getPollStatus() {
   p.last_error = sim::poll_error;
   return p;
 }
+AlertsStatus getAlertsStatus() {
+  AlertsStatus s;
+  if (sim::alerts_age_s >= 0) {
+    s.fetched = true;
+    s.age_s = (uint32_t)sim::alerts_age_s;
+  }
+  return s;
+}
 
 StopSummaryView getStopSummary(const std::string &stop_key) {
   auto it = sim::g_summaries.find(stop_key);
@@ -109,7 +120,7 @@ BikeView getBikes() {
   BikeView v;
   v.enabled = sim::bikes_enabled;
   if (!v.enabled) return v;
-  v.fetched_epoch = (uint32_t)time(nullptr) - 90;
+  v.fetched_epoch = sim::bike_age_s < 0 ? 0 : (uint32_t)time(nullptr) - (uint32_t)sim::bike_age_s;
   indego::Station a;
   a.id = 3005;
   a.name = "Snyder & Dorrance";
@@ -131,6 +142,14 @@ BikeView getBikes() {
 }
 
 // ---- weather_service.h ----
+WeatherView getWeather() {
+  WeatherView v;
+  v.enabled = true;
+  v.age_s = sim::weather_age_s;
+  v.stale = v.age_s > (int32_t)kWeatherStaleAfterS;
+  v.fetched_epoch = v.age_s < 0 ? 0 : (uint32_t)time(nullptr) - (uint32_t)v.age_s;
+  return v;
+}
 std::string headerWeatherText() {
   return sim::weather_text;
 }

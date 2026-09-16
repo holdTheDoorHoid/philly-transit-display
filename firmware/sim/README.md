@@ -45,6 +45,7 @@ path; `fakes.cpp` implements the app services the screens call):
 | `auth::pin()` | `123456` (the README's example, never a real device's PIN) |
 | `getSdStatus()` | mounted, 3720 MB free (`sim::sd_mounted`), write health from `sim::sd_dropped_rows`/`sim::sd_error` |
 | `getPollStatus()` | last SEPTA poll ok, 12 s ago (`sim::poll_ok`, `sim::poll_age_s`, `sim::poll_error`) |
+| `getWeather()`, `getAlertsStatus()`, `getBikes().fetched_epoch` | feed ages for the Data sources card (`sim::weather_age_s`, `sim::alerts_age_s`, `sim::bike_age_s`; -1 = nothing fetched yet) |
 | `getStopSummary(key)` | canned `StopSummaryView`s set per render (`sim::setSummary`); an unset key is "loading" |
 | `getBikes()` | two Indego stations |
 | `headerWeatherIcon()/Temp()/Text()`, `stopWeatherNote()` | `sim::weather_*`, `sim::stop_note` |

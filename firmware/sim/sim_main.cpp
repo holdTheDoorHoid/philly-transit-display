@@ -292,12 +292,15 @@ void renderStale(Job &job, Canvas &c, const Config &cfg) {
 }
 
 // Everything wrong at once on the device page: Wi-Fi down (0 bars, no IP), the last SEPTA poll
-// failed, and the SD card has been dropping rows.
+// failed, the weather and alerts stale, no Indego fetch yet, and the SD card dropping rows.
 void renderOffline(Job &job, Canvas &c, const Config &cfg) {
   sim::wifi_connected = false;
   sim::poll_ok = false;
   sim::poll_age_s = 4 * 60;
   sim::poll_error = "connect failed";
+  sim::weather_age_s = 2 * 3600;
+  sim::bike_age_s = -1;
+  sim::alerts_age_s = 20 * 60;
   sim::sd_dropped_rows = 3;
   sim::sd_error = "write failed";
   lv_obj_t *device = ui::createDeviceInfoScreen(cfg);
@@ -309,6 +312,9 @@ void renderOffline(Job &job, Canvas &c, const Config &cfg) {
   sim::poll_ok = true;
   sim::poll_age_s = 12;
   sim::poll_error.clear();
+  sim::weather_age_s = 4 * 60;
+  sim::bike_age_s = 90;
+  sim::alerts_age_s = 3 * 60;
   sim::sd_dropped_rows = 0;
   sim::sd_error.clear();
 }

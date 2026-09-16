@@ -60,6 +60,15 @@ transit::Snapshot getSnapshot();
 // Returns a copy of the latest poll diagnostics, safe to call from any task.
 PollStatus getPollStatus();
 
+// When the service-alert feeds were last fetched (DESIGN.md SS4.7: 5 min cadence, only with
+// config.alerts), for the device page's "Data sources" card. fetched=false until the first fetch
+// and again after alerts are switched off. Lock-free: one aligned 32-bit millis() stamp.
+struct AlertsStatus {
+  bool fetched = false;
+  uint32_t age_s = 0;
+};
+AlertsStatus getAlertsStatus();
+
 // What getStopSummary() can tell a caller without going anywhere near the SD card (F27).
 struct StopSummaryView {
   // false = nothing has been computed for this stop yet. The caller must render that as "loading"
