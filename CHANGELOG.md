@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 - 2026-09-16
 
 - **The display now notices when it has quietly stopped fetching arrivals, and restarts itself.**
   It already restarted itself when its memory got so chopped up that every fetch failed — but that
