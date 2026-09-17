@@ -1,57 +1,83 @@
 # Changelog
 
-## v0.3.2-rc1 - 2026-09-17 (release candidate, not verified on hardware)
+## v0.3.2 - 2026-09-17
 
-v0.3.1 ran cleanly on the owner's board for thirty-five to forty minutes and then stopped being
-able to poll at all - and, worse, stopped answering the web page that would have said why. This
-release is about both halves of that.
+v0.3.1 shipped today at 15:07. By about forty minutes of uptime the owner's board had crumbled
+into the same kind of lockout it was built to prevent - and this time it also locked the door,
+refusing the page that would have shown why and outlasting the safety net meant to catch it. This
+release states that plainly and fixes what it exposed.
 
-- **The display would refuse every connection once its memory got chopped up, including the page
-  you would use to look at it and the button you would use to restart it.** Measured on the owner's
-  board at 15:50 on 2026-09-17: the largest unbroken piece of memory had fallen to about 3.4 KB,
-  and a rule added in the last release - "do not accept a new connection when memory is this
-  short" - then turned away *every* request. The device answered ping and nothing else for five
-  minutes, and the only way back was a hard power cycle. The rule now applies only when the display
-  is already busy with another request: one request at a time is always accepted, whatever the
-  memory looks like. A single request cannot cause the crash that rule exists to prevent, and if
-  its own reply will not fit, the display answers "out of memory, try again" instead of going
-  silent.
+- **v0.3.1 collapsed again, and the lockout was worse than the crash it replaced.** Released at
+  15:07, the board ran normally for about forty minutes and then free memory fell from its usual
+  39 KB to 17-20 KB, with the single largest unbroken piece down to 3,444 bytes - too small for the
+  4,864-byte piece every poll reserves up front for the live-arrivals feed, so every poll failed in
+  exactly the same place. What actually triggers the crumbling still isn't known; the memory trace
+  running at the time only kept the last 90 seconds, and it had already scrolled past by 15:50.
+  Worse, the admission rule v0.3.1 itself added - refuse a new connection once memory is this
+  fragmented - refused *every* connection once the largest piece dropped under 4,308 bytes,
+  including the diagnostics page and the restart button: the two things you would need to see the
+  problem or clear it. And the board's own restart-if-stuck safety net didn't fire for over twenty
+  minutes, because a failing poll backs off to four minutes between tries - so "fifteen failed
+  polls in a row" is about fifty-one minutes, not the few the old code assumed. The board came back
+  only after a USB reset.
 
-- **A poll can now finish on a memory that has crumbled to about 3 KB pieces.** Every poll was
-  asking for one 4.9 KB unbroken piece up front - a working area for the live-arrivals feed - and
-  once the memory could not provide that, every poll failed in the same place forever. That area,
-  and the vehicle list that a busy route can grow to 5.6 KB, are now set aside once when the
-  display starts and reused every cycle instead of being asked for again. A routine poll now asks
-  for nothing bigger than about 1.2 KB. The cost is stated honestly: about 8 KB less free memory at
-  rest, which is the trade this release makes deliberately and which the next run on the hardware
-  is the test of.
+- **A single request is now always accepted, whatever the memory looks like.** The refusal rule
+  above only ever had to protect against several requests competing for memory at once; one
+  request alone cannot cause the crash it exists to prevent. It now applies only when the display
+  is already busy answering something else - one request at a time gets in regardless, and if its
+  own reply will not fit, the board answers "out of memory, try again" instead of going silent.
 
-- **The display now restarts itself after three failed-for-memory polls instead of fifteen.** The
-  old threshold assumed polls thirty seconds apart, but a failing poll backs off to four minutes,
-  so fifteen of them was really fifty-one minutes of a frozen screen - which is exactly what
-  happened on 2026-09-17, when the board never restarted itself at all before it was unplugged.
-  Three is about three and a half minutes, and the restart is now counted from the failure itself
-  rather than inferred from a memory reading taken afterwards.
+- **A nightly restart, on by default at 03:30** (Settings -> Device & network, time is editable).
+  This board has no way to tidy its own memory while running, and a restart is the only thing that
+  does - it takes a few seconds, nothing is lost, and the day starts with memory in one piece. It
+  only restarts once the clock has synced, the board has been up over an hour, and never in the
+  middle of an update. It is a mitigation and not a cure: the underlying cause of the crumbling is
+  still not known, which is what the memory log below is for.
 
-- **A nightly restart, on by default at 03:30** (Settings -> Device & network). This board has no
-  way to tidy its own memory while running, and a restart is the only thing that does. It takes a
-  few seconds, nothing is lost, and it starts each day with the memory in one piece. Turn it off or
-  move it in Settings. It is a mitigation and not a cure: the underlying cause of the crumbling is
-  still not known, which is what the next item is for.
+- **Service alerts are now off by default on new setups.** They cost a fetch and held memory
+  between polls for something that only ever showed on the web page and in the log. Existing
+  displays keep whatever they were already set to.
 
-- **Service alerts are now off by default.** They cost a fetch per route every five minutes and
-  memory held between polls, and most of what they bring back only ever shows on the web page and
-  in the log. Existing displays keep whatever they are set to; only a brand new one starts with
-  them off.
+- **The display now restarts itself after three failed-for-memory polls instead of fifteen** -
+  about three and a half minutes instead of the fifty-one the old count actually took once the
+  failure backoff is accounted for. It is now counted the moment a poll fails for memory rather
+  than inferred afterwards from a separate memory reading, and an older, slower check for a board
+  that has stalled without technically erroring stays at fifteen polls as a backstop. A bug that
+  could have silently crashed the board while running this very check was also found and removed.
 
-- **Two hours of memory history, so the cause can finally be found.** The display keeps one line
-  per poll for the last 240 polls - memory free, largest unbroken piece, the lowest it got during
-  that poll, and which optional work ran - readable at `/api/debug/ui?log=1`. The previous
-  instrument held three polls, which was enough to name the failing step and not nearly enough to
-  find what leads to it. Alongside it: how big the biggest reply ever received was, how fragmented
-  the memory is, and how much the schedule and alert caches are holding.
+- **A poll can now finish on memory that has crumbled to about 3 KB pieces.** The 4,864-byte piece
+  every poll asked for up front for the live-arrivals feed, and the vehicle list a busy route can
+  grow to 5.6 KB, are now set aside once when the display starts and reused every cycle instead of
+  being asked for fresh each time - sized to the stops actually configured (2,432 bytes for the
+  owner's two-stop setup) rather than the worst case. A routine poll now asks for nothing bigger
+  than about 1.2 KB. The cost is stated honestly: about 8 KB less free memory at rest, which is the
+  trade this release makes deliberately and which the next run on the hardware is the test of.
 
-Not verified on hardware. Nothing in this release was flashed or measured on a device.
+- **The shared reply buffer no longer grows and shrinks every cycle.** A reply bigger than its
+  usual 6 KB allowance used to make the buffer double in size and then get handed back and rebuilt
+  at the normal size on the very next poll - repeating that churn every cycle for as long as
+  replies stayed big. It now grows once, keeps the larger size, and is capped at 10 KB so a
+  runaway reply still cannot become permanent. Nothing is cut short to make this true: a busy-hour
+  vehicle list can honestly run 8-9 KB, and the board now tracks the biggest reply it has ever seen
+  so that number, not a guess, can set the buffer size later.
+
+- **The out-of-memory reply reserve can now come back on a fragmented board.** It used to only
+  re-arm once free memory reached 20 KB with a 4.3 KB largest piece - both worse than what the
+  board actually had during the 15:50 lockout, so the reserve stayed empty the whole time it was
+  needed. It now re-arms at about 13.5 KB free with a 2.3 KB piece, which is reachable even on a
+  heap crumbled this badly.
+
+- **Two hours of memory history, so the trigger can finally be caught.** The display keeps one
+  line per poll for the last 240 polls - memory free, largest unbroken piece, the lowest either
+  touched during that poll, and which optional steps ran - readable at `/api/debug/ui?log=1`. The
+  previous instrument held three polls, enough to name the failing step and nowhere near enough to
+  find what leads to it. Alongside it: the biggest reply ever received, how fragmented the memory
+  is, and how much the schedule and alert caches are holding.
+
+**Known residual:** what actually triggers the fragmentation is still not identified - the
+two-hour memory log above exists specifically to catch it in the act next time. And by design,
+this release's resting free-memory floor sits about 8 KB lower than v0.3.1's, which is the
+deliberate cost of the fix above.
 
 ## v0.3.1 - 2026-09-17
 
