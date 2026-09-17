@@ -20,11 +20,11 @@ void refreshBikes(const Config &cfg, const transit::HttpGet &http,
 void invalidateBikes();                                              // config changed
 
 // Allocates the feed scanner object itself at the same point in setup() as the other long-lived
-// objects. It is ~100 bytes once its 6 KB feature buffer is borrowed from the poller's shared
-// scratch (see refreshBikes); what this buys is not the bytes but never constructing the scanner
-// mid-cycle. Returns false if it could not be had, in which case refreshBikes() builds one per
-// refresh exactly as before.
-bool preallocateBikeStream();
+// objects, and hands it the shared scratch straight away so it never holds a 6 KB buffer of its own
+// - not even for the minute between boot and the first refresh. It is ~100 bytes thereafter; what
+// this buys is not the bytes but never constructing the scanner mid-cycle. Returns false if it
+// could not be had, in which case refreshBikes() builds one per refresh exactly as before.
+bool preallocateBikeStream(std::vector<uint8_t> *scratch = nullptr);
 
 struct BikeView {
   bool enabled = false;

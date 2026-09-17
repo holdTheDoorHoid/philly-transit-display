@@ -1167,8 +1167,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
     tracePoll(kStagePreBikes);
     // The scanner borrows the same bytes the transit fetches used earlier in this cycle; they
     // are done with them (transit_core PollBuffers).
-    refreshBikes(cfg, http_opt_plain,
-                 g_poll_buffers != nullptr ? &g_poll_buffers->scratch : nullptr);  // SS4.9: 10 min, 400 KB streamed
+    refreshBikes(cfg, http_opt_plain, pollScratch());  // DESIGN.md SS4.9: 10 min, 400 KB streamed
     tracePoll(kStagePostBikes);
   }
 
@@ -1394,6 +1393,10 @@ void pollerTask(void * /*arg*/) {
 
 bool preallocateTracker() {
   return tracker() != nullptr;
+}
+
+std::vector<uint8_t> *pollScratch() {
+  return g_poll_buffers != nullptr ? &g_poll_buffers->scratch : nullptr;
 }
 
 bool preallocatePollBuffers() {

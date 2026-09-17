@@ -52,8 +52,12 @@ indego::StatusStream *g_stream = nullptr;
 
 }  // namespace
 
-bool preallocateBikeStream() {
+bool preallocateBikeStream(std::vector<uint8_t> *scratch) {
   if (g_stream == nullptr) g_stream = new (std::nothrow) indego::StatusStream();
+  // Immediately, not on the first refresh: the constructor reserves its own 6 KB feature buffer,
+  // and handing the borrow over here releases that instead of leaving it held through the whole
+  // first cycle. setFeatureBuffer(nullptr) is a no-op, so the fallback path is unchanged.
+  if (g_stream != nullptr && scratch != nullptr) g_stream->setFeatureBuffer(scratch);
   return g_stream != nullptr;
 }
 

@@ -286,7 +286,7 @@ void setup() {
   if (!transit_app::preallocatePollBuffers()) {
     log_e("main: could not reserve the poll working set; each cycle will allocate its own");
   }
-  if (!transit_app::preallocateBikeStream()) {
+  if (!transit_app::preallocateBikeStream(transit_app::pollScratch())) {
     log_e("main: could not reserve the Indego feed scanner; each refresh will allocate its own");
   }
   // The kilobyte that lets the device still SAY "out of memory" when it is out of memory

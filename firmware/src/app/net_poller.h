@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "transit_core/model.h"
 #include "transit_stats/summary.h"
@@ -51,6 +52,10 @@ bool preallocateTracker();
 // if the allocation failed, in which case each cycle falls back to per-call buffers exactly as
 // before - a poll that is likelier to fail, not one that cannot run.
 bool preallocatePollBuffers();
+
+// The shared byte scratch itself, for the one consumer that is not inside transit_core: the Indego
+// feed scanner (bike_service.h). Null until preallocatePollBuffers() has succeeded.
+std::vector<uint8_t> *pollScratch();
 
 // Creates the poller task (12 KB stack) and its primitives without starting to poll. Call early
 // in setup(), before Wi-Fi, for the same heap-fragmentation reason as preallocateTracker().
