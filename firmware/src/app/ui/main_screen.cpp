@@ -219,7 +219,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   lv_obj_set_style_border_width(screen, 0, 0);
   lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(screen, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-  lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);  // DESIGN.md SS8: tap anywhere cycles pages
+  lv_obj_set_clickable(screen, true);  // DESIGN.md SS8: tap anywhere cycles pages
 
   auto *ctx = new MainScreenCtx();
 
@@ -235,7 +235,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   lv_label_set_text(ctx->clock_label, "--:--");
 
   ctx->weather_icon = lv_image_create(header);
-  lv_obj_add_flag(ctx->weather_icon, LV_OBJ_FLAG_HIDDEN);  // shown once a forecast picks an icon
+  lv_obj_set_hidden(ctx->weather_icon, true);  // shown once a forecast picks an icon
   ctx->weather_label = makeLabel(header, fontSmall(h), colorText());
   lv_label_set_text(ctx->weather_label, "");
 
@@ -255,14 +255,14 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   // DESIGN.md SS8: config.device.header picks what the (narrow) header shows; hidden flex items
   // take no space, so the remaining ones spread out.
   const HeaderConfig &hc = cfg.device.header;
-  if (!hc.name) lv_obj_add_flag(ctx->device_label, LV_OBJ_FLAG_HIDDEN);
-  if (!hc.clock) lv_obj_add_flag(ctx->clock_label, LV_OBJ_FLAG_HIDDEN);
+  if (!hc.name) lv_obj_set_hidden(ctx->device_label, true);
+  if (!hc.clock) lv_obj_set_hidden(ctx->clock_label, true);
   if (!hc.weather || !cfg.weather.enabled) {
-    lv_obj_add_flag(ctx->weather_icon, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ctx->weather_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(ctx->weather_icon, true);
+    lv_obj_set_hidden(ctx->weather_label, true);
   }
-  if (!hc.wifi) lv_obj_add_flag(ctx->wifi_bars, LV_OBJ_FLAG_HIDDEN);
-  if (!hc.updated) lv_obj_add_flag(ctx->updated_label, LV_OBJ_FLAG_HIDDEN);
+  if (!hc.wifi) lv_obj_set_hidden(ctx->wifi_bars, true);
+  if (!hc.updated) lv_obj_set_hidden(ctx->updated_label, true);
 
   // ---- Stop panels (ui_common.h makePanelsArea/makePanel: the stats page uses the same) ----
   lv_obj_t *panels_area = makePanelsArea(screen);
@@ -284,7 +284,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   lv_obj_set_style_pad_all(ctx->bike_box, 4, 0);
   lv_obj_set_style_pad_row(ctx->bike_box, 2, 0);
   lv_obj_set_flex_flow(ctx->bike_box, LV_FLEX_FLOW_COLUMN);
-  lv_obj_add_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_hidden(ctx->bike_box, true);
   auto makeBikeRow = [&](lv_obj_t *parent) {
     lv_obj_t *row = makeBox(parent);
     lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
@@ -305,7 +305,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_obj_set_flex_grow(ctx->bike_age, 1);
     lv_obj_set_style_text_align(ctx->bike_age, LV_TEXT_ALIGN_RIGHT, 0);
     lv_label_set_text(ctx->bike_age, "");
-    lv_obj_add_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(ctx->bike_age, true);
   }
   for (size_t i = 0; i < kMaxBikeStations; ++i) {
     MainScreenCtx::BikeRow br;
@@ -318,7 +318,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_label_set_recolor(br.counts, true);
     lv_obj_set_style_text_letter_space(br.counts, 1, 0);
     lv_label_set_text(br.counts, "");
-    lv_obj_add_flag(br.row, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(br.row, true);
     ctx->bike_rows.push_back(br);
   }
 
@@ -335,7 +335,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   lv_obj_set_size(ctx->ticker_box, lv_pct(100), ticker_h);
   lv_obj_set_style_bg_color(ctx->ticker_box, colorPanelBg(), 0);
   lv_obj_set_style_pad_all(ctx->ticker_box, ticker_pad, 0);
-  lv_obj_add_flag(ctx->ticker_box, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_hidden(ctx->ticker_box, true);
 
   ctx->ticker_label = makeLabel(ctx->ticker_box, ticker_font, colorText());
   lv_obj_set_style_text_line_space(ctx->ticker_label, line_space, 0);
@@ -388,7 +388,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   lv_obj_t *overflow_note = makeLabel(panels_area, fontSmall(h), colorLate());
   lv_obj_set_width(overflow_note, lv_pct(100));
   lv_label_set_text(overflow_note, "0 more stops will not fit in this display's memory");
-  lv_obj_add_flag(overflow_note, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_hidden(overflow_note, true);
 
   for (const StopConfig &s : visibleStops(cfg, time(nullptr))) {
     // DESIGN.md SS6/SS8: each stop shows `show` arrival rows (1..4). F31 - this loop used to run to
@@ -416,7 +416,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
 
     lv_obj_t *panel = makePanel(panels_area);
     pw.panel = panel;
-    if (!s.alt_of.empty()) lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);  // until the primary runs late
+    if (!s.alt_of.empty()) lv_obj_set_hidden(panel, true);  // until the primary runs late
 
     pw.title = makeLabel(panel, fontBody(h), colorText());
     lv_label_set_text(pw.title, panelTitle(s).c_str());
@@ -430,11 +430,11 @@ lv_obj_t *createMainScreen(const Config &cfg) {
     lv_obj_set_width(pw.weather_note, lv_pct(100));
     lv_label_set_long_mode(pw.weather_note, LV_LABEL_LONG_DOT);
     lv_label_set_text(pw.weather_note, "");
-    lv_obj_add_flag(pw.weather_note, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(pw.weather_note, true);
 
     pw.no_data_label = makeLabel(panel, fontSmall(h), colorSubtext());
     lv_label_set_text(pw.no_data_label, "no data yet");
-    lv_obj_add_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(pw.no_data_label, true);
 
     for (int r = 0; r < panel_rows; ++r) {
       lv_obj_t *row = makeBox(panel);
@@ -459,11 +459,11 @@ lv_obj_t *createMainScreen(const Config &cfg) {
       lv_label_set_recolor(rw.crowd_icons, true);  // crowdingIcons() colours each slot inline
       lv_obj_set_style_text_letter_space(rw.crowd_icons, 2, 0);
       lv_label_set_text(rw.crowd_icons, "");
-      lv_obj_add_flag(rw.crowd_icons, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(rw.crowd_icons, true);
 
       rw.crowding = makeLabel(row, fontSmall(h), colorSubtext());
       lv_label_set_text(rw.crowding, "");
-      lv_obj_add_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(rw.crowding, true);
 
       rw.minutes = makeLabel(row, minutes_font, colorText());
       lv_obj_set_style_text_align(rw.minutes, LV_TEXT_ALIGN_RIGHT, 0);
@@ -490,7 +490,7 @@ lv_obj_t *createMainScreen(const Config &cfg) {
                   dropped_panels, (unsigned)lvglPoolFree(), (unsigned)panel_cost, (unsigned)panel_cost_row);
     lv_label_set_text_fmt(overflow_note, "%d more stop%s will not fit in this display's memory",
                           dropped_panels, dropped_panels == 1 ? "" : "s");
-    lv_obj_remove_flag(overflow_note, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(overflow_note, false);
     lv_obj_move_to_index(overflow_note, -1);  // built first, but it belongs under the panels
   } else {
     lv_obj_delete(overflow_note);  // nothing to say: give the pool its ~0.5 KB back
@@ -515,30 +515,30 @@ void mainScreenDebug(lv_obj_t *screen, std::vector<std::string> &hidden_panels, 
   rows_debug.clear();
   if (ctx == nullptr) return;
   for (const PanelWidgets &pw : ctx->panels) {
-    if (lv_obj_has_flag(pw.panel, LV_OBJ_FLAG_HIDDEN)) {
+    if (lv_obj_is_hidden(pw.panel)) {
       hidden_panels.push_back(pw.stop_key);
       continue;
     }
     for (const RowWidgets &rw : pw.rows) {
       lv_obj_t *row = lv_obj_get_parent(rw.minutes);
-      if (lv_obj_has_flag(row, LV_OBJ_FLAG_HIDDEN)) continue;
+      if (lv_obj_is_hidden(row)) continue;
       char buf[160];
       snprintf(buf, sizeof buf, "%s|%s|%s|icons h=%d len=%u w=%d x=%d|word h=%d '%s'|row w=%d\n", pw.stop_key.c_str(),
                lv_label_get_text(rw.destination), lv_label_get_text(rw.minutes),
-               lv_obj_has_flag(rw.crowd_icons, LV_OBJ_FLAG_HIDDEN) ? 1 : 0,
+               lv_obj_is_hidden(rw.crowd_icons) ? 1 : 0,
                (unsigned)strlen(lv_label_get_text(rw.crowd_icons)), (int)lv_obj_get_width(rw.crowd_icons),
-               (int)lv_obj_get_x(rw.crowd_icons), lv_obj_has_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN) ? 1 : 0,
+               (int)lv_obj_get_x(rw.crowd_icons), lv_obj_is_hidden(rw.crowding) ? 1 : 0,
                lv_label_get_text(rw.crowding), (int)lv_obj_get_width(row));
       rows_debug += buf;
     }
   }
-  if (!lv_obj_has_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN)) {
+  if (!lv_obj_is_hidden(ctx->bike_box)) {
     char buf[120];
-    snprintf(buf, sizeof buf, "bike|age h=%d '%s'\n", lv_obj_has_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN) ? 1 : 0,
+    snprintf(buf, sizeof buf, "bike|age h=%d '%s'\n", lv_obj_is_hidden(ctx->bike_age) ? 1 : 0,
              lv_label_get_text(ctx->bike_age));
     rows_debug += buf;
     for (const MainScreenCtx::BikeRow &br : ctx->bike_rows) {
-      if (lv_obj_has_flag(br.row, LV_OBJ_FLAG_HIDDEN)) continue;
+      if (lv_obj_is_hidden(br.row)) continue;
       snprintf(buf, sizeof buf, "bike|%s|counts len=%u w=%d h=%d|name w=%d\n", lv_label_get_text(br.name),
                (unsigned)strlen(lv_label_get_text(br.counts)), (int)lv_obj_get_width(br.counts),
                (int)lv_obj_get_height(br.counts), (int)lv_obj_get_width(br.name));
@@ -567,17 +567,17 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
   snprintf(clock_buf, sizeof(clock_buf), "%d:%02d %s", hour12, local_tm.tm_min, local_tm.tm_hour < 12 ? "AM" : "PM");
   lv_label_set_text(ctx->clock_label, clock_buf);
 
-  if (!lv_obj_has_flag(ctx->weather_label, LV_OBJ_FLAG_HIDDEN)) {
+  if (!lv_obj_is_hidden(ctx->weather_label)) {
     // Colour icon + temperature ("[sun] 69°"); the words only while there is no forecast.
     static const lv_image_dsc_t *const kIcons[] = {nullptr, &wx_sun, &wx_moon, &wx_cloud_sun, &wx_cloud_moon, &wx_cloud,
                                                    &wx_rain, &wx_showers, &wx_snow, &wx_fog, &wx_storm};
     const lv_image_dsc_t *icon = kIcons[(int)headerWeatherIcon()];
     if (icon == nullptr) {
-      lv_obj_add_flag(ctx->weather_icon, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(ctx->weather_icon, true);
       lv_label_set_text(ctx->weather_label, headerWeatherText().c_str());
     } else {
       if (lv_image_get_src(ctx->weather_icon) != icon) lv_image_set_src(ctx->weather_icon, icon);
-      lv_obj_remove_flag(ctx->weather_icon, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(ctx->weather_icon, false);
       lv_label_set_text(ctx->weather_label, headerWeatherTemp().c_str());
     }
   }
@@ -642,9 +642,9 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
         }
       }
       if (primary_far) {
-        lv_obj_remove_flag(pw.panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_hidden(pw.panel, false);
       } else {
-        lv_obj_add_flag(pw.panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_hidden(pw.panel, true);
         continue;
       }
     }
@@ -691,20 +691,20 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
       if (caption.empty() && !has_rows) caption = "no arrivals";
     }
     if (caption.empty()) {
-      lv_obj_add_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(pw.no_data_label, true);
     } else {
       lv_label_set_text(pw.no_data_label, caption.c_str());
-      lv_obj_remove_flag(pw.no_data_label, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(pw.no_data_label, false);
     }
 
     std::string note = (have_data && cfg.weather.enabled && cfg.weather.per_stop)
                            ? stopWeatherNote(pw.stop_key, stop->arrivals.front().effective())
                            : std::string();
     if (note.empty()) {
-      lv_obj_add_flag(pw.weather_note, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(pw.weather_note, true);
     } else {
       lv_label_set_text(pw.weather_note, note.c_str());
-      lv_obj_remove_flag(pw.weather_note, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(pw.weather_note, false);
     }
 
     for (size_t i = 0; i < pw.rows.size(); ++i) {
@@ -712,10 +712,10 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
       bool row_hidden = !have_data || i >= stop->arrivals.size();
       lv_obj_t *row_parent = lv_obj_get_parent(rw.route_badge);
       if (row_hidden) {
-        lv_obj_add_flag(row_parent, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_hidden(row_parent, true);
         continue;
       }
-      lv_obj_remove_flag(row_parent, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(row_parent, false);
 
       const Arrival &a = stop->arrivals[i];
       lv_label_set_text(rw.route_badge, pw.route.c_str());
@@ -726,17 +726,17 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
       bool want_words = (cmode == "words" || cmode == "both");
       std::string icons = want_icons ? crowdingIcons(a.seats, cfg.device.crowding_icons) : std::string();
       if (icons.empty()) {
-        lv_obj_add_flag(rw.crowd_icons, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_hidden(rw.crowd_icons, true);
       } else {
         lv_label_set_text(rw.crowd_icons, icons.c_str());
-        lv_obj_remove_flag(rw.crowd_icons, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_hidden(rw.crowd_icons, false);
       }
       std::string crowd = want_words ? crowdingText(a.seats) : std::string();
       if (crowd.empty()) {
-        lv_obj_add_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_hidden(rw.crowding, true);
       } else {
         lv_label_set_text(rw.crowding, crowd.c_str());
-        lv_obj_remove_flag(rw.crowding, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_hidden(rw.crowding, false);
       }
 
       // Arrival::effective() is predicted-or-scheduled, which is what makes a Status::Skipped row
@@ -763,23 +763,23 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
 
   BikeView bikes = getBikes();
   if (!bikes.enabled || bikes.stations.empty()) {
-    lv_obj_add_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(ctx->bike_box, true);
   } else {
-    lv_obj_remove_flag(ctx->bike_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(ctx->bike_box, false);
     const bool icons = cfg.bike.style != "words";
     if (bikes.fetched_epoch == 0) {
       lv_label_set_text(ctx->bike_age, "no data yet");
-      lv_obj_remove_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(ctx->bike_age, false);
     } else if ((uint32_t)now > bikes.fetched_epoch + 600) {
       lv_label_set_text_fmt(ctx->bike_age, "%u min old", (unsigned)(((uint32_t)now - bikes.fetched_epoch) / 60));
-      lv_obj_remove_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(ctx->bike_age, false);
     } else {
-      lv_obj_add_flag(ctx->bike_age, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(ctx->bike_age, true);
     }
     for (size_t i = 0; i < ctx->bike_rows.size(); ++i) {
       MainScreenCtx::BikeRow &br = ctx->bike_rows[i];
       if (i >= bikes.stations.size()) {
-        lv_obj_add_flag(br.row, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_hidden(br.row, true);
         continue;
       }
       const indego::Station &st = bikes.stations[i];
@@ -797,7 +797,7 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
         std::string text = bikeCounts(classic, ebikes, st.docks, icons);
         lv_label_set_text(br.counts, text.c_str());
       }
-      lv_obj_remove_flag(br.row, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_hidden(br.row, false);
     }
   }
 
@@ -809,9 +809,9 @@ void refreshMainScreen(lv_obj_t *screen, const Config &cfg, const Snapshot &snap
       lv_label_set_text(ctx->ticker_label, "");
       ctx->ticker_text.clear();
     }
-    lv_obj_add_flag(ctx->ticker_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(ctx->ticker_box, true);
   } else {
-    lv_obj_remove_flag(ctx->ticker_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(ctx->ticker_box, false);
     if (ticker != ctx->ticker_text) {
       ctx->ticker_text = ticker;
       lv_label_set_text(ctx->ticker_label, ticker.c_str());

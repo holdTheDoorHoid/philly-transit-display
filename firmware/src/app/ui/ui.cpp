@@ -203,14 +203,14 @@ void buildParkingScreen() {
   lv_obj_set_size(g_parking_screen, w, h);
   lv_obj_set_style_border_width(g_parking_screen, 0, 0);
   lv_obj_set_style_pad_all(g_parking_screen, 12, 0);
-  lv_obj_remove_flag(g_parking_screen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollable(g_parking_screen, false);
   g_parking_label = lv_label_create(g_parking_screen);
   lv_obj_set_width(g_parking_label, lv_pct(96));
   lv_obj_center(g_parking_label);
   lv_label_set_long_mode(g_parking_label, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(g_parking_label, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_text(g_parking_label, "Not enough display memory for this page.\n\nShow fewer stops in Settings, then tap the screen.");
-  lv_obj_add_flag(g_parking_label, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_hidden(g_parking_label, true);
   attachTapHandlers(g_parking_screen);
   applyParkingStyle();
 }
@@ -291,12 +291,12 @@ void showPoolMessage() {
   g_stalled = true;
   if (g_parking_screen == nullptr) return;
   if (lv_screen_active() != g_parking_screen) lv_screen_load(g_parking_screen);
-  if (g_parking_label != nullptr) lv_obj_remove_flag(g_parking_label, LV_OBJ_FLAG_HIDDEN);
+  if (g_parking_label != nullptr) lv_obj_set_hidden(g_parking_label, false);
 }
 
 void hidePoolMessage() {
   g_stalled = false;
-  if (g_parking_label != nullptr) lv_obj_add_flag(g_parking_label, LV_OBJ_FLAG_HIDDEN);
+  if (g_parking_label != nullptr) lv_obj_set_hidden(g_parking_label, true);
 }
 
 // Loads the arrivals page or the night clock, whichever the data calls for (Page::Main only),
@@ -491,7 +491,7 @@ lv_obj_t *makeMessageScreen(int32_t w, int32_t h) {
   lv_obj_set_style_pad_row(screen, 6, 0);
   lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(screen, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollable(screen, false);
   return screen;
 }
 
@@ -573,7 +573,7 @@ void showConnectingScreen(const std::string &ssid, const std::string &detail) {
     lv_obj_t *screen = makeMessageScreen(w, h);
     // The whole screen is the tap target: this is the only way into the setup portal on a device
     // that already has credentials (review F10), and the owner should not have to find a button.
-    lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_clickable(screen, true);
     lv_obj_add_event_cb(screen, [](lv_event_t *) { g_tap_requested = true; }, LV_EVENT_CLICKED, nullptr);
 
     g_connecting_ssid_label = makeCentredLabel(screen, fontBody(h), colorText());
