@@ -293,28 +293,40 @@ ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len) {
 
 ParseResult<SchedEntry> parseBusSchedules(const uint8_t* data, size_t len) {
   ParseResult<SchedEntry> result;
+  parseBusSchedulesInto(&result, data, len);
+  return result;
+}
+
+void parseBusSchedulesInto(ParseResult<SchedEntry>* out, const uint8_t* data, size_t len) {
+  ParseResult<SchedEntry>& result = *out;
+  // Reset the caller's result without touching the items vector's capacity - clear() keeps it.
+  result.ok = true;
+  result.error.clear();
+  result.dropped = 0;
+  result.items.clear();
+
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, data, len);
   if (err) {
     result.ok = false;
     result.error = std::string("json parse error: ") + err.c_str();
-    return result;
+    return;
   }
 
   JsonVariantConst root = doc.as<JsonVariantConst>();
   if (!root.is<JsonObjectConst>()) {
     result.ok = false;
     result.error = "unexpected BusSchedules response shape";
-    return result;
+    return;
   }
   std::string em = sepptaErrorMessage(root);
   if (!em.empty()) {
     result.ok = false;
     result.error = em;
-    return result;
+    return;
   }
 
-  result.items.reserve(kMaxSchedEntries);
+  result.items.reserve(kMaxSchedEntries);  // a no-op once the caller reuses the same result
   for (JsonPairConst kv : root.as<JsonObjectConst>()) {
     std::string route = capId(kv.key().c_str());
     JsonVariantConst val = kv.value();
@@ -334,7 +346,6 @@ ParseResult<SchedEntry> parseBusSchedules(const uint8_t* data, size_t len) {
                    [](const SchedEntry& x) { return x.scheduled; });
     }
   }
-  return result;
 }
 
 Epoch firstUpcomingScheduleTime(const uint8_t* data, size_t len, Epoch now) {

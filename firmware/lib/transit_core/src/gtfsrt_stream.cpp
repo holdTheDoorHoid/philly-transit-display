@@ -83,6 +83,42 @@ GtfsRtStream::GtfsRtStream(size_t max_entity_bytes) : max_entity_bytes_(max_enti
   entity_buf_.reserve(max_entity_bytes_);
 }
 
+void GtfsRtStream::reset(size_t max_entity_bytes) {
+  max_entity_bytes_ = max_entity_bytes;
+  entity_buf_.clear();  // keeps the capacity: that is the whole point of reusing the object
+  if (entity_buf_.capacity() < max_entity_bytes_) entity_buf_.reserve(max_entity_bytes_);
+  entity_target_ = 0;
+
+  route_filter_.clear();
+  stop_filter_.clear();
+  on_update_ = nullptr;
+
+  // Retention off until the caller asks for it again, exactly as after construction.
+  // retainUpdates() clear()s and reserve()s, so the block below it is kept too.
+  retained_.clear();
+  max_retained_ = 0;
+  max_per_stop_route_ = 0;
+
+  state_ = State::kTag;
+  error_ = false;
+  varint_value_ = 0;
+  varint_shift_ = 0;
+  cur_field_ = 0;
+  cur_wiretype_ = 0;
+  skip_remaining_ = 0;
+  header_fill_ = 0;
+  header_target_ = 0;
+
+  entities_seen_ = 0;
+  entities_skipped_too_large_ = 0;
+  entities_matched_ = 0;
+  entities_malformed_ = 0;
+  updates_matched_ = 0;
+  updates_dropped_by_cap_ = 0;
+  identifiers_truncated_ = 0;
+  header_timestamp_ = 0;
+}
+
 void GtfsRtStream::setRouteFilter(std::vector<std::string> routes) {
   route_filter_ = std::move(routes);
 }

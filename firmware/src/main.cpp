@@ -17,6 +17,7 @@
 #include <new>
 
 #include "app/auth.h"
+#include "app/bike_service.h"
 #include "app/config_store.h"
 #include "app/cxx_exception_pool.h"
 #include "app/http_fetch.h"
@@ -230,6 +231,17 @@ void setup() {
   // to this allocation failing after Wi-Fi + web server had fragmented the heap).
   if (!transit_app::preallocateTracker()) {
     log_e("main: could not allocate the arrival tracker; SD logging disabled");
+  }
+  // The poll cycle's working set, for exactly the same reason and at exactly the same moment
+  // (DESIGN.md SS5 "the poll working set"): the GTFS-RT entity and retention buffers, the response
+  // body buffers and the schedule parse block are each a multi-kilobyte CONTIGUOUS request, and on
+  // this board the largest free block - not the free heap - is what runs out. A failure here is a
+  // slower poll, not a broken one: transit_core builds them per call as it always did.
+  if (!transit_app::preallocatePollBuffers()) {
+    log_e("main: could not reserve the poll working set; each cycle will allocate its own");
+  }
+  if (!transit_app::preallocateBikeStream()) {
+    log_e("main: could not reserve the Indego feed scanner; each refresh will allocate its own");
   }
   transit_app::initNetPoller();
   transit_app::startProxyWorker();

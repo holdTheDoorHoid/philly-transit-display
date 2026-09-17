@@ -5,6 +5,7 @@
 #include <freertos/semphr.h>
 
 #include <ctime>
+#include <memory>
 #include <new>
 #include <utility>
 
@@ -33,7 +34,20 @@ SemaphoreHandle_t mutex() {
   return g_mutex;
 }
 
+// The scanner, allocated once before Wi-Fi (preallocateBikeStream) and reset per refresh. Its
+// feature buffer is a 6,144 B contiguous block; constructing a StatusStream per refresh asked for
+// that block every five minutes, in the middle of a cycle, on a board whose largest free block
+// rests at 25-28 KB and decays (DESIGN.md SS5, SS12.1). Heap-allocated rather than a file-scope
+// object for the same reason the ArrivalTracker is: the ESP32's static .bss budget is separate
+// from and much smaller than the heap.
+indego::StatusStream *g_stream = nullptr;
+
 }  // namespace
+
+bool preallocateBikeStream() {
+  if (g_stream == nullptr) g_stream = new (std::nothrow) indego::StatusStream();
+  return g_stream != nullptr;
+}
 
 void invalidateBikes() {
   g_invalidate = true;
@@ -56,7 +70,18 @@ void refreshBikes(const Config &cfg, const transit::HttpGet &http) {
   if (!due) return;
   g_invalidate = false;
   g_fetched_ids = ids;
-  indego::StatusStream stream;
+  // The long-lived scanner when there is one - reset(), not constructed, so its 6 KB feature
+  // buffer is not asked for again. `own` is the fallback for a board where the pre-allocation
+  // failed, and is only ever constructed on that path.
+  std::unique_ptr<indego::StatusStream> own;
+  if (g_stream == nullptr) own.reset(new (std::nothrow) indego::StatusStream());
+  indego::StatusStream *sp = g_stream != nullptr ? g_stream : own.get();
+  if (sp == nullptr) {
+    Serial.println("[bike] no feed scanner (out of memory); skipping this refresh");
+    return;
+  }
+  indego::StatusStream &stream = *sp;
+  stream.reset();
   stream.setStationFilter(ids);
   int status = http(indego::statusUrl(), [&](const uint8_t *d, size_t n) { return stream.push(d, n); });
   stream.finish();

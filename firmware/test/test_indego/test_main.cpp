@@ -294,6 +294,62 @@ void test_status_url() {
   TEST_ASSERT_EQUAL_STRING("https://bts-status.bicycletransit.workers.dev/phl", statusUrl().c_str());
 }
 
+// One StatusStream, reused. The firmware allocates the scanner once before Wi-Fi and reset()s it
+// per refresh, because its one-feature buffer is a 6,144 B CONTIGUOUS block and the largest free
+// block on the target - not the free heap - is what runs out (DESIGN.md 5, "the poll working
+// set"). So a reused stream has to produce byte-for-byte what a fresh one does.
+void test_reset_rescans_identically_and_keeps_the_buffer() {
+  std::vector<uint8_t> body = readFixture("indego_bts_status_sample.json");
+
+  StatusStream fresh;
+  fresh.setStationFilter({3468, 3361});
+  fresh.push(body.data(), body.size());
+  fresh.finish();
+
+  StatusStream reused;
+  for (int pass = 0; pass < 3; ++pass) {
+    reused.reset();
+    // A different filter first, to prove the previous pass's state really is gone.
+    reused.setStationFilter({3361});
+    reused.push(body.data(), body.size());
+    reused.finish();
+    TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(reused.stations().size()));
+
+    reused.reset();
+    reused.setStationFilter({3468, 3361});
+    reused.push(body.data(), body.size());
+    reused.finish();
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(fresh.stations().size()),
+                              static_cast<uint32_t>(reused.stations().size()));
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(fresh.featuresSeen()),
+                              static_cast<uint32_t>(reused.featuresSeen()));
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(fresh.featuresSkipped()),
+                              static_cast<uint32_t>(reused.featuresSkipped()));
+    for (size_t i = 0; i < fresh.stations().size(); ++i) {
+      TEST_ASSERT_EQUAL_INT(fresh.stations()[i].id, reused.stations()[i].id);
+      TEST_ASSERT_EQUAL_STRING(fresh.stations()[i].name.c_str(), reused.stations()[i].name.c_str());
+      TEST_ASSERT_EQUAL_INT(fresh.stations()[i].bikes, reused.stations()[i].bikes);
+      TEST_ASSERT_EQUAL_INT(fresh.stations()[i].ebikes, reused.stations()[i].ebikes);
+      TEST_ASSERT_EQUAL_INT(fresh.stations()[i].docks, reused.stations()[i].docks);
+    }
+  }
+}
+
+// A reset in the MIDDLE of a feed must leave no half-captured feature behind.
+void test_reset_mid_stream_discards_partial_state() {
+  std::vector<uint8_t> body = readFixture("indego_bts_status_sample.json");
+  StatusStream s;
+  s.setStationFilter({3468, 3361});
+  s.push(body.data(), body.size() / 2);  // cut somewhere inside the features array
+  s.reset();
+  s.setStationFilter({3468, 3361});
+  s.push(body.data(), body.size());
+  s.finish();
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(s.stations().size()));
+  TEST_ASSERT_EQUAL_INT(3361, s.stations()[0].id);
+  TEST_ASSERT_EQUAL_INT(3468, s.stations()[1].id);
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(test_parse_fixture_filtered);
@@ -304,5 +360,7 @@ int main() {
   RUN_TEST(test_truncated_body);
   RUN_TEST(test_braces_and_quotes_in_strings);
   RUN_TEST(test_status_url);
+  RUN_TEST(test_reset_rescans_identically_and_keeps_the_buffer);
+  RUN_TEST(test_reset_mid_stream_discards_partial_state);
   return UNITY_END();
 }

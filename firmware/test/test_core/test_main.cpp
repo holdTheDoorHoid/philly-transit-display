@@ -22,6 +22,9 @@ void test_gtfsrt_empty_body_is_complete_not_truncated();
 void test_gtfsrt_malformed_entity_is_counted_not_fatal();
 void test_gtfsrt_trip_level_canceled_is_surfaced();
 void test_gtfsrt_fixture_updates_carry_the_header_timestamp();
+void test_gtfsrt_reset_decodes_a_second_feed_identically();
+void test_gtfsrt_reset_clears_a_half_parsed_feed();
+void test_gtfsrt_reset_grows_the_entity_cap_when_asked();
 
 // test_timeparse.cpp
 void test_bus_schedule_time_edt();
@@ -115,6 +118,10 @@ void test_poll_bus_stops_501_with_a_valid_body_still_succeeds();
 void test_poll_bus_stops_valid_empty_feed_succeeds();
 void test_poll_rail_stops_one_failed_station_is_local_to_that_station();
 void test_poll_rail_stops_malformed_json_is_a_failure();
+void test_poll_buffers_keep_their_capacity_across_cycles();
+void test_poll_buffers_do_not_change_what_a_cycle_produces();
+void test_poll_buffers_return_an_oversized_body_buffer();
+void test_poll_buffers_remove_the_large_contiguous_requests();
 
 int main(int argc, char** argv) {
   (void)argc;
@@ -136,6 +143,9 @@ int main(int argc, char** argv) {
   RUN_TEST(test_gtfsrt_malformed_entity_is_counted_not_fatal);
   RUN_TEST(test_gtfsrt_trip_level_canceled_is_surfaced);
   RUN_TEST(test_gtfsrt_fixture_updates_carry_the_header_timestamp);
+  RUN_TEST(test_gtfsrt_reset_decodes_a_second_feed_identically);
+  RUN_TEST(test_gtfsrt_reset_clears_a_half_parsed_feed);
+  RUN_TEST(test_gtfsrt_reset_grows_the_entity_cap_when_asked);
 
   RUN_TEST(test_bus_schedule_time_edt);
   RUN_TEST(test_bus_schedule_time_est);
@@ -225,6 +235,11 @@ int main(int argc, char** argv) {
   RUN_TEST(test_poll_bus_stops_valid_empty_feed_succeeds);
   RUN_TEST(test_poll_rail_stops_one_failed_station_is_local_to_that_station);
   RUN_TEST(test_poll_rail_stops_malformed_json_is_a_failure);
+
+  RUN_TEST(test_poll_buffers_keep_their_capacity_across_cycles);
+  RUN_TEST(test_poll_buffers_do_not_change_what_a_cycle_produces);
+  RUN_TEST(test_poll_buffers_return_an_oversized_body_buffer);
+  RUN_TEST(test_poll_buffers_remove_the_large_contiguous_requests);
 
   return UNITY_END();
 }

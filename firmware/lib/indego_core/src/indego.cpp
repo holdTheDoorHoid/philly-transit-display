@@ -86,6 +86,23 @@ void StatusStream::setStationFilter(const std::vector<int>& ids) {
   remaining_ids_ = ids;
 }
 
+void StatusStream::reset() {
+  state_ = State::kSeekKey;
+  key_match_pos_ = 0;
+  depth_ = 0;
+  in_string_ = false;
+  escape_ = false;
+  feature_oversized_ = false;
+  feature_buf_.clear();  // keeps the capacity: that is the whole point of reusing the object
+  if (feature_buf_.capacity() < kMaxFeatureBytes) feature_buf_.reserve(kMaxFeatureBytes);
+  filter_ids_.clear();
+  remaining_ids_.clear();
+  stations_.clear();
+  features_seen_ = 0;
+  features_skipped_ = 0;
+  done_ = false;
+}
+
 void StatusStream::appendFeatureByte(uint8_t b) {
   if (feature_buf_.size() < kMaxFeatureBytes) {
     feature_buf_.push_back(b);

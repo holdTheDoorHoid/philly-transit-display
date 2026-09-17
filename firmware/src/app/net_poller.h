@@ -42,6 +42,15 @@ void startNetPoller(uint32_t poll_seconds);
 // setup(), before Wi-Fi. Returns false (and logging stays disabled) if the allocation failed.
 bool preallocateTracker();
 
+// Allocates the poll cycle's working set - the GTFS-RT entity and retention buffers, the response
+// body buffers and the schedule parse block (transit_core PollBuffers) - for the same reason and
+// at the same moment as preallocateTracker(): every one of them is a multi-kilobyte CONTIGUOUS
+// request, and on this board the largest free block, not the free heap, is what runs out
+// (DESIGN.md SS5 "the poll working set", SS12.1). Returns false if the allocation failed, in which
+// case each cycle falls back to building them per call, exactly as before - a poll that is slower
+// to fail, not a poll that cannot run.
+bool preallocatePollBuffers();
+
 // Creates the poller task (12 KB stack) and its primitives without starting to poll. Call early
 // in setup(), before Wi-Fi, for the same heap-fragmentation reason as preallocateTracker().
 void initNetPoller();

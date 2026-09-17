@@ -144,6 +144,20 @@ class GtfsRtStream {
   // so one oversized entity never aborts the whole feed.
   explicit GtfsRtStream(size_t max_entity_bytes = 4096);
 
+  // Puts the stream back into its just-constructed state - parse state, filters, callback,
+  // counters, header timestamp and retention all cleared - while KEEPING the capacity of the
+  // entity buffer and the retention block. `max_entity_bytes` re-sizes the entity buffer's cap
+  // the way the constructor would, growing the reservation if it is larger than what is already
+  // held and leaving the existing capacity alone if it is not.
+  //
+  // This exists so one stream object can decode a new feed every poll cycle. Constructing one per
+  // cycle asks the allocator for a 4,096 B contiguous entity buffer plus a ~4,600 B retention
+  // block every time, which on this device is the single largest contiguous demand a cycle makes
+  // and the one that fails first once the heap has fragmented (DESIGN.md SS5 "the poll working
+  // set", SS12.1). A long-lived stream asks for them once, before Wi-Fi, out of a heap that is
+  // still one run.
+  void reset(size_t max_entity_bytes);
+
   // Restricts decoded updates to these route_ids (TripDescriptor.route_id). An empty vector
   // (the default) means "all routes". Call before push(); not safe to change mid-stream.
   void setRouteFilter(std::vector<std::string> routes);

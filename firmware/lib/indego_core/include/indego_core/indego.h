@@ -56,6 +56,14 @@ class StatusStream {
   // Reserves the one-feature scratch buffer up front so it never reallocates mid-stream.
   StatusStream() { feature_buf_.reserve(kMaxFeatureBytes); }
 
+  // Puts the scanner back into its just-constructed state - parse state, filter, matched stations
+  // and counters - while KEEPING the 6 KB feature buffer's capacity, so one stream object can
+  // scan a new feed every refresh. Constructing one per refresh asks the allocator for a 6,144 B
+  // contiguous block each time, which on the ESP32 target is one of the largest single requests
+  // the firmware makes and fails first once the heap has fragmented (DESIGN.md 5, "the poll
+  // working set"). A long-lived stream asks for it once, before Wi-Fi.
+  void reset();
+
   // Restricts reported stations to these ids. An empty filter (the default) reports nothing.
   // Call before push(); not safe to change mid-stream.
   void setStationFilter(const std::vector<int>& ids);

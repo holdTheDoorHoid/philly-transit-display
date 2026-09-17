@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <map>
+#include <memory>
+#include <string>
 
+#include "alloc_probe.h"
 #include "fixture_path.h"
 #include "transit_core/septa_source.h"
 
@@ -601,4 +604,191 @@ void test_poll_rail_stops_malformed_json_is_a_failure() {
   TEST_ASSERT_NOT_NULL(st);
   TEST_ASSERT_FALSE(st->ok);
   TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(st->arrivals.size()));
+}
+
+// --- The poll cycle's reusable working set (PollBuffers) --------------------------------------
+//
+// These pin the two properties the firmware depends on: the buffers keep their capacity across
+// cycles (so a cycle asks the allocator for nothing large), and using them changes NOTHING about
+// what a cycle produces.
+
+namespace {
+
+// Fixtures read once, up front, and replayed from memory - so nothing the HARNESS allocates lands
+// inside the window the allocation counter below measures.
+HttpGet makePreloadedHttp(std::map<std::string, std::string> url_to_fixture) {
+  // A shared_ptr and not the map itself: HttpGet/HttpGetEx are std::functions passed BY VALUE
+  // through pollBusStops() and every fetch under it, so a by-value capture would copy the 148 KB
+  // TripUpdates fixture on each hop - which is the harness allocating, inside the very window
+  // AllocProbe is measuring the library in.
+  auto bodies = std::make_shared<std::map<std::string, std::vector<uint8_t>>>();
+  for (const auto& kv : url_to_fixture) (*bodies)[kv.first] = transit_test::readFixture(kv.second);
+  return [bodies](const std::string& url,
+                   std::function<bool(const uint8_t*, size_t)> onData) -> int {
+    auto it = bodies->find(url);
+    if (it == bodies->end()) return 404;
+    const std::vector<uint8_t>& body = it->second;
+    const size_t kChunk = 4096;
+    for (size_t i = 0; i < body.size(); i += kChunk) {
+      size_t n = std::min(kChunk, body.size() - i);
+      if (!onData(body.data() + i, n)) break;
+    }
+    return 200;
+  };
+}
+
+// A cache that actually caches, so the "cache-hit cycle" of DESIGN.md SS5 can be exercised.
+class WarmScheduleCache : public ScheduleCache {
+ public:
+  bool get(const std::string& stop_id, std::vector<SchedEntry>* out) override {
+    auto it = stored.find(stop_id);
+    if (it == stored.end()) return false;
+    *out = it->second;
+    return true;
+  }
+  void put(const std::string& stop_id, const std::vector<SchedEntry>& entries) override {
+    stored[stop_id] = entries;
+  }
+  void putSuspect(const std::string& stop_id, const std::vector<SchedEntry>& entries) override {
+    stored[stop_id] = entries;
+  }
+  std::map<std::string, std::vector<SchedEntry>> stored;
+};
+
+std::map<std::string, std::string> twoStopRoutes() {
+  return {
+      {septaTripUpdatesUrl(), "septa_bus_tripupdates.pb"},
+      {septaTransitViewUrl("17"), "transitview_17.json"},
+      {septaBusSchedulesUrl("21332"), "busschedules_21332.json"},
+      {septaBusSchedulesUrl("21297"), "busschedules_21297.json"},
+  };
+}
+
+std::vector<StopConfig> twoStopConfigs() {
+  StopConfig sb;
+  sb.key = "17-21332";
+  sb.mode = Mode::Bus;
+  sb.route = "17";
+  sb.stop_id = "21332";
+  sb.direction = "1";
+  sb.headsign = "20th-Johnston";
+  StopConfig nb;
+  nb.key = "17-21297";
+  nb.mode = Mode::Bus;
+  nb.route = "17";
+  nb.stop_id = "21297";
+  nb.direction = "0";
+  nb.headsign = "2nd-Market";
+  return {sb, nb};
+}
+
+// Everything a caller can observe about a Snapshot, as one string, so "the buffers change nothing"
+// is an equality rather than a list of spot checks.
+std::string describe(const Snapshot& s) {
+  std::string out = std::to_string(s.generated) + "|" + (s.last_poll_ok ? "ok" : "bad") + "|" +
+                     s.last_error + "|";
+  for (const StopSnapshot& st : s.stops) {
+    out += st.key + ":" + std::to_string((int)st.health) + ":" + (st.ok ? "1" : "0") + ":" +
+           st.error + ":" + std::to_string(st.source_ts) + "[";
+    for (const Arrival& a : st.arrivals) {
+      out += a.trip + "," + a.vehicle + "," + a.destination + "," + std::to_string(a.predicted) +
+             "," + std::to_string(a.scheduled) + "," + std::to_string((int)a.status) + ";";
+    }
+    out += "]";
+  }
+  return out;
+}
+
+}  // namespace
+
+void test_poll_buffers_keep_their_capacity_across_cycles() {
+  HttpGetEx http = adaptHttpGet(makePreloadedHttp(twoStopRoutes()));
+  std::vector<StopConfig> configs = twoStopConfigs();
+  Epoch now = 1789352300;
+
+  PollBuffers buf;
+  buf.reserveAll();
+  const size_t body_cap = buf.body.capacity();
+  const size_t sched_cap = buf.sched.items.capacity();
+  const size_t retained_cap = buf.rt.retained().capacity();
+  TEST_ASSERT_TRUE(body_cap >= PollBuffers::kBodyReserve);
+  TEST_ASSERT_TRUE(sched_cap >= kMaxSchedEntries);
+  TEST_ASSERT_TRUE(retained_cap >= GtfsRtStream::kDefaultMaxRetainedUpdates);
+
+  WarmScheduleCache cache;
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    buf.beginCycle();
+    Snapshot snap = pollBusStops(configs, now, http, cache, &buf);
+    TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(snap.stops.size()));
+    // Not "at least": exactly what was reserved, cycle after cycle. A capacity that GREW would
+    // mean a reallocation happened; one that shrank would mean the buffer was given away.
+    TEST_ASSERT_EQUAL_UINT32(body_cap, static_cast<uint32_t>(buf.body.capacity()));
+    TEST_ASSERT_EQUAL_UINT32(sched_cap, static_cast<uint32_t>(buf.sched.items.capacity()));
+    TEST_ASSERT_EQUAL_UINT32(retained_cap, static_cast<uint32_t>(buf.rt.retained().capacity()));
+  }
+}
+
+void test_poll_buffers_do_not_change_what_a_cycle_produces() {
+  HttpGetEx http = adaptHttpGet(makePreloadedHttp(twoStopRoutes()));
+  std::vector<StopConfig> configs = twoStopConfigs();
+  Epoch now = 1789352300;
+
+  FakeScheduleCache plain_cache;
+  Snapshot without = pollBusStops(configs, now, http, plain_cache, nullptr);
+
+  PollBuffers buf;
+  buf.reserveAll();
+  FakeScheduleCache buffered_cache;
+  buf.beginCycle();
+  Snapshot with_first = pollBusStops(configs, now, http, buffered_cache, &buf);
+  buf.beginCycle();
+  Snapshot with_second = pollBusStops(configs, now, http, buffered_cache, &buf);
+
+  // Identical to the unbuffered answer, and identical again on the reused buffers - which is what
+  // says reset() left no state behind from the previous cycle.
+  TEST_ASSERT_EQUAL_STRING(describe(without).c_str(), describe(with_first).c_str());
+  TEST_ASSERT_EQUAL_STRING(describe(without).c_str(), describe(with_second).c_str());
+}
+
+void test_poll_buffers_return_an_oversized_body_buffer() {
+  PollBuffers buf;
+  buf.reserveAll();
+  // An unusually large response grew the body past the reserve. It must not stay resident: the
+  // next cycle's beginCycle() gives the block back and takes a fresh reserve-sized one.
+  buf.body.resize(3 * PollBuffers::kBodyReserve);
+  TEST_ASSERT_TRUE(buf.body.capacity() > PollBuffers::kBodyReserve);
+  buf.beginCycle();
+  TEST_ASSERT_EQUAL_UINT32(PollBuffers::kBodyReserve, static_cast<uint32_t>(buf.body.capacity()));
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(buf.body.size()));
+}
+
+void test_poll_buffers_remove_the_large_contiguous_requests() {
+  HttpGetEx http = adaptHttpGet(makePreloadedHttp(twoStopRoutes()));
+  std::vector<StopConfig> configs = twoStopConfigs();
+  Epoch now = 1789352300;
+
+  // WITHOUT the working set: the GTFS-RT entity buffer (4,096 B) and its retention block are
+  // constructed per cycle, so the cycle makes at least one 4 KB-or-larger contiguous request.
+  FakeScheduleCache plain_cache;
+  transit_test::AllocProbe::begin();
+  (void)pollBusStops(configs, now, http, plain_cache, nullptr);
+  const size_t largest_without = transit_test::AllocProbe::end();
+  TEST_ASSERT_TRUE_MESSAGE(largest_without >= 4096,
+                            "a per-call cycle should ask for at least one 4 KB block");
+
+  // WITH it, on a warm cycle: nothing that big is asked for again. The remaining requests are the
+  // Snapshot's own arrival vectors and the strings in them, which are the product of the poll.
+  PollBuffers buf;
+  buf.reserveAll();
+  WarmScheduleCache cache;
+  buf.beginCycle();
+  (void)pollBusStops(configs, now, http, cache, &buf);  // warm-up: fills the schedule cache
+  buf.beginCycle();
+  transit_test::AllocProbe::begin();
+  Snapshot snap = pollBusStops(configs, now, http, cache, &buf);
+  const size_t largest_with = transit_test::AllocProbe::end();
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(snap.stops.size()));
+  TEST_ASSERT_TRUE_MESSAGE(largest_with < 4096,
+                            "a warm cycle must not ask for a 4 KB contiguous block");
+  TEST_ASSERT_TRUE(largest_with < largest_without);
 }

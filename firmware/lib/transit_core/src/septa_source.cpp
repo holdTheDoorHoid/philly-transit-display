@@ -52,9 +52,16 @@ FetchResult fetchBuffered(const std::string& url, const HttpGetEx& http,
 // the status code (NOTES.md 1: SEPTA serves good bodies under 400/501 and bad ones under 200),
 // but a body that did not arrive whole is a failure regardless of what it parsed to - a truncated
 // document that happens to be valid JSON is worse than no document, because it looks fine.
+//
+// `borrowed` says the parse target is not this call's to give away: it is the caller's long-lived
+// PollBuffers::sched, whose whole purpose is to keep its capacity. The items are then COPIED out
+// size-exact instead of moved, which is also the smaller contiguous request - a 12-entry schedule
+// is ~1.5 KB where the parse block is a flat 3 KB. `*out` is still left untouched on every
+// failure path, which fetchPlausibleSchedule() and its host tests depend on.
 template <typename T>
 FetchOutcome finishJsonFetch(const char* what, const FetchResult& transport,
-                              ParseResult<T>&& parsed, bool body_empty, std::vector<T>* out) {
+                              ParseResult<T>* parsed, bool body_empty, std::vector<T>* out,
+                              bool borrowed = false) {
   FetchOutcome o;
   o.transport = transport;
   if (body_empty) {
@@ -66,11 +73,15 @@ FetchOutcome finishJsonFetch(const char* what, const FetchResult& transport,
     o.error = std::string(what) + " response truncated";
     return o;
   }
-  if (!parsed.ok) {
-    o.error = parsed.error.empty() ? std::string(what) + " unreadable response" : parsed.error;
+  if (!parsed->ok) {
+    o.error = parsed->error.empty() ? std::string(what) + " unreadable response" : parsed->error;
     return o;
   }
-  *out = std::move(parsed.items);
+  if (borrowed) {
+    out->assign(parsed->items.begin(), parsed->items.end());
+  } else {
+    *out = std::move(parsed->items);
+  }
   o.ok = true;
   return o;
 }
@@ -86,6 +97,34 @@ void addUnique(std::vector<std::string>& v, const std::string& item) {
 }
 
 }  // namespace
+
+// --- PollBuffers -----------------------------------------------------------------------------
+
+void PollBuffers::reserveAll(size_t entity_bytes, size_t retained, size_t sched_entries) {
+  // reset() reserves the entity buffer; retainUpdates() reserves the retention block. Doing both
+  // here means the two largest contiguous requests a poll cycle makes are paid once, by whoever
+  // calls this - on the firmware, main.cpp before Wi-Fi.
+  rt.reset(entity_bytes);
+  rt.retainUpdates(retained, GtfsRtStream::kDefaultMaxPerStopRoute);
+  body.reserve(kBodyReserve);
+  sched.items.reserve(sched_entries);
+}
+
+void PollBuffers::beginCycle() {
+  if (body.capacity() > kBodyReserve) {
+    // A response larger than the reserve made the vector double past it. Give that block back and
+    // take a fresh 4 KB one HERE, at the top of a cycle, where the largest free block is at its
+    // best - rather than letting an occasional big body become resident for the life of the
+    // device. swap-with-a-temporary is the only way to make a std::vector release capacity.
+    std::vector<uint8_t>().swap(body);
+    body.reserve(kBodyReserve);
+  }
+  body.clear();
+  sched.items.clear();
+  sched.error.clear();
+  sched.dropped = 0;
+  sched.ok = true;
+}
 
 std::string septaTripUpdatesUrl() {
   return std::string(kBase) + "/gtfsrt/septa-pa-us/Trip/rtTripUpdates.pb";
@@ -156,25 +195,34 @@ FetchOutcome SeptaSource::fetchRealtimeEx(GtfsRtStream& stream, HttpGetEx http) 
 
 FetchOutcome SeptaSource::fetchTransitViewEx(const std::string& route,
                                               std::vector<TvVehicle>* out, HttpGetEx http) {
-  std::vector<uint8_t> body;
+  std::vector<uint8_t> own_body;
+  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->body : own_body;
   FetchResult t = fetchBuffered(septaTransitViewUrl(route), http, &body);
-  return finishJsonFetch("TransitView", t,
-                          body.empty() ? ParseResult<TvVehicle>()
-                                       : parseTransitView(body.data(), body.size()),
-                          body.empty(), out);
+  ParseResult<TvVehicle> parsed;
+  if (!body.empty()) parsed = parseTransitView(body.data(), body.size());
+  return finishJsonFetch("TransitView", t, &parsed, body.empty(), out);
 }
 
 FetchOutcome SeptaSource::fetchScheduleEx(const std::string& stop_id,
                                            std::vector<SchedEntry>* out, HttpGetEx http) {
-  std::vector<uint8_t> body;
+  std::vector<uint8_t> own_body;
+  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->body : own_body;
   FetchResult t = fetchBuffered(septaBusSchedulesUrl(stop_id), http, &body);
   // Parse regardless of `status`: SEPTA has been observed returning a valid-shaped body on a
   // non-200 status for this endpoint (NOTES.md) - the status code alone is not a reliable
   // "was there usable data" signal here.
-  FetchOutcome o = finishJsonFetch("SEPTA schedule", t,
-                                    body.empty() ? ParseResult<SchedEntry>()
-                                                 : parseBusSchedules(body.data(), body.size()),
-                                    body.empty(), out);
+  //
+  // The parse target is the caller's long-lived one when there is one, so the 24 x 128 B
+  // kMaxSchedEntries reserve() inside parseBusSchedulesInto() is a no-op after the first cycle.
+  ParseResult<SchedEntry> own_parsed;
+  ParseResult<SchedEntry>& parsed = buffers_ != nullptr ? buffers_->sched : own_parsed;
+  parsed.ok = true;
+  parsed.error.clear();
+  parsed.dropped = 0;
+  parsed.items.clear();
+  if (!body.empty()) parseBusSchedulesInto(&parsed, body.data(), body.size());
+  FetchOutcome o = finishJsonFetch("SEPTA schedule", t, &parsed, body.empty(), out,
+                                    buffers_ != nullptr);
   if (!o.ok && o.error.empty()) o.error = "SEPTA schedule unavailable";
   return o;
 }
@@ -187,22 +235,22 @@ FetchOutcome SeptaSource::fetchAlertsEx(Mode mode, const std::string& route,
     o.error = "no alert route id for this line";
     return o;
   }
-  std::vector<uint8_t> body;
+  std::vector<uint8_t> own_body;
+  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->body : own_body;
   FetchResult t = fetchBuffered(url, http, &body);
-  return finishJsonFetch("Alerts", t,
-                          body.empty() ? ParseResult<transit::Alert>()
-                                       : parseAlerts(body.data(), body.size()),
-                          body.empty(), out);
+  ParseResult<transit::Alert> parsed;
+  if (!body.empty()) parsed = parseAlerts(body.data(), body.size());
+  return finishJsonFetch("Alerts", t, &parsed, body.empty(), out);
 }
 
 FetchOutcome SeptaSource::fetchRailArrivalsEx(const std::string& station,
                                                std::vector<RailArrival>* out, HttpGetEx http) {
-  std::vector<uint8_t> body;
+  std::vector<uint8_t> own_body;
+  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->body : own_body;
   FetchResult t = fetchBuffered(septaArrivalsUrl(station), http, &body);
-  return finishJsonFetch("SEPTA rail arrivals", t,
-                          body.empty() ? ParseResult<RailArrival>()
-                                       : parseRailArrivals(body.data(), body.size()),
-                          body.empty(), out);
+  ParseResult<RailArrival> parsed;
+  if (!body.empty()) parsed = parseRailArrivals(body.data(), body.size());
+  return finishJsonFetch("SEPTA rail arrivals", t, &parsed, body.empty(), out);
 }
 
 // --- Legacy status-code forms, on top of the Ex ones (see septa_source.h) --------------------
@@ -304,12 +352,12 @@ void summarize(Snapshot* snap, const std::string& preferred_error) {
 }  // namespace
 
 Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGetEx http,
-                      ScheduleCache& cache) {
+                      ScheduleCache& cache, PollBuffers* buffers) {
   Snapshot snap;
   snap.generated = now;
   snap.last_poll_ok = true;
 
-  SeptaSource src;
+  SeptaSource src(buffers);
 
   // Union of routes/stops for the GTFS-RT filter and the TransitView fetch loop: bus/trolley
   // only, since subway has neither (NOTES.md 7a).
@@ -332,7 +380,15 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
   // Declared out here because the merge loop below reads stream.retained() directly rather than
   // copying it into a vector of its own. A subway-only config never feeds this stream, so it is
   // built with a zero-byte entity buffer in that case and reserves nothing at all.
-  GtfsRtStream stream(rt_routes.empty() ? 0 : 4096);
+  //
+  // With a PollBuffers the stream is the caller's, reset rather than constructed, so the 4,096 B
+  // entity buffer and the ~4,600 B retention block are not asked for again (PollBuffers). The
+  // local is then an empty shell - GtfsRtStream(0) reserves nothing - and costs only its own
+  // ~150 bytes of stack.
+  const size_t entity_bytes = rt_routes.empty() ? 0 : 4096;
+  GtfsRtStream own_stream(buffers != nullptr ? 0 : entity_bytes);
+  GtfsRtStream& stream = buffers != nullptr ? buffers->rt : own_stream;
+  if (buffers != nullptr) stream.reset(entity_bytes);
   bool rt_ok = true;
   std::string rt_error;
   if (!rt_routes.empty()) {
@@ -438,12 +494,13 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
   return pollBusStops(configs, now, adaptHttpGet(std::move(http)), cache);
 }
 
-Snapshot pollRailStops(const std::vector<StopConfig>& configs, Epoch now, HttpGetEx http) {
+Snapshot pollRailStops(const std::vector<StopConfig>& configs, Epoch now, HttpGetEx http,
+                       PollBuffers* buffers) {
   Snapshot snap;
   snap.generated = now;
   snap.last_poll_ok = true;
 
-  SeptaSource src;
+  SeptaSource src(buffers);
 
   std::vector<std::string> stations;
   for (const auto& c : configs) {

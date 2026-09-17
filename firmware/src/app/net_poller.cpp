@@ -245,6 +245,26 @@ class AppScheduleCache : public transit::ScheduleCache {
 
 AppScheduleCache g_sched_cache;
 
+// ---- The poll cycle's working set (DESIGN.md SS5) --------------------------------------------
+// Allocated once by preallocatePollBuffers(), from main.cpp, before Wi-Fi - the same reasoning and
+// the same moment as the ArrivalTracker above. transit_core's PollBuffers owns the GTFS-RT entity
+// buffer (4,096 B), its retention block (~4,600 B), one response body buffer (4,096 B) and the
+// BusSchedules parse block (24 x 128 B); g_sched_raw below is the firmware's own, because the
+// BusSchedules branch of makeHttpGetEx() buffers the response at the TRANSPORT layer - before
+// transit_core sees it - so it cannot be the same vector transit_core is appending into.
+//
+// Every one of these is a multi-kilobyte contiguous request, they all fall inside the same few
+// hundred milliseconds of a cycle, and the largest free block on this board rests at 25-28 KB and
+// decays with uptime and request rate (DESIGN.md SS12.1). At 11.7 KB - measured, with 36 KB still
+// free - the cycle threw std::bad_alloc and every cycle after it did the same. Reserved before
+// Wi-Fi, out of a heap that is still one run, none of them is ever asked for again.
+//
+// Heap-allocated rather than a file-scope object, like the tracker: the ESP32's static .bss budget
+// is separate from and much smaller than the heap. A null pointer is a working fallback, not a
+// failure - transit_core builds them per call exactly as it used to.
+transit::PollBuffers *g_poll_buffers = nullptr;
+std::vector<uint8_t> g_sched_raw;
+
 // ---- stats-page summary cache (F27, DESIGN.md SS8 "Stats page") -------------------------------
 //
 // Computing one of these streams a month of CSV off the SD card - seconds on a slow card, times
@@ -371,7 +391,11 @@ transit::HttpGetEx makeHttpGetEx(uint32_t timeout_ms) {
       transit::FetchResult result;
       constexpr int kAttempts = 4;
       for (int attempt = 0; attempt < kAttempts; ++attempt) {
-        std::vector<uint8_t> body;
+        // The transport-level buffer, reserved once before Wi-Fi (g_sched_raw): the cap below is
+        // 4 KB, so with the reservation in place the insert() loop never reallocates and never
+        // asks for a contiguous block mid-cycle. clear() keeps the capacity.
+        std::vector<uint8_t> &body = g_sched_raw;
+        body.clear();
         bool overflow = false;
         ReplyInfo reply;
         notePollerProgress();
@@ -467,7 +491,7 @@ std::vector<Alert> collectAlerts(const std::vector<StopConfig> &stops, bool aler
     return {};
   }
 
-  transit::SeptaSource src;
+  transit::SeptaSource src(g_poll_buffers);  // the shared response body buffer, not a fresh one
   uint32_t now_ms = millis();
   std::vector<std::string> live_keys;
 
@@ -528,7 +552,7 @@ std::vector<LivenessEntry> g_liveness_cache;
 
 void refreshRouteLiveness(const std::vector<StopConfig> &stops, const transit::HttpGetEx &http,
                           const std::function<bool()> &have_time) {
-  transit::SeptaSource src;
+  transit::SeptaSource src(g_poll_buffers);  // the shared response body buffer, not a fresh one
   std::vector<std::string> live_keys;
   for (const auto &s : stops) {
     if (s.mode != Mode::Bus && s.mode != Mode::Trolley) continue;
@@ -700,6 +724,7 @@ void logBikeSamples(const Config &cfg, time_t now, const std::string &month) {
 transit_stats::ArrivalTracker *g_tracker = nullptr;
 volatile bool g_enabled = false;
 bool g_task_created = false;
+
 
 // May return nullptr: with exceptions disabled a plain `new` that fails calls std::terminate()
 // (seen as a boot loop on the owner's board when the heap was too fragmented after Wi-Fi came
@@ -986,6 +1011,10 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 #endif
+  // Clears the working set for this cycle and gives back an oversized body buffer, if some
+  // unusually large response grew one last cycle. Done HERE, at poll-start, because this is where
+  // the largest free block is at its best (DESIGN.md SS5).
+  if (g_poll_buffers != nullptr) g_poll_buffers->beginCycle();
   Config cfg = getActiveConfig();
   transit::HttpGetEx http = makeHttpGetEx(kFetchTimeoutMs);
   transit::HttpGetEx http_opt = makeHttpGetEx(kOptionalFetchTimeoutMs);
@@ -1017,8 +1046,8 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   bool out_of_memory = false;
   tracePoll(kStagePreTransit);
   try {
-    bus_snap = transit::pollBusStops(bus_like, now, http, sched_cache);
-    rail_snap = transit::pollRailStops(rail_like, now, http);
+    bus_snap = transit::pollBusStops(bus_like, now, http, sched_cache, g_poll_buffers);
+    rail_snap = transit::pollRailStops(rail_like, now, http, g_poll_buffers);
   } catch (const std::bad_alloc &) {
     // Stamped INSIDE the catch, before anything unwound by the throw has been rebuilt: with the
     // per-stage marks above it, the ring then reads "...sched-stop, oom-transit", which names the
@@ -1332,6 +1361,29 @@ void pollerTask(void * /*arg*/) {
 
 bool preallocateTracker() {
   return tracker() != nullptr;
+}
+
+bool preallocatePollBuffers() {
+  if (g_poll_buffers == nullptr) {
+    g_poll_buffers = new (std::nothrow) transit::PollBuffers();
+    if (g_poll_buffers != nullptr) {
+      try {
+        g_poll_buffers->reserveAll();
+      } catch (const std::bad_alloc &) {
+        // Partially reserved is still usable - whatever was not reserved is simply grown on
+        // demand, which is the old behaviour. Nothing here may throw past setup().
+        Serial.println("[net_poller] poll working set only partly reserved (out of memory)");
+      }
+    }
+  }
+  // The transport's own BusSchedules buffer (see g_sched_raw). 4 KB is the cap makeHttpGetEx
+  // enforces, so reserving it here means that branch never reallocates.
+  try {
+    g_sched_raw.reserve(4096);
+  } catch (const std::bad_alloc &) {
+    Serial.println("[net_poller] BusSchedules buffer not reserved (out of memory)");
+  }
+  return g_poll_buffers != nullptr;
 }
 
 void initNetPoller() {
