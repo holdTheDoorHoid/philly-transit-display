@@ -858,6 +858,12 @@ firmware/
     http_fetch.{h,cpp}           plain-HTTP GET, retry/backoff, streaming callback, sticky BusSchedules cookie
     config_store.{h,cpp}         LittleFS <-> Config struct, validation, defaults, migration
     web_server.{h,cpp}           routes in §7, serves gzipped assets from src/generated/
+    host_match.h                 the DNS-rebinding Host check as pure, non-allocating string work
+                                 (§12.1; it runs where a throw would be fatal), host-tested
+    json_response.h              sendJsonStreamed(): the one way a large JSON body leaves the
+                                 device, used from both the web task and the poller task (§12.1)
+    cpu_yield.{h,cpp}            how a CPU-bound loop on the poller lets IDLE0 run, and the
+                                 high-water it reports as cpu_stretch_ms_max (§12.1)
     ui/                          LVGL screens: main, stats, device info; uses only Snapshot data
     ui_lock.{h,cpp}              who may wait on whom: the display task's zero-wait lock policy and
                                  the last-good fallback every shared accessor uses (this §)
@@ -1182,7 +1188,7 @@ Status codes beyond the per-route ones below:
 |---|---|---|
 | 401 | `{"error":"pin required"}` / `{"error":"wrong pin"}` | Protected route, `X-Pin` missing or wrong |
 | 429 | `{"error":"too many attempts","retry_s":N}` | Five consecutive wrong PINs; every protected route is locked for 30 s. A correct PIN resets the counter; a *missing* header never counts towards it |
-| 421 | `{"error":"this device is not reachable under that host name"}` | The `Host` header is not the device's IP, `<device name>` or `<device name>.local`, `192.168.4.1` or `localhost` (optional `:port`, case-insensitive). DNS-rebinding defence — checked before any handler runs, on every route, and additionally at the first byte of a `POST /api/ota` upload, whose callback runs before the middleware chain (§12) |
+| 421 | `{"error":"this device is not reachable under that host name"}` | The `Host` header is not the device's IP, `<device name>` or `<device name>.local`, `192.168.4.1` or `localhost` (optional `:port`, case-insensitive). DNS-rebinding defence — checked at **end of headers**, on every route, by a first-registered `AsyncWebHandler` whose `canHandle()` claims the request when the `Host` is not one of ours (`HostGuardHandler`, §12.1). That is before the body is parsed and therefore before any body or upload callback, so `POST /api/ota` needs no repeat of the check and a rebound upload never reaches `Update.begin()`. It used to be a server middleware, which runs *after* the body and could reboot the device; §12.1 has why. A bad-`Host` request with a body has that body read and discarded — counted, never parsed — before the 421 |
 | 409 | `{"error":"another firmware upload is in progress"}` | A second `POST /api/ota` while one is streaming |
 | 500 | `{"error":"..."}` | `PUT /api/config` could not write the file (the live config is unchanged, §6) |
 
@@ -1206,7 +1212,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | `POST /api/ota` | multipart `firmware` field; reboots on success. One at a time. No file → 400 `no firmware file`; too little heap or a fragmented one → 503 naming which check failed; an image built for a different board → 400 `firmware is for a different board (expected <board>)`; larger than the OTA slot → 413. Answers 200 only after the final chunk arrived *and* `Update.end()` succeeded |
 | `POST /api/reboot`, `POST /api/wifi/reset` | Maintenance |
 | `POST /api/pin` | Body `{"pin":"new"}`, authenticated with the **current** PIN in `X-Pin`. New PIN: 4–32 printable ASCII, no whitespace. → `{"ok":true}`, or 400 with the rule that was broken. No reset-by-network path: recovery is the serial console or the device info screen (§12) |
-| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB |
+| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB. Also `lock_misses`, `tick_ms`/`tick_ms_max` (§5) and `cpu_stretch_ms_max` — the longest the poller task has run a CPU-bound loop without letting IDLE0 in, since boot, against the task watchdog's 5,000 ms (§12.1) |
 | `POST /api/debug/tap` | Test hook (PIN-protected: it changes what the screen shows): simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
 | `POST /api/debug/page` | Test hook (PIN-protected, same reason): go straight to `main` \| `night` \| `stats` \| `device`, named in `?page=`, a `page=` form field or the raw body. Performs exactly the transition a tap does, queued for the LVGL task like `/api/debug/tap` — nothing builds an `lv_obj` on the web server task. It exists because LVGL pool exhaustion cannot be reproduced in the simulator's 512 KB pool (§8) and measuring it wants thirty cycles, not thirty taps |
 | `POST /api/debug/oom` | Test hook (PIN-protected: it starves every other task for under a millisecond): exhausts the heap on purpose, forces a `std::bad_alloc`, frees everything and answers `{"caught":true,"blocks":N,"largest":B,"free_before":X,"free_after":Y}` - the deterministic proof of the emergency exception pool (§12.1). `largest` under ~100 means the exception object could only have come from the pool; without the pool the request reboots the device. Run it on a **fresh boot**: it then also proves the first-throw path (§12.1), which on a task that has already thrown answers `caught:true` either way |
@@ -1891,6 +1897,75 @@ exhaust the heap while a fetch is in flight. That is a real constraint on the *t
 normal operation - nothing else takes the whole heap on purpose - so the device suite fires
 `/api/debug/oom` only in the quiet window just after a poll completes (section A0).
 
+**A fourth case was in ESPAsyncWebServer's own middleware plumbing, and it is fixed by not having
+any middleware (2026-09-16).** It belongs in this list because it is where a reader will look for
+it, and because the shape is the one this section keeps meeting: a throw that the pool and the
+warming make *catchable* while nothing anywhere catches it. The release candidate's device suite
+failed its "no reboot during the page cycling" check on
+
+```
+__terminate <- std::terminate <- __cxa_throw <- operator new <- std::function copy
+  <- AsyncMiddlewareFunction::run <- AsyncMiddlewareChain::_runChain   Middleware.cpp:70
+  <- _runMiddlewareChain (WebRequest.cpp:1038) <- _parseLine <- _onData
+  <- AsyncClient::_recv <- _async_service_task
+```
+
+Read against the pinned source, `_runChain` costs **three small heap allocations per request per
+middleware**, and it is worth writing them down because the arithmetic is what decides which fixes
+are available. It builds a `next` `std::function` capturing five things *including a copy of the
+finalizer* - 32 bytes, past libstdc++'s 8-byte small-object buffer on this ABI (`_Nocopy_types` is
+a union whose largest member is an 8-byte pointer-to-member-function), so heap. It calls
+`m->run(request, next)`, whose parameter is `ArMiddlewareNext` **by value**: a second copy, a second
+allocation. `AsyncMiddlewareFunction::run` then calls `_fn(request, next)`, by value again: a third,
+and the one the backtrace names. None of them is catchable: `_runChain` has no `try`, nor does
+anything above it up to the AsyncTCP service task, and there is no user hook on that path at all.
+
+The cost being *per middleware* rules the obvious mitigation out rather than in: merging the Host
+check and the exception-globals warming into one registration was already done in the RC review, so
+there was one middleware and three allocations, and there was no second one to merge away. Nor can
+our middleware "allocate nothing" its way out - our code allocates nothing already; the throwing
+allocation is the library copying the chain's own `std::function` before our code runs. And the
+library is not vendored or patched, by policy.
+
+What is available is the first line of `_runChain`: `if (!_middlewares.size()) return finalizer();`.
+With nothing registered on the server and nothing on any handler, the chain is that branch: no
+`std::function` is copied, nothing is allocated, and the terminate site is **unreachable rather than
+unlikely**. So the Host check and the warming moved to `web_server.cpp`'s `HostGuardHandler`, an
+`AsyncWebHandler` registered first, whose `canHandle()` warms the task and claims the request only
+when the `Host` is not one of ours (and whose `handleRequest()` then answers 421 from a fixed
+literal). `AsyncWebServer::_attachHandler` calls `canHandle()` on each handler in registration order
+at **end of headers** - see `_parseLine`, which does `_attachHandler` before switching to
+`PARSE_REQ_BODY` - so this is not merely an equivalent hook, it is an *earlier* one.
+
+Three things fall out of that, and the first is the answer to this section's own standing note that
+the chain runs after body and upload callbacks:
+
+- **`handleOtaUpload` stops repeating the Host check and the warming.** It carried both only because
+  the chain runs late; the guard runs before the first body byte reaches the callback, so a
+  DNS-rebound upload is claimed by the guard and never becomes an OTA request at all - it cannot
+  reach `Update.begin()` or one `Update.write()`. The callback keeps its own `bad_alloc` guard,
+  which is a different job and still nobody else's.
+- **Every request does two or three fewer heap allocations**, because calling `hostAllowed()` from
+  `canHandle()` means it must not throw, so the string work moved to `src/app/host_match.h` and
+  works in fixed buffers: no `std::string` of the header, no `g_host_name + ".local"`, no `String`
+  from `WiFi.localIP().toString()`. Small, but it is per request, on the device whose resting
+  largest block is the open problem below.
+- **A bad-Host request with a body now has that body read and discarded before the 421**
+  (`isRequestHandlerTrivial()` stays `true`, so the bytes are counted, never parsed, and no callback
+  sees them), where the OTA-specific check used to hang up on the first chunk. Stated rather than
+  hidden. No side effect happens either way; making the handler non-trivial to get the hang-up back
+  would turn a hostile `text/plain` body into parsed form parameters, which is the worse trade.
+
+The proof is in the image, not in the argument: `AsyncMiddlewareFunction::run`, its destructors and
+`AsyncMiddlewareChain::addMiddleware` are all present in the RC's ELF and **all absent** from this
+one - nothing constructs a middleware, so `--gc-sections` drops them, and the frame the backtrace
+names does not exist in the build. `_runChain` itself is still linked and can only take its empty
+branch. The three finalizer `std::function`s that remain capture one pointer each; `objdump` shows
+their `_M_manager` bodies contain no calls at all, which is libstdc++'s stored-locally path.
+
+**Do not add a middleware back.** `g_server.addMiddleware(...)` is a one-line change that
+reintroduces an uncatchable reboot, and it will look completely reasonable to whoever writes it.
+
 A **third instance, and the one that matters for normal operation**, turned up on 2026-09-16 on a
 clean `dcb6353` image with `/api/debug/oom` never fired once (the capture was grepped: the only
 `oom` matches are the bootloader's `ho 8 tail 4 room 4` line matching inside the word "room"). Free
@@ -1939,6 +2014,70 @@ on core 0, so under web load it was starved while holding the snapshot mutex and
 read is the fix that avoids both.) Idle-slice work
 (stats summaries, queued proxy jobs) additionally waits for 40 KB free heap and a 12 KB largest
 block so it never collides with a config save on the web task.
+
+**The watchdog fired again (2026-09-16), and the rule has a chokepoint and a number now.** The
+paragraph above states the rule - the poller must not starve IDLE0 - and fixes the one call site
+that had broken it. This is the second breakage, and like the `vTaskPriorityDisinherit` pair below
+it was a class with one instance fixed rather than a fixed bug. The release candidate's suite
+decoded:
+
+```
+decomposeFloat (ArduinoJson FloatParts.hpp:57) <- TextFormatter::writeFloat
+  <- JsonSerializer<...>::visit... <- serializeJson
+  <- runStatsJob   proxy_worker.cpp:293
+  <- runJob (:346) <- runQueuedProxyJob (:388) <- pollerTask (net_poller.cpp:1213)
+```
+
+**The floats are not the cost, and reading the top frame as the cause would have produced a fix that
+changed nothing.** Measured on the owner's board: `GET /api/stats?days=30` is a **5,027 B** document
+with **28** floats in it and `GET /api/stats/overview?days=30` is 5,096 B with 87. Formatting those
+is milliseconds. What the same measurement shows is that the request takes **5.3-7.8 s end to end**,
+essentially all of it the month-of-CSV scan. The watchdog does not time a function, it times how
+long IDLE0 has not run: the whole job ran on the poller task without ever blocking, so the panic
+fired at the 5 s mark wherever the CPU happened to be, and `serializeJson` - the most CPU-dense
+stretch, right at the end - is where it happened to be. Reducing float precision, or yielding only
+during serialisation, would have left the number it fired on untouched.
+
+**The primitive is `vTaskDelay(1)`, and the two obvious alternatives are no-ops here.**
+`taskYIELD()` asks the scheduler for the highest-priority READY task, which is the poller itself;
+`vTaskDelay(0)` is documented as exactly equivalent to `taskYIELD()`. Neither lets a *lower*-priority
+task run, and IDLE0 is priority 0 against the poller's 1 - so neither does anything for this
+problem at all. Only a delay that actually Blocks the caller gives IDLE0 the core. This is the same
+fact the HTTPClient paragraph above records from the other direction ("yields only to
+same-or-higher-priority tasks"); it is easy to write the wrong one of these three and impossible to
+notice, because the wrong ones compile, run, and look like they are yielding.
+
+**The chokepoint is `sd_logger.cpp streamLogLines()`**, and that is what makes this a mechanism
+rather than another convention. Every CSV scan in the firmware goes through it - the stats page's
+per-stop summaries, `/api/stats`, `/api/stats/overview`, the log export - and it owns the loop. A
+job author never writes that loop, so a job author cannot forget the yield. `src/app/cpu_yield.h`
+holds the budget (40 ms, i.e. 1/125th of the watchdog, `static_assert`ed against it and covered by
+`pio test -e native -f test_cpu_yield` including the 49-day `millis()` wrap) and the reasoning
+above; the cost is one 1 ms tick per 40 ms of work at `CONFIG_FREERTOS_HZ=1000`, about 2.4 %,
+against a scan that already takes seconds.
+
+**And it is measured, for the same reason `lock_misses` and `tick_ms_max` are.** `CpuYielder` keeps
+the longest gap between two yields since boot and `GET /api/debug/ui` reports it as
+`cpu_stretch_ms_max`, against the watchdog's 5,000. Measured on the owner's board: a single
+`GET /api/stats?days=30` on a fresh boot takes **5.2 s** of wall time and leaves the high-water at
+**52 ms** - one budget plus the tail of the line that was in flight when it expired. That pair is
+the whole finding in two numbers: the job is exactly as long as it always was, and the longest the
+poller now holds core 0 is a hundredth of it, against a watchdog that panics at 5,000 ms and a job
+that used to run all 5,200 of them uninterrupted. A full suite run, which adds the overview scan,
+the per-stop summaries and a month's log download, reaches 53-55 ms. A future loop that
+does not yield shows up as a number climbing rather than as a panic on somebody's serial console,
+and the device suite can fail on it. A loop that is not routed through the yielder is still invisible to this - the measurement
+covers the rule's chokepoint, not the whole task - which is why the chokepoint matters more than
+the number.
+
+Separately, the stats jobs stopped serialising on the poller at all: they hand the document to
+`sendJsonStreamed()` (`src/app/json_response.h`, moved out of `web_server.cpp` so the queued jobs
+can reach it), whose chunked filler runs on the AsyncTCP task one bounded send-chunk at a time as
+the socket drains. That also drops the `String` and `AsyncBasicResponse`'s copy of it - two
+body-sized allocations per stats request. It is safe only because these documents are ~5 KB, i.e.
+two or three 2,872 B chunks: the filler re-walks the document per chunk, so a document of tens of KB
+would concentrate nearly a whole serialisation into the last chunk's call and move the starvation to
+the other task rather than removing it. `json_response.h` says so at the top.
 
 **`vTaskPriorityDisinheritAfterTimeout` came back (2026-09-16), and the rule now has enforcement
 rather than convention.** The paragraph above records the first occurrence and treats it as cured by

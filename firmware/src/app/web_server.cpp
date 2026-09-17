@@ -1,7 +1,6 @@
 #include "web_server.h"
 
 #include <Arduino.h>
-#include <ChunkPrint.h>  // ESPAsyncWebServer's per-chunk Print sink, see sendJsonStreamed()
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <Update.h>
@@ -17,8 +16,11 @@
 
 #include "auth.h"
 #include "config_store.h"
+#include "cpu_yield.h"  // cpuStretchMsMax() for /api/debug/ui (DESIGN.md SS12.1)
 #include "cxx_exception_pool.h"
 #include "demo_data.h"
+#include "host_match.h"
+#include "json_response.h"
 #include "net_poller.h"
 #include "weather_service.h"
 #include "ui/ui.h"
@@ -222,36 +224,9 @@ void sendJson(AsyncWebServerRequest *request, int code, JsonDocument &doc) {
   request->send(code, "application/json", body);
 }
 
-// DESIGN.md SS12.1 "zero-copy": the heavy responses (/api/state, /api/config) do not go through
-// sendJson(). The document is MOVED, not copied, into a holder the chunked response owns, and
-// serialised straight into each TCP send chunk as the socket drains (the filler re-walks the
-// document per chunk, skipping what was already sent - the same ChunkPrint ESPAsyncWebServer's own
-// AsyncJsonResponse uses). So the response holds the document plus one 2 x MSS send buffer - not,
-// as sendJson() costs, the document plus a String of the whole body plus AsyncBasicResponse's own
-// copy of that String, which needed a body-sized contiguous block twice at the worst moment.
-// Chunked transfer encoding, so there is no measuring pass and no Content-Length; every client this
-// device has (the web app's fetch(), curl, the device suite) handles that. Deliberately NOT used for
-// the small responses: their String is a few dozen bytes, while any chunked response allocates the
-// 2.9 KB send buffer (nothrow, retried on the next poll), which is the wrong trade for
-// /api/debug/ui, the endpoint the suite uses to watch the device while it is starved. Same overflow
-// rule as sendJson(): a truncated document is a 503, never an empty or partial 200. Why
-// AsyncJsonResponse itself is not used: it costs two more ArduinoJson serializer instantiations
-// (its ChunkPrint-typed fill and measureJson's counting pass, ~2.2 KB of flash) plus its class;
-// this serialises through a Print&, which config_store.cpp's two sinks do as well, so all three
-// share one instantiation. Measured on cyd-3248S035R: about +0.8 KB of flash for this path, against
-// +4.5 KB with AsyncJsonResponse.
-void sendJsonStreamed(AsyncWebServerRequest *request, JsonDocument &doc) {
-  if (doc.overflowed()) {
-    request->send(503, "application/json", "{\"error\":\"out of memory building the response, retry\"}");
-    return;
-  }
-  std::shared_ptr<JsonDocument> held = std::make_shared<JsonDocument>(std::move(doc));
-  request->send(request->beginChunkedResponse("application/json", [held](uint8_t *buf, size_t max_len, size_t index) -> size_t {
-    ChunkPrint dest(buf, index, max_len);
-    serializeJson(*held, static_cast<Print &>(dest));
-    return dest.written();  // 0 once `index` has reached the end of the document = last chunk
-  }));
-}
+// sendJsonStreamed() - the zero-copy chunked path for the heavy responses - now lives in
+// json_response.h, because the queued stats jobs on the poller task need it too (DESIGN.md SS12.1,
+// and cpu_yield.h for why serialising on that task was a watchdog problem as well as a heap one).
 
 void sendError(AsyncWebServerRequest *request, int code, const std::string &message, const std::string &path = "") {
   JsonDocument doc;
@@ -297,6 +272,14 @@ bool checkPin(AsyncWebServerRequest *request, ApiFailure &fail) {
       fail = {401, "pin required", 0};
       return false;
     case auth::Result::Wrong:
+      // The only record that a wrong PIN was presented, and the only thing that says WHICH route
+      // presented it. auth.cpp logs the lockout itself, but by then five attempts have already
+      // happened and the interesting question - who sent them - is unanswerable. A device-suite
+      // run on 2026-09-16 produced eleven `PUT 429`s with nothing in the suite sending a wrong
+      // PIN, and there was no evidence on the console to say otherwise because this line did not
+      // exist and auth.cpp's was compiled out (CORE_DEBUG_LEVEL=1). Plain Serial.printf for that
+      // reason; see auth.cpp.
+      Serial.printf("[auth] wrong PIN on %s %s\n", request->methodToString(), request->url().c_str());
       fail = {401, "wrong pin", 0};
       return false;
     case auth::Result::Locked:
@@ -334,12 +317,15 @@ bool requirePin(AsyncWebServerRequest *request) {
 // std::strings) per request on a 75 KB heap is real churn for one field. Written only by
 // setHostName() - from startWebServer() and the PUT /api/config handler, both on the async web
 // server's own task, so no lock is needed.
-std::string g_host_name;
+//
+// A char array rather than a std::string, and that is not a style choice: hostAllowed() is now
+// called from HostGuardHandler::canHandle(), which the library invokes from inside `_parseLine`
+// with no `try` above it anywhere. It must not allocate, because a std::bad_alloc escaping from
+// there is std::terminate - the very reboot this pass removed from the middleware chain. The old
+// version allocated twice per request (a std::string of the header, and `g_host_name + ".local"`).
+char g_host_name[kMaxHostChars + 1] = {0};
 
-void setHostName(const std::string &name) {
-  g_host_name = name;
-  for (char &c : g_host_name) c = (char)tolower((unsigned char)c);
-}
+void setHostName(const std::string &name) { storeHostName(name.c_str(), g_host_name, sizeof g_host_name); }
 
 // DNS rebinding defence (review F05). A page on the public internet can make the browser resolve
 // its own hostname to 192.168.1.x and then talk to this device with the *attacker's* origin -
@@ -348,20 +334,26 @@ void setHostName(const std::string &name) {
 // carries their domain, not ours. So every request must name the device by one of the ways the
 // owner can legitimately reach it, and anything else gets 421 (Misdirected Request) before a
 // handler runs.
+//
+// The string work is in host_match.h, where `pio test -e native -f test_host_match` can reach it.
+// Everything here is fixed buffers and integer compares: no allocation, nothing that can throw.
+// The IP comparison is numeric (IPAddress::fromString) rather than against
+// WiFi.localIP().toString(), because Arduino's String has no small-string buffer - that call
+// malloc()s on every request, which is exactly what this must not do.
 bool hostAllowed(const AsyncWebServerRequest *request) {
-  std::string host = request->host().c_str();
-  if (host.empty()) return false;  // HTTP/1.1 requires a Host header; a client without one is not the web UI
-  // Strip an optional ":port" (IPv6 literals are not a case this device can be reached by).
-  size_t colon = host.rfind(':');
-  if (colon != std::string::npos) host.resize(colon);
-  for (char &c : host) c = (char)tolower((unsigned char)c);
-  if (host.empty()) return false;
+  const String &raw = request->host();  // by reference: the library owns it, no copy
+  char host[kMaxHostChars + 1];
+  // HTTP/1.1 requires a Host header; a client without one, or with one too long to be any name
+  // this device answers to, is not the web UI.
+  if (normalizeHost(raw.c_str(), raw.length(), host, sizeof host) == 0) return false;
 
-  if (host == "localhost" || host == "192.168.4.1") return true;  // ssh tunnel / setup AP
-  if (host == std::string(WiFi.localIP().toString().c_str())) return true;
-
-  if (g_host_name.empty()) return false;
-  return host == g_host_name || host == g_host_name + ".local";
+  if (hostIsAlwaysAllowed(host)) return true;  // ssh tunnel / setup AP
+  const IPAddress own = WiFi.localIP();
+  IPAddress parsed;
+  // `own != 0.0.0.0` matters: with no STA address yet, localIP() is all zeros and a request
+  // claiming `Host: 0.0.0.0` would otherwise be accepted as "us".
+  if (own != IPAddress((uint32_t)0) && parsed.fromString(host) && parsed == own) return true;
+  return hostNamesDevice(host, g_host_name);
 }
 
 // Reboots shortly after the current request's response has had a chance to
@@ -814,23 +806,14 @@ void otaUploadStep(AsyncWebServerRequest *request, const String &filename, size_
     // released on every path out of here.
     request->onDisconnect([request]() { otaRelease(request); });
 
-    // The same Host check the middleware applies to every other route, for the same reason it runs
-    // first there - and it has to be repeated here because the middleware has not run yet and will
-    // not until this whole upload has been parsed (handleOtaUpload() below has the mechanism).
-    // Without it a DNS-rebound request reached Update.begin() and up to 1.7 MB of
-    // Update.write() before the chain finally answered 421: the flash writes happened anyway. Not
-    // a live bypass - the route is PIN-gated and a browser cannot attach X-Pin cross-origin without
-    // a preflight this server does not answer - but "the check gates the response" and "the check
-    // gates the side effect" are different properties, and this is the one worth having.
-    if (!hostAllowed(request)) {
-      g_ota.ok = false;
-      g_ota.status = 421;
-      g_ota.error = "this device is not reachable under that host name";
-      g_ota.busy = false;
-      if (request->client() != nullptr) request->client()->close();
-      return;
-    }
-
+    // The Host check that used to be repeated here is gone, and its absence is the point.
+    // HostGuardHandler (below) does it from `canHandle()`, which the library calls at END OF
+    // HEADERS - before this callback exists to be called. A DNS-rebound upload is claimed by that
+    // handler and never becomes an OTA request at all, so it cannot reach Update.begin() or a
+    // single Update.write(). The old duplication was needed only because the check lived in the
+    // middleware chain, which does not run until the whole body has been parsed; that is no longer
+    // where it lives. Do not put it back without checking that first - two copies of a security
+    // check drift, and the one that drifts is the copy nobody's test exercises.
     ApiFailure fail;
     if (!checkPin(request, fail)) {
       // Unauthorised: record the outcome, write nothing, and hang up rather than politely
@@ -935,29 +918,25 @@ void otaUploadStep(AsyncWebServerRequest *request, const String &filename, size_
   }
 }
 
-// ESPAsyncWebServer's upload callback, and the two things every other route gets from the
-// middleware chain but this one cannot (DESIGN.md SS12.1).
+// ESPAsyncWebServer's upload callback, and the one thing every other route gets from guarded()
+// but this one cannot (DESIGN.md SS12.1).
 //
-// The chain does NOT run before a request's body. ESPAsyncWebServer 3.12.1's `_parseLine` switches
-// to PARSE_REQ_BODY at end-of-headers and calls `_runMiddlewareChain()` only once the body has been
-// fully parsed, while `handleUpload` runs *during* that parse - so the middleware's
-// warmExceptionGlobals() and its Host check both come too late for everything an upload does.
-// Hence:
+// Catch here. Nothing in the library catches what escapes an upload callback - `handleUpload` is
+// invoked from inside `_parseLine`, with no `try` anywhere above it - so without this a bad_alloc
+// anywhere in the step would be std::terminate and a reboot. guarded() does the same job for the
+// ordinary handlers and cannot reach this one, because guarded() wraps `handleRequest`, which runs
+// after the whole body. The refusal text is short on purpose - 13 characters fits libstdc++'s
+// small-string buffer, so recording it allocates nothing, which is the one property that matters
+// in a catch block that runs because there was no memory.
 //
-//   1. Warm here, first. On a device whose very first request is a firmware upload, otaUploadStep()
-//      would otherwise run the std::function in onDisconnect(), checkPin() and otaFail()'s
-//      std::string concatenations on a task that has never thrown - the cold-first-throw shape
-//      cxx_exception_pool.cpp documents as fatal: the ~16 B malloc inside __cxa_get_globals()
-//      calls std::terminate() outright if it fails, past every try/catch and before the emergency
-//      pool is ever consulted. Idempotent and one pthread_getspecific once warm, so paying it per
-//      ~1.4 KB chunk of a 1.7 MB upload is free. (otaUploadStep() repeats the Host check itself.)
-//   2. Catch here. Warming only makes the throw *catchable*; nothing in the library catches what
-//      escapes an upload callback, so without this a bad_alloc anywhere in the step would still be
-//      std::terminate. guarded() does the same job for the ordinary handlers. The refusal text is
-//      short on purpose - 13 characters fits libstdc++'s small-string buffer, so recording it
-//      allocates nothing, which is the one property that matters in this catch block.
+// The warmExceptionGlobals() call that used to open this function is gone: HostGuardHandler's
+// canHandle() runs at end of headers, i.e. before the first byte of the body reaches this
+// callback, so by the time an upload starts the AsyncTCP task's __cxa_eh_globals have already been
+// paid for on this very request. Before that handler existed the warming lived in the middleware
+// chain, which does not run until the body is complete - which is why this callback had to repeat
+// it. It no longer does, and the catch below is what makes the difference visible: this is the
+// try/catch, and something else is now responsible for the throw being catchable at all.
 void handleOtaUpload(AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
-  transit_app::warmExceptionGlobals("async_tcp");
   try {
     otaUploadStep(request, filename, index, data, len, final);
   } catch (const std::bad_alloc &) {
@@ -1201,6 +1180,83 @@ void registerWebAssets() {
 }
 #endif  // TRANSIT_HAVE_WEB_ASSETS
 
+// ---------------------------------------------------------------------------
+// The Host check and the exception-globals warming, as a HANDLER rather than a middleware
+// (DESIGN.md SS7, SS12.1). This replaces the single `g_server.addMiddleware(...)` registration that
+// used to do both jobs, and the reason is not tidiness - it is that the middleware chain could
+// reboot the device and this cannot.
+//
+// WHAT THE CHAIN DOES WITH ONE MIDDLEWARE IN IT. `AsyncMiddlewareChain::_runChain`
+// (Middleware.cpp:56-71) builds a `std::function` `next` that captures five things including a
+// COPY of the finalizer - 32 bytes, well past libstdc++'s 8-byte small-object buffer, so it is
+// heap-allocated. It then calls `m->run(request, next)`, whose parameter is `ArMiddlewareNext` BY
+// VALUE: a second copy, a second allocation. `AsyncMiddlewareFunction::run` then calls
+// `_fn(request, next)`, whose parameter is by value again: a third. Three small allocations per
+// request, and the cost is per middleware - so "merge the two middlewares into one" was not
+// available as a mitigation here, because they were already one registration.
+//
+// WHY THAT WAS FATAL. `std::function`'s copy constructor allocates with plain `operator new`,
+// which THROWS. `_runChain` has no `try`, nor does `_runMiddlewareChain` (WebRequest.cpp:1032),
+// nor `_parseLine`, nor `_onData`, nor `AsyncClient::_recv`, nor `_async_service_task`. There is
+// no user hook anywhere on that path. So a `std::bad_alloc` from a 32-byte allocation was
+// `std::terminate` - a reboot - and the emergency exception pool and the per-task warming
+// (SS12.1) could not help: they make a throw CATCHABLE, and nothing in the library catches this
+// one. Observed in the 2026-09-16 device suite as a reboot during the page-cycling section:
+//   __terminate <- std::terminate <- __cxa_throw <- operator new <- std::function copy
+//     <- AsyncMiddlewareFunction::run <- AsyncMiddlewareChain::_runChain (Middleware.cpp:70)
+//     <- _runMiddlewareChain (WebRequest.cpp:1038) <- _parseLine <- _onData <- AsyncClient::_recv
+//
+// WHY A HANDLER FIXES IT RATHER THAN NARROWING IT. `_runChain`'s first line is
+// `if (!_middlewares.size()) return finalizer();`. With no middleware registered on the server and
+// none on any handler, the whole chain is that one branch: no `std::function` is copied, no
+// allocation is attempted, and the terminate site is unreachable rather than unlikely. The two
+// finalizer lambdas `_runMiddlewareChain` builds capture one pointer each, which fits the
+// small-object buffer and does not allocate either.
+//
+// AND IT RUNS EARLIER, WHICH FIXES A SECOND THING. `AsyncWebServer::_attachHandler` calls
+// `canHandle()` on each handler in registration order at END OF HEADERS - before the body is
+// parsed, and therefore before `handleBody`/`handleUpload`. The middleware chain runs AFTER the
+// body (`_parseLine` switches to PARSE_REQ_BODY at end-of-headers and only calls
+// `_runMiddlewareChain()` once the body is complete), which is why `handleOtaUpload()` had to
+// repeat the Host check and the warming itself. Registered first, this handler sees every request
+// before anything else does, so a DNS-rebound upload never reaches `Update.begin()` at all and the
+// duplication in the OTA path is gone.
+//
+// THE ONE THING IT COSTS. A bad-Host request with a body now has that body read and discarded
+// before the 421 goes out (`isRequestHandlerTrivial()` is left at its default `true`, so the bytes
+// are counted, not parsed, and no callback sees them), where the old OTA-specific check hung up on
+// the first chunk. Named rather than hidden: the property worth having is that no side effect
+// happens, and none does - nothing is written to flash, nothing is allocated per chunk. Making
+// `isRequestHandlerTrivial()` false to get the hang-up back would turn a hostile `text/plain` body
+// into parsed form parameters, which is a worse trade.
+class HostGuardHandler : public AsyncWebHandler {
+ public:
+  // const, and with two deliberate side effects. `_attachHandler` calls this exactly once per
+  // request, on the AsyncTCP task, which makes it the earliest code of ours that runs for ANY
+  // request - including one with a body.
+  bool canHandle(AsyncWebServerRequest *request) const override {
+    // DESIGN.md SS12.1: the AsyncTCP service task is created by the library, so we cannot warm it
+    // at its entry. A task's FIRST throw allocates its per-task __cxa_eh_globals with a plain
+    // malloc inside __cxa_throw and calls std::terminate() outright if that fails - past every
+    // try/catch and before the emergency pool is consulted - and on this task the first throw is
+    // overwhelmingly a bad_alloc, i.e. exactly when the heap is gone. Pay it here, on request
+    // number one, while the heap is healthy. One pthread_getspecific per request thereafter.
+    transit_app::warmExceptionGlobals("async_tcp");
+    // Claims the request only when the Host is NOT one of ours, so the real routes are reached
+    // exactly as before. hostAllowed() allocates nothing and cannot throw (host_match.h), which is
+    // what makes it safe to call from here: an exception escaping canHandle() would unwind into
+    // _parseLine, where there is no catch, which is the failure this whole class removes.
+    return !hostAllowed(request);
+  }
+
+  void handleRequest(AsyncWebServerRequest *request) override {
+    // A fixed literal rather than sendError()'s JsonDocument + String: this answer has to go out
+    // when the heap is momentarily exhausted, the same reasoning as sendFailure().
+    request->send(421, "application/json",
+                  "{\"error\":\"this device is not reachable under that host name\"}");
+  }
+};
+
 }  // namespace
 
 // Every handler runs on the AsyncTCP task and copies a Config (strings, vectors) or builds a
@@ -1220,33 +1276,10 @@ ArRequestHandlerFunction guarded(ArRequestHandlerFunction fn) {
 void startWebServer(std::function<void(bool)> onConfigChanged) {
   setHostName(getActiveConfig().device.name);
 
-  // Runs before the HANDLER of every route, including the static assets and the 404 (review F05).
-  //
-  // Not, however, before everything: for a request with a BODY the middleware chain runs only once
-  // the body has been fully parsed. ESPAsyncWebServer 3.12.1's `_parseLine` switches to
-  // PARSE_REQ_BODY at end-of-headers and calls `_runMiddlewareChain()` afterwards, while
-  // `handleBody`/`handleUpload` run during the parse - so those callbacks see the request first.
-  // There are two on this server. The JSON body handlers (PUT /api/config, POST /api/pin) are
-  // safe by construction: AsyncCallbackJsonWebHandler::handleBody only calloc()s a buffer and
-  // memcpy()s into it, with no C++ allocation and nothing that can throw, and the handler proper
-  // runs after the chain. POST /api/ota's upload callback is not, so it repeats both of the things
-  // below itself - see handleOtaUpload().
-  g_server.addMiddleware([](AsyncWebServerRequest *request, ArMiddlewareNext next) {
-    // First thing in the chain, ahead of even the host check, because the host check itself
-    // builds a std::string and can throw. DESIGN.md SS12.1: the AsyncTCP service task is created by
-    // the library, so this is the earliest place we get to run code ON that task for a request
-    // without a body - early enough to pay its one-time __cxa_eh_globals allocation while the heap
-    // is healthy. Without it the task's FIRST throw - which on this task is a bad_alloc under
-    // exactly the pressure guarded() exists for - does a plain malloc inside __cxa_throw and
-    // terminates when it fails. Costs one pthread_getspecific per request once warm; the real work
-    // happens on request number one, wherever that lands.
-    transit_app::warmExceptionGlobals("async_tcp");
-    if (!hostAllowed(request)) {
-      sendError(request, 421, "this device is not reachable under that host name");
-      return;
-    }
-    next();
-  });
+  // THE SERVER'S MIDDLEWARE CHAIN IS DELIBERATELY EMPTY. See HostGuardHandler above: this used to
+  // be `g_server.addMiddleware(...)`, and that one registration was an uncatchable reboot path.
+  // Nothing may add one back without reading that comment first.
+  g_server.addHandler(new HostGuardHandler());  // FIRST: _attachHandler takes the first match
 
   g_server.on("/api/state", HTTP_GET, guarded(handleGetState));
   g_server.on("/api/config", HTTP_GET, guarded(handleGetConfig));
@@ -1294,6 +1327,11 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["lock_misses"] = d.lock_misses;
     doc["tick_ms"] = d.tick_ms;
     doc["tick_ms_max"] = d.tick_ms_max;
+    // DESIGN.md SS12.1: the longest the poller task has run a CPU-bound loop without letting IDLE0
+    // in, since boot. The task watchdog panics the board at 5,000; cpu_yield.h aims for 40. This is
+    // the observable that keeps "do not starve IDLE0" a rule with a number attached instead of a
+    // convention that comes back as a backtrace.
+    doc["cpu_stretch_ms_max"] = cpuStretchMsMax();
     JsonObject costs = doc["lv_page_cost"].to<JsonObject>();
     costs["main"] = d.page_cost[0];
     costs["night"] = d.page_cost[1];

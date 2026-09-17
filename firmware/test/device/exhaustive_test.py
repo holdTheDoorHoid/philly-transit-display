@@ -553,7 +553,14 @@ cfg['profiles'][0]['stops'] = [k0]
 put_cfg(cfg); wait_for(lambda: not any(x['key'] == 'tmp-99999' for x in state().get('stops', [])), 20, 2)
 def soonest_k0_min():
     return min([a['eta_s'] for x in state().get('stops', []) if x['key'] == k0 for a in x.get('arrivals', [])] or [9999]) // 60
-if soonest_k0_min() >= 17:
+# Read once, into a name the SKIP branch can also use. It referred to `soonest`, which has not
+# existed since this became a function, so the branch raised NameError instead of printing - and
+# because that branch only runs when the next bus at k0 happens to be under 17 minutes away, it
+# survived every run where it was further off. On 2026-09-16 it aborted a run at 139 checks, past
+# every section that can fail on the firmware and before the restore, leaving the atexit net to put
+# the owner's config back. A skip message must not be able to end the run.
+soonest = soonest_k0_min()
+if soonest >= 17:
     cfg['profiles'][0]['stops'] = [k0]; cfg['device']['night'] = {'enabled': True, 'after_min': 15}; put_cfg(cfg)
     reached = wait_for(lambda: ui().get('page') == 'night', 90, 3)
     # Live data: if a bus rolled to within 15 min of k0 during the wait, the arrivals page is
