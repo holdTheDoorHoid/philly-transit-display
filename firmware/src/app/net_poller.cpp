@@ -1412,6 +1412,16 @@ std::vector<uint8_t> *pollScratch() {
   return g_poll_buffers != nullptr ? &g_poll_buffers->scratch : nullptr;
 }
 
+ScratchStats getScratchStats() {
+  ScratchStats s;
+  if (g_poll_buffers == nullptr) return s;
+  s.max_bytes = g_poll_buffers->scratch_max_bytes;
+  s.reserve_bytes = (uint32_t)g_poll_buffers->scratch_reserve;
+  s.capacity = (uint32_t)g_poll_buffers->scratch.capacity();
+  s.grows = g_poll_buffers->scratch_grows;
+  return s;
+}
+
 bool preallocatePollBuffers() {
   if (g_poll_buffers == nullptr) {
     g_poll_buffers = new (std::nothrow) transit::PollBuffers();

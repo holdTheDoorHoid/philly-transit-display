@@ -57,6 +57,20 @@ bool preallocatePollBuffers();
 // feed scanner (bike_service.h). Null until preallocatePollBuffers() has succeeded.
 std::vector<uint8_t> *pollScratch();
 
+// What the shared scratch has actually been asked to hold (0.3.2-rc1), reported by
+// GET /api/debug/ui. The reservation was a guess - kJsonBodyCap is 16 KB and the reservation is
+// 6 KB, so a bigger body reallocated the vector and poll-start reallocated it back, every cycle -
+// and nothing on this device could say how big a body had ever been. Now it can: if `max_bytes`
+// sits above `reserve_bytes`, the reservation in transit_core is the wrong number and should be
+// changed in the source rather than discovered again at runtime.
+struct ScratchStats {
+  uint32_t max_bytes = 0;      // largest response body buffered since boot
+  uint32_t reserve_bytes = 0;  // the reservation it is currently held at (ratchets up)
+  uint32_t capacity = 0;       // what the vector is holding right now
+  uint32_t grows = 0;          // times a body went past the reservation and forced a realloc
+};
+ScratchStats getScratchStats();
+
 // Creates the poller task (12 KB stack) and its primitives without starting to poll. Call early
 // in setup(), before Wi-Fi, for the same heap-fragmentation reason as preallocateTracker().
 void initNetPoller();

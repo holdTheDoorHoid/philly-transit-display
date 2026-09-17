@@ -1582,6 +1582,19 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["in_flight_requests"] = inFlightRequests();
     doc["admission_refusals"] = admissionRefusals();
     doc["max_in_flight_requests"] = (uint32_t)kMaxInFlightRequests;
+    // The shared poll scratch (net_poller.h ScratchStats, DESIGN.md SS5). `scratch_max_bytes` is
+    // the largest response body this device has ever buffered - the measurement that says whether
+    // the 6,144 B reservation is the right size at all, which nothing could previously answer.
+    // `scratch_grows` counts the bodies that went past the reservation; it should settle at a
+    // small number and then stop moving, because the reservation ratchets up to them rather than
+    // being handed back and retaken every cycle.
+    {
+      ScratchStats ss = getScratchStats();
+      doc["scratch_max_bytes"] = ss.max_bytes;
+      doc["scratch_reserve_bytes"] = ss.reserve_bytes;
+      doc["scratch_capacity"] = ss.capacity;
+      doc["scratch_grows"] = ss.grows;
+    }
     // Bytes of stack each task has never gone below. Rules a stack that has quietly eaten into the
     // heap in or out before any of the heap numbers are interpreted.
     JsonObject hwm = doc["stack_hwm"].to<JsonObject>();
