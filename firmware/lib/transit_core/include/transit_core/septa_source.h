@@ -136,7 +136,18 @@ struct PollBuffers {
   static constexpr size_t kScratchReserve = 6144;
   // How far the scratch reservation is allowed to RATCHET UP when a response body turns out to be
   // bigger than kScratchReserve (see beginCycle()). Above this, growth is still given back.
-  static constexpr size_t kScratchMaxReserve = 10 * 1024;
+  // 8 KB and not 10 since 0.3.2-rc2: rc1 of this pass was measured with scratch_max_bytes at 7,035
+  // on the owner's board, so 8 KB covers the real bodies with room to spare while capping what a
+  // single outsized response can make permanent.
+  static constexpr size_t kScratchMaxReserve = 8 * 1024;
+
+  // ...and the ratchet only fires on a heap that has PROVED it can spare the bytes. 0.3.2-rc1 was
+  // measured raising the reservation past 6,144 within four minutes of boot on a board whose
+  // resting free8 was already 22-23 KB - i.e. the one case where growing the resident footprint is
+  // the last thing wanted. 30 KB is comfortably above the resting floor this release is aiming at
+  // and comfortably below a healthy board's, so a rush-hour body grows the reservation on a
+  // healthy heap and is simply handed back on a struggling one.
+  static constexpr size_t kScratchRatchetMinFree8 = 30 * 1024;
   // Retained updates per configured (stop, route) pair. Matches GtfsRtStream's per-pair cap, which
   // is what actually bounds how many a pair can hold, so sizing by it loses nothing.
   static constexpr size_t kRetainedPerPair = 8;
@@ -161,11 +172,15 @@ struct PollBuffers {
   void reserveRetention(size_t pairs);
 
   // Call at the top of each cycle. Clears without releasing. Growth beyond the current reservation
-  // is KEPT (the reservation ratchets up to it) as long as it is under kScratchMaxReserve, and
-  // released above that - see the note on scratch churn below. Doing this at poll-start rather
-  // than at cycle end means any replacement block is asked for at the point in the cycle where the
-  // largest free block is at its healthiest.
-  void beginCycle();
+  // is KEPT (the reservation ratchets up to it) only when it is under kScratchMaxReserve AND
+  // `free8_at_poll_start` is at least kScratchRatchetMinFree8; otherwise it is released. Doing this
+  // at poll-start rather than at cycle end means any replacement block is asked for at the point in
+  // the cycle where the largest free block is at its healthiest.
+  //
+  // `free8_at_poll_start` is the caller's MALLOC_CAP_8BIT reading (this library has no Arduino and
+  // cannot take one). The default says "assume plenty", which is what every non-firmware caller and
+  // every host test that is not about the ratchet itself wants.
+  void beginCycle(size_t free8_at_poll_start = static_cast<size_t>(-1));
 
   // Records that a body reached `bytes`, for the high-water marks above. Called by fetchBuffered().
   void noteBodyBytes(size_t bytes);

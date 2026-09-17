@@ -889,18 +889,53 @@ void test_the_scratch_reservation_ratchets_instead_of_churning() {
   buf.reserveAll();
   const size_t base = buf.scratch.capacity();
   TEST_ASSERT_TRUE(base >= PollBuffers::kScratchReserve);
+  const size_t roomy = PollBuffers::kScratchRatchetMinFree8 + 1;
 
-  buf.scratch.reserve(PollBuffers::kScratchReserve + 2048);  // a body went past the reservation
-  buf.beginCycle();
-  TEST_ASSERT_TRUE(buf.scratch.capacity() >= PollBuffers::kScratchReserve + 2048);
+  buf.scratch.reserve(PollBuffers::kScratchReserve + 1024);  // a body went past the reservation
+  buf.beginCycle(roomy);
+  TEST_ASSERT_TRUE(buf.scratch.capacity() >= PollBuffers::kScratchReserve + 1024);
   const size_t kept = buf.scratch.capacity();
-  buf.beginCycle();
+  buf.beginCycle(roomy);
   TEST_ASSERT_EQUAL_size_t(kept, buf.scratch.capacity());  // and it stays, cycle after cycle
 
   buf.scratch.reserve(PollBuffers::kScratchMaxReserve + 4096);  // a pathological one
-  buf.beginCycle();
+  buf.beginCycle(roomy);
   TEST_ASSERT_TRUE(buf.scratch.capacity() <= PollBuffers::kScratchMaxReserve);
   TEST_ASSERT_TRUE(buf.scratch.capacity() >= kept);
+}
+
+void test_the_ratchet_waits_for_a_heap_that_can_spare_it() {
+  // THE 0.3.2-rc2 CORRECTION, and it is a measurement, not a hunch. rc1 of this pass was flashed
+  // and ratcheted the scratch past 6,144 B (scratch_max_bytes 7,035) within four minutes of boot,
+  // on a board whose resting free8 was already 22-23 KB and whose min_free8 reached 156 B. Keeping
+  // the bigger block is the right answer only on a heap that can spare it; on one that cannot, the
+  // block is handed back and the next oversized body simply pays for it again.
+  PollBuffers buf;
+  buf.reserveAll();
+  const size_t reserved = buf.scratch.capacity();
+
+  // A struggling heap: the growth is released and the reservation does NOT move.
+  buf.scratch.reserve(PollBuffers::kScratchReserve + 1024);
+  buf.beginCycle(PollBuffers::kScratchRatchetMinFree8 - 1);
+  TEST_ASSERT_EQUAL_size_t(reserved, buf.scratch.capacity());
+
+  // Exactly at the floor is enough - it is a minimum, not an exclusive bound.
+  buf.scratch.reserve(PollBuffers::kScratchReserve + 1024);
+  buf.beginCycle(PollBuffers::kScratchRatchetMinFree8);
+  TEST_ASSERT_TRUE(buf.scratch.capacity() > reserved);
+
+  // And the default argument means "assume plenty", which is what every caller outside the
+  // firmware (and every host test that is not about this gate) wants.
+  PollBuffers other;
+  other.reserveAll();
+  other.scratch.reserve(PollBuffers::kScratchReserve + 1024);
+  other.beginCycle();
+  TEST_ASSERT_TRUE(other.scratch.capacity() > PollBuffers::kScratchReserve);
+
+  // The cap came down from 10 KB to 8 KB in the same release: rc1 measured a real high-water of
+  // 7,035 B, so 8 KB covers the real bodies and bounds what one outsized response can make
+  // permanent.
+  TEST_ASSERT_EQUAL_size_t(8u * 1024u, PollBuffers::kScratchMaxReserve);
 }
 
 void test_the_scratch_high_water_is_recorded() {

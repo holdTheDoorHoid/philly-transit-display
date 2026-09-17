@@ -128,6 +128,7 @@ void test_poll_buffers_remove_the_large_contiguous_requests();
 void test_poll_buffers_keep_the_typed_blocks_across_cycles();
 void test_poll_buffers_size_retention_from_the_config();
 void test_the_scratch_reservation_ratchets_instead_of_churning();
+void test_the_ratchet_waits_for_a_heap_that_can_spare_it();
 void test_the_scratch_high_water_is_recorded();
 void test_poll_buffers_hand_the_same_storage_to_the_indego_scanner();
 
@@ -254,6 +255,7 @@ int main(int argc, char** argv) {
   RUN_TEST(test_poll_buffers_keep_the_typed_blocks_across_cycles);
   RUN_TEST(test_poll_buffers_size_retention_from_the_config);
   RUN_TEST(test_the_scratch_reservation_ratchets_instead_of_churning);
+  RUN_TEST(test_the_ratchet_waits_for_a_heap_that_can_spare_it);
   RUN_TEST(test_the_scratch_high_water_is_recorded);
   RUN_TEST(test_poll_buffers_hand_the_same_storage_to_the_indego_scanner);
 

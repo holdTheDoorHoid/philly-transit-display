@@ -124,7 +124,7 @@ void PollBuffers::noteBodyBytes(size_t bytes) {
   if (bytes > scratch_max_bytes) scratch_max_bytes = (uint32_t)bytes;
 }
 
-void PollBuffers::beginCycle() {
+void PollBuffers::beginCycle(size_t free8_at_poll_start) {
   // THE CHURN THIS AVOIDS (0.3.2-rc1). The scratch is reserved at kScratchReserve, but
   // kJsonBodyCap is 16 KB, so a body larger than the reservation used to make the vector DOUBLE
   // past it (a 12,288 B contiguous request mid-cycle) and then this function gave that block back
@@ -142,7 +142,13 @@ void PollBuffers::beginCycle() {
   // raised in the source, which is better than either of these behaviours and needs a measurement
   // this firmware could not previously take.
   if (scratch.capacity() > scratch_reserve) {
-    if (scratch.capacity() <= kScratchMaxReserve) {
+    // TWO conditions since 0.3.2-rc2, and the second one is the lesson of rc1. Keeping the bigger
+    // block is only the right answer on a heap that can spare it; measured on the owner's board,
+    // rc1 ratcheted the reservation past 6,144 B within four minutes while resting free8 was
+    // 22-23 KB, which is precisely when growing the resident footprint is the last thing wanted.
+    // On a struggling heap the block is handed back and the next big body simply pays for it
+    // again - one request per oversized cycle, which is the old cost and the affordable one.
+    if (scratch.capacity() <= kScratchMaxReserve && free8_at_poll_start >= kScratchRatchetMinFree8) {
       scratch_reserve = scratch.capacity();  // keep it: the ratchet
     } else {
       // swap-with-a-temporary is the only way to make a std::vector release capacity.

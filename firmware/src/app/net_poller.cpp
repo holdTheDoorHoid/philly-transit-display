@@ -1092,7 +1092,11 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // Clears the working set for this cycle and gives back an oversized body buffer, if some
   // unusually large response grew one last cycle. Done HERE, at poll-start, because this is where
   // the largest free block is at its best (DESIGN.md SS5).
-  if (g_poll_buffers != nullptr) g_poll_buffers->beginCycle();
+  // The free8 reading is passed IN because transit_core has no Arduino: it gates the scratch
+  // ratchet, which must not grow the resident footprint on a heap that is already low (0.3.2-rc2).
+  if (g_poll_buffers != nullptr) {
+    g_poll_buffers->beginCycle(heap_caps_get_free_size(MALLOC_CAP_8BIT));
+  }
   // Take the error-reply reserve back if a 503 spent it and the heap has recovered since
   // (heap_reserve.h). Poll-start is one of the two contexts this is allowed from - the other is
   // the idle slice below - because neither is the handler that released it, and both are on a task
