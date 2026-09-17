@@ -998,42 +998,71 @@ TLS connection at a time; ArduinoJson documents sized from measured payloads (§
 headroom; log free heap once per poll at `INFO`; refuse to start OTA below 16 KB of `MALLOC_CAP_8BIT`
 free with a 5,876 B largest block (§2.1 - the byte-addressable heap, not `ESP.getFreeHeap()`).
 
-**The poll working set: every large buffer a cycle needs is reserved once, before Wi-Fi
-(0.3.1).** This is the same rule as the line above, applied to the things that were NOT long-lived
-and should have been. A cycle used to build its own buffers every time: a `GtfsRtStream` (a 4,096 B
-entity buffer and a ~4,600 B retention block), a `std::vector<uint8_t>` body grown from nothing by
-doubling for each TransitView / BusSchedules / Alerts / Arrivals response, a 24 × 128 B `SchedEntry`
-block per schedule parse, the transport's own 4 KB BusSchedules buffer, and a 6,144 B Indego feature
-buffer. Every one of those is a request for a **contiguous** block, and they all land within a few
-hundred milliseconds of each other.
+**The poll working set: one shared buffer, lent to each stage in turn (0.3.1).** This is the same
+rule as the line above, applied to the things that were NOT long-lived and should have been — and it
+took two attempts to get right, which is worth recording because the first one was reasonable and
+wrong.
 
-Free heap is not the constraint on this board; the largest free *block* is (§12.1). It rests at
-25-28 KB and decays with uptime and request rate, and at **11.7 KB — with 36 KB still free —** the
-cycle threw `std::bad_alloc`, reported every stop as "out of memory during fetch", and every cycle
-after it did the same until the heap-wedge self-heal rebooted the device about ten minutes later.
-Nothing about that is fixed by having more free heap; it is fixed by not asking for those blocks
-again. So they are reserved in `setup()`, before Wi-Fi, out of a heap that is still a single run —
-the pattern `preallocateTracker()` and the exception pool already used — and reset per cycle
-(`clear()` keeps capacity):
+A cycle used to build its own buffers every time: a `GtfsRtStream` (a 4,096 B entity buffer and a
+~4,600 B retention block), a `std::vector<uint8_t>` body grown from nothing by doubling for each
+TransitView / BusSchedules / Alerts / Arrivals response, a 24 × 128 B `SchedEntry` block per
+schedule parse, the transport's own 4 KB BusSchedules buffer, and a 6,144 B Indego feature buffer.
+Every one is a request for a **contiguous** block, and they all land within a few hundred
+milliseconds of each other. Free heap is not the constraint on this board; the largest free *block*
+is (§12.1). It rests at 25–28 KB and decays, and at **11.7 KB — with 36 KB still free —** the cycle
+threw `std::bad_alloc`, reported every stop as "out of memory during fetch", and every cycle after
+it did the same until the heap-wedge self-heal rebooted the device.
 
-- `transit::PollBuffers` (`transit_core/septa_source.h`) owns the stream, the response body buffer
-  and the schedule parse target. `SeptaSource` takes a `PollBuffers*`; a null one restores the old
-  per-call behaviour exactly, which is what the host tests and any other consumer get.
-- `GtfsRtStream::reset()` and `indego::StatusStream::reset()` clear parse state, filters and
-  counters and keep the buffers.
-- `PollBuffers::beginCycle()`, at poll-start, hands back a body buffer that some oversized response
-  grew, so one large body cannot become resident.
-- `net_poller.cpp` keeps the transport-level BusSchedules buffer, because that branch buffers the
-  response *before* `transit_core` sees it and so cannot share the vector `transit_core` is
-  appending into.
+**The first attempt gave each of them a permanent buffer, and that was a net loss.** Measured on the
+owner's board (0.3.1-rc1, five minutes, sampler at 15 s):
 
-Measured on the host (`test_core`, with an allocation probe that records the largest single
-`operator new` in a window): the biggest block a cycle asks for drops from 5,888 B to 1,856 B, and a
-warm cycle asks for nothing 4 KB or larger at all. What it costs is resident heap — the working set
-is about 26 KB that used to be transient — which is the deliberate trade: it lowers the *floor*
-between polls to raise the *ceiling* on how fragmented the heap may be and still let a cycle
-complete. `min_free8` in `GET /api/debug/ui` is the number that would say if that floor is ever too
-low, and it is the thing to watch on the first device run of this change.
+| | diag1 | rc1 |
+|---|---:|---:|
+| per-cycle contiguous demand | ~12 KB | **~5 KB** |
+| resting free8 | ~35 KB | 22 KB |
+| resting largest block | ~24.5 KB | ~14 KB |
+| **margin (largest − demand)** | **~12 KB** | **~9 KB** |
+
+The demand halved and the margin still got *worse*, because holding ~26 KB permanently is how the
+floor drops. And `min_free8` reached **696 B at 115 s of uptime** — before any Indego refresh —
+from a combination that no stamped stage can see: a poll mid-fetch (~15–17 KB) plus one concurrent
+`/api/state` on the AsyncTCP task (~5 KB document plus response copies) plus the Wi-Fi/lwIP receive
+burst. On diag1's 35 KB floor the same combination bottomed at 1,452 B. A trough to zero is an lwIP
+`assert`, not a caught `bad_alloc` (§12.1). **So the floor matters as much as the per-cycle demand,
+and a fix that trades one for the other is not a fix.**
+
+**What rc2 does instead.** Those buffers are never live at the same time. They are all "one thing at
+a time" byte buffers, on one task, in sequence — the entity buffer during the TripUpdates fetch
+(dead the moment `finish()` is called), then each buffered JSON response, then the Indego scanner's
+one-feature buffer — so **one 6,144 B vector, sized for the largest borrower, is handed from stage
+to stage**:
+
+- `GtfsRtStream::setEntityBuffer()` and `indego::StatusStream::setFeatureBuffer()` borrow a
+  `std::vector<uint8_t>*` — the container, not its storage, so a reallocation by a larger borrower
+  cannot dangle the borrow — and each gives back what it was holding when it takes one.
+- `pollBusStops()` hands the borrow back immediately after `fetchRealtimeEx()`, before the first
+  buffered response needs it.
+- `PollBuffers::beginCycle()` releases growth beyond the reservation at poll-start, so one oversized
+  response cannot become resident. That is the floor drift above, in miniature.
+
+One buffer stays separate: the **transport-level BusSchedules body** (`net_poller.cpp`), because
+that layer buffers the response before `transit_core` sees it and then hands it over, so for that
+moment two really are live at once. It also sits on the path implicated in the collapse — the
+four-attempt loop inside `fetchPlausibleSchedule()`'s three, re-entered every two minutes while
+SEPTA answers with the wrong service day — so it keeps a 4 KB reservation of its own.
+
+Two things are deliberately **back to per-cycle**: the GTFS-RT retention block (~4.6 KB) and the
+BusSchedules parse block (~3 KB). Both are `std::vector`s of non-trivially-destructible values and
+cannot share raw bytes without a custom allocator, which would change the types in `transit_core`'s
+public API; and at a ~24 KB resting largest block, a 4.6 KB request is one the heap carries. Keeping
+the floor high is worth more than removing them.
+
+Resident total: **11,264 B** (6,144 shared scratch + 4,096 transport buffer + the 1 KB error-reply
+reserve of §12.1), against ~13 KB reclaimed elsewhere in the same release (draw buffer 1/20 → 1/30,
+the tracker's slot count, `esp_bt_mem_release()`). Measured on the host, a warm cycle's requests of
+4 KB or more go from several to exactly one — the retention block. `min_free8` on
+`GET /api/debug/ui` is the number that says whether the floor is right, and it is the first thing to
+read after flashing.
 
 Two consequences follow the same rule and are worth stating where a reader will look for them.
 `publishSnapshot()` takes its Snapshot **by rvalue and returns the published pointer**, so the
@@ -1267,7 +1296,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | `POST /api/ota` | multipart `firmware` field; reboots on success. One at a time. No file → 400 `no firmware file`; too little heap or a fragmented one → 503 naming which check failed; an image built for a different board → 400 `firmware is for a different board (expected <board>)`; larger than the OTA slot → 413. Answers 200 only after the final chunk arrived *and* `Update.end()` succeeded |
 | `POST /api/reboot`, `POST /api/wifi/reset` | Maintenance |
 | `POST /api/pin` | Body `{"pin":"new"}`, authenticated with the **current** PIN in `X-Pin`. New PIN: 4–32 printable ASCII, no whitespace. → `{"ok":true}`, or 400 with the rule that was broken. No reset-by-network path: recovery is the serial console or the device info screen (§12) |
-| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB. Also `lock_misses`, `tick_ms`/`tick_ms_max` (§5) and `cpu_stretch_ms_max` — the longest the poller task has run a CPU-bound loop without letting IDLE0 in, since boot, against the task watchdog's 5,000 ms (§12.1). Since 0.3.1 also `heap_8bit` and `min_free8` (the byte-addressable free heap now, and the lowest it has ever been — §2.1), `snapshots_live`, `failed_polls`, `wedged_polls`, `proxy_queue_depth`, `stack_hwm` per task, and `oom_replies_dropped` / `heap_reserve_held` (§12.1, "the 503 for out of memory needs memory") |
+| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB. Also `lock_misses`, `tick_ms`/`tick_ms_max` (§5) and `cpu_stretch_ms_max` — the longest the poller task has run a CPU-bound loop without letting IDLE0 in, since boot, against the task watchdog's 5,000 ms (§12.1). Since 0.3.1 also `heap_8bit` and `min_free8` (the byte-addressable free heap now, and the lowest it has ever been — §2.1), `snapshots_live`, `failed_polls`, `wedged_polls`, `proxy_queue_depth`, `stack_hwm` per task, and `oom_replies_dropped` / `heap_reserve_held` (§12.1, "the 503 for out of memory needs memory"), and `bt_release_rc` / `bt_release_gain_bytes` — `esp_bt_mem_release()`'s return code and the `MALLOC_CAP_8BIT` free-heap delta across it, reported here because the serial console cannot be captured on the owner's bench |
 | `POST /api/debug/tap` | Test hook (PIN-protected: it changes what the screen shows): simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
 | `POST /api/debug/page` | Test hook (PIN-protected, same reason): go straight to `main` \| `night` \| `stats` \| `device`, named in `?page=`, a `page=` form field or the raw body. Performs exactly the transition a tap does, queued for the LVGL task like `/api/debug/tap` — nothing builds an `lv_obj` on the web server task. It exists because LVGL pool exhaustion cannot be reproduced in the simulator's 512 KB pool (§8) and measuring it wants thirty cycles, not thirty taps |
 | `POST /api/debug/oom` | Test hook (PIN-protected: it starves every other task for under a millisecond): exhausts the heap on purpose, forces a `std::bad_alloc`, frees everything and answers `{"caught":true,"blocks":N,"largest":B,"free_before":X,"free_after":Y}` - the deterministic proof of the emergency exception pool (§12.1). `largest` under ~100 means the exception object could only have come from the pool; without the pool the request reboots the device. Run it on a **fresh boot**: it then also proves the first-throw path (§12.1), which on a task that has already thrown answers `caught:true` either way |
