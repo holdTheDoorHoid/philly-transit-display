@@ -517,6 +517,88 @@ void test_gtfsrt_reset_decodes_a_second_feed_identically() {
   }
 }
 
+void test_gtfsrt_borrowed_retention_block_is_never_reallocated() {
+  // 0.3.2-rc1. retainUpdates() reserves max_total slots, and pollBusStops() builds its stream as a
+  // LOCAL, so that reserve() was one ~4.9 KB contiguous request every poll cycle - the one that
+  // failed on the owner's board once the largest free block reached 3,444 B. With a borrowed
+  // retention vector it happens once and never again, which is what this pins.
+  std::vector<uint8_t> body = transit_test::readFixture("septa_bus_tripupdates.pb");
+
+  GtfsRtStream fresh;
+  fresh.setRouteFilter({"17"});
+  fresh.setStopFilter({"21332", "21297"});
+  fresh.retainUpdates();
+  TEST_ASSERT_TRUE(fresh.push(body.data(), body.size()));
+  TEST_ASSERT_TRUE(fresh.finish() == transit::FeedStatus::Complete);
+
+  std::vector<transit::StopTimeUpdate> block;
+  block.reserve(GtfsRtStream::kDefaultMaxRetainedUpdates);
+  const size_t cap = block.capacity();
+  const transit::StopTimeUpdate *storage = block.data();
+
+  GtfsRtStream borrower;
+  borrower.setRetentionBuffer(&block);
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    borrower.reset(4096);
+    borrower.setRouteFilter({"17"});
+    borrower.setStopFilter({"21332", "21297"});
+    borrower.retainUpdates();
+    TEST_ASSERT_TRUE(borrower.push(body.data(), body.size()));
+    TEST_ASSERT_TRUE(borrower.finish() == transit::FeedStatus::Complete);
+
+    // retained() reads through the borrow, and the answer is the same one an owning stream gives.
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(fresh.retained().size()),
+                              static_cast<uint32_t>(borrower.retained().size()));
+    for (size_t i = 0; i < fresh.retained().size(); ++i) {
+      TEST_ASSERT_TRUE(sameUpdate(fresh.retained()[i], borrower.retained()[i]));
+    }
+    // EQUAL, not >=: "it did not reallocate" is the claim, and the storage pointer says so
+    // outright.
+    TEST_ASSERT_EQUAL_size_t(cap, block.capacity());
+    TEST_ASSERT_TRUE(block.data() == storage);
+  }
+
+  // Clearing the caller's vector between cycles (PollBuffers::beginCycle does) drops the retained
+  // updates' identifier strings without giving the block back.
+  block.clear();
+  TEST_ASSERT_EQUAL_size_t(cap, block.capacity());
+
+  // And handing the borrow back puts the stream on its own vector again, with no state carried.
+  borrower.setRetentionBuffer(nullptr);
+  borrower.reset(4096);
+  borrower.setRouteFilter({"17"});
+  borrower.retainUpdates();
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(borrower.retained().size()));
+}
+
+void test_gtfsrt_retention_cap_can_be_sized_below_the_default() {
+  // pollBusStops() asks for 8 slots per configured (stop, route) pair rather than the 32-slot
+  // default, because the per-pair cap already bounds what a pair can hold - so a smaller total
+  // loses nothing for a small config. One pair, 8 slots: the same 8 updates the default keeps.
+  std::vector<uint8_t> body = transit_test::readFixture("septa_bus_tripupdates.pb");
+
+  GtfsRtStream wide;
+  wide.setRouteFilter({"17"});
+  wide.setStopFilter({"21332"});
+  wide.retainUpdates();  // 32 total, 8 per pair
+  TEST_ASSERT_TRUE(wide.push(body.data(), body.size()));
+  TEST_ASSERT_TRUE(wide.finish() == transit::FeedStatus::Complete);
+
+  GtfsRtStream tight;
+  tight.setRouteFilter({"17"});
+  tight.setStopFilter({"21332"});
+  tight.retainUpdates(GtfsRtStream::kDefaultMaxPerStopRoute, GtfsRtStream::kDefaultMaxPerStopRoute);
+  TEST_ASSERT_TRUE(tight.push(body.data(), body.size()));
+  TEST_ASSERT_TRUE(tight.finish() == transit::FeedStatus::Complete);
+
+  TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(wide.retained().size()),
+                            static_cast<uint32_t>(tight.retained().size()));
+  for (size_t i = 0; i < wide.retained().size(); ++i) {
+    TEST_ASSERT_TRUE(sameUpdate(wide.retained()[i], tight.retained()[i]));
+  }
+  TEST_ASSERT_TRUE(tight.retained().capacity() < GtfsRtStream::kDefaultMaxRetainedUpdates);
+}
+
 void test_gtfsrt_reset_clears_a_half_parsed_feed() {
   std::vector<uint8_t> body = transit_test::readFixture("septa_bus_tripupdates.pb");
 

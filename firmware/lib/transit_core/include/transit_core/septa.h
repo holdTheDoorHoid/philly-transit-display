@@ -117,6 +117,18 @@ struct RailArrival {
 // required).
 ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len);
 
+// The same parse, APPENDING to a result the caller already owns: whatever `out->items` holds is
+// left in place and this route's vehicles are added after it, with `out`'s ok/error/dropped reset.
+// kMaxTvVehicles applies to the TOTAL, so a multi-route poll cannot walk past the cap either.
+//
+// The point is the items vector's CAPACITY: a caller that hands the same vector back every cycle
+// pays for the block once instead of once per route per cycle. sizeof(TvVehicle) is 176 B on the
+// ESP32, so a 32-slot list is 5,632 B - and growing it from reserve(8) by doubling asked for
+// 2,816 B and then 5,632 B, both contiguous, both while the entity buffer and the retention block
+// were live (DESIGN.md SS5, septa_source.h PollBuffers).
+// parseTransitView() above is this with a fresh result.
+void parseTransitViewAppend(ParseResult<TvVehicle>* out, const uint8_t* data, size_t len);
+
 // Parses a BusSchedules response: normally `{"<route>": [...], ...}` (usually one key), or
 // `{"error": "..."}` on SEPTA's well-documented transient-failure responses (DESIGN.md 4.4;
 // NOTES.md has a live-captured example). Detects the latter and returns ok=false with SEPTA's

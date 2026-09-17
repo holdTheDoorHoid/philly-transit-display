@@ -38,11 +38,28 @@ std::string toLower(const std::string& s) {
 // SeptaSource::fetchRealtime).
 constexpr size_t kJsonBodyCap = 16 * 1024;
 
+// `buffers` may be null (every non-firmware caller): then this is exactly the old behaviour, an
+// owned vector grown by doubling. With one, growth past the current reservation is taken in ONE
+// rounded step rather than by std::vector's 2x rule, and recorded - see PollBuffers::beginCycle()
+// for why the doubling mattered.
+constexpr size_t kBodyGrowStep = 1024;
+
 FetchResult fetchBuffered(const std::string& url, const HttpGetEx& http,
-                           std::vector<uint8_t>* out) {
+                           std::vector<uint8_t>* out, PollBuffers* buffers) {
   out->clear();
   return http(url, [&](const uint8_t* data, size_t len) {
-    if (out->size() + len > kJsonBodyCap) return false;
+    const size_t want = out->size() + len;
+    if (want > kJsonBodyCap) return false;
+    if (buffers != nullptr) {
+      if (want > out->capacity()) {
+        // Round up to the next kBodyGrowStep and reserve exactly that: one reallocation to a size
+        // the body needs, instead of a doubling to a size nothing asked for.
+        const size_t rounded = ((want + kBodyGrowStep - 1) / kBodyGrowStep) * kBodyGrowStep;
+        out->reserve(rounded > kJsonBodyCap ? kJsonBodyCap : rounded);
+        buffers->scratch_grows++;
+      }
+      buffers->noteBodyBytes(want);
+    }
     out->insert(out->end(), data, data + len);
     return true;
   });
@@ -90,18 +107,55 @@ void addUnique(std::vector<std::string>& v, const std::string& item) {
 
 // --- PollBuffers -----------------------------------------------------------------------------
 
-void PollBuffers::reserveAll(size_t scratch_bytes) { scratch.reserve(scratch_bytes); }
+void PollBuffers::reserveAll(size_t scratch_bytes) {
+  scratch_reserve = scratch_bytes;
+  scratch.reserve(scratch_bytes);
+  // The TransitView list is sized at the parser's own cap: a rush-hour Route 17 carries 20-30
+  // vehicles, and any shorter reservation just reintroduces the doubling this exists to remove.
+  tv.reserve(kMaxTvVehicles);
+}
+
+void PollBuffers::reserveRetention(size_t pairs) {
+  const size_t want = pairs * kRetainedPerPair;
+  if (want > retained.capacity()) retained.reserve(want);
+}
+
+void PollBuffers::noteBodyBytes(size_t bytes) {
+  if (bytes > scratch_max_bytes) scratch_max_bytes = (uint32_t)bytes;
+}
 
 void PollBuffers::beginCycle() {
-  if (scratch.capacity() > kScratchReserve) {
-    // Some response larger than the reservation made the vector double past it. Give that block
-    // back and take a fresh one HERE, at the top of a cycle, where the largest free block is at
-    // its best - rather than letting one big body become resident for the life of the device.
-    // swap-with-a-temporary is the only way to make a std::vector release capacity.
-    std::vector<uint8_t>().swap(scratch);
-    scratch.reserve(kScratchReserve);
+  // THE CHURN THIS AVOIDS (0.3.2-rc1). The scratch is reserved at kScratchReserve, but
+  // kJsonBodyCap is 16 KB, so a body larger than the reservation used to make the vector DOUBLE
+  // past it (a 12,288 B contiguous request mid-cycle) and then this function gave that block back
+  // and took a fresh 6,144 B one - every single cycle, for as long as that endpoint kept answering
+  // big. Grow, shrink, grow, shrink: exactly the fragmentation this whole pass is fighting, and
+  // invisible because nothing recorded how big a body had ever been.
+  //
+  // So the reservation RATCHETS instead. A body that goes past it raises it (fetchBuffered()
+  // reserves the rounded-up size in one step, so the vector never doubles), and the bigger block
+  // is then kept - one reallocation for the life of the boot rather than one per cycle. The
+  // ratchet is bounded by kScratchMaxReserve so a pathological response cannot become resident:
+  // above that, the old give-it-back behaviour still applies.
+  //
+  // scratch_max_bytes on GET /api/debug/ui is what says whether kScratchReserve should simply be
+  // raised in the source, which is better than either of these behaviours and needs a measurement
+  // this firmware could not previously take.
+  if (scratch.capacity() > scratch_reserve) {
+    if (scratch.capacity() <= kScratchMaxReserve) {
+      scratch_reserve = scratch.capacity();  // keep it: the ratchet
+    } else {
+      // swap-with-a-temporary is the only way to make a std::vector release capacity.
+      std::vector<uint8_t>().swap(scratch);
+      scratch.reserve(scratch_reserve);
+    }
   }
   scratch.clear();
+  // The retained updates are dead the moment a cycle ends - the merge loop that reads them has
+  // returned - so their identifier strings are dropped here rather than held until the next
+  // cycle's retainUpdates(). The block itself stays: that is the whole point.
+  retained.clear();
+  tv.clear();
 }
 
 std::string septaTripUpdatesUrl() {
@@ -175,17 +229,48 @@ FetchOutcome SeptaSource::fetchTransitViewEx(const std::string& route,
                                               std::vector<TvVehicle>* out, HttpGetEx http) {
   std::vector<uint8_t> own_body;
   std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->scratch : own_body;
-  FetchResult t = fetchBuffered(septaTransitViewUrl(route), http, &body);
+  FetchResult t = fetchBuffered(septaTransitViewUrl(route), http, &body, buffers_);
   ParseResult<TvVehicle> parsed;
   if (!body.empty()) parsed = parseTransitView(body.data(), body.size());
   return finishJsonFetch("TransitView", t, &parsed, body.empty(), out);
+}
+
+FetchOutcome SeptaSource::fetchTransitViewAppendEx(const std::string& route,
+                                                    std::vector<TvVehicle>* out, HttpGetEx http) {
+  std::vector<uint8_t> own_body;
+  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->scratch : own_body;
+  FetchResult t = fetchBuffered(septaTransitViewUrl(route), http, &body, buffers_);
+
+  // The destination's storage IS the parse block for the duration: swapped in, parsed into,
+  // swapped back. No second vector is ever constructed, so nothing contiguous is asked for.
+  ParseResult<TvVehicle> parsed;
+  parsed.items.swap(*out);
+  const size_t before = parsed.items.size();
+  if (!body.empty()) parseTransitViewAppend(&parsed, body.data(), body.size());
+
+  FetchOutcome o;
+  o.transport = t;
+  if (body.empty()) {
+    o.error = t.status == 0 ? "TransitView unreachable" : "TransitView empty response";
+  } else if (!t.complete) {
+    o.error = "TransitView response truncated";
+  } else if (!parsed.ok) {
+    o.error = parsed.error.empty() ? "TransitView unreadable response" : parsed.error;
+  } else {
+    o.ok = true;
+  }
+  // "A failed fetch leaves *out untouched" is the contract finishJsonFetch() enforces for the
+  // replacing form; here it means dropping anything this route appended before it went wrong.
+  if (!o.ok && parsed.items.size() > before) parsed.items.resize(before);
+  parsed.items.swap(*out);  // always hand the block back, on every path
+  return o;
 }
 
 FetchOutcome SeptaSource::fetchScheduleEx(const std::string& stop_id,
                                            std::vector<SchedEntry>* out, HttpGetEx http) {
   std::vector<uint8_t> own_body;
   std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->scratch : own_body;
-  FetchResult t = fetchBuffered(septaBusSchedulesUrl(stop_id), http, &body);
+  FetchResult t = fetchBuffered(septaBusSchedulesUrl(stop_id), http, &body, buffers_);
   // Parse regardless of `status`: SEPTA has been observed returning a valid-shaped body on a
   // non-200 status for this endpoint (NOTES.md) - the status code alone is not a reliable
   // "was there usable data" signal here.
@@ -206,7 +291,7 @@ FetchOutcome SeptaSource::fetchAlertsEx(Mode mode, const std::string& route,
   }
   std::vector<uint8_t> own_body;
   std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->scratch : own_body;
-  FetchResult t = fetchBuffered(url, http, &body);
+  FetchResult t = fetchBuffered(url, http, &body, buffers_);
   ParseResult<transit::Alert> parsed;
   if (!body.empty()) parsed = parseAlerts(body.data(), body.size());
   return finishJsonFetch("Alerts", t, &parsed, body.empty(), out);
@@ -216,7 +301,7 @@ FetchOutcome SeptaSource::fetchRailArrivalsEx(const std::string& station,
                                                std::vector<RailArrival>* out, HttpGetEx http) {
   std::vector<uint8_t> own_body;
   std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->scratch : own_body;
-  FetchResult t = fetchBuffered(septaArrivalsUrl(station), http, &body);
+  FetchResult t = fetchBuffered(septaArrivalsUrl(station), http, &body, buffers_);
   ParseResult<RailArrival> parsed;
   if (!body.empty()) parsed = parseRailArrivals(body.data(), body.size());
   return finishJsonFetch("SEPTA rail arrivals", t, &parsed, body.empty(), out);
@@ -358,10 +443,29 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
   // allocated here (PollBuffers): it is live only until finish(), so the same bytes go on to serve
   // every buffered JSON response of this cycle and then the Indego scanner. The stream object
   // itself is still a local - it is ~150 bytes of stack once it owns no buffer.
+  // How many (stop, route) pairs the GTFS-RT retention block actually has to hold. GtfsRtStream
+  // caps each pair at kDefaultMaxPerStopRoute, so this is the exact number of slots that can ever
+  // be occupied - sizing by it rather than by the 32-slot default cap is what makes the block
+  // 2.4 KB for the owner's two Route 17 stops instead of 4.9 KB (0.3.2-rc1, PollBuffers).
+  size_t rt_pairs = 0;
+  for (const auto& c : configs) {
+    if (isBusOrTrolley(c.mode)) ++rt_pairs;
+  }
+  size_t retain_total = rt_pairs * GtfsRtStream::kDefaultMaxPerStopRoute;
+  if (retain_total > GtfsRtStream::kDefaultMaxRetainedUpdates) {
+    retain_total = GtfsRtStream::kDefaultMaxRetainedUpdates;  // the cap this device has always had
+  }
+  if (retain_total == 0) retain_total = GtfsRtStream::kDefaultMaxPerStopRoute;
+
   const size_t entity_bytes = rt_routes.empty() ? 0 : 4096;
   GtfsRtStream stream(buffers != nullptr ? 0 : entity_bytes);
   if (buffers != nullptr && entity_bytes > 0) {
     stream.setEntityBuffer(&buffers->scratch);
+    // The retention block is the OTHER per-cycle contiguous request this stage used to make, and
+    // the one that failed on the owner's board once the largest free block reached 3,444 B. Lent,
+    // not allocated: retainUpdates()' reserve() below is a no-op from the second cycle on.
+    buffers->reserveRetention(rt_pairs);
+    stream.setRetentionBuffer(&buffers->retained);
     stream.reset(entity_bytes);
   }
   bool rt_ok = true;
@@ -369,7 +473,7 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
   if (!rt_routes.empty()) {
     stream.setRouteFilter(rt_routes);
     stream.setStopFilter(rt_stops);
-    stream.retainUpdates();
+    stream.retainUpdates(retain_total, GtfsRtStream::kDefaultMaxPerStopRoute);
     FetchOutcome o = src.fetchRealtimeEx(stream, http);
     rt_ok = o.ok;
     if (!rt_ok) {
@@ -391,12 +495,17 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
     bool ok = true;
   };
   std::vector<RouteVehicles> tv_ok_by_route;
-  std::vector<TvVehicle> tv_all;  // grows per route; a cap-sized reserve() was a ~10-20 KB block
+  // ONE vehicle list for the whole cycle, parsed straight into (0.3.2-rc1). It used to be two -
+  // a per-route vector the parser grew by doubling, and this accumulator which the insert() grew
+  // by doubling again - so a 30-vehicle route asked for a 5,632 B contiguous block twice over,
+  // every cycle, with the retention block live. With PollBuffers it is resident and neither
+  // request happens at all.
+  std::vector<TvVehicle> own_tv;
+  std::vector<TvVehicle>& tv_all = buffers != nullptr ? buffers->tv : own_tv;
+  tv_all.clear();
   for (const auto& route : rt_routes) {
-    std::vector<TvVehicle> tv;
-    FetchOutcome o = src.fetchTransitViewEx(route, &tv, http);
+    FetchOutcome o = src.fetchTransitViewAppendEx(route, &tv_all, http);
     tv_ok_by_route.push_back({route, o.ok});
-    tv_all.insert(tv_all.end(), tv.begin(), tv.end());
     pollTrace(kPollTraceTransitView);  // once per route
   }
   auto tvOkFor = [&](const std::string& route) {

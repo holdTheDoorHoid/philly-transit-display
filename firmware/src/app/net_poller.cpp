@@ -585,8 +585,13 @@ void refreshRouteLiveness(const std::vector<StopConfig> &stops, const transit::H
     if (entry != nullptr && entry->fetched_ms != 0 && (millis() - entry->fetched_ms) < kLivenessRefreshMs) continue;
     if (have_time && !have_time()) break;
 
-    std::vector<TvVehicle> tv;
-    src.fetchTransitViewEx(s.route, &tv, http);
+    // The cycle's resident vehicle list, not a local one (0.3.2-rc1): pollBusStops() has long
+    // since returned and nothing reads it any more, and a local would be another per-cycle
+    // contiguous block of up to 5.6 KB for a question answered by `!tv.empty()`.
+    std::vector<TvVehicle> own_tv;
+    std::vector<TvVehicle> &tv = g_poll_buffers != nullptr ? g_poll_buffers->tv : own_tv;
+    tv.clear();
+    src.fetchTransitViewAppendEx(s.route, &tv, http);
     if (entry == nullptr) {
       g_liveness_cache.push_back({s.route, !tv.empty(), millis()});
     } else {

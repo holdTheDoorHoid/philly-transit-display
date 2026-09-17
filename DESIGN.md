@@ -1051,18 +1051,61 @@ moment two really are live at once. It also sits on the path implicated in the c
 four-attempt loop inside `fetchPlausibleSchedule()`'s three, re-entered every two minutes while
 SEPTA answers with the wrong service day — so it keeps a 4 KB reservation of its own.
 
-Two things are deliberately **back to per-cycle**: the GTFS-RT retention block (~4.6 KB) and the
-BusSchedules parse block (~3 KB). Both are `std::vector`s of non-trivially-destructible values and
-cannot share raw bytes without a custom allocator, which would change the types in `transit_core`'s
-public API; and at a ~24 KB resting largest block, a 4.6 KB request is one the heap carries. Keeping
-the floor high is worth more than removing them.
+rc2 left two things deliberately **per-cycle**: the GTFS-RT retention block and the BusSchedules
+parse block, both `std::vector`s of non-trivially-destructible values that cannot share raw bytes
+without a custom allocator. At a ~24 KB resting largest block a 4.9 KB request is one the heap
+carries — and on 2026-09-17 the heap stopped carrying it.
 
-Resident total: **11,264 B** (6,144 shared scratch + 4,096 transport buffer + the 1 KB error-reply
-reserve of §12.1), against ~13 KB reclaimed elsewhere in the same release (draw buffer 1/20 → 1/30,
-the tracker's slot count, `esp_bt_mem_release()`). Measured on the host, a warm cycle's requests of
-4 KB or more go from several to exactly one — the retention block. `min_free8` on
-`GET /api/debug/ui` is the number that says whether the floor is right, and it is the first thing to
-read after flashing.
+**The typed blocks, and why rc2's judgement was wrong (0.3.2-rc1).** v0.3.1 ran healthily for 35–40
+minutes on the owner's board (resting free8 39–40.7 KB, largest ≥22.5 KB at every poll start) and
+then fragmented to free8 17–20 KB with a **3,444 B** largest block. From that point every cycle
+failed in the same place: the ring read `pre-transit → oom-transit` with **no stage in between**,
+which names the allocation exactly — the first contiguous request of the rt-stream stage, which with
+the entity buffer already borrowed is `retainUpdates()`'s `reserved_.reserve(32)`. On-target sizes,
+read out of the image's DWARF rather than estimated: `sizeof(StopTimeUpdate)` **152 B**,
+`sizeof(TvVehicle)` **176 B**, `sizeof(SchedEntry)` **128 B**. So that reservation is **4,864 B**,
+against a 3,444 B largest block, every 30 seconds, forever.
+
+Both typed blocks are now **resident vectors in `PollBuffers`, lent out** the same way the byte
+scratch is — `retained` through `GtfsRtStream::setRetentionBuffer()`, `tv` as the vector
+`fetchTransitViewAppendEx()` parses straight into:
+
+- **The retention block is sized from the config**, not from the 32-slot default cap: 8 slots per
+  configured bus/trolley (stop, route) pair, which is exactly what the stream's per-pair cap allows
+  a pair to hold, so nothing is lost. The owner's two Route 17 stops need 16 slots = **2,432 B**
+  instead of 4,864 B.
+- **The TransitView list is one vector for the whole cycle.** It used to be two — the parser grew
+  its own from `reserve(8)` by doubling, and `tv_all` grew again on `insert()` — so a rush-hour
+  Route 17 (20–30 vehicles) asked for a 5,632 B contiguous block *twice*, with the retention block
+  live. It is reserved once at `kMaxTvVehicles` = **5,632 B** and every route appends into it.
+  `refreshRouteLiveness()` in the optional tail borrows the same vector rather than taking a local.
+- **The BusSchedules parse block stays per-cycle** at 24 × 128 = **3,072 B**, because it is asked
+  for only on a schedule *refetch* — once per stop per 10 minutes, not every cycle — and making it
+  resident would cost the floor 3 KB to speed up a path that already succeeds.
+
+**What this costs the resting floor: 8,064 B** for the owner's config (2,432 + 5,632), which is the
+whole of the added residency. rc1's lesson is not repealed by this, it is respected: the same trade
+is being made, but for 8 KB instead of 26 KB, and against a failure that was actually measured
+rather than predicted.
+
+Resident total: **19,328 B** (6,144 shared scratch + 4,096 transport buffer + the 1 KB error-reply
+reserve of §12.1 + these 8,064). Measured on the host with the allocation probe, a warm cache-hit
+cycle now makes **no** request of 2 KB or more at all; the largest single contiguous request left in
+such a cycle is an arrival vector at ~1.2 KB, and in a schedule-refetch cycle the 3,072 B parse
+block. `min_free8` on `GET /api/debug/ui` is the number that says whether the floor is right, and it
+is the first thing to read after flashing.
+
+**And the shared scratch no longer grows and shrinks.** `kJsonBodyCap` is 16 KB but the reservation
+is 6,144 B, so a body larger than the reservation made the vector *double* past it — a 12,288 B
+contiguous request — and `beginCycle()` then handed that block back and took a fresh 6,144 B one,
+every cycle, for as long as that endpoint kept answering big. Grow, shrink, grow, shrink: exactly
+the churn this section exists to remove, and invisible because nothing recorded how big a body had
+ever been. Now `fetchBuffered()` reserves the rounded-up size in **one** step (no doubling), and the
+reservation **ratchets** up to it and stays there — one reallocation per boot instead of one per
+cycle — bounded by `kScratchMaxReserve` (10 KB) so a pathological response still cannot become
+resident. `scratch_max_bytes`, `scratch_reserve_bytes` and `scratch_grows` on `GET /api/debug/ui`
+are the measurement that says whether `kScratchReserve` should simply be a different number in the
+source, which is better than either behaviour and which this firmware previously could not answer.
 
 Two consequences follow the same rule and are worth stating where a reader will look for them.
 `publishSnapshot()` takes its Snapshot **by rvalue and returns the published pointer**, so the

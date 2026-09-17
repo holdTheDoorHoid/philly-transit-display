@@ -230,12 +230,23 @@ std::string stripHtmlAndTrim(const std::string& raw, size_t max_len) {
 
 ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len) {
   ParseResult<TvVehicle> result;
+  parseTransitViewAppend(&result, data, len);
+  return result;
+}
+
+void parseTransitViewAppend(ParseResult<TvVehicle>* out, const uint8_t* data, size_t len) {
+  ParseResult<TvVehicle>& result = *out;
+  // Reset the verdict fields but NOT items: this appends (see the header). A failed parse below
+  // therefore leaves whatever the caller had accumulated exactly as it was.
+  result.ok = true;
+  result.error.clear();
+  result.dropped = 0;
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, data, len);
   if (err) {
     result.ok = false;
     result.error = std::string("json parse error: ") + err.c_str();
-    return result;
+    return;
   }
 
   JsonVariantConst root = doc.as<JsonVariantConst>();
@@ -247,28 +258,33 @@ ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len) {
     if (!em.empty()) {
       result.ok = false;
       result.error = em;
-      return result;
+      return;
     }
     JsonVariantConst bus = root["bus"];
     if (!bus.is<JsonArrayConst>()) {
       result.ok = false;
       result.error = "unexpected TransitView response shape";
-      return result;
+      return;
     }
     arr = bus.as<JsonArrayConst>();
   } else {
     result.ok = false;
     result.error = "unexpected TransitView response shape";
-    return result;
+    return;
   }
 
   // A vehicle list has no "nearest" ordering to prefer (these are positions, not arrival times),
-  // so the cap keeps the first kMaxTvVehicles in wire order and counts the rest.
-  // Grows as vehicles arrive rather than reserving the cap: sizeof(TvVehicle) is ~200 B on the
-  // ESP32, and one 48-slot reservation was a 9.6 KB contiguous block that bad_alloc'd against a
-  // 10-20 KB largest free block (2026-09-15). A real route is 5-25 vehicles; doubling from 8
-  // never asks for more than ~6 KB at once.
-  result.items.reserve(8);
+  // so the cap keeps the first kMaxTvVehicles in wire order and counts the rest - and since
+  // 0.3.2-rc1 it counts the caller's whole accumulated list, not just this route's share.
+  //
+  // Growing from 8 by doubling was the 2026-09-15 fix for a 48-slot reserve() that bad_alloc'd
+  // against a 10-20 KB largest free block. It halved the peak and did not remove it: a rush-hour
+  // Route 17 carries 20-30 vehicles, so the doubling still asked for 2,816 B and then 5,632 B,
+  // contiguous, with the retention block live. The answer is neither - it is for the CALLER to own
+  // the vector across cycles (PollBuffers::tv), so nothing is asked for at all. The doubling below
+  // is what a caller that brought an empty vector still gets: host tests, and any other consumer
+  // of this library.
+  if (result.items.capacity() < 8) result.items.reserve(8);
   for (JsonObjectConst v : arr) {
     if (result.items.size() >= kMaxTvVehicles) {
       ++result.dropped;
@@ -288,7 +304,6 @@ ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len) {
     tv.lng = jsonToDouble(v["lng"]);
     result.items.push_back(std::move(tv));
   }
-  return result;
 }
 
 ParseResult<SchedEntry> parseBusSchedules(const uint8_t* data, size_t len) {

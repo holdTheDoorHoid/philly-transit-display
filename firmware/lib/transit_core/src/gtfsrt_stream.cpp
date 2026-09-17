@@ -93,6 +93,14 @@ void GtfsRtStream::setEntityBuffer(std::vector<uint8_t>* borrowed) {
   }
 }
 
+void GtfsRtStream::setRetentionBuffer(std::vector<StopTimeUpdate>* borrowed) {
+  borrowed_retained_ = borrowed;
+  if (borrowed != nullptr) {
+    // Give back whatever this object was holding: one reservation, not two (see the header).
+    std::vector<StopTimeUpdate>().swap(own_retained_);
+  }
+}
+
 void GtfsRtStream::reset(size_t max_entity_bytes) {
   max_entity_bytes_ = max_entity_bytes;
   std::vector<uint8_t>& buf = entityBuf();
@@ -106,7 +114,7 @@ void GtfsRtStream::reset(size_t max_entity_bytes) {
 
   // Retention off until the caller asks for it again, exactly as after construction.
   // retainUpdates() clear()s and reserve()s, so the block below it is kept too.
-  retained_.clear();
+  retainedBuf().clear();
   max_retained_ = 0;
   max_per_stop_route_ = 0;
 
@@ -137,11 +145,16 @@ void GtfsRtStream::setRouteFilter(std::vector<std::string> routes) {
 void GtfsRtStream::retainUpdates(size_t max_total, size_t max_per_stop_route) {
   max_retained_ = max_total;
   max_per_stop_route_ = max_per_stop_route;
-  retained_.clear();
-  retained_.reserve(max_total);  // the only allocation this buffer ever makes
+  std::vector<StopTimeUpdate>& retained = retainedBuf();
+  retained.clear();
+  // The only allocation this buffer ever makes - and with a borrowed retention vector
+  // (setRetentionBuffer) it is a no-op from the second cycle on, which is the point: this
+  // reserve() is the ~4.9 KB contiguous request that failed on the owner's board once the largest
+  // free block had fragmented to 3,444 B (0.3.2-rc1, DESIGN.md SS5).
+  if (retained.capacity() < max_total) retained.reserve(max_total);
 }
 
-const std::vector<StopTimeUpdate>& GtfsRtStream::retained() const { return retained_; }
+const std::vector<StopTimeUpdate>& GtfsRtStream::retained() const { return retainedBuf(); }
 
 // Time to rank a retained update by, for the "keep the nearest" eviction rule. An update with no
 // time of its own (SKIPPED/NO_DATA - see StopRel) is ranked at the feed's own timestamp rather
@@ -154,6 +167,7 @@ static int64_t rankOf(const StopTimeUpdate& u) {
 
 void GtfsRtStream::retain(StopTimeUpdate&& u) {
   if (max_retained_ == 0) return;
+  std::vector<StopTimeUpdate>& retained_ = retainedBuf();
 
   // Per-(stop, route) cap first: one busy route must not crowd every other configured stop out
   // of the global cap.
