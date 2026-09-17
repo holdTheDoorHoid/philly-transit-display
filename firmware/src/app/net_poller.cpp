@@ -21,6 +21,7 @@
 #include "config_store.h"
 #include "cxx_exception_pool.h"
 #include "heap_reserve.h"
+#include "cycle_log.h"
 #include "heap_trace.h"
 #include "http_fetch.h"
 #include "sd_logger.h"
@@ -194,6 +195,12 @@ void captureRestartNote() {
   g_rtc_note.magic = 0;
 }
 
+// Only the bytes a std::string took from the HEAP: libstdc++ keeps up to 15 characters inside the
+// object itself, which every sizeof() term in getMemorySizes() has already counted.
+uint32_t strHeapBytes(const std::string &s) {
+  return s.capacity() > 15 ? (uint32_t)(s.capacity() + 1) : 0;
+}
+
 // ---- BusSchedules cache (DESIGN.md SS4.7: "cached 10 min", "also on config change") ----------
 // At most kMaxStops (8, config_store.h) distinct stop_ids, matching the config's own cap; a
 // linear scan over <=8 entries is cheaper than a map for this size.
@@ -222,6 +229,28 @@ class AppScheduleCache : public transit::ScheduleCache {
   // DESIGN.md SS4.7: refresh "also on config change" - force every stop to be refetched on the
   // next poll rather than waiting out the 10 minute window.
   void invalidateAll() { entries_.clear(); }
+
+  // Roughly what this cache is holding, for GET /api/debug/ui (0.3.2-rc1). "Roughly" because
+  // walking every string's capacity is the only honest way and allocator headers are not counted -
+  // what it is for is watching a number that should be FLAT drift upwards, not accounting.
+  uint32_t bytes() const {
+    uint32_t n = (uint32_t)(entries_.capacity() * sizeof(Entry));
+    for (const auto &e : entries_) {
+      n += strBytes(e.stop_id);
+      n += (uint32_t)(e.entries.capacity() * sizeof(SchedEntry));
+      for (const auto &s : e.entries) {
+        n += strBytes(s.route) + strBytes(s.trip_id) + strBytes(s.direction) +
+             strBytes(s.direction_desc) + strBytes(s.stop_name);
+      }
+    }
+    return n;
+  }
+
+  // Only the bytes that came off the HEAP: libstdc++ keeps up to 15 characters inside the string
+  // object itself, which the sizeof() terms above have already counted.
+  static uint32_t strBytes(const std::string &s) {
+    return s.capacity() > 15 ? (uint32_t)(s.capacity() + 1) : 0;
+  }
 
  private:
   struct Entry {
@@ -403,6 +432,11 @@ transit::HttpGetEx makeHttpGetEx(uint32_t timeout_ms) {
     // BusSchedules is tiny (~1 KB) and flaky, so buffer it and retry on the error shape before
     // handing the consumer a single clean delivery; everything else streams straight through.
     if (url.find("BusSchedules") != std::string::npos) {
+      // This branch is only reached on a REFETCH - a cache hit never gets here - so it is the
+      // honest place to flag the cycle (cycle_log.h). A refetch is one 3,072 B parse block plus up
+      // to twelve URL fetches, and it is a prime suspect for the fragmentation the log exists to
+      // catch.
+      cycleLogFlag(kCycleSchedRefetch);
       transit::FetchResult result;
       constexpr int kAttempts = 4;
       for (int attempt = 0; attempt < kAttempts; ++attempt) {
@@ -1079,6 +1113,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
     // per-stage marks above it, the ring then reads "...sched-stop, oom-transit", which names the
     // allocation that failed rather than only the call that contained it (diag branch).
     heapTraceMark(kStageOomTransit);
+    cycleLogFlag(kCycleOom);
     out_of_memory = true;
   }
   if (out_of_memory) {
@@ -1123,6 +1158,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   std::shared_ptr<const Snapshot> published = publishSnapshot(std::move(combined));
   tracePoll(kStagePostTransit);
   if (!poll_ok) g_failed_polls++;
+  cycleLogFlag((poll_ok ? 0 : kCycleFailed) | (g_last_poll_unsynced ? kCycleUnsynced : 0));
 
   // From here on everything is optional. The next transit poll's deadline is fixed first, so each
   // piece of work can ask whether it still has room rather than finding out afterwards.
@@ -1147,6 +1183,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
     // Only when something actually came back: a cycle where every alert feed was still fresh must
     // not re-publish an identical Snapshot and reset the header's "updated N s ago".
     if (alerts_fetched) {
+      cycleLogFlag(kCycleAlertsFetch);
       // The second publish of the cycle, and the one place a copy of the stops is unavoidable: the
       // published Snapshot is const and shared (the display task holds a reference to it for up to
       // a second), so the alerts cannot be written into it. What changed is that this is now ONE
@@ -1305,6 +1342,7 @@ void pollerTask(void * /*arg*/) {
       // which of them was live - "pre-bikes, oom-cycle" is the Indego stream, "post-weather,
       // oom-cycle" is the liveness fetch, and so on (diag branch).
       heapTraceMark(kStageOomCycle);
+      cycleLogFlag(kCycleOom);
       g_failed_polls++;
       Serial.printf("[net_poller] out of memory during the poll cycle (free %u, largest %u); short retry\n",
                     (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -1327,6 +1365,9 @@ void pollerTask(void * /*arg*/) {
     g_cycle_end_ms = millis();
     g_progress_ms = g_cycle_end_ms;
     g_before_first_cycle = false;
+    // Files the per-cycle log row here for the same reason the stamp above is here: this is the
+    // ONE path every cycle takes, whatever happened inside it (cycle_log.h).
+    cycleLogEnd();
 
     // HAZARD: a firmware upload, exactly as in main.cpp's liveness net. An OTA takes the heap for
     // the length of a ~1.7 MB write, which is precisely the condition this counter looks for, and
@@ -1410,6 +1451,52 @@ bool preallocateTracker() {
 
 std::vector<uint8_t> *pollScratch() {
   return g_poll_buffers != nullptr ? &g_poll_buffers->scratch : nullptr;
+}
+
+// Roughly how many heap bytes each long-lived structure is holding (0.3.2-rc1). Reported by
+// GET /api/debug/ui beside the heap figures so "free8 fell by 4 KB overnight" can be attributed to
+// something rather than guessed at. Only heap bytes are counted - a std::string of 15 characters
+// or fewer lives inside the object and is already in the sizeof() term - and allocator headers are
+// not, so these are lower bounds meant for watching drift, not for balancing the heap.
+MemorySizes getMemorySizes() {
+  MemorySizes m;
+  m.sched_cache_bytes = g_sched_cache.bytes();
+  for (const auto &e : g_alerts_cache) {
+    m.alerts_cache_bytes += (uint32_t)sizeof(AlertCacheEntry) + strHeapBytes(e.url);
+    m.alerts_cache_bytes += (uint32_t)(e.alerts.capacity() * sizeof(Alert));
+    for (const auto &a : e.alerts) {
+      m.alerts_cache_bytes += strHeapBytes(a.route) + strHeapBytes(a.text);
+      m.alerts_cache_bytes += (uint32_t)(a.detours.capacity() * sizeof(std::string));
+      for (const auto &d : a.detours) m.alerts_cache_bytes += strHeapBytes(d);
+    }
+  }
+  std::shared_ptr<const Snapshot> snap;
+  if (takeShared(g_mutex, kStatusWaitMs)) {
+    snap = g_snapshot;  // a refcount bump, not a copy
+    giveShared(g_mutex);
+  }
+  if (snap) {
+    uint32_t n = (uint32_t)sizeof(Snapshot) + strHeapBytes(snap->last_error);
+    n += (uint32_t)(snap->stops.capacity() * sizeof(StopSnapshot));
+    for (const auto &st : snap->stops) {
+      n += strHeapBytes(st.key) + strHeapBytes(st.error);
+      n += (uint32_t)(st.arrivals.capacity() * sizeof(transit::Arrival));
+      for (const auto &a : st.arrivals) {
+        n += strHeapBytes(a.trip) + strHeapBytes(a.vehicle) + strHeapBytes(a.destination) +
+             strHeapBytes(a.seats) + strHeapBytes(a.sched_trip);
+      }
+    }
+    n += (uint32_t)(snap->alerts.capacity() * sizeof(Alert));
+    for (const auto &a : snap->alerts) {
+      n += strHeapBytes(a.route) + strHeapBytes(a.text);
+      n += (uint32_t)(a.detours.capacity() * sizeof(std::string));
+      for (const auto &d : a.detours) n += strHeapBytes(d);
+    }
+    m.snapshot_bytes = n;
+  }
+  m.retained_capacity = g_poll_buffers != nullptr ? (uint32_t)g_poll_buffers->retained.capacity() : 0;
+  m.tv_capacity = g_poll_buffers != nullptr ? (uint32_t)g_poll_buffers->tv.capacity() : 0;
+  return m;
 }
 
 ScratchStats getScratchStats() {

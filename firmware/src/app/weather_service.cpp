@@ -1,5 +1,7 @@
 #include "weather_service.h"
 
+#include "cycle_log.h"
+
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -120,6 +122,7 @@ void regroup(const Config &cfg, std::vector<Location> &locs, std::vector<StopLoc
 bool fetchLocation(Location &loc, bool fahrenheit, const transit::HttpGet &http) {
   std::string url = weather::openMeteoUrl(loc.lat, loc.lng, fahrenheit, kForecastHours);
   std::vector<uint8_t> body;
+  cycleLogFlag(kCycleWeather);  // this cycle actually went to Open-Meteo (cycle_log.h)
   int status = http(url, [&](const uint8_t *d, size_t n) {
     if (body.size() + n > kBodyCap) return false;
     body.insert(body.end(), d, d + n);

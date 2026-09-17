@@ -71,6 +71,22 @@ struct ScratchStats {
 };
 ScratchStats getScratchStats();
 
+// Roughly how many heap bytes the long-lived structures are holding (0.3.2-rc1), reported by
+// GET /api/debug/ui beside the heap figures. The point is attribution: "free8 fell 4 KB over an
+// hour" is a fact with no owner until these are beside it, and the schedule and alerts caches are
+// the two things on this device that legitimately hold data across cycles and could therefore
+// legitimately grow. Lower bounds, not an audit - only bytes that actually came off the heap are
+// counted (a std::string of 15 characters or fewer lives inside the object), and allocator headers
+// are not. Safe to call from any task; takes the poller's shared lock briefly for the Snapshot.
+struct MemorySizes {
+  uint32_t sched_cache_bytes = 0;
+  uint32_t alerts_cache_bytes = 0;
+  uint32_t snapshot_bytes = 0;      // the currently published Snapshot
+  uint32_t retained_capacity = 0;   // PollBuffers::retained slots (DESIGN.md SS5)
+  uint32_t tv_capacity = 0;         // PollBuffers::tv slots
+};
+MemorySizes getMemorySizes();
+
 // Creates the poller task (12 KB stack) and its primitives without starting to poll. Call early
 // in setup(), before Wi-Fi, for the same heap-fragmentation reason as preallocateTracker().
 void initNetPoller();

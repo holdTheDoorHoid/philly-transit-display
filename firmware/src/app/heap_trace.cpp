@@ -1,5 +1,7 @@
 #include "heap_trace.h"
 
+#include "cycle_log.h"  // every stage sample also feeds the per-cycle minimum (cycle_log.h)
+
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -39,6 +41,10 @@ void heapTraceMark(uint8_t stage) {
   const uint32_t free8 = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
   const uint32_t largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
+  // The per-cycle log's "lowest free8 seen" column is fed from here: every stage boundary is
+  // already a sample, so the two instruments cost one pair of heap_caps_ calls between them.
+  cycleLogNoteFree8(free8);
+
   portENTER_CRITICAL(&g_lock);
   HeapTraceEntry &e = g_ring[g_seq % kHeapTraceCap];
   e.cycle = g_cycle;
@@ -54,6 +60,12 @@ void heapTraceBeginCycle() {
   portENTER_CRITICAL(&g_lock);
   g_cycle++;
   portEXIT_CRITICAL(&g_lock);
+  // Opens the per-cycle log row with the same two numbers kStagePollStart is about to record.
+  // Sampled separately rather than threaded through heapTraceMark(): two heap_caps_ calls a few
+  // microseconds apart is not a measurement this resolves, and it keeps heapTraceMark's signature
+  // (which a dozen call sites use) unchanged.
+  cycleLogBegin((uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   heapTraceMark(kStagePollStart);
 }
 

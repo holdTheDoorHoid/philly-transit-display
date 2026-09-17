@@ -24,6 +24,7 @@
 #include "cpu_yield.h"  // cpuStretchMsMax() for /api/debug/ui (DESIGN.md SS12.1)
 #include "cxx_exception_pool.h"
 #include "demo_data.h"
+#include "cycle_log.h"  // the per-cycle memory log served by /api/debug/ui?log=1
 #include "heap_trace.h"  // the poll-cycle heap ring for /api/debug/ui (diag branch)
 #include "host_match.h"
 #include "heap_reserve.h"
@@ -139,7 +140,13 @@ class GatedWebServer : public AsyncWebServer {
         if (c == nullptr) return;
         try {
           const uint32_t live = sweepInFlight();
-          if (!admitConnection(live, heap_caps_get_free_size(MALLOC_CAP_8BIT),
+          const size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+          // The one sample the per-cycle log takes from OUTSIDE the poller task (cycle_log.h). The
+          // troughs that matter are a poll mid-fetch plus a concurrent request on this task, and
+          // the poller's own stage boundaries cannot see the second half of that. It is free here:
+          // the number has already been read for the admission decision.
+          cycleLogNoteFree8((uint32_t)free8);
+          if (!admitConnection(live, free8,
                                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))) {
             // Zero allocations on this path, which is the entire point: no request, no response,
             // no header list, no send buffer. The client sees a closed connection, which the web
@@ -1140,8 +1147,18 @@ void handleProxySchedule(AsyncWebServerRequest *request) {
 // two contiguous bytes at the worst moment. A sampler passes `since` and gets only new rows, which
 // is a few hundred bytes per poll; `?n=64` is there for a one-off full dump on a healthy board.
 constexpr size_t kTraceMaxRows = 32;
+// The per-cycle log (cycle_log.h) renders through the SAME buffer, and `?log=1` therefore returns
+// the log INSTEAD of the stage trace rather than beside it. Two buffers would be ~1.3 KB more
+// .bss for two instruments that are never read in the same breath: the trace answers "where
+// inside this cycle", the log answers "which cycle", and an investigation moves from one to the
+// other. A row is "[2592000,131072,131072,65535,127]," - 34 characters at the widest.
+constexpr size_t kCycleLogMaxRows = 40;
+constexpr size_t kLogRowBytes = 40;
 // "[65535,22,1048576,1048576]," is 27 characters; 32 B a row is slack, not a measurement.
-char g_trace_json[kTraceMaxRows * 32 + 8];
+constexpr size_t kRenderBufBytes =
+  (kTraceMaxRows * 32 > kCycleLogMaxRows * kLogRowBytes ? kTraceMaxRows * 32
+                                                        : kCycleLogMaxRows * kLogRowBytes) + 8;
+char g_trace_json[kRenderBufBytes];
 
 const char *renderTrace(uint32_t since, size_t want, uint32_t *first_seq, size_t *count) {
   if (want == 0 || want > kTraceMaxRows) want = kTraceMaxRows;
@@ -1154,6 +1171,34 @@ const char *renderTrace(uint32_t since, size_t want, uint32_t *first_seq, size_t
     int w = snprintf(g_trace_json + at, sizeof(g_trace_json) - at - 2, "%s[%u,%u,%u,%u]", i ? "," : "",
                      (unsigned)rows[i].cycle, (unsigned)rows[i].stage, (unsigned)rows[i].free8,
                      (unsigned)rows[i].largest);
+    if (w <= 0 || (size_t)w >= sizeof(g_trace_json) - at - 2) break;  // cannot happen at these widths
+    at += (size_t)w;
+    written++;
+  }
+  g_trace_json[at++] = ']';
+  g_trace_json[at] = '\0';
+  *count = written;
+  return g_trace_json;
+}
+
+// The per-cycle memory log (cycle_log.h), rendered the same way and into the same buffer as the
+// stage trace above and for the same reason: hand-written rows injected with serialized(), not
+// nested JsonArrays, so /api/debug/ui does not become the endpoint that cannot answer on a starved
+// heap. Row shape: [uptime_s, free8, largest, min_free8, flags] - min_free8 in BYTES here (the
+// ring stores it in 64-byte units), because a reader should not have to know the scale.
+const char *renderCycleLog(uint32_t since, size_t want, uint32_t *first_seq, size_t *count) {
+  if (want == 0 || want > kCycleLogMaxRows) want = kCycleLogMaxRows;
+  CycleLogEntry rows[kCycleLogMaxRows];  // 640 B on the AsyncTCP task's 8 KB stack, freed on return
+  size_t n = cycleLogRead(since, rows, want, first_seq);
+  size_t at = 0;
+  g_trace_json[at++] = '[';
+  size_t written = 0;
+  for (size_t i = 0; i < n; i++) {
+    int w = snprintf(g_trace_json + at, sizeof(g_trace_json) - at - 2, "%s[%u,%u,%u,%u,%u]",
+                     i ? "," : "", (unsigned)rows[i].uptime_s, (unsigned)rows[i].free8,
+                     (unsigned)rows[i].largest,
+                     (unsigned)((uint32_t)rows[i].min_free8_64 * kMinFreeScale),
+                     (unsigned)rows[i].flags);
     if (w <= 0 || (size_t)w >= sizeof(g_trace_json) - at - 2) break;  // cannot happen at these widths
     at += (size_t)w;
     written++;
@@ -1553,6 +1598,36 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     // trough may fall between two stages.
     doc["heap_8bit"] = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
     doc["min_free8"] = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    // The allocator's own view of the same heap (0.3.2-rc1). `free_blocks` against
+    // `largest_free_block` is the fragmentation figure this device has never had: 40 KB free in
+    // one piece and 40 KB free in thirty pieces read identically on every other line here, and it
+    // is the difference between a healthy board and the one that spent 2026-09-17 refusing every
+    // allocation over 3,444 B. `total_blocks` rising while `allocated_blocks` does not is the
+    // signature of a heap being cut up rather than filled up.
+    {
+      multi_heap_info_t hi;
+      heap_caps_get_info(&hi, MALLOC_CAP_8BIT);
+      JsonObject h8 = doc["heap8_info"].to<JsonObject>();
+      h8["total_free_bytes"] = (uint32_t)hi.total_free_bytes;
+      h8["total_allocated_bytes"] = (uint32_t)hi.total_allocated_bytes;
+      h8["largest_free_block"] = (uint32_t)hi.largest_free_block;
+      h8["minimum_free_bytes"] = (uint32_t)hi.minimum_free_bytes;
+      h8["allocated_blocks"] = (uint32_t)hi.allocated_blocks;
+      h8["free_blocks"] = (uint32_t)hi.free_blocks;
+      h8["total_blocks"] = (uint32_t)hi.total_blocks;
+    }
+    // What the long-lived structures are holding (net_poller.h MemorySizes). The schedule and
+    // alerts caches are the only two things here that legitimately keep data across cycles, so
+    // they are the only two that could legitimately grow - which makes them the first place to
+    // look when the resting floor drifts.
+    {
+      MemorySizes ms = getMemorySizes();
+      doc["sched_cache_bytes"] = ms.sched_cache_bytes;
+      doc["alerts_cache_bytes"] = ms.alerts_cache_bytes;
+      doc["snapshot_bytes"] = ms.snapshot_bytes;
+      doc["retained_slots"] = ms.retained_capacity;
+      doc["tv_slots"] = ms.tv_capacity;
+    }
     doc["uptime_s"] = (uint32_t)(millis() / 1000);
     doc["reset_reason"] = (int)esp_reset_reason();  // 3 = SW restart, i.e. a self-heal reboot
     // How many published Snapshots are alive (net_poller.h). Since the publish became a move it is
@@ -1607,9 +1682,21 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     uint32_t first_seq = 0;
     size_t rows = 0;
     const uint32_t since = queryU32(request, "since", 0);
-    doc["trace"] = serialized(renderTrace(since, (size_t)queryU32(request, "n", kTraceMaxRows), &first_seq, &rows));
-    doc["trace_first"] = first_seq;  // sequence number of trace[0]; > since means the ring wrapped
-    doc["trace_rows"] = (uint32_t)rows;
+    if (request->hasParam("log")) {
+      // ?log=1: the per-cycle memory log (cycle_log.h) INSTEAD of the stage trace, because the two
+      // share a render buffer and are never wanted in the same breath. ?since=<cycle_log_seq> and
+      // ?n=1..40 work the same way. Two hours of history at a 30 s cadence, which is what the
+      // 64-entry stage ring - three cycles - cannot give.
+      doc["cycle_log"] = serialized(renderCycleLog(since, (size_t)queryU32(request, "n", kCycleLogMaxRows), &first_seq, &rows));
+      doc["cycle_log_first"] = first_seq;  // sequence number of cycle_log[0]; > since means it wrapped
+      doc["cycle_log_rows"] = (uint32_t)rows;
+      doc["cycle_log_cap"] = (uint32_t)kCycleLogCap;
+    } else {
+      doc["trace"] = serialized(renderTrace(since, (size_t)queryU32(request, "n", kTraceMaxRows), &first_seq, &rows));
+      doc["trace_first"] = first_seq;  // sequence number of trace[0]; > since means the ring wrapped
+      doc["trace_rows"] = (uint32_t)rows;
+    }
+    doc["cycle_log_seq"] = cycleLogSeq();  // pass this back as ?log=1&since= next time
     doc["trace_seq"] = heapTraceSeq();  // pass this back as ?since= next time
     if (request->hasParam("stages")) {
       JsonArray stages = doc["trace_stages"].to<JsonArray>();
