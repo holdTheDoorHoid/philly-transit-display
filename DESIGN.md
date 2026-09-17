@@ -844,7 +844,12 @@ Each feature is `{ "geometry": {"coordinates": [lng, lat]}, "properties": { "id"
 a feature with its dock list can run to ~3 KB. The device never buffers the body: `lib/indego_core`
 scans the stream feature by feature (brace depth inside `"features"`), keeps at most one feature
 (cap 6 KB) and parses only those whose `"id"` is configured. The web UI fetches the same feed in
-the browser to offer the stations nearest each configured stop. Cadence 5 min.
+the browser to offer the stations nearest each configured stop. Cadence 10 min (5 min until
+0.3.1; halved because each refresh is the single most expensive thing a poll cycle does - the
+measured per-stage ring puts the bikes stage at -17.6 KB of byte-addressable free heap with the
+largest free block down to 6.4 KB, held to the end of the cycle - and dock counts do not move
+meaningfully in ten minutes. The first fetch of a boot and any fetch forced by a config change are
+unaffected.)
 
 ## 5. Firmware architecture
 

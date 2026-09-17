@@ -25,7 +25,15 @@ namespace transit_stats {
 
 // Hard caps, per DESIGN's "never load a month into memory" / bounded-heap requirement.
 constexpr size_t kMaxTrackedStops = 8;          // matches config.json's 8-stop maximum (§6)
-constexpr size_t kMaxTrackedTripsPerStop = 12;  // live trips + pending scheduled trips, combined
+// 8, not 12, since 0.3.1 (owner decision, 2026-09-17). F19 had raised it from 8 to 12 to stop an
+// ordinary feed churning its slots; this gives ~4,000 B of the ESP32's heap back - 8 stops x 4
+// slots x ~124 B - on a board where the largest free block, not the free heap, is the resource
+// that runs out (DESIGN.md SS12.1). What it costs is stated rather than hidden: a stop whose feed
+// carries more than eight upcoming trips at once now drops the farthest ones, and if the set
+// churns across polls the tracker can emit a fresh first-sighting `pred` row for a trip it had
+// already seen. The owner's stops carry 4-8, so this does not bite there; a busier stop would
+// show it as extra `pred` rows in the CSV, never as a wrong arrival.
+constexpr size_t kMaxTrackedTripsPerStop = 8;   // live trips + pending scheduled trips, combined
 
 // ---- admission / retention policy (F19) -------------------------------------------------------
 //
@@ -104,10 +112,11 @@ struct StopCounters {
 };
 
 // One configured stop's tracking state.
-// sizeof(StopState) is dominated by trips[kMaxTrackedTripsPerStop]: 12 * 128 B = 1536 B measured
-// on the host (12 * ~112 B ~= 1.3 KB on target), plus three std::strings and the outage/headway
-// scalars. Measured totals: sizeof(StopState) = 1720 B and sizeof(ArrivalTracker) = 13768 B on
-// the 64-bit host, so roughly 10.5 KB on the 32-bit target -- comfortably inside the ~20 KB
+// sizeof(StopState) is dominated by trips[kMaxTrackedTripsPerStop]: 8 * 128 B = 1024 B measured
+// on the host (8 * ~112 B ~= 0.9 KB on target), plus three std::strings and the outage/headway
+// scalars. At 12 slots the measured totals were sizeof(StopState) = 1720 B and
+// sizeof(ArrivalTracker) = 13768 B on the 64-bit host (~12,040 B on the 32-bit target, measured);
+// at 8 they are 4 x 128 B and 8 x 4 x 128 B smaller -- comfortably inside the ~20 KB
 // budget the F19 review set, and asserted in test_stats/test_main.cpp. That is
 // intentionally *not* held to the StatsAggregator's <8 KB rule: it is a long-lived singleton (one
 // instance for the process lifetime), not something instantiated per web request.

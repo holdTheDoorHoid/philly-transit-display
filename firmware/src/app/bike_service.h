@@ -1,5 +1,5 @@
 // Indego bike share (DESIGN.md SS4.9, SS6 "bike"): fetches Bicycle Transit's status feed on the
-// poller task every 5 minutes and keeps the configured stations for the UI and /api/state.
+// poller task every 10 minutes and keeps the configured stations for the UI and /api/state.
 // lib/indego_core scans the ~400 KB body feature by feature; nothing is buffered whole.
 #pragma once
 #include <cstdint>

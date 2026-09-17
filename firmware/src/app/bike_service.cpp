@@ -16,7 +16,15 @@ namespace transit_app {
 
 namespace {
 
-constexpr uint32_t kRefreshMs = 5 * 60 * 1000;
+// 10 minutes, not 5, since 0.3.1 (owner decision, 2026-09-17). Each refresh streams a ~400 KB
+// GeoJSON body through this task; on the measured ring the bikes stage is the single most
+// expensive thing a cycle does (post-bikes free8 -17.6 KB, largest block down to 6.4 KB, held to
+// cycle end). Halving how often it happens halves how often the cycle spends that, and dock counts
+// at a station do not move meaningfully in ten minutes. The FIRST fetch of a boot is unaffected -
+// g_fetched_ms == 0 below makes it due immediately - and a config change still forces one through
+// invalidateBikes(). The hourly `bike` log rows stay inside kBikeSampleMaxAgeS (15 min,
+// net_poller.cpp), which a 10-minute cadence clears with 5 minutes to spare.
+constexpr uint32_t kRefreshMs = 10 * 60 * 1000;
 // What a NON-display task waits for the view. The display task's wait is zero, decided by
 // takeShared() (ui_lock.h): getBikes() at 500 ms, called from refreshMainScreen() on every tick the
 // arrivals page is up, is the accessor that panicked the board on 2026-09-16 in

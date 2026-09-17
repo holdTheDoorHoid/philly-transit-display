@@ -656,7 +656,7 @@ void annotateEvents(std::vector<transit_stats::LogEvent> &events, const std::vec
 }
 
 // DESIGN.md SS9.1 `bike` rows: one per configured Indego station per local clock hour, taken from
-// the last successful refresh (bike_service.cpp polls every 5 min, so a healthy sample is that
+// the last successful refresh (bike_service.cpp polls every 10 min, so a healthy sample is that
 // fresh).
 //
 // F29 - a `bike` row is a claim that "this is what the docks held at ts", so three rules:
@@ -717,7 +717,8 @@ void logBikeSamples(const Config &cfg, time_t now, const std::string &month) {
 // One long-lived ArrivalTracker across the device's uptime (DESIGN.md SS9.1); registerStop() is
 // idempotent so it's safe to re-run on every config change. Heap-allocated on first use rather
 // than a plain global/static instance: ArrivalTracker's own header doc puts sizeof(ArrivalTracker)
-// at ~14-16KB (kMaxTrackedStops * StopState, each holding a kMaxTrackedTripsPerStop array), which
+// at ~8 KB on the target (kMaxTrackedStops * StopState, each holding a kMaxTrackedTripsPerStop
+// array; it was ~12 KB before the slot count dropped from 12 to 8 in 0.3.1), which
 // is fine for the heap (~200KB free at boot per firmware/README.md) but overflows the ESP32's
 // fixed static .bss/.data budget if declared as a file-scope object - confirmed by hitting
 // "DRAM segment data does not fit" at link time with it declared that way.
@@ -1144,7 +1145,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   }
   if (have_time()) {
     tracePoll(kStagePreBikes);
-    refreshBikes(cfg, http_opt_plain);    // DESIGN.md SS4.9: 5 min, 400 KB streamed
+    refreshBikes(cfg, http_opt_plain);    // DESIGN.md SS4.9: 10 min, 400 KB streamed
     tracePoll(kStagePostBikes);
   }
 
