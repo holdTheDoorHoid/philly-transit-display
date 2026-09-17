@@ -54,50 +54,66 @@ struct FetchOutcome {
   std::string error;    // short, human-readable, empty when ok
 };
 
-// --- The poll cycle's reusable working set (DESIGN.md 5, "the poll working set") -------------
+// --- The poll cycle's shared scratch buffer (DESIGN.md 5, "the poll working set") -------------
 //
-// Everything one poll cycle needs a sizeable buffer for, in ONE long-lived object the caller
-// allocates once - on this device, before Wi-Fi, out of a heap that is still a single run - and
-// hands to every fetch of every cycle thereafter.
+// ONE buffer, reserved once by the caller (on this device, in setup() before Wi-Fi) and lent to
+// each stage of a poll cycle IN TURN.
 //
-// WHY. A cycle used to construct these per call: a GtfsRtStream (4,096 B entity buffer +
-// ~4,600 B retention block), a std::vector<uint8_t> body grown from nothing by doubling for each
-// TransitView / BusSchedules / Alerts / Arrivals response, and a 24 x 128 B SchedEntry block per
-// schedule parse. Every one of them is a CONTIGUOUS request, all of them land inside a few
-// hundred milliseconds of each other, and the free heap on the target is not the constraint - the
-// largest free BLOCK is. Measured on the owner's board, that block rests at 25-28 KB and decays
-// with uptime and request rate; at 11.7 KB (seen 2026-09-16, free heap still 36 KB) the cycle
-// threw std::bad_alloc, and every cycle after it did the same until the heap-wedge self-heal
-// rebooted the device. Reserved once, up front, none of these is ever asked for again.
+// WHY ONE AND NOT SIX. The first attempt at this gave every consumer its own permanent buffer -
+// the GTFS-RT entity buffer, the retention block, a response body buffer, the schedule parse
+// block, the transport's own BusSchedules buffer and the Indego feature buffer, about 26 KB in
+// all. Measured on the owner's board (0.3.1-rc1, 2026-09-17) that worked exactly as designed and
+// was still a net loss: the per-cycle CONTIGUOUS demand fell from ~12 KB to ~5 KB, but the resting
+// free heap fell from ~35 KB to ~22 KB and the resting largest block from ~24.5 KB to ~14 KB, so
+// the margin that actually matters - largest block minus demand - went from ~12 KB to ~9 KB. Worse,
+// `min_free8` reached 696 B at 115 s of uptime, with a poll mid-fetch and one concurrent
+// /api/state on the other task: a trough to zero is an lwIP assert, not a caught bad_alloc
+// (DESIGN.md 12.1). The FLOOR matters as much as the demand, and holding memory permanently is
+// how you lower the floor.
+//
+// The fix is that these buffers are never live at the same time. They are all "one thing at a
+// time" byte buffers on a single task, in sequence:
+//
+//   rt-stream    the GtfsRtStream's entity buffer      (4,096 B, dead once finish() is called)
+//   tv-route     the buffered TransitView response     (~1-4 KB)
+//   sched-stop   the buffered BusSchedules response    (<=4 KB)
+//   alerts       the buffered Alerts response          (~1-3 KB)
+//   bikes        the Indego scanner's feature buffer   (6,144 B)
+//
+// so one 6 KB reservation covers the whole cycle. Each consumer BORROWS it (GtfsRtStream::
+// setEntityBuffer, indego::StatusStream::setFeatureBuffer, and this struct's own `scratch` for the
+// buffered JSON bodies) and the next one takes it over.
+//
+// WHAT IS DELIBERATELY *NOT* IN HERE, and why. The GTFS-RT retention block
+// (std::vector<StopTimeUpdate>) and the BusSchedules parse block (std::vector<SchedEntry>) are
+// vectors of non-trivially-destructible types, so backing them with shared bytes would need a
+// custom allocator and a change to the types in this library's public API. They go back to being
+// allocated per cycle - one 4.6 KB request at rt-stream and one 3 KB request per schedule parse -
+// which is a size the measured resting largest block (~24 KB) carries comfortably. Keeping the
+// floor high is worth more than removing them.
+//
+// The ONE buffer the firmware still keeps separately is the transport-level BusSchedules body
+// (net_poller.cpp): that layer buffers the response before transit_core sees it and then copies it
+// in, so the two are briefly live together and cannot be the same vector.
 //
 // LIFETIME AND REENTRANCY. One cycle at a time, on one task: pollBusStops(), pollRailStops() and
-// the firmware's alerts/liveness helpers run one after another on the poller task and never nest.
-// `body` holds one response at a time; `sched` is the parse target for one stop's schedule, which
-// is copied out size-exact before the next stop is fetched. Passing a null PollBuffers* (the
-// default everywhere) restores exactly the old per-call behaviour, which is what the host tests
-// and any other consumer of this library get.
+// the firmware's alerts/liveness/bike helpers run one after another on the poller task and never
+// nest. Passing a null PollBuffers* (the default everywhere) restores per-call buffers exactly,
+// which is what the host tests and any other consumer of this library get.
 struct PollBuffers {
-  // The TripUpdates decoder. reset() per cycle keeps the two blocks above.
-  GtfsRtStream rt{0};
-  // One buffered JSON response body (TransitView, BusSchedules, Alerts, Arrivals). Capped by
-  // kJsonBodyCap inside fetchBuffered(), as before.
-  std::vector<uint8_t> body;
-  // The BusSchedules parse target, kept at kMaxSchedEntries capacity across cycles.
-  ParseResult<SchedEntry> sched;
+  // The shared buffer. Sized for the largest single borrower (the Indego feature buffer at
+  // 6,144 B); the JSON body path may grow it past that for one unusually large response, and
+  // beginCycle() gives that growth back.
+  std::vector<uint8_t> scratch;
 
-  // What body is reserved to, and trimmed back to. 4 KB covers every response this project
-  // fetches (real payloads are 0.8-4 KB - DESIGN.md 4.3-4.6) and is the hard cap the firmware's
-  // own BusSchedules buffering applies; a larger one is still accepted, it just is not kept.
-  static constexpr size_t kBodyReserve = 4096;
+  static constexpr size_t kScratchReserve = 6144;
 
   // Call once, before the first cycle, while the heap is unfragmented.
-  void reserveAll(size_t entity_bytes = 4096,
-                   size_t retained = GtfsRtStream::kDefaultMaxRetainedUpdates,
-                   size_t sched_entries = kMaxSchedEntries);
+  void reserveAll(size_t scratch_bytes = kScratchReserve);
 
-  // Call at the top of each cycle. Clears without releasing, and releases only an oversized body
-  // buffer - a one-off large response must not become resident for the life of the device. Doing
-  // that here rather than at the end of a cycle means the replacement 4 KB block is asked for at
+  // Call at the top of each cycle. Clears without releasing, and releases only growth beyond the
+  // reservation - a one-off large response must not become resident for the life of the device.
+  // Doing it here rather than at the end of a cycle means the replacement block is asked for at
   // the point in the cycle where the largest free block is at its healthiest.
   void beginCycle();
 };
@@ -121,10 +137,10 @@ struct PollBuffers {
 // SchedEntry/RailArrival vectors for one poll cycle - each bounded by its own retention cap
 // (GtfsRtStream::retainUpdates, septa.h's kMax* constants) and freed on return.
 //
-// Constructed with a PollBuffers*, the body buffer and the schedule parse target come from there
-// instead, so a cycle asks the allocator for neither (see PollBuffers above). Nothing else
-// changes: the same bodies are buffered under the same cap and the same out-parameter contract
-// holds - a fetch that fails leaves `*out` untouched.
+// Constructed with a PollBuffers*, the body buffer is that struct's shared scratch instead of a
+// function local, so a cycle asks the allocator for it once rather than once per fetch (see
+// PollBuffers above). Nothing else changes: the same bodies are buffered under the same cap and
+// the same out-parameter contract holds - a fetch that fails leaves `*out` untouched.
 class SeptaSource : public TransitSource {
  public:
   SeptaSource() = default;
@@ -209,9 +225,9 @@ bool fetchPlausibleSchedule(SeptaSource& src, const std::string& stop_id, Epoch 
 // Health::ScheduleOnly) and leaves the subway alone. Snapshot::last_poll_ok is then simply "every
 // stop's required sources succeeded", and last_error the first stop error seen.
 //
-// `buffers`, when non-null, is the caller's long-lived working set (PollBuffers above): the
-// TripUpdates decoder, the response body buffer and the schedule parse target all come from it
-// instead of being constructed for this call. Null (the default) behaves exactly as before.
+// `buffers`, when non-null, is the caller's shared scratch buffer (PollBuffers above): the
+// TripUpdates decoder borrows it for its entity buffer and then hands it on to each buffered JSON
+// response. Null (the default) behaves exactly as before.
 Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGetEx http,
                       ScheduleCache& cache, PollBuffers* buffers = nullptr);
 Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet http,

@@ -43,11 +43,11 @@ SemaphoreHandle_t mutex() {
 }
 
 // The scanner, allocated once before Wi-Fi (preallocateBikeStream) and reset per refresh. Its
-// feature buffer is a 6,144 B contiguous block; constructing a StatusStream per refresh asked for
-// that block every five minutes, in the middle of a cycle, on a board whose largest free block
-// rests at 25-28 KB and decays (DESIGN.md SS5, SS12.1). Heap-allocated rather than a file-scope
-// object for the same reason the ArrivalTracker is: the ESP32's static .bss budget is separate
-// from and much smaller than the heap.
+// 6,144 B feature buffer is BORROWED from the poller's shared scratch (refreshBikes below), so the
+// object itself is about a hundred bytes: the bytes were already paid for by the transit fetches
+// earlier in the same cycle, which are done with them by now. Heap-allocated rather than a
+// file-scope object for the same reason the ArrivalTracker is: the ESP32's static .bss budget is
+// separate from and much smaller than the heap.
 indego::StatusStream *g_stream = nullptr;
 
 }  // namespace
@@ -61,7 +61,7 @@ void invalidateBikes() {
   g_invalidate = true;
 }
 
-void refreshBikes(const Config &cfg, const transit::HttpGet &http) {
+void refreshBikes(const Config &cfg, const transit::HttpGet &http, std::vector<uint8_t> *scratch) {
   if (!cfg.bike.enabled || cfg.bike.stations.empty()) {
     BikeView empty;  // swapped out and destroyed below, with the lock released
     if (xSemaphoreTake(mutex(), pdMS_TO_TICKS(kBikeLockWaitMs)) == pdTRUE) {
@@ -89,6 +89,9 @@ void refreshBikes(const Config &cfg, const transit::HttpGet &http) {
     return;
   }
   indego::StatusStream &stream = *sp;
+  // Borrow the poller's shared buffer for the one-feature scratch. Order matters: setFeatureBuffer
+  // gives back whatever the scanner was holding, and reset() then sizes the borrowed vector.
+  stream.setFeatureBuffer(scratch);
   stream.reset();
   stream.setStationFilter(ids);
   int status = http(indego::statusUrl(), [&](const uint8_t *d, size_t n) { return stream.push(d, n); });

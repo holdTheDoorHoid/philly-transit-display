@@ -246,23 +246,37 @@ class AppScheduleCache : public transit::ScheduleCache {
 
 AppScheduleCache g_sched_cache;
 
-// ---- The poll cycle's working set (DESIGN.md SS5) --------------------------------------------
-// Allocated once by preallocatePollBuffers(), from main.cpp, before Wi-Fi - the same reasoning and
-// the same moment as the ArrivalTracker above. transit_core's PollBuffers owns the GTFS-RT entity
-// buffer (4,096 B), its retention block (~4,600 B), one response body buffer (4,096 B) and the
-// BusSchedules parse block (24 x 128 B); g_sched_raw below is the firmware's own, because the
-// BusSchedules branch of makeHttpGetEx() buffers the response at the TRANSPORT layer - before
-// transit_core sees it - so it cannot be the same vector transit_core is appending into.
+// ---- The poll cycle's shared scratch (DESIGN.md SS5, "the poll working set") -----------------
+// Two buffers, allocated once by preallocatePollBuffers() from main.cpp before Wi-Fi - the same
+// reasoning and the same moment as the ArrivalTracker above.
 //
-// Every one of these is a multi-kilobyte contiguous request, they all fall inside the same few
-// hundred milliseconds of a cycle, and the largest free block on this board rests at 25-28 KB and
-// decays with uptime and request rate (DESIGN.md SS12.1). At 11.7 KB - measured, with 36 KB still
-// free - the cycle threw std::bad_alloc and every cycle after it did the same. Reserved before
-// Wi-Fi, out of a heap that is still one run, none of them is ever asked for again.
+// transit::PollBuffers::scratch (6,144 B) is ONE buffer lent to each stage of a cycle in turn: the
+// GTFS-RT entity buffer during the TripUpdates fetch, then each buffered JSON response
+// (TransitView, BusSchedules, Alerts, Arrivals), then the Indego scanner's one-feature buffer.
+// None of those is live at the same time as another, so one reservation covers the whole cycle.
+//
+// g_sched_raw (4,096 B) is the ONE exception, and it is the firmware's own: the BusSchedules
+// branch of makeHttpGetEx() buffers the response at the TRANSPORT layer - before transit_core sees
+// it - and then hands it over, so for that moment two byte buffers really are live at once and
+// they cannot be the same vector. It is also the buffer on the path implicated in the morning
+// collapse (the 4-attempt loop inside fetchPlausibleSchedule's 3, re-entered every two minutes
+// while SEPTA answers with the wrong service day), which is why it is worth a reservation of its
+// own rather than one allocation per schedule fetch.
+//
+// WHAT IS NOT HERE, and it is the correction 0.3.1-rc1 earned on the hardware. rc1 gave every
+// consumer a permanent buffer - about 26 KB. That did what it said (per-cycle contiguous demand
+// ~12 KB -> ~5 KB) and was still a net loss: resting free8 fell from ~35 KB to ~22 KB and the
+// resting largest block from ~24.5 KB to ~14 KB, so the margin that decides whether a cycle
+// survives - largest block minus demand - went from ~12 KB to ~9 KB, and min_free8 reached 696 B
+// at 115 s of uptime with a poll mid-fetch and one concurrent /api/state. A trough to zero is an
+// lwIP assert, not a caught bad_alloc (DESIGN.md SS12.1). So the GTFS-RT retention block and the
+// BusSchedules parse block - both vectors of non-trivially-destructible values, which cannot share
+// raw bytes without a custom allocator - go back to being allocated per cycle. They are 4.6 KB and
+// 3 KB, sizes a ~24 KB resting largest block carries comfortably.
 //
 // Heap-allocated rather than a file-scope object, like the tracker: the ESP32's static .bss budget
 // is separate from and much smaller than the heap. A null pointer is a working fallback, not a
-// failure - transit_core builds them per call exactly as it used to.
+// failure - transit_core builds its buffers per call exactly as it used to.
 transit::PollBuffers *g_poll_buffers = nullptr;
 std::vector<uint8_t> g_sched_raw;
 
@@ -1151,7 +1165,10 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   }
   if (have_time()) {
     tracePoll(kStagePreBikes);
-    refreshBikes(cfg, http_opt_plain);    // DESIGN.md SS4.9: 10 min, 400 KB streamed
+    // The scanner borrows the same bytes the transit fetches used earlier in this cycle; they
+    // are done with them (transit_core PollBuffers).
+    refreshBikes(cfg, http_opt_plain,
+                 g_poll_buffers != nullptr ? &g_poll_buffers->scratch : nullptr);  // SS4.9: 10 min, 400 KB streamed
     tracePoll(kStagePostBikes);
   }
 
@@ -1386,9 +1403,9 @@ bool preallocatePollBuffers() {
       try {
         g_poll_buffers->reserveAll();
       } catch (const std::bad_alloc &) {
-        // Partially reserved is still usable - whatever was not reserved is simply grown on
-        // demand, which is the old behaviour. Nothing here may throw past setup().
-        Serial.println("[net_poller] poll working set only partly reserved (out of memory)");
+        // Unreserved is still usable - the buffer is simply grown on demand, which is the old
+        // behaviour. Nothing here may throw past setup().
+        Serial.println("[net_poller] shared poll scratch not reserved (out of memory)");
       }
     }
   }
@@ -1399,6 +1416,9 @@ bool preallocatePollBuffers() {
   } catch (const std::bad_alloc &) {
     Serial.println("[net_poller] BusSchedules buffer not reserved (out of memory)");
   }
+  Serial.printf("[heap] poll_scratch %u B + sched %u B\n",
+                (unsigned)(g_poll_buffers != nullptr ? g_poll_buffers->scratch.capacity() : 0),
+                (unsigned)g_sched_raw.capacity());
   return g_poll_buffers != nullptr;
 }
 

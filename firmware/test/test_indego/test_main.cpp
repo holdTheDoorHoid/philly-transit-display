@@ -350,6 +350,56 @@ void test_reset_mid_stream_discards_partial_state() {
   TEST_ASSERT_EQUAL_INT(3468, s.stations()[1].id);
 }
 
+// The buffer borrow (DESIGN.md 5, "the poll working set"). The firmware hands this scanner the
+// SAME std::vector the GTFS-RT decoder used as its entity buffer, and each buffered JSON response
+// used as its body, earlier in the same cycle - one 6 KB reservation instead of four. So a
+// borrowing scanner has to produce exactly what an owning one does, and must not take a buffer of
+// its own on top.
+void test_borrowed_feature_buffer_scans_identically() {
+  std::vector<uint8_t> body = readFixture("indego_bts_status_sample.json");
+
+  StatusStream owning;
+  owning.setStationFilter({3468, 3361});
+  owning.push(body.data(), body.size());
+  owning.finish();
+
+  // Deliberately handed a vector that is EMPTY and unreserved, the way the real one would be after
+  // a previous borrower cleared it: setFeatureBuffer sizes it.
+  std::vector<uint8_t> shared;
+  StatusStream borrowing;
+  borrowing.setFeatureBuffer(&shared);
+  TEST_ASSERT_TRUE(shared.capacity() >= StatusStream::kMaxFeatureBytes);
+  const size_t cap_after_borrow = shared.capacity();
+
+  for (int pass = 0; pass < 3; ++pass) {
+    borrowing.reset();
+    borrowing.setStationFilter({3468, 3361});
+    borrowing.push(body.data(), body.size());
+    borrowing.finish();
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(owning.stations().size()),
+                              static_cast<uint32_t>(borrowing.stations().size()));
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(owning.featuresSeen()),
+                              static_cast<uint32_t>(borrowing.featuresSeen()));
+    for (size_t i = 0; i < owning.stations().size(); ++i) {
+      TEST_ASSERT_EQUAL_INT(owning.stations()[i].id, borrowing.stations()[i].id);
+      TEST_ASSERT_EQUAL_STRING(owning.stations()[i].name.c_str(),
+                                borrowing.stations()[i].name.c_str());
+      TEST_ASSERT_EQUAL_INT(owning.stations()[i].bikes, borrowing.stations()[i].bikes);
+    }
+    // The borrowed buffer is REUSED, not replaced: a capacity that moved would mean the scanner
+    // took storage of its own and the shared reservation had been defeated.
+    TEST_ASSERT_EQUAL_UINT32(cap_after_borrow, static_cast<uint32_t>(shared.capacity()));
+  }
+
+  // And handing the borrow back puts the scanner on its own buffer again, still correct.
+  borrowing.setFeatureBuffer(nullptr);
+  borrowing.reset();
+  borrowing.setStationFilter({3361});
+  borrowing.push(body.data(), body.size());
+  borrowing.finish();
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(borrowing.stations().size()));
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(test_parse_fixture_filtered);
@@ -362,5 +412,6 @@ int main() {
   RUN_TEST(test_status_url);
   RUN_TEST(test_reset_rescans_identically_and_keeps_the_buffer);
   RUN_TEST(test_reset_mid_stream_discards_partial_state);
+  RUN_TEST(test_borrowed_feature_buffer_scans_identically);
   return UNITY_END();
 }

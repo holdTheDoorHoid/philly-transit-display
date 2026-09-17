@@ -53,15 +53,9 @@ FetchResult fetchBuffered(const std::string& url, const HttpGetEx& http,
 // but a body that did not arrive whole is a failure regardless of what it parsed to - a truncated
 // document that happens to be valid JSON is worse than no document, because it looks fine.
 //
-// `borrowed` says the parse target is not this call's to give away: it is the caller's long-lived
-// PollBuffers::sched, whose whole purpose is to keep its capacity. The items are then COPIED out
-// size-exact instead of moved, which is also the smaller contiguous request - a 12-entry schedule
-// is ~1.5 KB where the parse block is a flat 3 KB. `*out` is still left untouched on every
-// failure path, which fetchPlausibleSchedule() and its host tests depend on.
 template <typename T>
 FetchOutcome finishJsonFetch(const char* what, const FetchResult& transport,
-                              ParseResult<T>* parsed, bool body_empty, std::vector<T>* out,
-                              bool borrowed = false) {
+                              ParseResult<T>* parsed, bool body_empty, std::vector<T>* out) {
   FetchOutcome o;
   o.transport = transport;
   if (body_empty) {
@@ -77,11 +71,7 @@ FetchOutcome finishJsonFetch(const char* what, const FetchResult& transport,
     o.error = parsed->error.empty() ? std::string(what) + " unreadable response" : parsed->error;
     return o;
   }
-  if (borrowed) {
-    out->assign(parsed->items.begin(), parsed->items.end());
-  } else {
-    *out = std::move(parsed->items);
-  }
+  *out = std::move(parsed->items);
   o.ok = true;
   return o;
 }
@@ -100,30 +90,18 @@ void addUnique(std::vector<std::string>& v, const std::string& item) {
 
 // --- PollBuffers -----------------------------------------------------------------------------
 
-void PollBuffers::reserveAll(size_t entity_bytes, size_t retained, size_t sched_entries) {
-  // reset() reserves the entity buffer; retainUpdates() reserves the retention block. Doing both
-  // here means the two largest contiguous requests a poll cycle makes are paid once, by whoever
-  // calls this - on the firmware, main.cpp before Wi-Fi.
-  rt.reset(entity_bytes);
-  rt.retainUpdates(retained, GtfsRtStream::kDefaultMaxPerStopRoute);
-  body.reserve(kBodyReserve);
-  sched.items.reserve(sched_entries);
-}
+void PollBuffers::reserveAll(size_t scratch_bytes) { scratch.reserve(scratch_bytes); }
 
 void PollBuffers::beginCycle() {
-  if (body.capacity() > kBodyReserve) {
-    // A response larger than the reserve made the vector double past it. Give that block back and
-    // take a fresh 4 KB one HERE, at the top of a cycle, where the largest free block is at its
-    // best - rather than letting an occasional big body become resident for the life of the
-    // device. swap-with-a-temporary is the only way to make a std::vector release capacity.
-    std::vector<uint8_t>().swap(body);
-    body.reserve(kBodyReserve);
+  if (scratch.capacity() > kScratchReserve) {
+    // Some response larger than the reservation made the vector double past it. Give that block
+    // back and take a fresh one HERE, at the top of a cycle, where the largest free block is at
+    // its best - rather than letting one big body become resident for the life of the device.
+    // swap-with-a-temporary is the only way to make a std::vector release capacity.
+    std::vector<uint8_t>().swap(scratch);
+    scratch.reserve(kScratchReserve);
   }
-  body.clear();
-  sched.items.clear();
-  sched.error.clear();
-  sched.dropped = 0;
-  sched.ok = true;
+  scratch.clear();
 }
 
 std::string septaTripUpdatesUrl() {
@@ -196,7 +174,7 @@ FetchOutcome SeptaSource::fetchRealtimeEx(GtfsRtStream& stream, HttpGetEx http) 
 FetchOutcome SeptaSource::fetchTransitViewEx(const std::string& route,
                                               std::vector<TvVehicle>* out, HttpGetEx http) {
   std::vector<uint8_t> own_body;
-  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->body : own_body;
+  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->scratch : own_body;
   FetchResult t = fetchBuffered(septaTransitViewUrl(route), http, &body);
   ParseResult<TvVehicle> parsed;
   if (!body.empty()) parsed = parseTransitView(body.data(), body.size());
@@ -206,23 +184,14 @@ FetchOutcome SeptaSource::fetchTransitViewEx(const std::string& route,
 FetchOutcome SeptaSource::fetchScheduleEx(const std::string& stop_id,
                                            std::vector<SchedEntry>* out, HttpGetEx http) {
   std::vector<uint8_t> own_body;
-  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->body : own_body;
+  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->scratch : own_body;
   FetchResult t = fetchBuffered(septaBusSchedulesUrl(stop_id), http, &body);
   // Parse regardless of `status`: SEPTA has been observed returning a valid-shaped body on a
   // non-200 status for this endpoint (NOTES.md) - the status code alone is not a reliable
   // "was there usable data" signal here.
-  //
-  // The parse target is the caller's long-lived one when there is one, so the 24 x 128 B
-  // kMaxSchedEntries reserve() inside parseBusSchedulesInto() is a no-op after the first cycle.
-  ParseResult<SchedEntry> own_parsed;
-  ParseResult<SchedEntry>& parsed = buffers_ != nullptr ? buffers_->sched : own_parsed;
-  parsed.ok = true;
-  parsed.error.clear();
-  parsed.dropped = 0;
-  parsed.items.clear();
+  ParseResult<SchedEntry> parsed;
   if (!body.empty()) parseBusSchedulesInto(&parsed, body.data(), body.size());
-  FetchOutcome o = finishJsonFetch("SEPTA schedule", t, &parsed, body.empty(), out,
-                                    buffers_ != nullptr);
+  FetchOutcome o = finishJsonFetch("SEPTA schedule", t, &parsed, body.empty(), out);
   if (!o.ok && o.error.empty()) o.error = "SEPTA schedule unavailable";
   return o;
 }
@@ -236,7 +205,7 @@ FetchOutcome SeptaSource::fetchAlertsEx(Mode mode, const std::string& route,
     return o;
   }
   std::vector<uint8_t> own_body;
-  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->body : own_body;
+  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->scratch : own_body;
   FetchResult t = fetchBuffered(url, http, &body);
   ParseResult<transit::Alert> parsed;
   if (!body.empty()) parsed = parseAlerts(body.data(), body.size());
@@ -246,7 +215,7 @@ FetchOutcome SeptaSource::fetchAlertsEx(Mode mode, const std::string& route,
 FetchOutcome SeptaSource::fetchRailArrivalsEx(const std::string& station,
                                                std::vector<RailArrival>* out, HttpGetEx http) {
   std::vector<uint8_t> own_body;
-  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->body : own_body;
+  std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->scratch : own_body;
   FetchResult t = fetchBuffered(septaArrivalsUrl(station), http, &body);
   ParseResult<RailArrival> parsed;
   if (!body.empty()) parsed = parseRailArrivals(body.data(), body.size());
@@ -385,14 +354,16 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
   // copying it into a vector of its own. A subway-only config never feeds this stream, so it is
   // built with a zero-byte entity buffer in that case and reserves nothing at all.
   //
-  // With a PollBuffers the stream is the caller's, reset rather than constructed, so the 4,096 B
-  // entity buffer and the ~4,600 B retention block are not asked for again (PollBuffers). The
-  // local is then an empty shell - GtfsRtStream(0) reserves nothing - and costs only its own
-  // ~150 bytes of stack.
+  // With a PollBuffers the entity buffer is BORROWED from the shared scratch rather than
+  // allocated here (PollBuffers): it is live only until finish(), so the same bytes go on to serve
+  // every buffered JSON response of this cycle and then the Indego scanner. The stream object
+  // itself is still a local - it is ~150 bytes of stack once it owns no buffer.
   const size_t entity_bytes = rt_routes.empty() ? 0 : 4096;
-  GtfsRtStream own_stream(buffers != nullptr ? 0 : entity_bytes);
-  GtfsRtStream& stream = buffers != nullptr ? buffers->rt : own_stream;
-  if (buffers != nullptr) stream.reset(entity_bytes);
+  GtfsRtStream stream(buffers != nullptr ? 0 : entity_bytes);
+  if (buffers != nullptr && entity_bytes > 0) {
+    stream.setEntityBuffer(&buffers->scratch);
+    stream.reset(entity_bytes);
+  }
   bool rt_ok = true;
   std::string rt_error;
   if (!rt_routes.empty()) {
@@ -406,7 +377,13 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
                                  : ("TripUpdates: " + o.error);
     }
   }
-  pollTrace(kPollTraceRtStream);  // 4,096 B entity buffer + ~4,800 B retained buffer are live here
+  // The entity buffer is dead the moment the feed has been consumed - nothing reads it after
+  // finish() - so the borrow is handed back HERE, before the first buffered response needs it.
+  // The retention block is NOT: the merge loop at the bottom reads stream.retained() directly, so
+  // that one stays live for the whole call (it is a vector of non-trivially-destructible values
+  // and cannot share the byte scratch - see PollBuffers).
+  if (buffers != nullptr) stream.setEntityBuffer(nullptr);
+  pollTrace(kPollTraceRtStream);  // the ~4,600 B retention block is what is live from here on
   const std::vector<StopTimeUpdate>& rt_updates = stream.retained();
 
   struct RouteVehicles {

@@ -14,6 +14,9 @@ namespace {
 // has already run out.
 std::atomic<void *> g_reserve{nullptr};
 std::atomic<uint32_t> g_dropped{0};
+// Written once in setup(), read by the web task thereafter.
+int g_bt_rc = -1;
+int32_t g_bt_gain = 0;
 }  // namespace
 
 bool heapReserveHeld() { return g_reserve.load() != nullptr; }
@@ -46,6 +49,15 @@ bool rearmHeapReserveIfSafe() {
   }
   return armHeapReserve();
 }
+
+void noteBluetoothRelease(int rc, int32_t gain_bytes) {
+  g_bt_rc = rc;
+  g_bt_gain = gain_bytes;
+}
+
+int bluetoothReleaseRc() { return g_bt_rc; }
+
+int32_t bluetoothReleaseGainBytes() { return g_bt_gain; }
 
 uint32_t oomRepliesDropped() { return g_dropped.load(); }
 

@@ -126,12 +126,10 @@ ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len);
 // match.
 ParseResult<SchedEntry> parseBusSchedules(const uint8_t* data, size_t len);
 
-// The same parse, writing into a result the caller already owns. `out` is reset (items cleared,
-// ok/error/dropped restored) but its items vector's CAPACITY is kept, so a caller that hands the
-// same result back every time pays the kMaxSchedEntries reserve() - 24 x 128 B, i.e. a 3 KB
-// contiguous block - once instead of once per schedule fetch. That block is asked for with the
-// GTFS-RT entity and retention buffers and the response body all still live, which is the
-// allocation order DESIGN.md SS5's "poll working set" exists to take apart.
+// The same parse, writing into a result the caller already owns: `out` is reset (items cleared,
+// ok/error/dropped restored) with its items vector's CAPACITY kept, so a caller that hands the
+// same result back each time pays the kMaxSchedEntries reserve() once rather than per fetch.
+// parseBusSchedules() above is this with a fresh result.
 void parseBusSchedulesInto(ParseResult<SchedEntry>* out, const uint8_t* data, size_t len);
 
 // The earliest still-upcoming `DateCalender` in a RAW BusSchedules body, as epoch seconds, or 0

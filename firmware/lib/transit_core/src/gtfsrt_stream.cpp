@@ -80,13 +80,24 @@ int32_t toInt32(uint64_t v) { return static_cast<int32_t>(static_cast<int64_t>(v
 }  // namespace
 
 GtfsRtStream::GtfsRtStream(size_t max_entity_bytes) : max_entity_bytes_(max_entity_bytes) {
-  entity_buf_.reserve(max_entity_bytes_);
+  own_entity_buf_.reserve(max_entity_bytes_);
+}
+
+void GtfsRtStream::setEntityBuffer(std::vector<uint8_t>* borrowed) {
+  borrowed_entity_buf_ = borrowed;
+  if (borrowed != nullptr) {
+    // Give back whatever this object was holding: the whole point of the borrow is that one
+    // reservation serves several stages, so keeping a second one would defeat it.
+    std::vector<uint8_t>().swap(own_entity_buf_);
+    if (borrowed->capacity() < max_entity_bytes_) borrowed->reserve(max_entity_bytes_);
+  }
 }
 
 void GtfsRtStream::reset(size_t max_entity_bytes) {
   max_entity_bytes_ = max_entity_bytes;
-  entity_buf_.clear();  // keeps the capacity: that is the whole point of reusing the object
-  if (entity_buf_.capacity() < max_entity_bytes_) entity_buf_.reserve(max_entity_bytes_);
+  std::vector<uint8_t>& buf = entityBuf();
+  buf.clear();  // keeps the capacity: that is the whole point of reusing the object
+  if (buf.capacity() < max_entity_bytes_) buf.reserve(max_entity_bytes_);
   entity_target_ = 0;
 
   route_filter_.clear();
@@ -305,7 +316,7 @@ void GtfsRtStream::feedByte(uint8_t b) {
           decodeEntity(nullptr, 0);
           state_ = State::kTag;
         } else {
-          entity_buf_.clear();
+          entityBuf().clear();
           entity_target_ = static_cast<size_t>(length);
           state_ = State::kEntityBody;
         }
@@ -330,9 +341,9 @@ void GtfsRtStream::feedByte(uint8_t b) {
       return;
 
     case State::kEntityBody:
-      entity_buf_.push_back(b);
-      if (entity_buf_.size() == entity_target_) {
-        decodeEntity(entity_buf_.data(), entity_buf_.size());
+      entityBuf().push_back(b);
+      if (entityBuf().size() == entity_target_) {
+        decodeEntity(entityBuf().data(), entityBuf().size());
         state_ = State::kTag;
       }
       return;

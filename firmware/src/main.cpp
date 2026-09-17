@@ -219,11 +219,16 @@ void releaseBluetoothMemory() {
   const size_t before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   const esp_err_t err = esp_bt_mem_release(ESP_BT_MODE_BTDM);
   const size_t after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-  Serial.printf("[heap] bt_release err=%d (%s) free8 %u -> %u (+%d) largest=%u\n", (int)err,
-                esp_err_to_name(err), (unsigned)before, (unsigned)after, (int)(after - before),
+  const int32_t gain = (int32_t)after - (int32_t)before;
+  Serial.printf("[heap] bt_release err=%d (%s) free8 %u -> %u (%+d) largest=%u\n", (int)err,
+                esp_err_to_name(err), (unsigned)before, (unsigned)after, (int)gain,
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  // ...and where it can be READ: the serial console cannot be captured on this bench (opening the
+  // port resets the board), so GET /api/debug/ui carries the same two numbers.
+  transit_app::noteBluetoothRelease((int)err, gain);
 #else
   Serial.println("[heap] bt_release skipped: no Bluetooth controller in this build");
+  transit_app::noteBluetoothRelease(-1, 0);
 #endif
 }
 

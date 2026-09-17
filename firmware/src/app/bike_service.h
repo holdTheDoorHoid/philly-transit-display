@@ -11,13 +11,19 @@
 
 namespace transit_app {
 
-void refreshBikes(const Config &cfg, const transit::HttpGet &http);  // once per poll cycle; no-op when not due
+// `scratch`, when non-null, is the poller's shared byte buffer (transit_core PollBuffers): the
+// feed scanner borrows it for its 6 KB one-feature buffer instead of taking one of its own. By the
+// time this runs, the transit fetches that used the same bytes earlier in the cycle are done with
+// them. Null means the scanner owns its buffer, exactly as before.
+void refreshBikes(const Config &cfg, const transit::HttpGet &http,
+                  std::vector<uint8_t> *scratch = nullptr);  // once per poll cycle; no-op when not due
 void invalidateBikes();                                              // config changed
 
-// Allocates the feed scanner, whose one-feature scratch buffer is a 6,144 B contiguous block, at
-// the same point in setup() as the other long-lived objects - before Wi-Fi, out of a heap that is
-// still one run (DESIGN.md SS5 "the poll working set"). Returns false if it could not be had, in
-// which case refreshBikes() builds one per refresh exactly as before.
+// Allocates the feed scanner object itself at the same point in setup() as the other long-lived
+// objects. It is ~100 bytes once its 6 KB feature buffer is borrowed from the poller's shared
+// scratch (see refreshBikes); what this buys is not the bytes but never constructing the scanner
+// mid-cycle. Returns false if it could not be had, in which case refreshBikes() builds one per
+// refresh exactly as before.
 bool preallocateBikeStream();
 
 struct BikeView {

@@ -708,12 +708,8 @@ void test_poll_buffers_keep_their_capacity_across_cycles() {
 
   PollBuffers buf;
   buf.reserveAll();
-  const size_t body_cap = buf.body.capacity();
-  const size_t sched_cap = buf.sched.items.capacity();
-  const size_t retained_cap = buf.rt.retained().capacity();
-  TEST_ASSERT_TRUE(body_cap >= PollBuffers::kBodyReserve);
-  TEST_ASSERT_TRUE(sched_cap >= kMaxSchedEntries);
-  TEST_ASSERT_TRUE(retained_cap >= GtfsRtStream::kDefaultMaxRetainedUpdates);
+  const size_t cap = buf.scratch.capacity();
+  TEST_ASSERT_TRUE(cap >= PollBuffers::kScratchReserve);
 
   WarmScheduleCache cache;
   for (int cycle = 0; cycle < 3; ++cycle) {
@@ -721,10 +717,10 @@ void test_poll_buffers_keep_their_capacity_across_cycles() {
     Snapshot snap = pollBusStops(configs, now, http, cache, &buf);
     TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(snap.stops.size()));
     // Not "at least": exactly what was reserved, cycle after cycle. A capacity that GREW would
-    // mean a reallocation happened; one that shrank would mean the buffer was given away.
-    TEST_ASSERT_EQUAL_UINT32(body_cap, static_cast<uint32_t>(buf.body.capacity()));
-    TEST_ASSERT_EQUAL_UINT32(sched_cap, static_cast<uint32_t>(buf.sched.items.capacity()));
-    TEST_ASSERT_EQUAL_UINT32(retained_cap, static_cast<uint32_t>(buf.rt.retained().capacity()));
+    // mean a response outran the reservation; one that shrank would mean the buffer was given
+    // away. Every borrower - the GTFS-RT entity buffer, each buffered JSON response - hands the
+    // same storage on rather than taking its own.
+    TEST_ASSERT_EQUAL_UINT32(cap, static_cast<uint32_t>(buf.scratch.capacity()));
   }
 }
 
@@ -744,8 +740,8 @@ void test_poll_buffers_do_not_change_what_a_cycle_produces() {
   buf.beginCycle();
   Snapshot with_second = pollBusStops(configs, now, http, buffered_cache, &buf);
 
-  // Identical to the unbuffered answer, and identical again on the reused buffers - which is what
-  // says reset() left no state behind from the previous cycle.
+  // Identical to the unbuffered answer, and identical again on the reused buffer - which is what
+  // says the entity-buffer borrow was handed back cleanly and no stage read another's leftovers.
   TEST_ASSERT_EQUAL_STRING(describe(without).c_str(), describe(with_first).c_str());
   TEST_ASSERT_EQUAL_STRING(describe(without).c_str(), describe(with_second).c_str());
 }
@@ -753,13 +749,15 @@ void test_poll_buffers_do_not_change_what_a_cycle_produces() {
 void test_poll_buffers_return_an_oversized_body_buffer() {
   PollBuffers buf;
   buf.reserveAll();
-  // An unusually large response grew the body past the reserve. It must not stay resident: the
-  // next cycle's beginCycle() gives the block back and takes a fresh reserve-sized one.
-  buf.body.resize(3 * PollBuffers::kBodyReserve);
-  TEST_ASSERT_TRUE(buf.body.capacity() > PollBuffers::kBodyReserve);
+  // An unusually large response grew the scratch past the reservation. It must not stay resident:
+  // the next cycle's beginCycle() gives the block back and takes a fresh reserve-sized one. This
+  // is what keeps the FLOOR from drifting down over uptime, which is the failure the first
+  // attempt at this made (see PollBuffers).
+  buf.scratch.resize(3 * PollBuffers::kScratchReserve);
+  TEST_ASSERT_TRUE(buf.scratch.capacity() > PollBuffers::kScratchReserve);
   buf.beginCycle();
-  TEST_ASSERT_EQUAL_UINT32(PollBuffers::kBodyReserve, static_cast<uint32_t>(buf.body.capacity()));
-  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(buf.body.size()));
+  TEST_ASSERT_EQUAL_UINT32(PollBuffers::kScratchReserve, static_cast<uint32_t>(buf.scratch.capacity()));
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(buf.scratch.size()));
 }
 
 void test_poll_buffers_remove_the_large_contiguous_requests() {
@@ -767,17 +765,17 @@ void test_poll_buffers_remove_the_large_contiguous_requests() {
   std::vector<StopConfig> configs = twoStopConfigs();
   Epoch now = 1789352300;
 
-  // WITHOUT the working set: the GTFS-RT entity buffer (4,096 B) and its retention block are
-  // constructed per cycle, so the cycle makes at least one 4 KB-or-larger contiguous request.
+  // Counted rather than measured as a maximum, and the comment in alloc_probe.h says why: the
+  // single biggest request a cycle makes is the GTFS-RT retention block, which is DELIBERATELY
+  // still per-cycle. What the shared scratch removes is every OTHER multi-kilobyte request - the
+  // entity buffer and each buffered response body - so the question is how many there are.
   FakeScheduleCache plain_cache;
   transit_test::AllocProbe::begin();
   (void)pollBusStops(configs, now, http, plain_cache, nullptr);
-  const size_t largest_without = transit_test::AllocProbe::end();
-  TEST_ASSERT_TRUE_MESSAGE(largest_without >= 4096,
-                            "a per-call cycle should ask for at least one 4 KB block");
+  (void)transit_test::AllocProbe::end();
+  const size_t big_without = transit_test::AllocProbe::countAtLeast(4096);
+  TEST_ASSERT_TRUE_MESSAGE(big_without >= 2, "a per-call cycle makes several 4 KB+ requests");
 
-  // WITH it, on a warm cycle: nothing that big is asked for again. The remaining requests are the
-  // Snapshot's own arrival vectors and the strings in them, which are the product of the poll.
   PollBuffers buf;
   buf.reserveAll();
   WarmScheduleCache cache;
@@ -786,9 +784,22 @@ void test_poll_buffers_remove_the_large_contiguous_requests() {
   buf.beginCycle();
   transit_test::AllocProbe::begin();
   Snapshot snap = pollBusStops(configs, now, http, cache, &buf);
-  const size_t largest_with = transit_test::AllocProbe::end();
+  (void)transit_test::AllocProbe::end();
+  const size_t big_with = transit_test::AllocProbe::countAtLeast(4096);
+
   TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(snap.stops.size()));
-  TEST_ASSERT_TRUE_MESSAGE(largest_with < 4096,
-                            "a warm cycle must not ask for a 4 KB contiguous block");
-  TEST_ASSERT_TRUE(largest_with < largest_without);
+  // Exactly one left, and it is the retention block: everything else now comes out of the scratch.
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(big_with));
+  TEST_ASSERT_TRUE(big_with < big_without);
+}
+
+void test_poll_buffers_hand_the_same_storage_to_the_indego_scanner() {
+  // The cross-library half of the arrangement, stated as a test because nothing else would catch
+  // it: the same vector that was the GTFS-RT entity buffer and then each response body is handed
+  // to indego::StatusStream later in the SAME cycle. It is checked here as capacity retention -
+  // the scanner must not take a buffer of its own - with the scanner's own behaviour covered by
+  // test_indego.
+  PollBuffers buf;
+  buf.reserveAll();
+  TEST_ASSERT_TRUE(buf.scratch.capacity() >= 6144);  // sized for the largest borrower
 }

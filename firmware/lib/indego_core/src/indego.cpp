@@ -86,6 +86,15 @@ void StatusStream::setStationFilter(const std::vector<int>& ids) {
   remaining_ids_ = ids;
 }
 
+void StatusStream::setFeatureBuffer(std::vector<uint8_t>* borrowed) {
+  borrowed_feature_buf_ = borrowed;
+  if (borrowed != nullptr) {
+    // Give back what this object was holding: one reservation is the point of the borrow.
+    std::vector<uint8_t>().swap(own_feature_buf_);
+    if (borrowed->capacity() < kMaxFeatureBytes) borrowed->reserve(kMaxFeatureBytes);
+  }
+}
+
 void StatusStream::reset() {
   state_ = State::kSeekKey;
   key_match_pos_ = 0;
@@ -93,8 +102,9 @@ void StatusStream::reset() {
   in_string_ = false;
   escape_ = false;
   feature_oversized_ = false;
-  feature_buf_.clear();  // keeps the capacity: that is the whole point of reusing the object
-  if (feature_buf_.capacity() < kMaxFeatureBytes) feature_buf_.reserve(kMaxFeatureBytes);
+  std::vector<uint8_t>& buf = featureBuf();
+  buf.clear();  // keeps the capacity: that is the whole point of reusing the object
+  if (buf.capacity() < kMaxFeatureBytes) buf.reserve(kMaxFeatureBytes);
   filter_ids_.clear();
   remaining_ids_.clear();
   stations_.clear();
@@ -104,8 +114,8 @@ void StatusStream::reset() {
 }
 
 void StatusStream::appendFeatureByte(uint8_t b) {
-  if (feature_buf_.size() < kMaxFeatureBytes) {
-    feature_buf_.push_back(b);
+  if (featureBuf().size() < kMaxFeatureBytes) {
+    featureBuf().push_back(b);
   } else {
     feature_oversized_ = true;
   }
@@ -118,27 +128,27 @@ void StatusStream::onFeatureClosed() {
 
   if (oversized) {
     ++features_skipped_;
-    feature_buf_.clear();
+    featureBuf().clear();
     return;
   }
   if (filter_ids_.empty()) {
-    feature_buf_.clear();
+    featureBuf().clear();
     return;
   }
 
   int id = 0;
-  if (extractId(feature_buf_, &id)) {
+  if (extractId(featureBuf(), &id)) {
     auto it = std::find(remaining_ids_.begin(), remaining_ids_.end(), id);
     if (it != remaining_ids_.end()) {
       Station st;
-      if (parseStation(feature_buf_, &st)) {
+      if (parseStation(featureBuf(), &st)) {
         stations_.push_back(std::move(st));
       }
       remaining_ids_.erase(it);
       if (remaining_ids_.empty()) done_ = true;
     }
   }
-  feature_buf_.clear();
+  featureBuf().clear();
 }
 
 void StatusStream::processByte(uint8_t b) {
@@ -169,7 +179,7 @@ void StatusStream::processByte(uint8_t b) {
         in_string_ = false;
         escape_ = false;
         feature_oversized_ = false;
-        feature_buf_.clear();
+        featureBuf().clear();
         appendFeatureByte(b);
         state_ = State::kInFeature;
       } else if (b == ']') {

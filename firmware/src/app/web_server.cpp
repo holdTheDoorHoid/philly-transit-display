@@ -1451,6 +1451,12 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     // even a fixed-literal 503 would not fit, which is the state that used to reboot the board.
     doc["oom_replies_dropped"] = oomRepliesDropped();
     doc["heap_reserve_held"] = heapReserveHeld();
+    // The Bluetooth-memory release, proved rather than inferred (heap_reserve.h, main.cpp).
+    // `bt_release_rc` is esp_bt_mem_release()'s esp_err_t - 0 is ESP_OK, -1 means it was never
+    // called - and `bt_release_gain_bytes` is the MALLOC_CAP_8BIT free-heap delta across the call,
+    // which is what says whether libbt's 4,464 B really joined the heap.
+    doc["bt_release_rc"] = bluetoothReleaseRc();
+    doc["bt_release_gain_bytes"] = bluetoothReleaseGainBytes();
     // Bytes of stack each task has never gone below. Rules a stack that has quietly eaten into the
     // heap in or out before any of the heap numbers are interpreted.
     JsonObject hwm = doc["stack_hwm"].to<JsonObject>();

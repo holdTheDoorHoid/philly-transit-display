@@ -19,12 +19,18 @@
 namespace transit_test {
 
 struct AllocProbe {
-  // Starts a measurement window (and resets the high-water mark).
+  // Starts a measurement window (and resets the counters).
   static void begin();
   // Ends it and returns the largest single operator new request made inside it, in bytes.
   static size_t end();
   // Allocations counted inside the last window.
   static size_t count();
+  // How many of those were at least `bytes` - which is the question that matters here. "The
+  // largest single request" cannot show the shared-scratch win on its own, because the biggest
+  // request a cycle makes is the GTFS-RT retention block, which is deliberately still per-cycle
+  // (it is a vector of non-trivially-destructible values). What the scratch removes is the OTHER
+  // multi-kilobyte requests, so counting them is the measurement.
+  static size_t countAtLeast(size_t bytes);
 };
 
 }  // namespace transit_test

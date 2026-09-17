@@ -80,6 +80,21 @@ bool releaseHeapReserve();
 // two used here.
 bool rearmHeapReserveIfSafe();
 
+// ---- The Bluetooth-memory release, as a readable fact rather than a serial line ---------------
+//
+// main.cpp calls esp_bt_mem_release(ESP_BT_MODE_BTDM) once, first thing in setup(), to hand
+// libbt's `_bt_data` (4,464 B of .dram0.data on this image) back to the heap - see the comment
+// there and audit_static SS4.1. The call was read out of the disassembly and had never run on this
+// hardware, so it records what happened where it can be READ over HTTP: the serial console cannot
+// be captured on this bench, because opening the port resets the board.
+//
+// `rc` is the esp_err_t it returned (0 = ESP_OK), -1 until the call has been made or if the build
+// has no Bluetooth controller at all. `gain` is the MALLOC_CAP_8BIT free-heap delta across the
+// call, which is the number that says whether the region actually joined the heap.
+void noteBluetoothRelease(int rc, int32_t gain_bytes);
+int bluetoothReleaseRc();
+int32_t bluetoothReleaseGainBytes();
+
 // How many error replies could not be sent at all, since boot, and ended in a closed connection
 // instead. Reported as `oom_replies_dropped` by GET /api/debug/ui. It should be zero; a number
 // that moves means the heap reached a state where even a fixed-literal 503 would not fit.
