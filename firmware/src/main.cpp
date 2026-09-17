@@ -26,6 +26,7 @@
 #include "app/config_store.h"
 #include "app/cxx_exception_pool.h"
 #include "app/http_fetch.h"
+#include "app/heap_reserve.h"
 #include "app/hw_probe.h"
 #include "app/net_poller.h"
 #include "app/poller_liveness.h"
@@ -283,6 +284,12 @@ void setup() {
   if (!transit_app::preallocateBikeStream()) {
     log_e("main: could not reserve the Indego feed scanner; each refresh will allocate its own");
   }
+  // The kilobyte that lets the device still SAY "out of memory" when it is out of memory
+  // (app/heap_reserve.h: a coredump on 2026-09-17 caught guarded()'s own 503 throwing out of its
+  // catch handler and terminating). Armed here, with the others, before Wi-Fi.
+  Serial.printf("[heap] oom_reserve %s (%u B)\n",
+                transit_app::armHeapReserve() ? "armed" : "NOT ARMED (out of memory)",
+                (unsigned)transit_app::kHeapReserveBytes);
   transit_app::initNetPoller();
   transit_app::startProxyWorker();
   heapStage("tasks");

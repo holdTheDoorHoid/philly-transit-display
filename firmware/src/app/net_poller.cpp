@@ -20,6 +20,7 @@
 
 #include "config_store.h"
 #include "cxx_exception_pool.h"
+#include "heap_reserve.h"
 #include "heap_trace.h"
 #include "http_fetch.h"
 #include "sd_logger.h"
@@ -1016,6 +1017,11 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // unusually large response grew one last cycle. Done HERE, at poll-start, because this is where
   // the largest free block is at its best (DESIGN.md SS5).
   if (g_poll_buffers != nullptr) g_poll_buffers->beginCycle();
+  // Take the error-reply reserve back if a 503 spent it and the heap has recovered since
+  // (heap_reserve.h). Poll-start is one of the two contexts this is allowed from - the other is
+  // the idle slice below - because neither is the handler that released it, and both are on a task
+  // that can afford to be told "not yet".
+  rearmHeapReserveIfSafe();
   Config cfg = getActiveConfig();
   transit::HttpGetEx http = makeHttpGetEx(kFetchTimeoutMs);
   transit::HttpGetEx http_opt = makeHttpGetEx(kOptionalFetchTimeoutMs);
@@ -1353,6 +1359,7 @@ void pollerTask(void * /*arg*/) {
       // off, and once both slots were held every later stats/proxy request got a permanent "proxy
       // worker busy". Dequeuing is always allowed; the gate now decides only whether the job is
       // RUN or answered 503, which the client retries.
+      rearmHeapReserveIfSafe();  // see pollOnce(): the other safe context, four times a second
       if (runQueuedProxyJob(idleWorkHasHeadroom())) {
         notePollerProgress();
         if ((int32_t)(millis() - deadline) >= 0) break;

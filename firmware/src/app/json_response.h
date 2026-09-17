@@ -43,11 +43,15 @@
 #include <memory>
 #include <utility>
 
+#include "oom_reply.h"
+
 namespace transit_app {
 
 inline void sendJsonStreamed(AsyncWebServerRequest *request, JsonDocument &doc) {
   if (doc.overflowed()) {
-    request->send(503, "application/json", "{\"error\":\"out of memory building the response, retry\"}");
+    // The document did not fit, so the heap is already short - and building this 503 is itself an
+    // allocation (oom_reply.h). Same treatment as every other reply on an out-of-memory path.
+    sendUnderPressure(request, 503, "{\"error\":\"out of memory building the response, retry\"}");
     return;
   }
   std::shared_ptr<JsonDocument> held = std::make_shared<JsonDocument>(std::move(doc));

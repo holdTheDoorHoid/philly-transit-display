@@ -23,7 +23,9 @@
 #include "demo_data.h"
 #include "heap_trace.h"  // the poll-cycle heap ring for /api/debug/ui (diag branch)
 #include "host_match.h"
+#include "heap_reserve.h"
 #include "json_response.h"
+#include "oom_reply.h"
 #include "net_poller.h"
 #include "weather_service.h"
 #include "ui/ui.h"
@@ -221,7 +223,9 @@ void sendJson(AsyncWebServerRequest *request, int code, JsonDocument &doc) {
   String body;
   bool ok = !doc.overflowed() && serializeJson(doc, body) > 0 && body.length() > 0;
   if (!ok) {
-    request->send(503, "application/json", "{\"error\":\"out of memory building the response, retry\"}");
+    // sendUnderPressure(), not send(): this reply is on an out-of-memory path and the response
+    // object it needs is itself an allocation (oom_reply.h).
+    sendUnderPressure(request, 503, "{\"error\":\"out of memory building the response, retry\"}");
     return;
   }
   request->send(code, "application/json", body);
@@ -303,7 +307,10 @@ void sendFailure(AsyncWebServerRequest *request, const ApiFailure &fail) {
   } else {
     snprintf(body, sizeof body, "{\"error\":\"%s\"}", fail.message.c_str());
   }
-  request->send(fail.status, "application/json", body);
+  // Through sendUnderPressure() for the same reason the buffer is on the stack: this answer has to
+  // go out when the heap is momentarily exhausted, and request->send() itself allocates the
+  // response object (oom_reply.h). `body` is stack memory and is copied by the send.
+  sendUnderPressure(request, fail.status, body);
 }
 
 // What every protected handler calls as its first statement: answers the request itself and
@@ -410,7 +417,9 @@ bool refuseIfLowHeap(AsyncWebServerRequest *request) {
       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= kMinHeavyResponseBlock) {
     return false;
   }
-  request->send(503, "application/json", "{\"error\":\"low memory, retry\"}");
+  // By definition the heap is already under the floor here, so this is the reply most likely to
+  // fail to be built at all (oom_reply.h).
+  sendUnderPressure(request, 503, "{\"error\":\"low memory, retry\"}");
   return true;
 }
 
@@ -1322,8 +1331,7 @@ class HostGuardHandler : public AsyncWebHandler {
   void handleRequest(AsyncWebServerRequest *request) override {
     // A fixed literal rather than sendError()'s JsonDocument + String: this answer has to go out
     // when the heap is momentarily exhausted, the same reasoning as sendFailure().
-    request->send(421, "application/json",
-                  "{\"error\":\"this device is not reachable under that host name\"}");
+    sendUnderPressure(request, 421, "{\"error\":\"this device is not reachable under that host name\"}");
   }
 };
 
@@ -1338,7 +1346,13 @@ ArRequestHandlerFunction guarded(ArRequestHandlerFunction fn) {
     try {
       fn(request);
     } catch (const std::bad_alloc &) {
-      request->send(503, "application/json", "{\"error\":\"out of memory, retry\"}");
+      // THE CRASH THIS LINE CAUSED, and now does not (coredump, 2026-09-17, heap_reserve.h): the
+      // catch handler was `request->send(503, ...)`, and send() allocates - beginResponse() does
+      // `new AsyncBasicResponse(...)`, sz=100 in the dump, plus two Strings. With the heap gone
+      // that second allocation threw too, out of a catch handler with nothing outside it, which is
+      // std::terminate. sendUnderPressure() frees the 1 KB reserve first and wraps the send in a
+      // nested try/catch, which IS legal inside a handler.
+      sendUnderPressure(request, 503, "{\"error\":\"out of memory, retry\"}");
     }
   };
 }
@@ -1358,7 +1372,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     try {
       handlePostPin(request, json);
     } catch (const std::bad_alloc &) {
-      request->send(503, "application/json", "{\"error\":\"out of memory, retry\"}");
+      sendUnderPressure(request, 503, "{\"error\":\"out of memory, retry\"}");
     }
   });
   g_server.on("/api/reboot", HTTP_POST, guarded(handlePostReboot));
@@ -1432,6 +1446,11 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["failed_polls"] = failedPolls();
     doc["wedged_polls"] = wedgedPolls();  // 15 reboots the board
     doc["proxy_queue_depth"] = proxyQueueDepth();  // pinned at 2 = the audit's stuck-queue wedge
+    // Error replies that could not be built at all and ended in a closed connection instead
+    // (heap_reserve.h). Should be zero; a number that moves means the heap reached a state where
+    // even a fixed-literal 503 would not fit, which is the state that used to reboot the board.
+    doc["oom_replies_dropped"] = oomRepliesDropped();
+    doc["heap_reserve_held"] = heapReserveHeld();
     // Bytes of stack each task has never gone below. Rules a stack that has quietly eaten into the
     // heap in or out before any of the heap numbers are interpreted.
     JsonObject hwm = doc["stack_hwm"].to<JsonObject>();

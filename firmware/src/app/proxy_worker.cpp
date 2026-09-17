@@ -21,6 +21,7 @@
 #include "heap_trace.h"
 #include "http_fetch.h"
 #include "json_response.h"
+#include "oom_reply.h"
 #include "proxy_queue.h"
 #include "sd_logger.h"
 #include "transit_core/septa_source.h"
@@ -277,7 +278,7 @@ void runStatsJob(const ProxyJob &job) {
   // computeStopSummary().
   std::unique_ptr<transit_stats::StatsAggregator> agg(new (std::nothrow) transit_stats::StatsAggregator(job.param, window_start, window_end));
   if (!agg) {
-    if (auto r = lockRequest(job)) r->send(503, "application/json", "{\"error\":\"out of memory, try again\"}");
+    if (auto r = lockRequest(job)) sendUnderPressure(r.get(), 503, "{\"error\":\"out of memory, try again\"}");
     return;
   }
   for (const std::string &month : transit_stats::monthsInWindow(window_start, window_end)) {
@@ -333,7 +334,7 @@ void runOverviewJob(const ProxyJob &job) {
   std::unique_ptr<transit_stats::OverviewAggregator> agg(
       new (std::nothrow) transit_stats::OverviewAggregator(window_start, window_end, stop_keys, bike_keys));
   if (!agg) {
-    if (auto r = lockRequest(job)) r->send(503, "application/json", "{\"error\":\"out of memory, try again\"}");
+    if (auto r = lockRequest(job)) sendUnderPressure(r.get(), 503, "{\"error\":\"out of memory, try again\"}");
     return;
   }
   for (const std::string &month : transit_stats::monthsInWindow(window_start, window_end)) {
@@ -365,7 +366,7 @@ void runJob(const ProxyJob &job) {
   } catch (const std::bad_alloc &) {
     heapTraceMark(kStageOomProxy);  // diag branch
     Serial.printf("[proxy] out of memory running a queued job (free %u)\n", (unsigned)ESP.getFreeHeap());
-    if (auto r = lockRequest(job)) r->send(503, "application/json", "{\"error\":\"out of memory, try again\"}");
+    if (auto r = lockRequest(job)) sendUnderPressure(r.get(), 503, "{\"error\":\"out of memory, try again\"}");
   }
 }
 
@@ -420,7 +421,7 @@ bool runQueuedProxyJob(bool may_start_heavy) {
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
       if (auto r = lockRequest(*owner)) {
-        r->send(503, "application/json", "{\"error\":\"low memory, retry\"}");
+        sendUnderPressure(r.get(), 503, "{\"error\":\"low memory, retry\"}");
       }
       break;
     case QueuedJobAction::Run:
