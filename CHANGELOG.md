@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.3.2-rc1 - 2026-09-17 (release candidate, not verified on hardware)
+
+v0.3.1 ran cleanly on the owner's board for thirty-five to forty minutes and then stopped being
+able to poll at all - and, worse, stopped answering the web page that would have said why. This
+release is about both halves of that.
+
+- **The display would refuse every connection once its memory got chopped up, including the page
+  you would use to look at it and the button you would use to restart it.** Measured on the owner's
+  board at 15:50 on 2026-09-17: the largest unbroken piece of memory had fallen to about 3.4 KB,
+  and a rule added in the last release - "do not accept a new connection when memory is this
+  short" - then turned away *every* request. The device answered ping and nothing else for five
+  minutes, and the only way back was a hard power cycle. The rule now applies only when the display
+  is already busy with another request: one request at a time is always accepted, whatever the
+  memory looks like. A single request cannot cause the crash that rule exists to prevent, and if
+  its own reply will not fit, the display answers "out of memory, try again" instead of going
+  silent.
+
+- **A poll can now finish on a memory that has crumbled to about 3 KB pieces.** Every poll was
+  asking for one 4.9 KB unbroken piece up front - a working area for the live-arrivals feed - and
+  once the memory could not provide that, every poll failed in the same place forever. That area,
+  and the vehicle list that a busy route can grow to 5.6 KB, are now set aside once when the
+  display starts and reused every cycle instead of being asked for again. A routine poll now asks
+  for nothing bigger than about 1.2 KB. The cost is stated honestly: about 8 KB less free memory at
+  rest, which is the trade this release makes deliberately and which the next run on the hardware
+  is the test of.
+
+- **The display now restarts itself after three failed-for-memory polls instead of fifteen.** The
+  old threshold assumed polls thirty seconds apart, but a failing poll backs off to four minutes,
+  so fifteen of them was really fifty-one minutes of a frozen screen - which is exactly what
+  happened on 2026-09-17, when the board never restarted itself at all before it was unplugged.
+  Three is about three and a half minutes, and the restart is now counted from the failure itself
+  rather than inferred from a memory reading taken afterwards.
+
+- **A nightly restart, on by default at 03:30** (Settings -> Device & network). This board has no
+  way to tidy its own memory while running, and a restart is the only thing that does. It takes a
+  few seconds, nothing is lost, and it starts each day with the memory in one piece. Turn it off or
+  move it in Settings. It is a mitigation and not a cure: the underlying cause of the crumbling is
+  still not known, which is what the next item is for.
+
+- **Service alerts are now off by default.** They cost a fetch per route every five minutes and
+  memory held between polls, and most of what they bring back only ever shows on the web page and
+  in the log. Existing displays keep whatever they are set to; only a brand new one starts with
+  them off.
+
+- **Two hours of memory history, so the cause can finally be found.** The display keeps one line
+  per poll for the last 240 polls - memory free, largest unbroken piece, the lowest it got during
+  that poll, and which optional work ran - readable at `/api/debug/ui?log=1`. The previous
+  instrument held three polls, which was enough to name the failing step and not nearly enough to
+  find what leads to it. Alongside it: how big the biggest reply ever received was, how fragmented
+  the memory is, and how much the schedule and alert caches are holding.
+
+Not verified on hardware. Nothing in this release was flashed or measured on a device.
+
 ## v0.3.1 - 2026-09-17
 
 A memory pass on the owner's board after v0.3.0 had been running for a day. Nothing here changes
