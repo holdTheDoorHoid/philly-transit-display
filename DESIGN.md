@@ -1104,12 +1104,20 @@ DWARF, not estimated. The ledger against v0.3.1, in full:
 | `kMaxTrackedStops` 8 → 4 (`ArrivalTracker` 8,456 → 4,232 B) | **+4,224** |
 | **net vs v0.3.1** | **−8,384** |
 
-So the expected resting `free8` is **≈ 31–32 KB**, not v0.3.1's 39–40.7 KB. That is still ~8.4 KB
-of floor spent to remove every per-cycle contiguous request above ~1.2 KB, and it is above the
-12 KB idle-work gate with room, but it is **not** a return to the v0.3.1 floor and should not be
-read as one. If the next run shows `min_free8` under ~1.5 KB, the levers in order are: the cycle
-log at 120 rows instead of 240 (+1,920 B, one hour of history instead of two), and the TransitView
-list back to per-cycle (+5,632 B, at the cost of one 5.6 KB request per route per cycle).
+**Measured, not predicted:** a two-hour, thirteen-minute run on the owner's board (2026-09-17,
+his own two-stop/weather/Indego/SD-logging configuration) put resting `free8` at **31.6–32.2 KB at
+the start of every single poll for the whole run**, against v0.3.1's 39–40.7 KB — in line with the
+~8.4 KB the ledger above predicts. That is ~8.4 KB of floor spent to remove every per-cycle
+contiguous request above ~1.2 KB, and it holds well above the 12 KB idle-work gate with room to
+spare, but it is **not** a return to the v0.3.1 floor and should not be read as one. Over the same
+run the largest free block held at **14,324 B at every poll start and never moved once** (dipping
+to 9.2–10.2 KB inside Indego downloads and recovering every time), `min_free8` since boot reached
+**4,488 B** — set during the first Indego refresh and never lower afterward — against v0.3.1's
+2,220 B, and there were zero failed polls, zero out-of-memory stages and zero refused connections
+across the whole run. If a future run ever shows the floor trending back down toward that range,
+the levers in order are: the cycle log at 120 rows instead of 240 (+1,920 B, one hour of history
+instead of two), and the TransitView list back to per-cycle (+5,632 B, at the cost of one 5.6 KB
+request per route per cycle).
 
 rc1's lesson is not repealed by any of this, it is respected — but it was nearly repeated, and the
 thing that nearly repeated it was counting only the heap.

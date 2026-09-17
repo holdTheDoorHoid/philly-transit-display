@@ -6,7 +6,9 @@
 out to do and still left about 12 KB less free memory than v0.3.1 - enough that several requests
 came back "low memory" during testing and the board came within 156 bytes of nothing at all. rc2
 takes most of that back with the four-stop limit below and stops the reply buffer growing on a
-board that is already short. Nothing in rc2 has been flashed or measured on a device.
+board that is already short. rc2 was then flashed on the owner's board on 2026-09-17 and left
+running for two hours and thirteen minutes under the owner's own configuration - the numbers below
+are measured from that run, not predicted.
 
 v0.3.1 shipped today at 15:07. By about forty minutes of uptime the owner's board had crumbled
 into the same kind of lockout it was built to prevent - and this time it also locked the door,
@@ -56,8 +58,14 @@ release states that plainly and fixes what it exposed.
   grow to 5.6 KB, are now set aside once when the display starts and reused every cycle instead of
   being asked for fresh each time - sized to the stops actually configured (2,432 bytes for the
   owner's two-stop setup) rather than the worst case. A routine poll now asks for nothing bigger
-  than about 1.2 KB. The cost is stated honestly: about 8 KB less free memory at rest, which is the
-  trade this release makes deliberately and which the next run on the hardware is the test of.
+  than about 1.2 KB (3 KB on a schedule refetch). The cost is stated honestly: measured over two
+  hours and thirteen minutes on the owner's board, free memory at rest runs about 7-11 KB lower
+  than v0.3.1 depending where in the cycle you look - but the largest free block held at exactly
+  14,324 bytes at the start of every single poll for the entire run and never moved once, against
+  v0.3.1's decay from 32 KB down to 3.4 KB within about 40 minutes. The worst moment since boot is
+  actually higher than before (4,488 bytes, against v0.3.1's 2,220), because the per-poll transient
+  shrank by more than the resting floor fell. Less free memory at rest, in exchange for memory that
+  stops fragmenting - that is the trade this release makes deliberately.
 
 - **The shared reply buffer no longer grows and shrinks every cycle.** A reply bigger than its
   usual 6 KB allowance used to make the buffer double in size and then get handed back and rebuilt
@@ -93,13 +101,18 @@ release states that plainly and fixes what it exposed.
   find what leads to it. Alongside it: the biggest reply ever received, how fragmented the memory
   is, and how much the schedule and alert caches are holding.
 
-**Known residual:** what actually triggers the fragmentation is still not identified - the
-two-hour memory log above exists specifically to catch it in the act next time. And by design,
-this release's resting free-memory floor sits about 8.4 KB lower than v0.3.1's - roughly 31-32 KB
-where v0.3.1 rested at 39-40 KB - which is the deliberate cost of the fix above. That figure is
-stated after measurement, not before it: rc1 claimed 8 KB, counted only the memory the poll cycle
-holds, and left out the 4.5 KB the new memory log occupies; the real gap was about 12 KB until the
-four-stop limit gave 4 KB of it back.
+**Known residual:** what actually triggers the fragmentation has still never been caught in the
+act - not on v0.3.0, not on v0.3.1. On v0.3.2, a two-hour watch on the owner's board (2026-09-17,
+two hours and thirteen minutes) showed no fragmentation at all: the largest free block held at
+14,324 bytes at the start of every poll for the entire run and never moved. That is not proof it
+cannot happen, only that this run did not see it. The two-hour memory log above
+(`/api/debug/ui?log=1`) exists to catch it if it ever returns, and the nightly restart is the
+backstop regardless of whether it is ever explained. By design, this release's resting
+free-memory floor measures about 32 KB against v0.3.1's 39-40 KB - the deliberate cost of the fix
+above, and close to the ~8.4 KB the ledger predicts. That figure was wrong once already: rc1
+claimed 8 KB, counted only the memory the poll cycle holds, and left out the 4.5 KB the new memory
+log occupies; the real gap was about 12 KB until the four-stop limit gave 4 KB of it back. This
+time it comes from a measured two-hour run on the shipping board, not an estimate.
 
 ## v0.3.1 - 2026-09-17
 
