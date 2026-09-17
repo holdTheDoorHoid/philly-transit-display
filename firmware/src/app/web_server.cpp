@@ -1412,8 +1412,11 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["min_free8"] = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
     doc["uptime_s"] = (uint32_t)(millis() / 1000);
     doc["reset_reason"] = (int)esp_reset_reason();  // 3 = SW restart, i.e. a self-heal reboot
-    // How many published Snapshots are alive (net_poller.h). Three during a cycle's tail is the
-    // expected reading; a number that climbs is a reference nobody is releasing.
+    // How many published Snapshots are alive (net_poller.h). Since the publish became a move it is
+    // ONE between publishes and TWO for up to a second after one, while the display task's
+    // last-good reference still names the outgoing Snapshot. It read three before that change (the
+    // poller's working value, the published copy, and the display's). Above two, or climbing, is a
+    // reference nobody is releasing.
     doc["snapshots_live"] = snapshotsLive();
     doc["failed_polls"] = failedPolls();
     doc["wedged_polls"] = wedgedPolls();  // 15 reboots the board

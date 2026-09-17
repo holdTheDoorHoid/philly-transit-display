@@ -779,16 +779,20 @@ void transitCoreTrace(int stage) {
 }
 
 // ---- Instrument counters (diag branch) ------------------------------------------------------
-// How many Snapshot objects published by publishSnapshot() are still alive. The audit's M1 says
-// three should be (the poller's `combined`, the published one, and the display task's last-good
-// reference), each 4-8 KB; anything above that is a reference nobody is releasing. Counted by
+// How many Snapshot objects published by publishSnapshot() are still alive. The audit's M1 found
+// THREE: the poller's own `combined`, the published copy of it, and the display task's last-good
+// reference - each 4-8 KB. Since the publish became a move (publishSnapshot() below) the poller's
+// `combined` and the published object are the same object, so the expected reading is ONE between
+// publishes and TWO for up to a second after one, while the display's last-good still names the
+// outgoing Snapshot. A number above two, or one that climbs, is a reference nobody is releasing.
+// Counted by
 // construction and destruction of the published object itself rather than by a custom deleter, so
 // make_shared's single allocation is preserved: a `shared_ptr(new T, deleter)` would have added a
 // second block per publish, which is the instrument changing the thing it measures. The counter is
 // touched from whichever task drops the last reference, hence atomic.
 std::atomic<uint32_t> g_snapshots_live{0};
 struct CountedSnapshot : Snapshot {
-  explicit CountedSnapshot(const Snapshot &s) : Snapshot(s) { g_snapshots_live.fetch_add(1); }
+  explicit CountedSnapshot(Snapshot &&s) : Snapshot(std::move(s)) { g_snapshots_live.fetch_add(1); }
   ~CountedSnapshot() { g_snapshots_live.fetch_sub(1); }
 };
 
@@ -802,24 +806,38 @@ volatile uint32_t g_wedged_polls = 0;
 // Publishes a Snapshot to every reader (UI, web server) and moves the LED with it. Called more
 // than once per cycle (F12): the arrivals go out the moment they exist, and again when the alerts
 // that belong to the same Snapshot arrive.
-void publishSnapshot(const Snapshot &snap) {
-  // Everything that allocates happens HERE, with nothing held: the Snapshot copy and the error
-  // string. This used to run with g_mutex held, which is what made a reader's wait long enough to
-  // matter in the first place - the display task was not waiting for a pointer, it was waiting out
-  // somebody else's allocation of a few kilobytes of arrivals. A bad_alloc now escapes before the
-  // lock is ever taken and is caught by pollOnce()/pollerTask() exactly as before, leaving the
-  // published Snapshot untouched.
+//
+// TAKES ITS ARGUMENT BY RVALUE, and that is the point (audit_runtime SS2/M1, ranked
+// recommendation 3). It used to take `const Snapshot&` and COPY it into the shared_ptr, so the
+// caller's `combined` and the published object were two distinct Snapshots - 4-8 KB each, six of
+// their blocks being 1.1-2.3 KB contiguous arrival vectors - and `combined` then stayed alive
+// through the whole optional tail: the alerts fetch, the weather fetch, the 400 KB Indego stream,
+// the tracker pass and every SD write. Moving it means there is ONE Snapshot: the caller is left
+// holding the returned pointer, not a second object.
+//
+// Returns the published pointer so the tail can read the stops and alerts it has just handed over.
+// That is a refcount, not a copy.
+std::shared_ptr<const Snapshot> publishSnapshot(Snapshot &&snap) {
+  // Everything that allocates happens HERE, with nothing held: make_shared's single block and the
+  // error string. This used to run with g_mutex held, which is what made a reader's wait long
+  // enough to matter in the first place - the display task was not waiting for a pointer, it was
+  // waiting out somebody else's allocation of a few kilobytes of arrivals. A bad_alloc escapes
+  // before the lock is ever taken and is caught by pollOnce()/pollerTask() exactly as before,
+  // leaving the published Snapshot untouched.
   // CountedSnapshot, not Snapshot: same object, same single make_shared allocation, but its ctor
   // and dtor move g_snapshots_live so /api/debug/ui can say how many published Snapshots are alive
   // (diag branch). The shared_ptr is converted to shared_ptr<const Snapshot> immediately; the
   // control block still destroys the real type, so the non-virtual destructor is not a problem.
-  std::shared_ptr<const Snapshot> next = std::make_shared<const CountedSnapshot>(snap);
+  std::shared_ptr<const Snapshot> next = std::make_shared<const CountedSnapshot>(std::move(snap));
+  // Read off the published object, not off `snap`: `snap` has been moved from and owns nothing.
   PollStatus status;
   status.has_polled = true;
-  status.ok = snap.last_poll_ok;
-  status.last_http_status = snap.last_poll_ok ? 200 : 0;
-  status.last_poll_epoch = (uint32_t)snap.generated;
-  status.last_error = snap.last_error;
+  status.ok = next->last_poll_ok;
+  status.last_http_status = next->last_poll_ok ? 200 : 0;
+  status.last_poll_epoch = (uint32_t)next->generated;
+  status.last_error = next->last_error;
+  const bool ok = next->last_poll_ok;
+  std::shared_ptr<const Snapshot> published = next;  // a refcount bump; `next` is emptied below
 
   // `previous` takes the outgoing Snapshot out of the critical section so its destructor - freeing
   // those same vectors and strings - also runs with the lock released.
@@ -834,12 +852,13 @@ void publishSnapshot(const Snapshot &snap) {
     xSemaphoreGive(g_mutex);
   }
 
-  if (snap.last_poll_ok) {
+  if (ok) {
     flashPollOk();
     setStatusLed(LedState::Off);
   } else {
     setStatusLed(LedState::Error);
   }
+  return published;
 }
 
 // DESIGN.md SS7 / model.h: last_poll_ok is "every stop's required sources succeeded" - which is
@@ -1035,14 +1054,24 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // publishing without them is never a reason to withhold the arrivals (F12). A second publish
   // follows below if a fetch brings new ones.
   combined.alerts = cachedAlerts();
-  publishSnapshot(combined);
+
+  // Everything the tail needs out of `combined` that is not the Snapshot itself, read BEFORE it is
+  // handed over: after the move it owns nothing.
+  const bool poll_ok = combined.last_poll_ok;
+  const bool urgent = anyArrivalUrgent(combined, combined.generated);
+
+  // Published by MOVE (audit_runtime SS2/M1). The poller keeps the pointer, not a second Snapshot:
+  // `combined` used to stay alive here until the end of the function, i.e. across the alerts
+  // fetch, the weather fetch, the 400 KB Indego stream, the tracker pass and every SD write, while
+  // the published copy of the same 4-8 KB - six of whose blocks are 1.1-2.3 KB contiguous arrival
+  // vectors - sat beside it.
+  std::shared_ptr<const Snapshot> published = publishSnapshot(std::move(combined));
   tracePoll(kStagePostTransit);
-  if (!combined.last_poll_ok) g_failed_polls++;
+  if (!poll_ok) g_failed_polls++;
 
   // From here on everything is optional. The next transit poll's deadline is fixed first, so each
   // piece of work can ask whether it still has room rather than finding out afterwards.
-  bool urgent = anyArrivalUrgent(combined, combined.generated);
-  uint32_t interval_s = nextIntervalS(cfg, combined.last_poll_ok, urgent, consecutive_failures);
+  uint32_t interval_s = nextIntervalS(cfg, poll_ok, urgent, consecutive_failures);
   if (g_last_poll_unsynced) interval_s = std::min<uint32_t>(interval_s, 10);  // re-poll soon once NTP lands
   const uint32_t deadline_ms = millis() + interval_s * 1000UL;
   // The liveness window is a multiple of the interval the poller is ACTUALLY running at, backoff
@@ -1059,10 +1088,24 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   if (have_time()) {
     bool alerts_fetched = false;
     tracePoll(kStagePreAlerts);
-    combined.alerts = collectAlerts(cfg.stops, cfg.alerts, http_opt, have_time, &alerts_fetched);
+    std::vector<Alert> fresh_alerts = collectAlerts(cfg.stops, cfg.alerts, http_opt, have_time, &alerts_fetched);
     // Only when something actually came back: a cycle where every alert feed was still fresh must
     // not re-publish an identical Snapshot and reset the header's "updated N s ago".
-    if (alerts_fetched) publishSnapshot(combined);  // same stops, now with the alerts for them
+    if (alerts_fetched) {
+      // The second publish of the cycle, and the one place a copy of the stops is unavoidable: the
+      // published Snapshot is const and shared (the display task holds a reference to it for up to
+      // a second), so the alerts cannot be written into it. What changed is that this is now ONE
+      // copy, made and handed over in the same breath, instead of a second copy of a `combined`
+      // the poller was going to hold for the rest of the cycle anyway. It runs at most once every
+      // kAlertsRefreshMs (5 min), and only when a feed actually answered.
+      Snapshot with_alerts;
+      with_alerts.generated = published->generated;
+      with_alerts.last_poll_ok = published->last_poll_ok;
+      with_alerts.last_error = published->last_error;
+      with_alerts.stops = published->stops;  // may throw bad_alloc; pollerTask() catches it
+      with_alerts.alerts = std::move(fresh_alerts);
+      published = publishSnapshot(std::move(with_alerts));
+    }
     tracePoll(kStagePostAlerts);
   }
   if (have_time()) {
@@ -1088,7 +1131,9 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
     refreshRouteLiveness(bus_like, http_opt, have_time);
     tracePoll(kStagePostLiveness);
     std::vector<transit_stats::LogEvent> events;
-    for (const auto &stop : combined.stops) {
+    // The stops the poller published a moment ago, read through the pointer it kept rather than
+    // out of a second copy it was holding for exactly this (audit_runtime SS2).
+    for (const auto &stop : published->stops) {
       const StopConfig *sc = nullptr;
       for (const auto &s : cfg.stops) {
         if (s.key == stop.key) {
@@ -1108,7 +1153,12 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
     if (now >= kSaneClockEpoch) {
       std::string month = currentLocalMonth();
       if (!events.empty()) {
-        annotateEvents(events, combined.alerts);
+        // The alerts on the Snapshot that is live right now - which is the list the second publish
+        // above put there when a feed answered, and the cached list otherwise. collectAlerts()'s
+        // return value differs from this only by entries for routes that are no longer configured,
+        // and annotateEvents() matches alerts to events BY ROUTE, so an unconfigured route has no
+        // event to annotate: the flag it writes is the same either way.
+        annotateEvents(events, published->alerts);
         uint32_t dropped = 0;
         for (const auto &ev : events) {
           std::string line = transit_stats::toCsv(ev);
