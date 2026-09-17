@@ -75,6 +75,32 @@ inline HttpGetEx adaptHttpGet(HttpGet http) {
   };
 }
 
+// ---------------------------------------------------------------------------------------------
+// Optional instrumentation hook (diag branch, 2026-09-17).
+//
+// pollBusStops() is where three of the poll cycle's four biggest allocations live - the 4,096 B
+// GTFS-RT entity buffer, the ~4,800 B retained-updates buffer and the per-stop BusSchedules body
+// with its 3,072 B SchedEntry reserve - so a heap trace that only samples either side of the whole
+// call cannot say which of them is the one that stops fitting. This lets the firmware sample
+// INSIDE the call without transit_core gaining an Arduino, FreeRTOS or heap dependency.
+//
+// A plain function pointer, deliberately, and not a std::function: a std::function member would
+// allocate for any capture over 8 bytes, and an instrument must not allocate on the path it is
+// measuring. Null everywhere nothing installs one - the host tests, the simulator - so the cost
+// where it is not used is one null check per stage.
+enum PollTraceStage : int {
+  kPollTraceRtStream = 0,     // the GTFS-RT TripUpdates stream has been fetched and filtered
+  kPollTraceTransitView = 1,  // one route's TransitView fetch+parse has finished
+  kPollTraceSchedStop = 2,    // one stop's BusSchedules lookup has finished (cache hit or fetch)
+  kPollTraceMerge = 3,        // every stop has been merged into the Snapshot
+};
+using PollTraceHook = void (*)(int stage);
+inline PollTraceHook g_poll_trace_hook = nullptr;
+inline void setPollTraceHook(PollTraceHook hook) { g_poll_trace_hook = hook; }
+inline void pollTrace(int stage) {
+  if (g_poll_trace_hook != nullptr) g_poll_trace_hook(stage);
+}
+
 // Caches BusSchedules results per stop_id (DESIGN.md 4.7: cache 10 minutes, "also on config
 // change"). transit_core defines only the interface - it has no clock or persistent storage of
 // its own. The Arduino glue layer supplies a concrete implementation (e.g. backed by millis()

@@ -144,6 +144,31 @@ class GtfsRtStream {
   // so one oversized entity never aborts the whole feed.
   explicit GtfsRtStream(size_t max_entity_bytes = 4096);
 
+  // Puts the stream back into its just-constructed state - parse state, filters, callback,
+  // counters, header timestamp and retention all cleared - while KEEPING the capacity of the
+  // entity buffer and the retention block. `max_entity_bytes` re-sizes the entity buffer's cap
+  // the way the constructor would, growing the reservation if it is larger than what is already
+  // held and leaving the existing capacity alone if it is not.
+  //
+  // This exists so one stream object can decode a new feed every poll cycle instead of asking the
+  // allocator for its buffers again (DESIGN.md SS5, "the poll working set").
+  void reset(size_t max_entity_bytes);
+
+  // Decode entities into a buffer the CALLER owns, instead of one of this object's own.
+  //
+  // The entity buffer is a few kilobytes that are live only while push() is running: once
+  // finish() has been called nothing reads it again. On the ESP32 that makes it the ideal thing
+  // to share - the same bytes serve as this decoder's entity buffer during the TripUpdates fetch,
+  // as the buffered-JSON-response buffer for every fetch after it, and as the Indego feed
+  // scanner's one-feature buffer later in the cycle, so ONE reservation covers a whole poll
+  // instead of four (DESIGN.md SS5). `borrowed` must outlive the decode; passing nullptr (the
+  // default state) puts the stream back on its own buffer.
+  //
+  // The borrow is a `std::vector<uint8_t>*` and not a pointer to raw bytes on purpose: the vector
+  // may reallocate while somebody else is using it for something larger, and a borrow of the
+  // container rather than of its storage survives that.
+  void setEntityBuffer(std::vector<uint8_t>* borrowed);
+
   // Restricts decoded updates to these route_ids (TripDescriptor.route_id). An empty vector
   // (the default) means "all routes". Call before push(); not safe to change mid-stream.
   void setRouteFilter(std::vector<std::string> routes);
@@ -284,7 +309,12 @@ class GtfsRtStream {
   size_t header_fill_ = 0;
   size_t header_target_ = 0;
 
-  std::vector<uint8_t> entity_buf_;
+  // The entity buffer is reached through entityBuf() so it can be the caller's (setEntityBuffer)
+  // rather than own_entity_buf_. own_entity_buf_ stays empty and unreserved while a borrow is in
+  // place, so a borrowing caller pays for one buffer and not two.
+  std::vector<uint8_t>& entityBuf() { return borrowed_entity_buf_ != nullptr ? *borrowed_entity_buf_ : own_entity_buf_; }
+  std::vector<uint8_t> own_entity_buf_;
+  std::vector<uint8_t>* borrowed_entity_buf_ = nullptr;
   size_t entity_target_ = 0;
 
   std::vector<StopTimeUpdate> retained_;

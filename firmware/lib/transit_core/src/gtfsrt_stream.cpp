@@ -80,7 +80,54 @@ int32_t toInt32(uint64_t v) { return static_cast<int32_t>(static_cast<int64_t>(v
 }  // namespace
 
 GtfsRtStream::GtfsRtStream(size_t max_entity_bytes) : max_entity_bytes_(max_entity_bytes) {
-  entity_buf_.reserve(max_entity_bytes_);
+  own_entity_buf_.reserve(max_entity_bytes_);
+}
+
+void GtfsRtStream::setEntityBuffer(std::vector<uint8_t>* borrowed) {
+  borrowed_entity_buf_ = borrowed;
+  if (borrowed != nullptr) {
+    // Give back whatever this object was holding: the whole point of the borrow is that one
+    // reservation serves several stages, so keeping a second one would defeat it.
+    std::vector<uint8_t>().swap(own_entity_buf_);
+    if (borrowed->capacity() < max_entity_bytes_) borrowed->reserve(max_entity_bytes_);
+  }
+}
+
+void GtfsRtStream::reset(size_t max_entity_bytes) {
+  max_entity_bytes_ = max_entity_bytes;
+  std::vector<uint8_t>& buf = entityBuf();
+  buf.clear();  // keeps the capacity: that is the whole point of reusing the object
+  if (buf.capacity() < max_entity_bytes_) buf.reserve(max_entity_bytes_);
+  entity_target_ = 0;
+
+  route_filter_.clear();
+  stop_filter_.clear();
+  on_update_ = nullptr;
+
+  // Retention off until the caller asks for it again, exactly as after construction.
+  // retainUpdates() clear()s and reserve()s, so the block below it is kept too.
+  retained_.clear();
+  max_retained_ = 0;
+  max_per_stop_route_ = 0;
+
+  state_ = State::kTag;
+  error_ = false;
+  varint_value_ = 0;
+  varint_shift_ = 0;
+  cur_field_ = 0;
+  cur_wiretype_ = 0;
+  skip_remaining_ = 0;
+  header_fill_ = 0;
+  header_target_ = 0;
+
+  entities_seen_ = 0;
+  entities_skipped_too_large_ = 0;
+  entities_matched_ = 0;
+  entities_malformed_ = 0;
+  updates_matched_ = 0;
+  updates_dropped_by_cap_ = 0;
+  identifiers_truncated_ = 0;
+  header_timestamp_ = 0;
 }
 
 void GtfsRtStream::setRouteFilter(std::vector<std::string> routes) {
@@ -269,7 +316,7 @@ void GtfsRtStream::feedByte(uint8_t b) {
           decodeEntity(nullptr, 0);
           state_ = State::kTag;
         } else {
-          entity_buf_.clear();
+          entityBuf().clear();
           entity_target_ = static_cast<size_t>(length);
           state_ = State::kEntityBody;
         }
@@ -294,9 +341,9 @@ void GtfsRtStream::feedByte(uint8_t b) {
       return;
 
     case State::kEntityBody:
-      entity_buf_.push_back(b);
-      if (entity_buf_.size() == entity_target_) {
-        decodeEntity(entity_buf_.data(), entity_buf_.size());
+      entityBuf().push_back(b);
+      if (entityBuf().size() == entity_target_) {
+        decodeEntity(entityBuf().data(), entityBuf().size());
         state_ = State::kTag;
       }
       return;

@@ -1252,9 +1252,9 @@ static void test_stats_aggregator_size_budget(void) {
   // DESIGN §9.3 aims for < 2 KB; asserted here with headroom rather than the exact target, since
   // std::string SSO thresholds differ between the 64-bit host and the 32-bit ESP32 target.
   TEST_ASSERT_TRUE(sizeof(OverviewAggregator) < 4096);
-  // F19 raised kMaxTrackedTripsPerStop from 8 to 12 to stop an ordinary feed churning its slots.
-  // The budget that buys is ~20 KB on the 32-bit target; the 64-bit host build is the larger of
-  // the two (std::string is 32 B there, 24 B on ESP32), so asserting it here is the strict case.
+  // kMaxTrackedTripsPerStop went 8 -> 12 for F19 and back to 8 in 0.3.1 (tracker.h says why, and
+  // what it costs). The budget is ~20 KB on the 32-bit target; the 64-bit host build is the larger
+  // of the two (std::string is 32 B there, 24 B on ESP32), so asserting it here is the strict case.
   TEST_ASSERT_TRUE(sizeof(ArrivalTracker) < 20480);
 }
 
@@ -1596,20 +1596,28 @@ static void test_tracker_pending_scheduled_dropped_on_outage_not_noshow(void) {
 // The review's reproduction: nine trips, the same nine every poll, eight slots -- every poll
 // evicted the entry it was about to need and re-emitted nine first-sighting `pred` rows, ten
 // evictions deep. An unchanged feed must produce no rows at all after the first poll.
-static void test_tracker_nine_trip_feed_does_not_churn(void) {
+//
+// Written against kMaxTrackedTripsPerStop + 1 rather than a literal nine, because what fixed F19
+// is the ADMISSION POLICY (keep the soonest, stably), not the slot count: the trip that does not
+// fit is refused once and stays refused, instead of displacing one that is already there. So this
+// holds at 8 slots (0.3.1) exactly as it did at 12, and it is the test that would fail if a future
+// change made the working set churn again at whatever the cap is then.
+static void test_tracker_one_over_the_cap_does_not_churn(void) {
   ArrivalTracker tracker;
   tracker.registerStop("F19a", "17", "0");
   std::vector<LogEvent> out;
 
+  const int cap = (int)transit_stats::kMaxTrackedTripsPerStop;
   std::vector<transit::Arrival> feed;
-  for (int i = 0; i < 9; i++) {
+  for (int i = 0; i < cap + 1; i++) {
     // Far enough out that no horizon milestone is crossed between the two polls, so anything that
     // shows up in round two is churn and nothing else.
     feed.push_back(liveArrival("T" + std::to_string(i), kT + 1000 + i * 120));
   }
 
   tracker.observe(snapOf("F19a", feed), kT, true, true, out);
-  TEST_ASSERT_EQUAL_UINT32(9, static_cast<uint32_t>(countOf(out, EventType::Pred)));
+  TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(cap),
+                            static_cast<uint32_t>(countOf(out, EventType::Pred)));
 
   out.clear();
   tracker.observe(snapOf("F19a", feed), kT + 30, true, true, out);
@@ -1617,13 +1625,13 @@ static void test_tracker_nine_trip_feed_does_not_churn(void) {
 
   StopCounters ctr;
   TEST_ASSERT_TRUE(tracker.getStopCounters("F19a", ctr));
-  TEST_ASSERT_EQUAL_UINT32(0, ctr.evicted_trips);
-  TEST_ASSERT_EQUAL_UINT32(0, ctr.dropped_observations);
+  TEST_ASSERT_EQUAL_UINT32(0, ctr.evicted_trips);       // nothing already admitted was displaced
+  TEST_ASSERT_EQUAL_UINT32(2, ctr.dropped_observations);  // the one that did not fit, once a poll
   TEST_ASSERT_EQUAL_UINT32(0, ctr.arrivals_seen);
   TEST_ASSERT_EQUAL_UINT32(0, ctr.ghosts_seen);
 }
 
-// Twenty trips into twelve slots: the twelve SOONEST are kept, the rest are counted as dropped
+// Twenty trips into kMaxTrackedTripsPerStop slots: the SOONEST are kept, the rest are counted as dropped
 // observations, and the set is stable -- no first sighting ever repeats, and the soonest arrivals
 // are never the ones lost.
 static void test_tracker_twenty_trip_feed_keeps_the_soonest(void) {
@@ -1643,9 +1651,9 @@ static void test_tracker_twenty_trip_feed_keeps_the_soonest(void) {
     const std::string trip = "T" + std::to_string(i);
     const size_t preds = countOfTrip(out, EventType::Pred, trip);
     if (i < (int)transit_stats::kMaxTrackedTripsPerStop) {
-      TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(preds));  // soonest twelve: admitted
+      TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(preds));  // the soonest kMax..: admitted
     } else {
-      TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(preds));  // farthest eight: ignored
+      TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(preds));  // the rest: ignored
     }
   }
 
@@ -1657,7 +1665,9 @@ static void test_tracker_twenty_trip_feed_keeps_the_soonest(void) {
   StopCounters ctr;
   TEST_ASSERT_TRUE(tracker.getStopCounters("F19b", ctr));
   TEST_ASSERT_EQUAL_UINT32(0, ctr.evicted_trips);
-  TEST_ASSERT_EQUAL_UINT32(24, ctr.dropped_observations);  // 8 per poll, 3 polls
+  // (20 - kMaxTrackedTripsPerStop) never admitted, on each of three polls.
+  TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(3 * (20 - transit_stats::kMaxTrackedTripsPerStop)),
+                            ctr.dropped_observations);
 }
 
 // A trip beyond the admission horizon is ignored rather than admitted-then-evicted, and is picked
@@ -2329,7 +2339,7 @@ int main(int argc, char** argv) {
   RUN_TEST(test_tracker_never_observed_scheduled_still_noshow);
   RUN_TEST(test_tracker_pending_scheduled_dropped_on_outage_not_noshow);
 
-  RUN_TEST(test_tracker_nine_trip_feed_does_not_churn);
+  RUN_TEST(test_tracker_one_over_the_cap_does_not_churn);
   RUN_TEST(test_tracker_twenty_trip_feed_keeps_the_soonest);
   RUN_TEST(test_tracker_far_future_arrival_is_ignored_until_close);
 

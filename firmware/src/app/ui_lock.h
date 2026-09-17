@@ -114,6 +114,40 @@ bool onDisplayTask();
 bool takeShared(SemaphoreHandle_t m, uint32_t normal_ms);
 inline void giveShared(SemaphoreHandle_t m) { xSemaphoreGive(m); }
 
+// The same take, released by leaving the scope INCLUDING BY A THROW (2026-09-17).
+//
+// The hand-written take/give pair is correct only while nothing between them can throw, and in
+// ui.cpp it is not: every one of those four critical sections copies a Config or a UiDebug - both
+// of them vectors of std::string - so a bad_alloc there walks out past the give and the mutex is
+// held for the rest of the device's life. Nothing ever takes it again: tick() stops applying config
+// changes, debugSnapshot() times out and hands GET /api/debug/ui an all-zero UiDebug that looks
+// like data, and onConfigChanged() silently drops every save. That is reachable precisely when the
+// heap troughs, which is when this endpoint is being read hardest.
+//
+// It changes no wait and no policy: the take is still takeShared()'s, misses are still counted the
+// same way, and a miss is still "use what you had". The only difference is which paths give it
+// back. RawWait exists for the one caller that deliberately does not use the policy wait -
+// ui::debugSnapshot()'s 500 ms, which is a non-display-task read with its own documented reason.
+class SharedLock {
+ public:
+  struct RawWait {
+    uint32_t ms;
+  };
+  SharedLock(SemaphoreHandle_t m, uint32_t normal_ms) : m_(m), held_(takeShared(m, normal_ms)) {}
+  SharedLock(SemaphoreHandle_t m, RawWait w)
+      : m_(m), held_(m != nullptr && xSemaphoreTake(m, pdMS_TO_TICKS(w.ms)) == pdTRUE) {}
+  ~SharedLock() {
+    if (held_) giveShared(m_);
+  }
+  SharedLock(const SharedLock &) = delete;
+  SharedLock &operator=(const SharedLock &) = delete;
+  explicit operator bool() const { return held_; }
+
+ private:
+  SemaphoreHandle_t m_;
+  bool held_;
+};
+
 // Display-task lock misses since boot, across every accessor. GET /api/debug/ui reports it; the
 // device suite watches it stay small, which is how "a miss costs one frame" is checked rather than
 // asserted.

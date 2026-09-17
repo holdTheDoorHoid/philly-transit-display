@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <ctime>
 #include <memory>
+#include <utility>
 
 #include "../demo_data.h"
 #include "../due_alert.h"
@@ -202,14 +203,14 @@ void buildParkingScreen() {
   lv_obj_set_size(g_parking_screen, w, h);
   lv_obj_set_style_border_width(g_parking_screen, 0, 0);
   lv_obj_set_style_pad_all(g_parking_screen, 12, 0);
-  lv_obj_remove_flag(g_parking_screen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollable(g_parking_screen, false);
   g_parking_label = lv_label_create(g_parking_screen);
   lv_obj_set_width(g_parking_label, lv_pct(96));
   lv_obj_center(g_parking_label);
   lv_label_set_long_mode(g_parking_label, LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_align(g_parking_label, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_text(g_parking_label, "Not enough display memory for this page.\n\nShow fewer stops in Settings, then tap the screen.");
-  lv_obj_add_flag(g_parking_label, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_hidden(g_parking_label, true);
   attachTapHandlers(g_parking_screen);
   applyParkingStyle();
 }
@@ -290,12 +291,12 @@ void showPoolMessage() {
   g_stalled = true;
   if (g_parking_screen == nullptr) return;
   if (lv_screen_active() != g_parking_screen) lv_screen_load(g_parking_screen);
-  if (g_parking_label != nullptr) lv_obj_remove_flag(g_parking_label, LV_OBJ_FLAG_HIDDEN);
+  if (g_parking_label != nullptr) lv_obj_set_hidden(g_parking_label, false);
 }
 
 void hidePoolMessage() {
   g_stalled = false;
-  if (g_parking_label != nullptr) lv_obj_add_flag(g_parking_label, LV_OBJ_FLAG_HIDDEN);
+  if (g_parking_label != nullptr) lv_obj_set_hidden(g_parking_label, true);
 }
 
 // Loads the arrivals page or the night clock, whichever the data calls for (Page::Main only),
@@ -490,7 +491,7 @@ lv_obj_t *makeMessageScreen(int32_t w, int32_t h) {
   lv_obj_set_style_pad_row(screen, 6, 0);
   lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(screen, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollable(screen, false);
   return screen;
 }
 
@@ -572,7 +573,7 @@ void showConnectingScreen(const std::string &ssid, const std::string &detail) {
     lv_obj_t *screen = makeMessageScreen(w, h);
     // The whole screen is the tap target: this is the only way into the setup portal on a device
     // that already has credentials (review F10), and the owner should not have to find a button.
-    lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_clickable(screen, true);
     lv_obj_add_event_cb(screen, [](lv_event_t *) { g_tap_requested = true; }, LV_EVENT_CLICKED, nullptr);
 
     g_connecting_ssid_label = makeCentredLabel(screen, fontBody(h), colorText());
@@ -606,13 +607,22 @@ void tick() {
   // takeShared(): this task does not wait at all; 50 ms is what any OTHER task gets (ui_lock.h).
   // A miss just means the new config is applied on the next tick, a second later - g_pending
   // stays set.
-  if (g_pending && takeShared(g_pending_mutex, 50)) {
-    if (g_pending) {
-      next = g_pending_cfg;
+  if (g_pending) {
+    // SharedLock and not take/give: whatever happens under this lock must not be able to strand it
+    // (ui_lock.h). The handover used to be `next = g_pending_cfg`, a COPY of a whole Config - nine
+    // std::strings per stop - which allocated, could throw, and then left the copy behind in
+    // g_pending_cfg for the life of the device: ~1.2 KB of small blocks held permanently after any
+    // config save, for a value that has already been consumed (runtime audit SS5, "a second copy of
+    // anything"). Moving it hands the buffers over instead: no allocation, nothing to throw, and
+    // g_pending_cfg is left empty - the strings and the stop vector are released here rather than
+    // the next time a save happens to overwrite them. It is only ever read under `g_pending`, and
+    // onConfigChanged() copy-assigns a fresh Config into it, which a moved-from object accepts.
+    SharedLock lk(g_pending_mutex, 50);
+    if (lk && g_pending) {
+      next = std::move(g_pending_cfg);
       g_pending = false;
       apply = true;
     }
-    giveShared(g_pending_mutex);
   }
   if (apply) {
     bool rotate = next.device.rotation != g_cfg.device.rotation;
@@ -716,9 +726,9 @@ void tick() {
   d.ver_res = lv_display_get_vertical_resolution(disp);
   // Same policy: a miss leaves GET /api/debug/ui reading the previous tick's snapshot of the UI,
   // which is a 1 Hz sample of a 1 Hz value.
-  if (takeShared(g_pending_mutex, 20)) {
-    g_debug = d;
-    giveShared(g_pending_mutex);
+  {
+    SharedLock lk(g_pending_mutex, 20);  // g_debug = d copies five strings and two string vectors
+    if (lk) g_debug = d;
   }
 }
 
@@ -727,10 +737,8 @@ UiDebug debugSnapshot() {
   // 500 ms, not 200: this is how the device suite watches the panel, including while the UI task
   // is mid-rebuild and holding core 1, and a timeout here answers a default-constructed UiDebug -
   // an all-zero pool reading that looks like data. Seen intermittently at 200 ms on 2026-09-16.
-  if (g_pending_mutex && xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-    d = g_debug;
-    xSemaphoreGive(g_pending_mutex);
-  }
+  SharedLock lk(g_pending_mutex, SharedLock::RawWait{500});  // the copy below can throw
+  if (lk) d = g_debug;
   return d;
 }
 
@@ -787,10 +795,10 @@ void applyInvert(bool invert) {
 
 void onConfigChanged(const Config &cfg) {
   if (g_pending_mutex == nullptr) return;  // before init(): main.cpp applies the boot config itself
-  if (xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+  SharedLock lk(g_pending_mutex, SharedLock::RawWait{200});  // a whole Config copy: it can throw
+  if (lk) {
     g_pending_cfg = cfg;
     g_pending = true;
-    xSemaphoreGive(g_pending_mutex);
   }
 }
 

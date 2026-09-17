@@ -11,6 +11,7 @@
 // Every request also has its `Host` header checked against the ways this device can legitimately
 // be addressed; anything else gets 421 (DNS-rebinding defence, review F05).
 #pragma once
+#include <cstdint>
 #include <functional>
 
 namespace transit_app {
@@ -32,5 +33,14 @@ void startWebServer(std::function<void(bool)> onConfigChanged = nullptr);
 // start of an upload and once at its end, and the reader only cares about a state that lasts for
 // the whole upload.
 bool otaBusy();
+
+// How many AsyncWebServerRequest objects are alive right now (admission.h). Read by the poller's
+// queued-job gate: a ~9 KB stats scan must not start while a burst of web requests is in flight,
+// which is what crashed the 0.3.1-rc2 device suite. A few milliseconds stale by construction,
+// which is fine for a question that only has to distinguish "quiet" from "burst".
+uint32_t inFlightRequests();
+
+// Connections closed at accept because the in-flight cap or a heap floor refused them, since boot.
+uint32_t admissionRefusals();
 
 }  // namespace transit_app

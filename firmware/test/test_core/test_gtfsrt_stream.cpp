@@ -474,3 +474,90 @@ void test_gtfsrt_fixture_updates_carry_the_header_timestamp() {
     TEST_ASSERT_EQUAL_INT64(1789352333, u.feed_timestamp);
   }
 }
+
+// --- reset(): one stream object, a new feed every cycle ---------------------------------------
+//
+// The firmware keeps ONE GtfsRtStream for the life of the device (transit_core PollBuffers,
+// DESIGN.md 5 "the poll working set"), because constructing one asks the allocator for a 4,096 B
+// entity buffer and a ~4,600 B retention block, and the largest free BLOCK on the target - not the
+// free heap - is what runs out. So a reset stream has to behave exactly like a fresh one.
+
+void test_gtfsrt_reset_decodes_a_second_feed_identically() {
+  std::vector<uint8_t> body = transit_test::readFixture("septa_bus_tripupdates.pb");
+
+  GtfsRtStream fresh;
+  fresh.setRouteFilter({"17"});
+  fresh.setStopFilter({"21332", "21297"});
+  fresh.retainUpdates();
+  TEST_ASSERT_TRUE(fresh.push(body.data(), body.size()));
+  TEST_ASSERT_TRUE(fresh.finish() == transit::FeedStatus::Complete);
+
+  GtfsRtStream reused;
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    reused.reset(4096);
+    reused.setRouteFilter({"17"});
+    reused.setStopFilter({"21332", "21297"});
+    reused.retainUpdates();
+    TEST_ASSERT_TRUE(reused.push(body.data(), body.size()));
+    TEST_ASSERT_TRUE(reused.finish() == transit::FeedStatus::Complete);
+
+    TEST_ASSERT_EQUAL_INT64(fresh.headerTimestamp(), reused.headerTimestamp());
+    TEST_ASSERT_EQUAL_UINT32(fresh.entitiesSeen(), reused.entitiesSeen());
+    TEST_ASSERT_EQUAL_UINT32(fresh.entitiesMatched(), reused.entitiesMatched());
+    TEST_ASSERT_EQUAL_UINT32(fresh.entitiesMalformed(), reused.entitiesMalformed());
+    TEST_ASSERT_EQUAL_UINT32(fresh.updatesMatched(), reused.updatesMatched());
+    TEST_ASSERT_EQUAL_UINT32(fresh.updatesDroppedByCap(), reused.updatesDroppedByCap());
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(fresh.retained().size()),
+                              static_cast<uint32_t>(reused.retained().size()));
+    for (size_t i = 0; i < fresh.retained().size(); ++i) {
+      TEST_ASSERT_TRUE(sameUpdate(fresh.retained()[i], reused.retained()[i]));
+    }
+    // The retention block is kept across the reset: that is the allocation this exists to avoid.
+    TEST_ASSERT_TRUE(reused.retained().capacity() >= GtfsRtStream::kDefaultMaxRetainedUpdates);
+  }
+}
+
+void test_gtfsrt_reset_clears_a_half_parsed_feed() {
+  std::vector<uint8_t> body = transit_test::readFixture("septa_bus_tripupdates.pb");
+
+  GtfsRtStream s;
+  s.setRouteFilter({"17"});
+  s.retainUpdates();
+  TEST_ASSERT_TRUE(s.push(body.data(), body.size() / 2));  // cut mid-entity
+  TEST_ASSERT_TRUE(s.feedStatus() == transit::FeedStatus::Truncated);
+  TEST_ASSERT_TRUE(s.entitiesSeen() > 0);
+
+  s.reset(4096);
+  // Immediately after a reset the stream is an empty, complete feed - not a truncated one.
+  TEST_ASSERT_TRUE(s.feedStatus() == transit::FeedStatus::Complete);
+  TEST_ASSERT_EQUAL_UINT32(0, s.entitiesSeen());
+  TEST_ASSERT_EQUAL_UINT32(0, s.updatesMatched());
+  TEST_ASSERT_EQUAL_INT64(0, s.headerTimestamp());
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(s.retained().size()));
+
+  // And the filters are gone too, so a cycle that configures fewer routes is not still filtering
+  // on the previous cycle's list.
+  s.retainUpdates();
+  TEST_ASSERT_TRUE(s.push(body.data(), body.size()));
+  TEST_ASSERT_TRUE(s.finish() == transit::FeedStatus::Complete);
+  GtfsRtStream unfiltered;
+  unfiltered.retainUpdates();
+  TEST_ASSERT_TRUE(unfiltered.push(body.data(), body.size()));
+  unfiltered.finish();
+  TEST_ASSERT_EQUAL_UINT32(unfiltered.updatesMatched(), s.updatesMatched());
+}
+
+void test_gtfsrt_reset_grows_the_entity_cap_when_asked() {
+  // A stream first used with no entity buffer at all (the subway-only config: no GTFS-RT fetch)
+  // and then reset with a real cap must decode the feed properly rather than skipping every
+  // entity as oversized.
+  std::vector<uint8_t> body = transit_test::readFixture("septa_bus_tripupdates.pb");
+  GtfsRtStream s(0);
+  s.reset(4096);
+  s.setRouteFilter({"17"});
+  s.retainUpdates();
+  TEST_ASSERT_TRUE(s.push(body.data(), body.size()));
+  TEST_ASSERT_TRUE(s.finish() == transit::FeedStatus::Complete);
+  TEST_ASSERT_TRUE(s.updatesMatched() > 0);
+  TEST_ASSERT_EQUAL_UINT32(0, s.entitiesSkippedTooLarge());
+}

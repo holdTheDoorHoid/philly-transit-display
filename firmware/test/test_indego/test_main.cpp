@@ -294,6 +294,112 @@ void test_status_url() {
   TEST_ASSERT_EQUAL_STRING("https://bts-status.bicycletransit.workers.dev/phl", statusUrl().c_str());
 }
 
+// One StatusStream, reused. The firmware allocates the scanner once before Wi-Fi and reset()s it
+// per refresh, because its one-feature buffer is a 6,144 B CONTIGUOUS block and the largest free
+// block on the target - not the free heap - is what runs out (DESIGN.md 5, "the poll working
+// set"). So a reused stream has to produce byte-for-byte what a fresh one does.
+void test_reset_rescans_identically_and_keeps_the_buffer() {
+  std::vector<uint8_t> body = readFixture("indego_bts_status_sample.json");
+
+  StatusStream fresh;
+  fresh.setStationFilter({3468, 3361});
+  fresh.push(body.data(), body.size());
+  fresh.finish();
+
+  StatusStream reused;
+  for (int pass = 0; pass < 3; ++pass) {
+    reused.reset();
+    // A different filter first, to prove the previous pass's state really is gone.
+    reused.setStationFilter({3361});
+    reused.push(body.data(), body.size());
+    reused.finish();
+    TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(reused.stations().size()));
+
+    reused.reset();
+    reused.setStationFilter({3468, 3361});
+    reused.push(body.data(), body.size());
+    reused.finish();
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(fresh.stations().size()),
+                              static_cast<uint32_t>(reused.stations().size()));
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(fresh.featuresSeen()),
+                              static_cast<uint32_t>(reused.featuresSeen()));
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(fresh.featuresSkipped()),
+                              static_cast<uint32_t>(reused.featuresSkipped()));
+    for (size_t i = 0; i < fresh.stations().size(); ++i) {
+      TEST_ASSERT_EQUAL_INT(fresh.stations()[i].id, reused.stations()[i].id);
+      TEST_ASSERT_EQUAL_STRING(fresh.stations()[i].name.c_str(), reused.stations()[i].name.c_str());
+      TEST_ASSERT_EQUAL_INT(fresh.stations()[i].bikes, reused.stations()[i].bikes);
+      TEST_ASSERT_EQUAL_INT(fresh.stations()[i].ebikes, reused.stations()[i].ebikes);
+      TEST_ASSERT_EQUAL_INT(fresh.stations()[i].docks, reused.stations()[i].docks);
+    }
+  }
+}
+
+// A reset in the MIDDLE of a feed must leave no half-captured feature behind.
+void test_reset_mid_stream_discards_partial_state() {
+  std::vector<uint8_t> body = readFixture("indego_bts_status_sample.json");
+  StatusStream s;
+  s.setStationFilter({3468, 3361});
+  s.push(body.data(), body.size() / 2);  // cut somewhere inside the features array
+  s.reset();
+  s.setStationFilter({3468, 3361});
+  s.push(body.data(), body.size());
+  s.finish();
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(s.stations().size()));
+  TEST_ASSERT_EQUAL_INT(3361, s.stations()[0].id);
+  TEST_ASSERT_EQUAL_INT(3468, s.stations()[1].id);
+}
+
+// The buffer borrow (DESIGN.md 5, "the poll working set"). The firmware hands this scanner the
+// SAME std::vector the GTFS-RT decoder used as its entity buffer, and each buffered JSON response
+// used as its body, earlier in the same cycle - one 6 KB reservation instead of four. So a
+// borrowing scanner has to produce exactly what an owning one does, and must not take a buffer of
+// its own on top.
+void test_borrowed_feature_buffer_scans_identically() {
+  std::vector<uint8_t> body = readFixture("indego_bts_status_sample.json");
+
+  StatusStream owning;
+  owning.setStationFilter({3468, 3361});
+  owning.push(body.data(), body.size());
+  owning.finish();
+
+  // Deliberately handed a vector that is EMPTY and unreserved, the way the real one would be after
+  // a previous borrower cleared it: setFeatureBuffer sizes it.
+  std::vector<uint8_t> shared;
+  StatusStream borrowing;
+  borrowing.setFeatureBuffer(&shared);
+  TEST_ASSERT_TRUE(shared.capacity() >= StatusStream::kMaxFeatureBytes);
+  const size_t cap_after_borrow = shared.capacity();
+
+  for (int pass = 0; pass < 3; ++pass) {
+    borrowing.reset();
+    borrowing.setStationFilter({3468, 3361});
+    borrowing.push(body.data(), body.size());
+    borrowing.finish();
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(owning.stations().size()),
+                              static_cast<uint32_t>(borrowing.stations().size()));
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(owning.featuresSeen()),
+                              static_cast<uint32_t>(borrowing.featuresSeen()));
+    for (size_t i = 0; i < owning.stations().size(); ++i) {
+      TEST_ASSERT_EQUAL_INT(owning.stations()[i].id, borrowing.stations()[i].id);
+      TEST_ASSERT_EQUAL_STRING(owning.stations()[i].name.c_str(),
+                                borrowing.stations()[i].name.c_str());
+      TEST_ASSERT_EQUAL_INT(owning.stations()[i].bikes, borrowing.stations()[i].bikes);
+    }
+    // The borrowed buffer is REUSED, not replaced: a capacity that moved would mean the scanner
+    // took storage of its own and the shared reservation had been defeated.
+    TEST_ASSERT_EQUAL_UINT32(cap_after_borrow, static_cast<uint32_t>(shared.capacity()));
+  }
+
+  // And handing the borrow back puts the scanner on its own buffer again, still correct.
+  borrowing.setFeatureBuffer(nullptr);
+  borrowing.reset();
+  borrowing.setStationFilter({3361});
+  borrowing.push(body.data(), body.size());
+  borrowing.finish();
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(borrowing.stations().size()));
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(test_parse_fixture_filtered);
@@ -304,5 +410,8 @@ int main() {
   RUN_TEST(test_truncated_body);
   RUN_TEST(test_braces_and_quotes_in_strings);
   RUN_TEST(test_status_url);
+  RUN_TEST(test_reset_rescans_identically_and_keeps_the_buffer);
+  RUN_TEST(test_reset_mid_stream_discards_partial_state);
+  RUN_TEST(test_borrowed_feature_buffer_scans_identically);
   return UNITY_END();
 }

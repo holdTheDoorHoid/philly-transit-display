@@ -9,18 +9,26 @@
 #include <freertos/task.h>
 
 #include <cctype>
+#include <cstdio>   // snprintf() for the heap-trace rows (diag branch)
+#include <cstdlib>  // strtoul() for the heap-trace query params (diag branch)
 #include <cstring>
 #include <ctime>
+#include <array>
+#include <atomic>
 #include <memory>
 #include <new>
 
 #include "auth.h"
+#include "admission.h"
 #include "config_store.h"
 #include "cpu_yield.h"  // cpuStretchMsMax() for /api/debug/ui (DESIGN.md SS12.1)
 #include "cxx_exception_pool.h"
 #include "demo_data.h"
+#include "heap_trace.h"  // the poll-cycle heap ring for /api/debug/ui (diag branch)
 #include "host_match.h"
+#include "heap_reserve.h"
 #include "json_response.h"
+#include "oom_reply.h"
 #include "net_poller.h"
 #include "weather_service.h"
 #include "ui/ui.h"
@@ -62,7 +70,111 @@ namespace transit_app {
 
 namespace {
 
-AsyncWebServer g_server(80);
+// ---- Admission control at accept time (admission.h, DESIGN.md SS12.1) -------------------------
+//
+// The fourth uncatchable-OOM instance: the library assembles a response's header list LATER, from
+// inside _parseLine, on a frame with no handler of ours above it, so neither the 1 KB reserve nor
+// oom_reply.h's nested try/catch can reach the allocation that crashed the device suite's section E
+// burst. admission.h has the backtrace and the arithmetic. The only lever left is to refuse the
+// connection before ANYTHING is built for it.
+//
+// HOW IN-FLIGHT REQUESTS ARE COUNTED, and why it is weak_ptrs rather than a counter. The obvious
+// design - increment at accept, decrement on disconnect - has nowhere to put the decrement:
+// AsyncWebServerRequest's constructor overwrites every AsyncClient callback, and the one user hook
+// the library offers, request->onDisconnect(), is a SINGLE slot that three call sites in this
+// firmware already own (the proxy file lease, the OTA guard and the log-download lease). Taking it
+// would break them; chaining would need a per-request registry.
+//
+// AsyncWebServerRequest::create() hands back a shared_ptr whose control block IS the request's
+// lifetime - _onDisconnect() drops the self-reference and the object destructs. A weak_ptr to it
+// therefore expires exactly when the request is gone, needs no hook, collides with nothing, and
+// costs no allocation to copy or test. Sweeping the array is the count.
+//
+// TASK SAFETY: every touch of g_in_flight_slots happens on the AsyncTCP task (the accept callback
+// and HostGuardHandler::canHandle), so the array needs no lock. g_in_flight_count is the atomic
+// snapshot the poller task reads for its job gate; it can be a few milliseconds stale, which for a
+// gate that only has to say "is a burst happening" is fine.
+std::array<std::weak_ptr<AsyncWebServerRequest>, kMaxInFlightRequests + 3> g_in_flight_slots;
+std::atomic<uint32_t> g_in_flight_count{0};
+std::atomic<uint32_t> g_admission_refusals{0};
+
+// Drops expired slots and returns how many requests are alive. AsyncTCP task only. Allocates
+// nothing and cannot throw: weak_ptr::expired() and reset() only touch an existing control block.
+uint32_t sweepInFlight() {
+  uint32_t live = 0;
+  for (auto &slot : g_in_flight_slots) {
+    if (slot.expired()) {
+      slot.reset();
+    } else {
+      ++live;
+    }
+  }
+  g_in_flight_count.store(live, std::memory_order_relaxed);
+  return live;
+}
+
+// Records a newly admitted request in the first free slot. The array is larger than the cap, so
+// after a successful admission there is always one; if there somehow is not, the request still
+// runs - it is simply not counted, which errs toward serving rather than refusing.
+void rememberInFlight(const std::shared_ptr<AsyncWebServerRequest> &r) {
+  for (auto &slot : g_in_flight_slots) {
+    if (slot.expired()) {
+      slot = r;
+      g_in_flight_count.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+// AsyncWebServer with the accept path replaced. `_server` is protected in the library, so a
+// subclass can re-register the AsyncServer's onClient callback; the base constructor installs the
+// library's version first and this one replaces it. The body below is the library's own
+// (WebServer.cpp's constructor), with the admission check in front of it and a try/catch around
+// it - the library's version has neither, and a throw on this task is std::terminate.
+class GatedWebServer : public AsyncWebServer {
+ public:
+  explicit GatedWebServer(uint16_t port) : AsyncWebServer(port) {
+    _server.onClient(
+      [](void *s, AsyncClient *c) {
+        if (c == nullptr) return;
+        try {
+          const uint32_t live = sweepInFlight();
+          if (!admitConnection(live, heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))) {
+            // Zero allocations on this path, which is the entire point: no request, no response,
+            // no header list, no send buffer. The client sees a closed connection, which the web
+            // app's resilientRead() already treats as retryable (DESIGN.md SS10.2) and the device
+            // suite counts against its refusal budget alongside the empty-200 shape.
+            g_admission_refusals.fetch_add(1, std::memory_order_relaxed);
+            c->abort();
+            delete c;
+            return;
+          }
+          c->setRxTimeout(3);  // the library's own value
+          std::shared_ptr<AsyncWebServerRequest> r =
+            AsyncWebServerRequest::create(static_cast<AsyncWebServer *>(s), c);
+          if (!r) {
+            c->abort();
+            delete c;
+            return;
+          }
+          rememberInFlight(r);
+        } catch (const std::bad_alloc &) {
+          // create() allocates with nothrow, but the request's constructor builds Strings and
+          // std::functions. The library runs this callback with no catch above it anywhere, so
+          // without this a throw here is std::terminate - the same shape as everything else in
+          // DESIGN.md SS12.1's list.
+          g_admission_refusals.fetch_add(1, std::memory_order_relaxed);
+          c->abort();
+          delete c;
+        }
+      },
+      this
+    );
+  }
+};
+
+GatedWebServer g_server(80);
 
 const char *statusToString(Status s) {
   switch (s) {
@@ -218,7 +330,9 @@ void sendJson(AsyncWebServerRequest *request, int code, JsonDocument &doc) {
   String body;
   bool ok = !doc.overflowed() && serializeJson(doc, body) > 0 && body.length() > 0;
   if (!ok) {
-    request->send(503, "application/json", "{\"error\":\"out of memory building the response, retry\"}");
+    // sendUnderPressure(), not send(): this reply is on an out-of-memory path and the response
+    // object it needs is itself an allocation (oom_reply.h).
+    sendUnderPressure(request, 503, "{\"error\":\"out of memory building the response, retry\"}");
     return;
   }
   request->send(code, "application/json", body);
@@ -300,7 +414,10 @@ void sendFailure(AsyncWebServerRequest *request, const ApiFailure &fail) {
   } else {
     snprintf(body, sizeof body, "{\"error\":\"%s\"}", fail.message.c_str());
   }
-  request->send(fail.status, "application/json", body);
+  // Through sendUnderPressure() for the same reason the buffer is on the stack: this answer has to
+  // go out when the heap is momentarily exhausted, and request->send() itself allocates the
+  // response object (oom_reply.h). `body` is stack memory and is copied by the send.
+  sendUnderPressure(request, fail.status, body);
 }
 
 // What every protected handler calls as its first statement: answers the request itself and
@@ -407,7 +524,9 @@ bool refuseIfLowHeap(AsyncWebServerRequest *request) {
       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= kMinHeavyResponseBlock) {
     return false;
   }
-  request->send(503, "application/json", "{\"error\":\"low memory, retry\"}");
+  // By definition the heap is already under the floor here, so this is the reply most likely to
+  // fail to be built at all (oom_reply.h).
+  sendUnderPressure(request, 503, "{\"error\":\"low memory, retry\"}");
   return true;
 }
 
@@ -529,7 +648,7 @@ void handleGetState(AsyncWebServerRequest *request) {
   Snapshot snap = buildDemoSnapshot((transit::Epoch)time(nullptr));
   serializeSnapshot(snap, cfg, doc.as<JsonObject>());
 #else
-  // snapshotPtr(), not getSnapshot(): this handler only READS the Snapshot, and borrowing the
+  // snapshotPtr(), and not a copy: this handler only READS the Snapshot, and borrowing the
   // poller's own costs neither a copy of every arrival in it nor a contiguous block to put that copy
   // in. On a device whose largest free block sits at 5 KB between polls that difference is the
   // difference between answering and answering 503 (DESIGN.md SS12.1), and it is also a whole
@@ -998,6 +1117,62 @@ void handleProxySchedule(AsyncWebServerRequest *request) {
   queueScheduleProxy(request, request->getParam("stop_id")->value().c_str());
 }
 
+// ---------------------------------------------------------------------------------------------
+// The heap instrument's readout side (diag branch, 2026-09-17). heap_trace.h has the why.
+//
+// THE CONSTRAINT THAT SHAPES ALL OF THIS: /api/debug/ui is deliberately outside refuseIfLowHeap()
+// and is the only endpoint that still answers on a board whose largest block is under 4 KB. The
+// trace must therefore not be the thing that stops it answering. So the rows are rendered by hand
+// into a fixed .bss buffer and injected with serialized(), NOT built as nested JsonArrays: 32 rows
+// of four numbers would be ~160 ArduinoJson slots, i.e. two or three more 1,024 B pool chunks, and
+// a pool that cannot grow makes the document overflow, which sendJson() correctly turns into a 503.
+// ArduinoJson copies a serialized() value into one StringNode, so the added heap cost is a single
+// contiguous block of what the rows actually measure - about 700 B at 32 rows - and nothing else.
+//
+// 32 rows and not the ring's full 64 for the same reason: the response body is copied twice on the
+// way out (the serialised String, then AsyncBasicResponse's own copy of it), so every byte here is
+// two contiguous bytes at the worst moment. A sampler passes `since` and gets only new rows, which
+// is a few hundred bytes per poll; `?n=64` is there for a one-off full dump on a healthy board.
+constexpr size_t kTraceMaxRows = 32;
+// "[65535,22,1048576,1048576]," is 27 characters; 32 B a row is slack, not a measurement.
+char g_trace_json[kTraceMaxRows * 32 + 8];
+
+const char *renderTrace(uint32_t since, size_t want, uint32_t *first_seq, size_t *count) {
+  if (want == 0 || want > kTraceMaxRows) want = kTraceMaxRows;
+  HeapTraceEntry rows[kTraceMaxRows];  // 384 B on the AsyncTCP task's 8 KB stack, freed on return
+  size_t n = heapTraceRead(since, rows, want, first_seq);
+  size_t at = 0;
+  g_trace_json[at++] = '[';
+  size_t written = 0;
+  for (size_t i = 0; i < n; i++) {
+    int w = snprintf(g_trace_json + at, sizeof(g_trace_json) - at - 2, "%s[%u,%u,%u,%u]", i ? "," : "",
+                     (unsigned)rows[i].cycle, (unsigned)rows[i].stage, (unsigned)rows[i].free8,
+                     (unsigned)rows[i].largest);
+    if (w <= 0 || (size_t)w >= sizeof(g_trace_json) - at - 2) break;  // cannot happen at these widths
+    at += (size_t)w;
+    written++;
+  }
+  g_trace_json[at++] = ']';
+  g_trace_json[at] = '\0';
+  *count = written;
+  return g_trace_json;
+}
+
+// uxTaskGetStackHighWaterMark by task name: the smallest number of stack BYTES that task has ever
+// had left (StackType_t is a byte on this port, which is why net_poller.cpp's own stack_free line
+// reads in bytes too). Looked up by name rather than by a stored handle because two of the three
+// tasks are not ours - "loopTask" is the Arduino core's and "async_tcp" is AsyncTCP's. A task that
+// does not exist yet reports 0. Neither call allocates.
+uint32_t taskStackHwm(const char *name) {
+  TaskHandle_t h = xTaskGetHandle(name);
+  return h == nullptr ? 0 : (uint32_t)uxTaskGetStackHighWaterMark(h);
+}
+
+uint32_t queryU32(AsyncWebServerRequest *request, const char *name, uint32_t fallback) {
+  if (!request->hasParam(name)) return fallback;
+  return (uint32_t)strtoul(request->getParam(name)->value().c_str(), nullptr, 10);
+}
+
 // DESIGN.md SS12.1: the deterministic on-device proof of the C++ emergency exception pool
 // (cxx_exception_pool.cpp). Takes the heap away in shrinking blocks until even a 16-byte allocation
 // fails, then forces a std::bad_alloc: with no pool, __cxa_allocate_exception cannot get the ~100
@@ -1040,18 +1215,29 @@ void handleDebugOom(AsyncWebServerRequest *request) {
 
 // Static list embedded in firmware (transit_core/rail_stations.h) - no network needed, so this
 // runs directly on the web server's own task.
+//
+// Streamed, not sendJson()'d (audit_runtime SS5, ranked recommendation 6): 149 station names is a
+// ~2-4 KB body, and sendJson() serialises it into a String and then hands that to
+// AsyncBasicResponse, which copies it - two body-sized CONTIGUOUS blocks, on the device whose
+// largest free block is the thing that runs out. sendJsonStreamed() moves the document into the
+// response and serialises it straight into each 2,872 B send chunk, so the only contiguous block
+// is that chunk buffer. Same reasoning, same helper, as /api/state and /api/config.
 void handleRailStations(AsyncWebServerRequest *request) {
+  if (refuseIfLowHeap(request)) return;
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
   for (size_t i = 0; i < transit::kRailStationCount; ++i) {
     arr.add(transit::kRailStationNames[i]);
   }
-  sendJson(request, 200, doc);
+  sendJsonStreamed(request, doc);
 }
 
 // DESIGN.md SS9.3: queued to proxy_worker.cpp's task since it streams one or more monthly CSV
 // files off SD (never instant, and never something to do on the async server's own task).
 void handleGetStats(AsyncWebServerRequest *request) {
+  // Entry gate, like /api/state and /api/config: a queued job that cannot be started is worse
+  // than a 503, because pausing the request turns its server-side timeout off (audit_runtime SS4).
+  if (refuseIfLowHeap(request)) return;
   if (!request->hasParam("stop")) {
     sendError(request, 400, "stop is required");
     return;
@@ -1242,6 +1428,11 @@ class HostGuardHandler : public AsyncWebHandler {
     // overwhelmingly a bad_alloc, i.e. exactly when the heap is gone. Pay it here, on request
     // number one, while the heap is healthy. One pthread_getspecific per request thereafter.
     transit_app::warmExceptionGlobals("async_tcp");
+    // Refresh the in-flight count here as well as at accept. Requests finish between connections,
+    // and this is the only other place that runs on the AsyncTCP task for every request - without
+    // it the poller's job gate would read a count that only ever moved when a NEW connection
+    // arrived. Allocates nothing (admission control, above).
+    sweepInFlight();
     // Claims the request only when the Host is NOT one of ours, so the real routes are reached
     // exactly as before. hostAllowed() allocates nothing and cannot throw (host_match.h), which is
     // what makes it safe to call from here: an exception escaping canHandle() would unwind into
@@ -1252,8 +1443,7 @@ class HostGuardHandler : public AsyncWebHandler {
   void handleRequest(AsyncWebServerRequest *request) override {
     // A fixed literal rather than sendError()'s JsonDocument + String: this answer has to go out
     // when the heap is momentarily exhausted, the same reasoning as sendFailure().
-    request->send(421, "application/json",
-                  "{\"error\":\"this device is not reachable under that host name\"}");
+    sendUnderPressure(request, 421, "{\"error\":\"this device is not reachable under that host name\"}");
   }
 };
 
@@ -1268,7 +1458,13 @@ ArRequestHandlerFunction guarded(ArRequestHandlerFunction fn) {
     try {
       fn(request);
     } catch (const std::bad_alloc &) {
-      request->send(503, "application/json", "{\"error\":\"out of memory, retry\"}");
+      // THE CRASH THIS LINE CAUSED, and now does not (coredump, 2026-09-17, heap_reserve.h): the
+      // catch handler was `request->send(503, ...)`, and send() allocates - beginResponse() does
+      // `new AsyncBasicResponse(...)`, sz=100 in the dump, plus two Strings. With the heap gone
+      // that second allocation threw too, out of a catch handler with nothing outside it, which is
+      // std::terminate. sendUnderPressure() frees the 1 KB reserve first and wraps the send in a
+      // nested try/catch, which IS legal inside a handler.
+      sendUnderPressure(request, 503, "{\"error\":\"out of memory, retry\"}");
     }
   };
 }
@@ -1288,10 +1484,10 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     try {
       handlePostPin(request, json);
     } catch (const std::bad_alloc &) {
-      request->send(503, "application/json", "{\"error\":\"out of memory, retry\"}");
+      sendUnderPressure(request, 503, "{\"error\":\"out of memory, retry\"}");
     }
   });
-  g_server.on("/api/reboot", HTTP_POST, handlePostReboot);
+  g_server.on("/api/reboot", HTTP_POST, guarded(handlePostReboot));
   // Test hooks (DESIGN.md SS7): what the screen is doing, and a simulated touch.
   g_server.on("/api/debug/ui", HTTP_GET, guarded([](AsyncWebServerRequest *request) {
     ui::UiDebug d = ui::debugSnapshot();
@@ -1341,20 +1537,79 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["ver_res"] = d.ver_res;
     doc["heap"] = ESP.getFreeHeap();
     doc["largest_block"] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+    // ---- The heap instrument (diag branch, 2026-09-17) ---------------------------------------
+    // `heap` above stays ESP.getFreeHeap() because clients parse it, and it is MALLOC_CAP_INTERNAL:
+    // it includes ~33.7 KB of 32-bit-word-only IRAM heap that malloc() will never hand out for a
+    // buffer or a string, so it sits beside an 8-bit largest_block reading two different heaps.
+    // heap_8bit is the one that can be compared with largest_block, and min_free8 is how close the
+    // board has ever come to nothing at all - a value the trace ring cannot show, because the
+    // trough may fall between two stages.
+    doc["heap_8bit"] = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    doc["min_free8"] = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    doc["uptime_s"] = (uint32_t)(millis() / 1000);
+    doc["reset_reason"] = (int)esp_reset_reason();  // 3 = SW restart, i.e. a self-heal reboot
+    // How many published Snapshots are alive (net_poller.h). Since the publish became a move it is
+    // ONE between publishes and TWO for up to a second after one, while the display task's
+    // last-good reference still names the outgoing Snapshot. It read three before that change (the
+    // poller's working value, the published copy, and the display's). Above two, or climbing, is a
+    // reference nobody is releasing.
+    doc["snapshots_live"] = snapshotsLive();
+    doc["failed_polls"] = failedPolls();
+    doc["wedged_polls"] = wedgedPolls();  // 15 reboots the board
+    doc["proxy_queue_depth"] = proxyQueueDepth();  // pinned at 2 = the audit's stuck-queue wedge
+    // Error replies that could not be built at all and ended in a closed connection instead
+    // (heap_reserve.h). Should be zero; a number that moves means the heap reached a state where
+    // even a fixed-literal 503 would not fit, which is the state that used to reboot the board.
+    doc["oom_replies_dropped"] = oomRepliesDropped();
+    doc["heap_reserve_held"] = heapReserveHeld();
+    // The Bluetooth-memory release, proved rather than inferred (heap_reserve.h, main.cpp).
+    // `bt_release_rc` is esp_bt_mem_release()'s esp_err_t - 0 is ESP_OK, -1 means it was never
+    // called - and `bt_release_gain_bytes` is the MALLOC_CAP_8BIT free-heap delta across the call,
+    // which is what says whether libbt's 4,464 B really joined the heap.
+    doc["bt_release_rc"] = bluetoothReleaseRc();
+    doc["bt_release_gain_bytes"] = bluetoothReleaseGainBytes();
+    // Admission control (admission.h). `in_flight` is how many AsyncWebServerRequest objects are
+    // alive; `admission_refusals` counts connections closed at accept because the cap or a heap
+    // floor said no. A refusal is a working defence, not a fault - but a number that climbs while
+    // nobody is bursting means a floor is too high or the sweep is not seeing completions.
+    doc["in_flight_requests"] = inFlightRequests();
+    doc["admission_refusals"] = admissionRefusals();
+    doc["max_in_flight_requests"] = (uint32_t)kMaxInFlightRequests;
+    // Bytes of stack each task has never gone below. Rules a stack that has quietly eaten into the
+    // heap in or out before any of the heap numbers are interpreted.
+    JsonObject hwm = doc["stack_hwm"].to<JsonObject>();
+    hwm["loopTask"] = taskStackHwm("loopTask");
+    hwm["async_tcp"] = taskStackHwm("async_tcp");
+    hwm["net_poller"] = taskStackHwm("net_poller");
+    // The ring. ?since=<trace_seq from the last sample> returns only what is new, which is what a
+    // sampler should use; ?n=1..32 caps the rows; ?stages=1 adds the id->name table (left out of
+    // the routine sample because it is ~300 B of body that never changes).
+    uint32_t first_seq = 0;
+    size_t rows = 0;
+    const uint32_t since = queryU32(request, "since", 0);
+    doc["trace"] = serialized(renderTrace(since, (size_t)queryU32(request, "n", kTraceMaxRows), &first_seq, &rows));
+    doc["trace_first"] = first_seq;  // sequence number of trace[0]; > since means the ring wrapped
+    doc["trace_rows"] = (uint32_t)rows;
+    doc["trace_seq"] = heapTraceSeq();  // pass this back as ?since= next time
+    if (request->hasParam("stages")) {
+      JsonArray stages = doc["trace_stages"].to<JsonArray>();
+      for (size_t i = 0; i < kHeapTraceStageCount; i++) stages.add(kHeapTraceStages[i]);
+    }
     sendJson(request, 200, doc);
   }));
-  g_server.on("/api/debug/tap", HTTP_POST, [](AsyncWebServerRequest *request) {
+  g_server.on("/api/debug/tap", HTTP_POST, guarded([](AsyncWebServerRequest *request) {
     if (!requirePin(request)) return;  // it changes what the screen shows, so it is state-changing
     ui::requestTap();
     request->send(200, "application/json", "{\"ok\":true}");
-  });
+  }));
   // POST /api/debug/page?page=main|night|stats|device (or the same word as the whole body): drive
   // the page cycle from the LAN without a finger on the panel. It exists because the LVGL pool is
   // the one thing the native simulator cannot reproduce - firmware/sim builds with a 512 KB
   // LV_MEM_SIZE for 64-bit pointers - so the peak a page transition reaches has to be measured on
   // the hardware, and that needs thirty cycles, not thirty taps. ui::requestPage() only sets a
   // flag the LVGL task reads in tick(); nothing here touches an lv_obj from the web server task.
-  g_server.on("/api/debug/page", HTTP_POST, [](AsyncWebServerRequest *request) {
+  g_server.on("/api/debug/page", HTTP_POST, guarded([](AsyncWebServerRequest *request) {
     if (!requirePin(request)) return;  // it changes what the screen shows, like /api/debug/tap
     std::string page;
     if (request->hasParam("page")) {
@@ -1369,7 +1624,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
       return;
     }
     request->send(200, "application/json", "{\"ok\":true}");
-  }, nullptr, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  }), nullptr, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
     // A raw body ("stats"), which is what curl -d sends. It is only PARSED here - the PIN check
     // lives in the handler above, which runs after this, and applying the page from an unchecked
     // body would be an auth bypass. Short by construction, so one chunk is the only case worth
@@ -1386,22 +1641,27 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     buf[n] = '\0';
     request->_tempObject = buf;
   });
-  g_server.on("/api/debug/oom", HTTP_POST, handleDebugOom);  // SS12.1 exception-pool proof; PIN-gated
-  g_server.on("/api/wifi/reset", HTTP_POST, handlePostWifiReset);
+  g_server.on("/api/debug/oom", HTTP_POST, guarded(handleDebugOom));  // SS12.1 exception-pool proof; PIN-gated
+  g_server.on("/api/wifi/reset", HTTP_POST, guarded(handlePostWifiReset));
 
-  g_server.on("/api/proxy/stops", HTTP_GET, handleProxyStops);
-  g_server.on("/api/proxy/schedule", HTTP_GET, handleProxySchedule);
-  g_server.on("/api/rail/stations", HTTP_GET, handleRailStations);
+  g_server.on("/api/proxy/stops", HTTP_GET, guarded(handleProxyStops));
+  g_server.on("/api/proxy/schedule", HTTP_GET, guarded(handleProxySchedule));
+  g_server.on("/api/rail/stations", HTTP_GET, guarded(handleRailStations));
   startProxyWorker();
 
   // Registered before /api/stats: ESPAsyncWebServer matches handler URIs by prefix, so the
   // longer path has to come first or handleGetStats answers it with "stop is required".
-  g_server.on("/api/stats/overview", HTTP_GET, [](AsyncWebServerRequest *request) {
+  g_server.on("/api/stats/overview", HTTP_GET, guarded([](AsyncWebServerRequest *request) {
+    // The same entry gate the other heavy reads take (refuseIfLowHeap). This endpoint needed MORE
+    // memory than /api/state and had no gate at all, so on a low heap it degraded into silence -
+    // the request was queued, paused (which turns its server-side timeout off) and never reached,
+    // and the client waited until IT gave up (audit_runtime SS4). A prompt 503 is the right answer.
+    if (refuseIfLowHeap(request)) return;
     int days = request->hasParam("days") ? atoi(request->getParam("days")->value().c_str()) : 7;
     queueOverviewRequest(request, days);
-  });
-  g_server.on("/api/stats", HTTP_GET, handleGetStats);
-  g_server.on("/api/log/index", HTTP_GET, handleLogIndex);
+  }));
+  g_server.on("/api/stats", HTTP_GET, guarded(handleGetStats));
+  g_server.on("/api/log/index", HTTP_GET, guarded(handleLogIndex));
   // "/api/log/<file>.csv" - matched with a regex-free prefix check in onNotFound below instead of
   // a wildcard pattern, to keep the matcher simple.
 
@@ -1415,17 +1675,21 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
   });
 #endif
 
-  g_server.onNotFound([](AsyncWebServerRequest *request) {
+  g_server.onNotFound(guarded([](AsyncWebServerRequest *request) {
     if (request->url().startsWith("/api/log/") && handleLogDownload(request)) {
       return;
     }
     request->send(404, "application/json", "{\"error\":\"not found\"}");
-  });
+  }));
 
   g_server.begin();
   log_i("web_server: listening on port 80");
 }
 
 bool otaBusy() { return g_ota.busy; }
+
+uint32_t inFlightRequests() { return g_in_flight_count.load(std::memory_order_relaxed); }
+
+uint32_t admissionRefusals() { return g_admission_refusals.load(std::memory_order_relaxed); }
 
 }  // namespace transit_app

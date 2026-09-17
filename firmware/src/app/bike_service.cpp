@@ -5,16 +5,26 @@
 #include <freertos/semphr.h>
 
 #include <ctime>
+#include <memory>
 #include <new>
 #include <utility>
 
+#include "heap_trace.h"
 #include "ui_lock.h"
 
 namespace transit_app {
 
 namespace {
 
-constexpr uint32_t kRefreshMs = 5 * 60 * 1000;
+// 10 minutes, not 5, since 0.3.1 (owner decision, 2026-09-17). Each refresh streams a ~400 KB
+// GeoJSON body through this task; on the measured ring the bikes stage is the single most
+// expensive thing a cycle does (post-bikes free8 -17.6 KB, largest block down to 6.4 KB, held to
+// cycle end). Halving how often it happens halves how often the cycle spends that, and dock counts
+// at a station do not move meaningfully in ten minutes. The FIRST fetch of a boot is unaffected -
+// g_fetched_ms == 0 below makes it due immediately - and a config change still forces one through
+// invalidateBikes(). The hourly `bike` log rows stay inside kBikeSampleMaxAgeS (15 min,
+// net_poller.cpp), which a 10-minute cadence clears with 5 minutes to spare.
+constexpr uint32_t kRefreshMs = 10 * 60 * 1000;
 // What a NON-display task waits for the view. The display task's wait is zero, decided by
 // takeShared() (ui_lock.h): getBikes() at 500 ms, called from refreshMainScreen() on every tick the
 // arrivals page is up, is the accessor that panicked the board on 2026-09-16 in
@@ -32,13 +42,30 @@ SemaphoreHandle_t mutex() {
   return g_mutex;
 }
 
+// The scanner, allocated once before Wi-Fi (preallocateBikeStream) and reset per refresh. Its
+// 6,144 B feature buffer is BORROWED from the poller's shared scratch (refreshBikes below), so the
+// object itself is about a hundred bytes: the bytes were already paid for by the transit fetches
+// earlier in the same cycle, which are done with them by now. Heap-allocated rather than a
+// file-scope object for the same reason the ArrivalTracker is: the ESP32's static .bss budget is
+// separate from and much smaller than the heap.
+indego::StatusStream *g_stream = nullptr;
+
 }  // namespace
+
+bool preallocateBikeStream(std::vector<uint8_t> *scratch) {
+  if (g_stream == nullptr) g_stream = new (std::nothrow) indego::StatusStream();
+  // Immediately, not on the first refresh: the constructor reserves its own 6 KB feature buffer,
+  // and handing the borrow over here releases that instead of leaving it held through the whole
+  // first cycle. setFeatureBuffer(nullptr) is a no-op, so the fallback path is unchanged.
+  if (g_stream != nullptr && scratch != nullptr) g_stream->setFeatureBuffer(scratch);
+  return g_stream != nullptr;
+}
 
 void invalidateBikes() {
   g_invalidate = true;
 }
 
-void refreshBikes(const Config &cfg, const transit::HttpGet &http) {
+void refreshBikes(const Config &cfg, const transit::HttpGet &http, std::vector<uint8_t> *scratch) {
   if (!cfg.bike.enabled || cfg.bike.stations.empty()) {
     BikeView empty;  // swapped out and destroyed below, with the lock released
     if (xSemaphoreTake(mutex(), pdMS_TO_TICKS(kBikeLockWaitMs)) == pdTRUE) {
@@ -55,7 +82,21 @@ void refreshBikes(const Config &cfg, const transit::HttpGet &http) {
   if (!due) return;
   g_invalidate = false;
   g_fetched_ids = ids;
-  indego::StatusStream stream;
+  // The long-lived scanner when there is one - reset(), not constructed, so its 6 KB feature
+  // buffer is not asked for again. `own` is the fallback for a board where the pre-allocation
+  // failed, and is only ever constructed on that path.
+  std::unique_ptr<indego::StatusStream> own;
+  if (g_stream == nullptr) own.reset(new (std::nothrow) indego::StatusStream());
+  indego::StatusStream *sp = g_stream != nullptr ? g_stream : own.get();
+  if (sp == nullptr) {
+    Serial.println("[bike] no feed scanner (out of memory); skipping this refresh");
+    return;
+  }
+  indego::StatusStream &stream = *sp;
+  // Borrow the poller's shared buffer for the one-feature scratch. Order matters: setFeatureBuffer
+  // gives back whatever the scanner was holding, and reset() then sizes the borrowed vector.
+  stream.setFeatureBuffer(scratch);
+  stream.reset();
   stream.setStationFilter(ids);
   int status = http(indego::statusUrl(), [&](const uint8_t *d, size_t n) { return stream.push(d, n); });
   stream.finish();
@@ -109,6 +150,7 @@ BikeView getBikes() {
   try {
     v = g_view;  // copies a string per station: small, but it allocates, so it can throw
   } catch (const std::bad_alloc &) {
+    heapTraceMark(kStageOomBikes);  // diag branch
     giveShared(mutex());
     throw;  // loop()'s guard in main.cpp skips the frame; guarded() answers 503 on the web task
   }

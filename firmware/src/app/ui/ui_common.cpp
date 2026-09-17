@@ -16,9 +16,6 @@ void setTheme(const std::string &name) {
   g_dark = (name == "dark");
 }
 
-bool isDarkTheme() {
-  return g_dark;
-}
 
 // Light palette: every text colour clears WCAG AA (4.5:1) against the white panel background.
 // The first build shipped only the dark palette, which on a panel that needs colour inversion
@@ -296,8 +293,8 @@ lv_obj_t *makeBox(lv_obj_t *parent) {
   lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
   // border_width and radius are already 0 with no theme compiled in; setting them again would
   // only cost a style slot per box (LVGL's 36 KB pool, lv_conf.h).
-  lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_scrollable(o, false);
+  lv_obj_set_clickable(o, false);
   return o;
 }
 

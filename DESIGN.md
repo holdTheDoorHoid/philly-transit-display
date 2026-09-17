@@ -844,7 +844,12 @@ Each feature is `{ "geometry": {"coordinates": [lng, lat]}, "properties": { "id"
 a feature with its dock list can run to ~3 KB. The device never buffers the body: `lib/indego_core`
 scans the stream feature by feature (brace depth inside `"features"`), keeps at most one feature
 (cap 6 KB) and parses only those whose `"id"` is configured. The web UI fetches the same feed in
-the browser to offer the stations nearest each configured stop. Cadence 5 min.
+the browser to offer the stations nearest each configured stop. Cadence 10 min (5 min until
+0.3.1; halved because each refresh is the single most expensive thing a poll cycle does - the
+measured per-stage ring puts the bikes stage at -17.6 KB of byte-addressable free heap with the
+largest free block down to 6.4 KB, held to the end of the cycle - and dock counts do not move
+meaningfully in ten minutes. The first fetch of a boot and any fetch forced by a config change are
+unaffected.)
 
 ## 5. Firmware architecture
 
@@ -982,10 +987,89 @@ a 200.
 scans for a summary, so downloads take a single-reader lease (`acquireLogReader()`); a second
 concurrent download gets a 503 rather than a truncated file.
 
-Memory rules: no full framebuffer; LVGL partial buffer is 1/10 of the screen in RGB565 (the library default of 1/4 with 3-byte pixels does not fit, see `firmware/boards/README.md`); large long-lived objects (ArrivalTracker ~16 KB, StatsAggregator ~8 KB) are heap-allocated, never file-scope globals, because the ESP32's static .bss budget is separate from and much smaller than the heap; one
+Memory rules: no full framebuffer; the LVGL partial buffer is **1/30** of the screen in RGB565 on
+the 3.5" boards and 1/16 on the 240-tall ones (the library default of 1/4 with 3-byte pixels does
+not fit; `firmware/boards/README.md` has the history, including 1/20 → 1/30 in 0.3.1 for 5,120 B of
+heap — this line said "1/10" until then, which was never any board's value); large long-lived
+objects (`ArrivalTracker` **8,040 B** and `StatsAggregator` **8,744 B**, both measured on the target
+ABI rather than the "~16 KB / ~8 KB" this line used to carry) are heap-allocated, never file-scope
+globals, because the ESP32's static .bss budget is separate from and much smaller than the heap; one
 TLS connection at a time; ArduinoJson documents sized from measured payloads (§4) with 25 %
 headroom; log free heap once per poll at `INFO`; refuse to start OTA below 16 KB of `MALLOC_CAP_8BIT`
 free with a 5,876 B largest block (§2.1 - the byte-addressable heap, not `ESP.getFreeHeap()`).
+
+**The poll working set: one shared buffer, lent to each stage in turn (0.3.1).** This is the same
+rule as the line above, applied to the things that were NOT long-lived and should have been — and it
+took two attempts to get right, which is worth recording because the first one was reasonable and
+wrong.
+
+A cycle used to build its own buffers every time: a `GtfsRtStream` (a 4,096 B entity buffer and a
+~4,600 B retention block), a `std::vector<uint8_t>` body grown from nothing by doubling for each
+TransitView / BusSchedules / Alerts / Arrivals response, a 24 × 128 B `SchedEntry` block per
+schedule parse, the transport's own 4 KB BusSchedules buffer, and a 6,144 B Indego feature buffer.
+Every one is a request for a **contiguous** block, and they all land within a few hundred
+milliseconds of each other. Free heap is not the constraint on this board; the largest free *block*
+is (§12.1). It rests at 25–28 KB and decays, and at **11.7 KB — with 36 KB still free —** the cycle
+threw `std::bad_alloc`, reported every stop as "out of memory during fetch", and every cycle after
+it did the same until the heap-wedge self-heal rebooted the device.
+
+**The first attempt gave each of them a permanent buffer, and that was a net loss.** Measured on the
+owner's board (0.3.1-rc1, five minutes, sampler at 15 s):
+
+| | diag1 | rc1 |
+|---|---:|---:|
+| per-cycle contiguous demand | ~12 KB | **~5 KB** |
+| resting free8 | ~35 KB | 22 KB |
+| resting largest block | ~24.5 KB | ~14 KB |
+| **margin (largest − demand)** | **~12 KB** | **~9 KB** |
+
+The demand halved and the margin still got *worse*, because holding ~26 KB permanently is how the
+floor drops. And `min_free8` reached **696 B at 115 s of uptime** — before any Indego refresh —
+from a combination that no stamped stage can see: a poll mid-fetch (~15–17 KB) plus one concurrent
+`/api/state` on the AsyncTCP task (~5 KB document plus response copies) plus the Wi-Fi/lwIP receive
+burst. On diag1's 35 KB floor the same combination bottomed at 1,452 B. A trough to zero is an lwIP
+`assert`, not a caught `bad_alloc` (§12.1). **So the floor matters as much as the per-cycle demand,
+and a fix that trades one for the other is not a fix.**
+
+**What rc2 does instead.** Those buffers are never live at the same time. They are all "one thing at
+a time" byte buffers, on one task, in sequence — the entity buffer during the TripUpdates fetch
+(dead the moment `finish()` is called), then each buffered JSON response, then the Indego scanner's
+one-feature buffer — so **one 6,144 B vector, sized for the largest borrower, is handed from stage
+to stage**:
+
+- `GtfsRtStream::setEntityBuffer()` and `indego::StatusStream::setFeatureBuffer()` borrow a
+  `std::vector<uint8_t>*` — the container, not its storage, so a reallocation by a larger borrower
+  cannot dangle the borrow — and each gives back what it was holding when it takes one.
+- `pollBusStops()` hands the borrow back immediately after `fetchRealtimeEx()`, before the first
+  buffered response needs it.
+- `PollBuffers::beginCycle()` releases growth beyond the reservation at poll-start, so one oversized
+  response cannot become resident. That is the floor drift above, in miniature.
+
+One buffer stays separate: the **transport-level BusSchedules body** (`net_poller.cpp`), because
+that layer buffers the response before `transit_core` sees it and then hands it over, so for that
+moment two really are live at once. It also sits on the path implicated in the collapse — the
+four-attempt loop inside `fetchPlausibleSchedule()`'s three, re-entered every two minutes while
+SEPTA answers with the wrong service day — so it keeps a 4 KB reservation of its own.
+
+Two things are deliberately **back to per-cycle**: the GTFS-RT retention block (~4.6 KB) and the
+BusSchedules parse block (~3 KB). Both are `std::vector`s of non-trivially-destructible values and
+cannot share raw bytes without a custom allocator, which would change the types in `transit_core`'s
+public API; and at a ~24 KB resting largest block, a 4.6 KB request is one the heap carries. Keeping
+the floor high is worth more than removing them.
+
+Resident total: **11,264 B** (6,144 shared scratch + 4,096 transport buffer + the 1 KB error-reply
+reserve of §12.1), against ~13 KB reclaimed elsewhere in the same release (draw buffer 1/20 → 1/30,
+the tracker's slot count, `esp_bt_mem_release()`). Measured on the host, a warm cycle's requests of
+4 KB or more go from several to exactly one — the retention block. `min_free8` on
+`GET /api/debug/ui` is the number that says whether the floor is right, and it is the first thing to
+read after flashing.
+
+Two consequences follow the same rule and are worth stating where a reader will look for them.
+`publishSnapshot()` takes its Snapshot **by rvalue and returns the published pointer**, so the
+poller holds one Snapshot and not two through the optional tail (§12.1's `snapshots_live` says so:
+1 between publishes, 2 for up to a second after one). And `mountSd()` runs **before**
+`startWebServer()`, because the FAT mount is one ~12.5 KB contiguous `calloc` and should come off a
+heap the async web server has not been allocating out of yet.
 
 Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-16, with the §12 hardening, the screen pass, the LVGL pool safety work, the release-candidate fixes and the display task's lock policy (this §), the full feature set uses **1,862,942 B (98.0 %)** on `cyd-3248S035R` — 37,602 B of headroom — and 1,858,614 B (97.8 %) on `cyd-2432S024C`; the tightest env of all is the HTTPS prototype `cyd-3248S035R-https` (§2.1), which ships in no image. (This line read "93.9 % / 93.7 %, ~112 KB headroom" until 2026-09-16, which was the 2026-09-15 measurement left behind by three later passes — the same failure §2.1's threshold note describes, so the figures here are now absolute bytes with the date they were taken.) `firmware/README.md` carries the per-env table and ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
 
@@ -1212,7 +1296,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | `POST /api/ota` | multipart `firmware` field; reboots on success. One at a time. No file → 400 `no firmware file`; too little heap or a fragmented one → 503 naming which check failed; an image built for a different board → 400 `firmware is for a different board (expected <board>)`; larger than the OTA slot → 413. Answers 200 only after the final chunk arrived *and* `Update.end()` succeeded |
 | `POST /api/reboot`, `POST /api/wifi/reset` | Maintenance |
 | `POST /api/pin` | Body `{"pin":"new"}`, authenticated with the **current** PIN in `X-Pin`. New PIN: 4–32 printable ASCII, no whitespace. → `{"ok":true}`, or 400 with the rule that was broken. No reset-by-network path: recovery is the serial console or the device info screen (§12) |
-| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB. Also `lock_misses`, `tick_ms`/`tick_ms_max` (§5) and `cpu_stretch_ms_max` — the longest the poller task has run a CPU-bound loop without letting IDLE0 in, since boot, against the task watchdog's 5,000 ms (§12.1) |
+| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB. Also `lock_misses`, `tick_ms`/`tick_ms_max` (§5) and `cpu_stretch_ms_max` — the longest the poller task has run a CPU-bound loop without letting IDLE0 in, since boot, against the task watchdog's 5,000 ms (§12.1). Since 0.3.1 also `heap_8bit` and `min_free8` (the byte-addressable free heap now, and the lowest it has ever been — §2.1), `snapshots_live`, `failed_polls`, `wedged_polls`, `proxy_queue_depth`, `stack_hwm` per task, and `oom_replies_dropped` / `heap_reserve_held` (§12.1, "the 503 for out of memory needs memory"), and `bt_release_rc` / `bt_release_gain_bytes` — `esp_bt_mem_release()`'s return code and the `MALLOC_CAP_8BIT` free-heap delta across it, reported here because the serial console cannot be captured on the owner's bench — and `in_flight_requests` / `admission_refusals` / `max_in_flight_requests` (§12.1, accept-time admission control) |
 | `POST /api/debug/tap` | Test hook (PIN-protected: it changes what the screen shows): simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
 | `POST /api/debug/page` | Test hook (PIN-protected, same reason): go straight to `main` \| `night` \| `stats` \| `device`, named in `?page=`, a `page=` form field or the raw body. Performs exactly the transition a tap does, queued for the LVGL task like `/api/debug/tap` — nothing builds an `lv_obj` on the web server task. It exists because LVGL pool exhaustion cannot be reproduced in the simulator's 512 KB pool (§8) and measuring it wants thirty cycles, not thirty taps |
 | `POST /api/debug/oom` | Test hook (PIN-protected: it starves every other task for under a millisecond): exhausts the heap on purpose, forces a `std::bad_alloc`, frees everything and answers `{"caught":true,"blocks":N,"largest":B,"free_before":X,"free_after":Y}` - the deterministic proof of the emergency exception pool (§12.1). `largest` under ~100 means the exception object could only have come from the pool; without the pool the request reboots the device. Run it on a **fresh boot**: it then also proves the first-throw path (§12.1), which on a task that has already thrown answers `caught:true` either way |
@@ -1887,7 +1971,11 @@ streamed filler serialises through a `Print&` and `saveConfig()`'s two sinks now
 three share one instantiation and the streamed path costs about 0.8 KB of flash instead of 4.5.
 What remains uncatchable, by design: C code that gets NULL from `malloc` and does not check it (no
 throw, so no pool helps), a catch block that itself allocates with nothing left (building the 503
-response object; it rethrows out of the handler), and the pool being finite. Two instances of the
+response object; it rethrows out of the handler - **this one stopped being hypothetical on
+2026-09-17, see "the 503 for out of memory needs memory" below**), **an allocation the library
+makes on its own frames after our handler has returned - the header list of a response, assembled
+inside `_parseLine`; nothing we can write is on that stack, which is why the defence there is
+admission control rather than a catch (below)** - and the pool being finite. Two instances of the
 first are no longer hypothetical - both seen on 2026-09-16 while `/api/debug/oom` held the heap and
 the poller was mid-fetch, and both `assert`-and-panic rather than failing soft: newlib's `_dtoa_r`
 (`assert failed: dtoa.c:239 (REENT malloc succeeded)`, reached from the `snprintf("%f")` in
@@ -1897,7 +1985,124 @@ exhaust the heap while a fetch is in flight. That is a real constraint on the *t
 normal operation - nothing else takes the whole heap on purpose - so the device suite fires
 `/api/debug/oom` only in the quiet window just after a poll completes (section A0).
 
-**A fourth case was in ESPAsyncWebServer's own middleware plumbing, and it is fixed by not having
+**"The 503 for out of memory needs memory" - the third instance, and it is ours (2026-09-17).**
+The list above has carried "a catch block that itself allocates with nothing left (building the 503
+response object)" as a known, accepted limit since the pool work. It is not hypothetical. The diag
+board panicked at 78 minutes of uptime; the coredump was read off flash and decoded. Crashed task
+`async_tcp`, "abort() was called":
+
+```
+abort <- std::terminate <- __cxa_throw <- operator new (sz=100)
+  <- AsyncWebServerRequest::beginResponse        WebRequest.cpp:1212
+  <- AsyncWebServerRequest::send(503, "application/json", "{"error":"out of memory, retry"}")
+  <- the catch handler in transit_app::guarded()  src/app/web_server.cpp:1330
+```
+
+Read it bottom up and every step is this project working as designed until the last one: a handler
+threw `std::bad_alloc`, `guarded()` caught it, and then the 503 it answered with **allocated** -
+`beginResponse()` is `new AsyncBasicResponse(...)`, the sz=100 in the dump, plus an Arduino `String`
+for the content type and one for the body. That allocation failed as well, out of a catch handler
+with nothing outside it, and a throw that escapes a catch handler is `std::terminate`. It fires
+precisely when the heap troughs during a web request; `min_free8` since boot on that board was
+1,452 B. The exception pool and the per-task warming cannot help: they make a throw *catchable*, and
+this throw is in the code that was doing the catching.
+
+Two layers, because neither is sufficient alone, and both are in `src/app/heap_reserve.h` /
+`oom_reply.h`:
+
+1. **A 1 KB reserve, held from boot.** Taken before Wi-Fi alongside the other long-lived
+   allocations, and simply held. Every reply that exists *because* memory ran out - `guarded()`'s
+   503, `refuseIfLowHeap()`'s 503, `sendJson()`/`sendJsonStreamed()`'s truncated-document 503, the
+   401/429s, the Host check's 421, the queued jobs' 503s - frees it immediately **before** calling
+   `request->send()`, so the response object has somewhere to come from. It is re-armed from a
+   context that is *not* the handler that spent it (the poller's idle slice and poll-start) and only
+   when `MALLOC_CAP_8BIT` free is at least 20 KB with a 4,340 B largest block - deliberately well
+   above the 12 KB / 7,924 B gate it exists to get past, so re-arming can never be the allocation
+   that pushes a device back under the floor it just recovered over. The arm/disarm decision is a
+   pure function, host-tested (`pio test -e native -f test_heap_reserve`), the same shape as
+   `poller_liveness.h` and `proxy_queue.h`. Cost: 1 KB that is deliberately unavailable at rest.
+2. **A nested `try`/`catch` around the send.** A throw inside a catch handler *is* catchable by a
+   `try` block nested inside that handler - which is what makes this legal where an outer guard is
+   not, and there is no outer guard on the AsyncTCP path, which is the whole problem. If the send
+   still cannot be built, the connection is closed with no reply and `oom_replies_dropped` counts
+   it on `GET /api/debug/ui`. A dropped connection is a deliberate answer: the web app's
+   `resilientRead()` (SS10.2) already treats one as a retryable failure. `heap_reserve_held` is
+   reported beside it.
+
+The rule for anyone adding an error path: **a reply that exists because memory ran out goes through
+`sendUnderPressure()`**, its body is a fixed literal, and anything that has to be formatted first is
+formatted into a stack buffer (which is why `sendFailure()` already did).
+
+**"The reply is assembled later, on the library's frame" - the fourth instance, and it is the one
+neither defence above can reach (0.3.1-rc3).** The entry immediately above adds a 1 KB reserve and a
+nested `try`/`catch` so that a reply which exists *because* memory ran out can still be built. That
+fixes the path it was written for and **does not fix this one**, and the difference is worth being
+precise about. The rc2 device suite crashed under section E (three rounds of seven concurrent
+requests: 4 x `/api/state`, `/api/proxy/stops`, `/api/stats`, one asset). Decoded backtrace, task
+`async_tcp`:
+
+```
+abort <- std::terminate <- __cxa_throw <- operator new
+  <- std::list<AsyncWebHeader>::emplace_back
+  <- AsyncWebServerResponse::addHeader <- AsyncAbstractResponse::_assembleHead
+  <- AsyncWebServerRequest::_respond <- _send <- _parseLine <- _onData <- AsyncClient::_recv
+```
+
+The response object handed to `request->send()` is only **stored**. The library assembles its header
+list **later**, when the request completes, from inside `_parseLine` - a frame with no handler of
+ours anywhere above it. By then `sendUnderPressure()` has returned, the reserve it released has been
+consumed, and its nested `try`/`catch` is nowhere on that stack. **Both defences are structurally
+out of reach of this allocation, and no defence written in our code can reach an allocation the
+library makes on its own frames.** Keep them anyway - they close the path they were written for -
+but do not read them as covering this one.
+
+What is left is to not have that many requests in flight at once, which is a decision that can be
+taken at **accept**, where a refusal costs nothing: no request object, no response, no header list,
+no send buffer. `src/app/admission.h` holds the rule as pure arithmetic (host-tested);
+`web_server.cpp`'s `GatedWebServer` holds the machinery.
+
+- **Where the hook is.** `AsyncWebServer::_server` is `protected`, so a subclass can re-register the
+  `AsyncServer` `onClient` callback that the base constructor installed. The replacement is the
+  library's own body plus the check in front and a `try`/`catch` around it - the library's version
+  has neither, and a throw on that task is `std::terminate` like everything else in this list.
+- **The floors are derived, not chosen.** One in-flight request costs about 5,028 B
+  (`AsyncWebServerRequest` 356 + `AsyncClient` 196 + `tcp_pcb` 208 + the parsed Strings + the
+  response object) and its chunked send buffer another 2,872 B, so the free-heap floor is their sum,
+  **7,900**, and the largest-block floor is 1.5x the send buffer, **4,308**. Neither is a multiple of
+  512, for the lattice reason SS2.1 gives.
+- **The cap is on COUNT, because a heap reading at accept cannot see the future.** At accept a
+  request has cost only ~760 B; its document, response and send buffer come later. A free-heap floor
+  therefore cannot refuse the seventh request of a burst on the strength of what the first six are
+  about to do. Only a count can. It is **5**, and that is an acceptance constraint rather than a
+  preference: the suite allows at most six refusals across the three rounds ("E at most 2 refusals
+  per round"), and a cap of N refuses about (7 - N) per round, so anything below 5 fails that check
+  by construction however well it protects the heap. A host test asserts the relationship. Note that
+  the check's own comment says "Not connection-count exhaustion: nothing here caps concurrent
+  clients" - true when it was written, no longer true; if a run still shows more than six refusals
+  the budget is what needs revisiting, not the floors.
+- **In-flight requests are counted with `weak_ptr`s, not a counter**, because there is nowhere to
+  put a decrement: `AsyncWebServerRequest`'s constructor overwrites every `AsyncClient` callback,
+  and `request->onDisconnect()` is a single slot three call sites here already own (the proxy file
+  lease, the OTA guard, the log-reader lease). `create()` returns a `shared_ptr` whose control block
+  *is* the request's lifetime, so a `weak_ptr` expires exactly when the request is gone - no hook,
+  no collision, and nothing allocated to copy or test. The array is swept at accept and in
+  `HostGuardHandler::canHandle()`, both on the AsyncTCP task, so it needs no lock;
+  `in_flight_requests`, `admission_refusals` and `max_in_flight_requests` report it on
+  `GET /api/debug/ui`.
+
+**And the background jobs had to stop starting inside a burst.** The same run showed why a heap gate
+alone is the wrong question: `[proxy] refusing a queued job: not enough heap to start it (free8
+19528, largest 11252)` and the board aborted regardless. `idleWorkHasHeadroom()` describes *this
+instant*, and at the start of a seven-request burst it is true while every one of those requests
+still has its document and send buffer ahead of it. The queued stats/proxy gate now also requires
+`inFlightRequests() <= 1` (one being the job's own paused request), and a job that cannot start is
+**deferred** - put back at the front of the queue and reconsidered next idle slice - rather than
+refused, because a burst passes in seconds. The deferral is bounded (`kMaxJobDeferrals`, ~6 s,
+deliberately under the ~8 s a client waits) and then becomes a 503: a queued job holds a paused
+request whose server-side timeout the library switched off, so "wait" must always become an answer.
+That is the hang above, and it does not come back.
+
+**A fifth case was in ESPAsyncWebServer's own middleware plumbing, and it is fixed by not having
 any middleware (2026-09-16).** It belongs in this list because it is where a reader will look for
 it, and because the shape is the one this section keeps meeting: a throw that the pool and the
 warming make *catchable* while nothing anywhere catches it. The release candidate's device suite
@@ -1966,7 +2171,7 @@ their `_M_manager` bodies contain no calls at all, which is libstdc++'s stored-l
 **Do not add a middleware back.** `g_server.addMiddleware(...)` is a one-line change that
 reintroduces an uncatchable reboot, and it will look completely reasonable to whoever writes it.
 
-A **third instance, and the one that matters for normal operation**, turned up on 2026-09-16 on a
+A **fourth instance, and the one that matters for normal operation**, turned up on 2026-09-16 on a
 clean `dcb6353` image with `/api/debug/oom` never fired once (the capture was grepped: the only
 `oom` matches are the bootloader's `ho 8 tail 4 room 4` line matching inside the word "room"). Free
 heap decayed to ~34.5 KB with the largest block down to 164 B under light polling, `main.cpp
@@ -2012,8 +2217,59 @@ retry loop. (Dropping the poller to priority 0 also cured the watchdog but made 
 on core 0, so under web load it was starved while holding the snapshot mutex and the display task's
 1 s `getSnapshot()` wait asserted in `vTaskPriorityDisinheritAfterTimeout`; priority 1 + the capped
 read is the fix that avoids both.) Idle-slice work
-(stats summaries, queued proxy jobs) additionally waits for 40 KB free heap and a 12 KB largest
-block so it never collides with a config save on the web task.
+(stats summaries, queued proxy jobs) additionally waits for 16 KB of `MALLOC_CAP_8BIT` free and a
+12,020 B largest block so it never collides with a config save on the web task. (The "40 KB free
+heap" that line carried was `ESP.getFreeHeap()`, i.e. `MALLOC_CAP_INTERNAL`, which includes ~34 KB
+of 32-bit-word-only IRAM heap — so it asked for about 6 KB of the heap an allocation can actually
+use and almost never fired; the largest-block half had been doing the work alone. Both halves read
+`MALLOC_CAP_8BIT` since 2026-09-16, §2.1.)
+
+**The stats/proxy job queue: always dequeue, always answer (0.3.1).** That gate is the right
+question for "may I start a ~9 KB `StatsAggregator` or stream 400 KB through LittleFS?" and the
+*wrong* question for "may I look at the queue at all", and for a while it was asked as one:
+
+```
+if (idleWorkHasHeadroom() && runQueuedProxyJob()) { ... }
+```
+
+`&&` short-circuits, so on a heap that could no longer clear the gate the queue was **never read**.
+A queued job is not inert. `proxy_worker.cpp`'s `enqueue()` calls `AsyncWebServerRequest::pause()`,
+which in the pinned library returns a `shared_ptr` that keeps the request alive **and** calls
+`client()->setRxTimeout(0)` — it turns the server-side deadline off. So the job sat there for the
+rest of the device's uptime pinning a request object, an `AsyncClient` and an lwIP pcb; the client
+waited until *it* gave up (observed as an 8 s hang with no reply); and once both of the two slots
+were held, every later `/api/proxy/*`, `/api/stats` and `/api/stats/overview` got a prompt but
+permanent `503 "proxy worker busy, try again"` — permanent because the only thing that could free a
+slot was the caller that was gated off. Measured at 13.7 KB free8 with a 3,444 B largest block, both
+halves of the gate failing. The asymmetry is what made it the worst available failure shape:
+`/api/state` and `/api/config` answer a cheap 503 below a *lower* floor, while the endpoint that
+needs *more* memory had no entry gate at all and degraded into silence.
+
+Three changes, and the rule is now written down where it can be read and tested
+(`src/app/proxy_queue.h`, pure and host-tested, the same shape as `poller_liveness.h`):
+
+- **Dequeuing is unconditional.** `runQueuedProxyJob()` takes the gate as an argument and disposes
+  of the job on every path: drop it if the client has gone, answer `503 {"error":"low memory,
+  retry"}` if there is no headroom to start it — which releases the paused request and returns the
+  slot — otherwise run it. There is no "leave it on the queue" outcome, and the host test asserts
+  that there is not.
+- **`/api/stats` and `/api/stats/overview` take the same `refuseIfLowHeap()` entry gate** the heavy
+  reads do, at the same thresholds, so a low-heap device answers promptly instead of queueing work
+  it cannot start.
+- **`enqueue()` refuses a request whose client has already disconnected**, rather than pausing one
+  nobody is waiting on.
+
+The 2-slot queue semantics are otherwise unchanged. `proxy_queue_depth` in `GET /api/debug/ui`
+used to be able to pin at 2 forever; it now means "the poller is not running its idle slices".
+
+**And every route is inside `guarded()` (0.3.1).** This § asserts that the AsyncTCP handlers catch
+`bad_alloc`. Only three of about seventeen actually did: `/api/reboot`, `/api/wifi/reset`,
+`/api/proxy/*`, `/api/rail/stations`, `/api/stats`, `/api/stats/overview`, `/api/log/index`,
+`/api/debug/page`, `/api/debug/tap`, `/api/debug/oom` and `onNotFound` (which is where
+`handleLogDownload` runs) all built `JsonDocument`s or `std::string`s with nothing catching above
+them — an uncaught-throw reboot each, at a 3,444 B largest block. `/api/rail/stations` also moved to
+`sendJsonStreamed()`: 149 station names is a 2-4 KB body, and `sendJson()` needed that many bytes
+contiguous *twice* (a `String`, then `AsyncBasicResponse`'s copy of it).
 
 **The watchdog fired again (2026-09-16), and the rule has a chokepoint and a number now.** The
 paragraph above states the rule - the poller must not starve IDLE0 - and fixes the one call site

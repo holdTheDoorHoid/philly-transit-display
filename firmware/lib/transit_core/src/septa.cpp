@@ -293,28 +293,40 @@ ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len) {
 
 ParseResult<SchedEntry> parseBusSchedules(const uint8_t* data, size_t len) {
   ParseResult<SchedEntry> result;
+  parseBusSchedulesInto(&result, data, len);
+  return result;
+}
+
+void parseBusSchedulesInto(ParseResult<SchedEntry>* out, const uint8_t* data, size_t len) {
+  ParseResult<SchedEntry>& result = *out;
+  // Reset the caller's result without touching the items vector's capacity - clear() keeps it.
+  result.ok = true;
+  result.error.clear();
+  result.dropped = 0;
+  result.items.clear();
+
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, data, len);
   if (err) {
     result.ok = false;
     result.error = std::string("json parse error: ") + err.c_str();
-    return result;
+    return;
   }
 
   JsonVariantConst root = doc.as<JsonVariantConst>();
   if (!root.is<JsonObjectConst>()) {
     result.ok = false;
     result.error = "unexpected BusSchedules response shape";
-    return result;
+    return;
   }
   std::string em = sepptaErrorMessage(root);
   if (!em.empty()) {
     result.ok = false;
     result.error = em;
-    return result;
+    return;
   }
 
-  result.items.reserve(kMaxSchedEntries);
+  result.items.reserve(kMaxSchedEntries);  // a no-op once the caller reuses the same result
   for (JsonPairConst kv : root.as<JsonObjectConst>()) {
     std::string route = capId(kv.key().c_str());
     JsonVariantConst val = kv.value();
@@ -334,7 +346,46 @@ ParseResult<SchedEntry> parseBusSchedules(const uint8_t* data, size_t len) {
                    [](const SchedEntry& x) { return x.scheduled; });
     }
   }
-  return result;
+}
+
+Epoch firstUpcomingScheduleTime(const uint8_t* data, size_t len, Epoch now) {
+  static const char kKey[] = "\"DateCalender\":\"";
+  constexpr size_t klen = sizeof(kKey) - 1;
+  if (data == nullptr || len < klen) return 0;
+
+  Epoch best = 0;
+  size_t pos = 0;
+  while (pos + klen <= len) {
+    // memchr on the key's first byte rather than a character-by-character search: a 4 KB body
+    // holds a few hundred quotes, and this is on the poller task's critical path.
+    const void* q = std::memchr(data + pos, '"', len - pos);
+    if (q == nullptr) break;
+    size_t at = static_cast<size_t>(static_cast<const uint8_t*>(q) - data);
+    if (at + klen > len || std::memcmp(data + at, kKey, klen) != 0) {
+      pos = at + 1;
+      continue;
+    }
+    size_t vstart = at + klen;
+    const void* endq = std::memchr(data + vstart, '"', len - vstart);
+    if (endq == nullptr) break;  // the body was cut mid-value
+    size_t vend = static_cast<size_t>(static_cast<const uint8_t*>(endq) - data);
+
+    // "09\/15\/26 12:32 am" -> "09/15/26 12:32 am". 17 characters; anything that overruns this
+    // buffer is not a DateCalender and will simply fail to parse.
+    char buf[40];
+    size_t n = 0;
+    for (size_t i = vstart; i < vend && n + 1 < sizeof buf; ++i) {
+      if (data[i] == '\\' && i + 1 < vend && data[i + 1] == '/') continue;
+      buf[n++] = static_cast<char>(data[i]);
+    }
+    buf[n] = '\0';
+
+    bool ok = false;
+    Epoch t = parseBusScheduleTime(buf, &ok);
+    if (ok && t >= now - 60 && (best == 0 || t < best)) best = t;
+    pos = vend;
+  }
+  return best;
 }
 
 ParseResult<transit::Alert> parseAlerts(const uint8_t* data, size_t len) {

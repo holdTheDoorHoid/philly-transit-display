@@ -10,6 +10,7 @@
 #include <freertos/task.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <ctime>
 #include <functional>
@@ -19,6 +20,8 @@
 
 #include "config_store.h"
 #include "cxx_exception_pool.h"
+#include "heap_reserve.h"
+#include "heap_trace.h"
 #include "http_fetch.h"
 #include "sd_logger.h"
 #include "proxy_worker.h"
@@ -32,7 +35,7 @@
 #include "ui_lock.h"
 #include "weather_service.h"
 #include "bike_service.h"
-#include "web_server.h"  // otaBusy(): the wedge counter stands down during a firmware upload
+#include "web_server.h"  // otaBusy() for the wedge counter; inFlightRequests() for the job gate
 
 using transit::Alert;
 using transit::Mode;
@@ -243,6 +246,40 @@ class AppScheduleCache : public transit::ScheduleCache {
 
 AppScheduleCache g_sched_cache;
 
+// ---- The poll cycle's shared scratch (DESIGN.md SS5, "the poll working set") -----------------
+// Two buffers, allocated once by preallocatePollBuffers() from main.cpp before Wi-Fi - the same
+// reasoning and the same moment as the ArrivalTracker above.
+//
+// transit::PollBuffers::scratch (6,144 B) is ONE buffer lent to each stage of a cycle in turn: the
+// GTFS-RT entity buffer during the TripUpdates fetch, then each buffered JSON response
+// (TransitView, BusSchedules, Alerts, Arrivals), then the Indego scanner's one-feature buffer.
+// None of those is live at the same time as another, so one reservation covers the whole cycle.
+//
+// g_sched_raw (4,096 B) is the ONE exception, and it is the firmware's own: the BusSchedules
+// branch of makeHttpGetEx() buffers the response at the TRANSPORT layer - before transit_core sees
+// it - and then hands it over, so for that moment two byte buffers really are live at once and
+// they cannot be the same vector. It is also the buffer on the path implicated in the morning
+// collapse (the 4-attempt loop inside fetchPlausibleSchedule's 3, re-entered every two minutes
+// while SEPTA answers with the wrong service day), which is why it is worth a reservation of its
+// own rather than one allocation per schedule fetch.
+//
+// WHAT IS NOT HERE, and it is the correction 0.3.1-rc1 earned on the hardware. rc1 gave every
+// consumer a permanent buffer - about 26 KB. That did what it said (per-cycle contiguous demand
+// ~12 KB -> ~5 KB) and was still a net loss: resting free8 fell from ~35 KB to ~22 KB and the
+// resting largest block from ~24.5 KB to ~14 KB, so the margin that decides whether a cycle
+// survives - largest block minus demand - went from ~12 KB to ~9 KB, and min_free8 reached 696 B
+// at 115 s of uptime with a poll mid-fetch and one concurrent /api/state. A trough to zero is an
+// lwIP assert, not a caught bad_alloc (DESIGN.md SS12.1). So the GTFS-RT retention block and the
+// BusSchedules parse block - both vectors of non-trivially-destructible values, which cannot share
+// raw bytes without a custom allocator - go back to being allocated per cycle. They are 4.6 KB and
+// 3 KB, sizes a ~24 KB resting largest block carries comfortably.
+//
+// Heap-allocated rather than a file-scope object, like the tracker: the ESP32's static .bss budget
+// is separate from and much smaller than the heap. A null pointer is a working fallback, not a
+// failure - transit_core builds its buffers per call exactly as it used to.
+transit::PollBuffers *g_poll_buffers = nullptr;
+std::vector<uint8_t> g_sched_raw;
+
 // ---- stats-page summary cache (F27, DESIGN.md SS8 "Stats page") -------------------------------
 //
 // Computing one of these streams a month of CSV off the SD card - seconds on a slow card, times
@@ -337,31 +374,14 @@ bool isSeptaErrorBody(const std::vector<uint8_t> &b) {
 }
 
 // Minutes until the earliest upcoming "DateCalender" in a BusSchedules body, or -1 if none
-// parsed. A cheap scan over the raw JSON (the entries are ~90 bytes each and there are at most a
-// dozen) so the fetch layer can judge SEPTA's service day per backend and steer the sticky
-// cookie before transit_core ever parses the body. Mirrors fetchPlausibleSchedule()'s test.
+// parsed. The scan itself is transit_core's (septa.h firstUpcomingScheduleTime) and runs over the
+// body vector IN PLACE. It used to start with `std::string text(body.begin(), body.end())` - a
+// second full copy of a body capped at 4 KB, i.e. a second contiguous block of up to 4 KB asked
+// for while the GTFS-RT entity buffer, the retention buffer and the body itself were all still
+// live (audit_runtime SS3 #12, ranked recommendation 7) - plus two small strings per entry.
 long firstUpcomingMinutes(const std::vector<uint8_t> &body) {
-  static const char kKey[] = "\"DateCalender\":\"";
-  const size_t klen = sizeof(kKey) - 1;
   transit::Epoch now = (transit::Epoch)time(nullptr);
-  transit::Epoch best = 0;
-  std::string text(body.begin(), body.end());
-  size_t pos = 0;
-  while ((pos = text.find(kKey, pos)) != std::string::npos) {
-    pos += klen;
-    size_t end = text.find('"', pos);
-    if (end == std::string::npos) break;
-    std::string raw = text.substr(pos, end - pos);
-    std::string unescaped;
-    for (size_t i = 0; i < raw.size(); ++i) {
-      if (raw[i] == '\\' && i + 1 < raw.size() && raw[i + 1] == '/') continue;  // "09\/15\/26"
-      unescaped.push_back(raw[i]);
-    }
-    bool ok = false;
-    transit::Epoch t = transit::parseBusScheduleTime(unescaped, &ok);
-    if (ok && t >= now - 60 && (best == 0 || t < best)) best = t;
-    pos = end;
-  }
+  transit::Epoch best = transit::firstUpcomingScheduleTime(body.data(), body.size(), now);
   if (best == 0) return -1;
   return (long)((best - now) / 60);
 }
@@ -386,7 +406,11 @@ transit::HttpGetEx makeHttpGetEx(uint32_t timeout_ms) {
       transit::FetchResult result;
       constexpr int kAttempts = 4;
       for (int attempt = 0; attempt < kAttempts; ++attempt) {
-        std::vector<uint8_t> body;
+        // The transport-level buffer, reserved once before Wi-Fi (g_sched_raw): the cap below is
+        // 4 KB, so with the reservation in place the insert() loop never reallocates and never
+        // asks for a contiguous block mid-cycle. clear() keeps the capacity.
+        std::vector<uint8_t> &body = g_sched_raw;
+        body.clear();
         bool overflow = false;
         ReplyInfo reply;
         notePollerProgress();
@@ -482,7 +506,7 @@ std::vector<Alert> collectAlerts(const std::vector<StopConfig> &stops, bool aler
     return {};
   }
 
-  transit::SeptaSource src;
+  transit::SeptaSource src(g_poll_buffers);  // the shared response body buffer, not a fresh one
   uint32_t now_ms = millis();
   std::vector<std::string> live_keys;
 
@@ -543,7 +567,7 @@ std::vector<LivenessEntry> g_liveness_cache;
 
 void refreshRouteLiveness(const std::vector<StopConfig> &stops, const transit::HttpGetEx &http,
                           const std::function<bool()> &have_time) {
-  transit::SeptaSource src;
+  transit::SeptaSource src(g_poll_buffers);  // the shared response body buffer, not a fresh one
   std::vector<std::string> live_keys;
   for (const auto &s : stops) {
     if (s.mode != Mode::Bus && s.mode != Mode::Trolley) continue;
@@ -647,7 +671,7 @@ void annotateEvents(std::vector<transit_stats::LogEvent> &events, const std::vec
 }
 
 // DESIGN.md SS9.1 `bike` rows: one per configured Indego station per local clock hour, taken from
-// the last successful refresh (bike_service.cpp polls every 5 min, so a healthy sample is that
+// the last successful refresh (bike_service.cpp polls every 10 min, so a healthy sample is that
 // fresh).
 //
 // F29 - a `bike` row is a claim that "this is what the docks held at ts", so three rules:
@@ -708,13 +732,15 @@ void logBikeSamples(const Config &cfg, time_t now, const std::string &month) {
 // One long-lived ArrivalTracker across the device's uptime (DESIGN.md SS9.1); registerStop() is
 // idempotent so it's safe to re-run on every config change. Heap-allocated on first use rather
 // than a plain global/static instance: ArrivalTracker's own header doc puts sizeof(ArrivalTracker)
-// at ~14-16KB (kMaxTrackedStops * StopState, each holding a kMaxTrackedTripsPerStop array), which
+// at ~8 KB on the target (kMaxTrackedStops * StopState, each holding a kMaxTrackedTripsPerStop
+// array; it was ~12 KB before the slot count dropped from 12 to 8 in 0.3.1), which
 // is fine for the heap (~200KB free at boot per firmware/README.md) but overflows the ESP32's
 // fixed static .bss/.data budget if declared as a file-scope object - confirmed by hitting
 // "DRAM segment data does not fit" at link time with it declared that way.
 transit_stats::ArrivalTracker *g_tracker = nullptr;
 volatile bool g_enabled = false;
 bool g_task_created = false;
+
 
 // May return nullptr: with exceptions disabled a plain `new` that fails calls std::terminate()
 // (seen as a boot loop on the owner's board when the heap was too fragmented after Wi-Fi came
@@ -757,38 +783,102 @@ void logHeapHeartbeat() {
                 (unsigned)largest, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
 
+// DESIGN.md SS2.1. One sample per stage of pollOnce, so the question "is there a point in the poll
+// cycle where a TLS session would fit?" - and, on this branch, "which stage takes the largest block
+// from 23.5 KB to under 12 KB, and which one leaks on the failure path?" - is answered by
+// measurement instead of by moving fetches around and hoping. The numbers are MALLOC_CAP_8BIT -
+// what an allocation can really get - and are directly comparable with `need` in the [https] gate
+// lines and with tlsHeapNeed() in /api/state.
+//
+// CHANGED ON THIS BRANCH (2026-09-17): the sample itself is now unconditional and goes into
+// heap_trace.cpp's .bss ring, which GET /api/debug/ui reads out. Serial cannot be captured on this
+// bench - opening the port resets the board - so a trace that only exists as Serial output is a
+// measurement that cannot be taken. The Serial LINE is unchanged and still behind
+// -DTRANSIT_HEAP_TRACE, so the -https envs keep printing exactly what DESIGN.md SS2.1's figures
+// were read off. Cost when the flag is off: two heap_caps_ calls and a 12-byte store per stage.
+void tracePoll(uint8_t stage) {
+  heapTraceMark(stage);
 #ifdef TRANSIT_HEAP_TRACE
-// DESIGN.md SS2.1. One line per stage of pollOnce, so the question "is there a point in the poll
-// cycle where a TLS session would fit?" is answered by measurement instead of by moving fetches
-// around and hoping. The numbers are MALLOC_CAP_8BIT - what an allocation can really get - and are
-// directly comparable with `need` in the [https] gate lines and with tlsHeapNeed() in /api/state.
-// Compiled only when the env asks for it (the cyd-*-https prototype envs do); costs one
-// Serial.printf per stage per poll and nothing at all in a shipping image.
-void tracePoll(const char *stage) {
-  Serial.printf("[poll-heap] %-13s free8=%u largest=%u\n", stage, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+  Serial.printf("[poll-heap] %-13s free8=%u largest=%u\n", kHeapTraceStages[stage],
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-}
-#else
-inline void tracePoll(const char *) {}
 #endif
+}
+
+// transit_core calls this through the function pointer in source.h, so the three big allocations
+// inside pollBusStops() (the GTFS-RT buffers, each route's TransitView, each stop's BusSchedules)
+// get their own stage rather than being hidden inside one pre/post pair. Installed by
+// initNetPoller(); the library holds nothing but the pointer.
+void transitCoreTrace(int stage) {
+  switch (stage) {
+    case transit::kPollTraceRtStream: heapTraceMark(kStageRtStream); break;
+    case transit::kPollTraceTransitView: heapTraceMark(kStageTvRoute); break;
+    case transit::kPollTraceSchedStop: heapTraceMark(kStageSchedStop); break;
+    case transit::kPollTraceMerge: heapTraceMark(kStageMerge); break;
+    default: break;
+  }
+}
+
+// ---- Instrument counters (diag branch) ------------------------------------------------------
+// How many Snapshot objects published by publishSnapshot() are still alive. The audit's M1 found
+// THREE: the poller's own `combined`, the published copy of it, and the display task's last-good
+// reference - each 4-8 KB. Since the publish became a move (publishSnapshot() below) the poller's
+// `combined` and the published object are the same object, so the expected reading is ONE between
+// publishes and TWO for up to a second after one, while the display's last-good still names the
+// outgoing Snapshot. A number above two, or one that climbs, is a reference nobody is releasing.
+// Counted by
+// construction and destruction of the published object itself rather than by a custom deleter, so
+// make_shared's single allocation is preserved: a `shared_ptr(new T, deleter)` would have added a
+// second block per publish, which is the instrument changing the thing it measures. The counter is
+// touched from whichever task drops the last reference, hence atomic.
+std::atomic<uint32_t> g_snapshots_live{0};
+struct CountedSnapshot : Snapshot {
+  explicit CountedSnapshot(Snapshot &&s) : Snapshot(std::move(s)) { g_snapshots_live.fetch_add(1); }
+  ~CountedSnapshot() { g_snapshots_live.fetch_sub(1); }
+};
+
+// Cycles that reported failure, and the live value of pollerTask's wedge tally. Both are read by
+// GET /api/debug/ui: `failed_polls` says how far into the failure loop the board is, and
+// `wedged_polls` says how close the self-heal reboot is - the two numbers that place a trace
+// sample in the ~10 minute cycle the board is repeating.
+volatile uint32_t g_failed_polls = 0;
+volatile uint32_t g_wedged_polls = 0;
 
 // Publishes a Snapshot to every reader (UI, web server) and moves the LED with it. Called more
 // than once per cycle (F12): the arrivals go out the moment they exist, and again when the alerts
 // that belong to the same Snapshot arrive.
-void publishSnapshot(const Snapshot &snap) {
-  // Everything that allocates happens HERE, with nothing held: the Snapshot copy and the error
-  // string. This used to run with g_mutex held, which is what made a reader's wait long enough to
-  // matter in the first place - the display task was not waiting for a pointer, it was waiting out
-  // somebody else's allocation of a few kilobytes of arrivals. A bad_alloc now escapes before the
-  // lock is ever taken and is caught by pollOnce()/pollerTask() exactly as before, leaving the
-  // published Snapshot untouched.
-  std::shared_ptr<const Snapshot> next = std::make_shared<const Snapshot>(snap);
+//
+// TAKES ITS ARGUMENT BY RVALUE, and that is the point (audit_runtime SS2/M1, ranked
+// recommendation 3). It used to take `const Snapshot&` and COPY it into the shared_ptr, so the
+// caller's `combined` and the published object were two distinct Snapshots - 4-8 KB each, six of
+// their blocks being 1.1-2.3 KB contiguous arrival vectors - and `combined` then stayed alive
+// through the whole optional tail: the alerts fetch, the weather fetch, the 400 KB Indego stream,
+// the tracker pass and every SD write. Moving it means there is ONE Snapshot: the caller is left
+// holding the returned pointer, not a second object.
+//
+// Returns the published pointer so the tail can read the stops and alerts it has just handed over.
+// That is a refcount, not a copy.
+std::shared_ptr<const Snapshot> publishSnapshot(Snapshot &&snap) {
+  // Everything that allocates happens HERE, with nothing held: make_shared's single block and the
+  // error string. This used to run with g_mutex held, which is what made a reader's wait long
+  // enough to matter in the first place - the display task was not waiting for a pointer, it was
+  // waiting out somebody else's allocation of a few kilobytes of arrivals. A bad_alloc escapes
+  // before the lock is ever taken and is caught by pollOnce()/pollerTask() exactly as before,
+  // leaving the published Snapshot untouched.
+  // CountedSnapshot, not Snapshot: same object, same single make_shared allocation, but its ctor
+  // and dtor move g_snapshots_live so /api/debug/ui can say how many published Snapshots are alive
+  // (diag branch). The shared_ptr is converted to shared_ptr<const Snapshot> immediately; the
+  // control block still destroys the real type, so the non-virtual destructor is not a problem.
+  std::shared_ptr<const Snapshot> next = std::make_shared<const CountedSnapshot>(std::move(snap));
+  // Read off the published object, not off `snap`: `snap` has been moved from and owns nothing.
   PollStatus status;
   status.has_polled = true;
-  status.ok = snap.last_poll_ok;
-  status.last_http_status = snap.last_poll_ok ? 200 : 0;
-  status.last_poll_epoch = (uint32_t)snap.generated;
-  status.last_error = snap.last_error;
+  status.ok = next->last_poll_ok;
+  status.last_http_status = next->last_poll_ok ? 200 : 0;
+  status.last_poll_epoch = (uint32_t)next->generated;
+  status.last_error = next->last_error;
+  const bool ok = next->last_poll_ok;
+  std::shared_ptr<const Snapshot> published = next;  // a refcount bump; `next` is emptied below
 
   // `previous` takes the outgoing Snapshot out of the critical section so its destructor - freeing
   // those same vectors and strings - also runs with the lock released.
@@ -803,12 +893,13 @@ void publishSnapshot(const Snapshot &snap) {
     xSemaphoreGive(g_mutex);
   }
 
-  if (snap.last_poll_ok) {
+  if (ok) {
     flashPollOk();
     setStatusLed(LedState::Off);
   } else {
     setStatusLed(LedState::Error);
   }
+  return published;
 }
 
 // DESIGN.md SS7 / model.h: last_poll_ok is "every stop's required sources succeeded" - which is
@@ -930,7 +1021,21 @@ void evictUnconfiguredSummaries(const std::vector<StopConfig> &stops) {
 // so the header cheerfully reported them as fresh. The arrivals are the product; they are
 // published the instant they exist, and everything else runs afterwards on its own clock.
 uint32_t pollOnce(uint32_t &consecutive_failures) {
-  tracePoll("poll-start");
+  heapTraceBeginCycle();  // bumps the cycle number, then stamps kStagePollStart
+#ifdef TRANSIT_HEAP_TRACE
+  Serial.printf("[poll-heap] %-13s free8=%u largest=%u\n", kHeapTraceStages[kStagePollStart],
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+#endif
+  // Clears the working set for this cycle and gives back an oversized body buffer, if some
+  // unusually large response grew one last cycle. Done HERE, at poll-start, because this is where
+  // the largest free block is at its best (DESIGN.md SS5).
+  if (g_poll_buffers != nullptr) g_poll_buffers->beginCycle();
+  // Take the error-reply reserve back if a 503 spent it and the heap has recovered since
+  // (heap_reserve.h). Poll-start is one of the two contexts this is allowed from - the other is
+  // the idle slice below - because neither is the handler that released it, and both are on a task
+  // that can afford to be told "not yet".
+  rearmHeapReserveIfSafe();
   Config cfg = getActiveConfig();
   transit::HttpGetEx http = makeHttpGetEx(kFetchTimeoutMs);
   transit::HttpGetEx http_opt = makeHttpGetEx(kOptionalFetchTimeoutMs);
@@ -960,11 +1065,15 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // poll, reported per stop like any other outage, not a reset.
   Snapshot bus_snap, rail_snap;
   bool out_of_memory = false;
-  tracePoll("pre-transit");
+  tracePoll(kStagePreTransit);
   try {
-    bus_snap = transit::pollBusStops(bus_like, now, http, sched_cache);
-    rail_snap = transit::pollRailStops(rail_like, now, http);
+    bus_snap = transit::pollBusStops(bus_like, now, http, sched_cache, g_poll_buffers);
+    rail_snap = transit::pollRailStops(rail_like, now, http, g_poll_buffers);
   } catch (const std::bad_alloc &) {
+    // Stamped INSIDE the catch, before anything unwound by the throw has been rebuilt: with the
+    // per-stage marks above it, the ring then reads "...sched-stop, oom-transit", which names the
+    // allocation that failed rather than only the call that contained it (diag branch).
+    heapTraceMark(kStageOomTransit);
     out_of_memory = true;
   }
   if (out_of_memory) {
@@ -995,13 +1104,24 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // publishing without them is never a reason to withhold the arrivals (F12). A second publish
   // follows below if a fetch brings new ones.
   combined.alerts = cachedAlerts();
-  publishSnapshot(combined);
-  tracePoll("post-transit");
+
+  // Everything the tail needs out of `combined` that is not the Snapshot itself, read BEFORE it is
+  // handed over: after the move it owns nothing.
+  const bool poll_ok = combined.last_poll_ok;
+  const bool urgent = anyArrivalUrgent(combined, combined.generated);
+
+  // Published by MOVE (audit_runtime SS2/M1). The poller keeps the pointer, not a second Snapshot:
+  // `combined` used to stay alive here until the end of the function, i.e. across the alerts
+  // fetch, the weather fetch, the 400 KB Indego stream, the tracker pass and every SD write, while
+  // the published copy of the same 4-8 KB - six of whose blocks are 1.1-2.3 KB contiguous arrival
+  // vectors - sat beside it.
+  std::shared_ptr<const Snapshot> published = publishSnapshot(std::move(combined));
+  tracePoll(kStagePostTransit);
+  if (!poll_ok) g_failed_polls++;
 
   // From here on everything is optional. The next transit poll's deadline is fixed first, so each
   // piece of work can ask whether it still has room rather than finding out afterwards.
-  bool urgent = anyArrivalUrgent(combined, combined.generated);
-  uint32_t interval_s = nextIntervalS(cfg, combined.last_poll_ok, urgent, consecutive_failures);
+  uint32_t interval_s = nextIntervalS(cfg, poll_ok, urgent, consecutive_failures);
   if (g_last_poll_unsynced) interval_s = std::min<uint32_t>(interval_s, 10);  // re-poll soon once NTP lands
   const uint32_t deadline_ms = millis() + interval_s * 1000UL;
   // The liveness window is a multiple of the interval the poller is ACTUALLY running at, backoff
@@ -1017,19 +1137,38 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
 
   if (have_time()) {
     bool alerts_fetched = false;
-    tracePoll("pre-alerts");
-    combined.alerts = collectAlerts(cfg.stops, cfg.alerts, http_opt, have_time, &alerts_fetched);
+    tracePoll(kStagePreAlerts);
+    std::vector<Alert> fresh_alerts = collectAlerts(cfg.stops, cfg.alerts, http_opt, have_time, &alerts_fetched);
     // Only when something actually came back: a cycle where every alert feed was still fresh must
     // not re-publish an identical Snapshot and reset the header's "updated N s ago".
-    if (alerts_fetched) publishSnapshot(combined);  // same stops, now with the alerts for them
+    if (alerts_fetched) {
+      // The second publish of the cycle, and the one place a copy of the stops is unavoidable: the
+      // published Snapshot is const and shared (the display task holds a reference to it for up to
+      // a second), so the alerts cannot be written into it. What changed is that this is now ONE
+      // copy, made and handed over in the same breath, instead of a second copy of a `combined`
+      // the poller was going to hold for the rest of the cycle anyway. It runs at most once every
+      // kAlertsRefreshMs (5 min), and only when a feed actually answered.
+      Snapshot with_alerts;
+      with_alerts.generated = published->generated;
+      with_alerts.last_poll_ok = published->last_poll_ok;
+      with_alerts.last_error = published->last_error;
+      with_alerts.stops = published->stops;  // may throw bad_alloc; pollerTask() catches it
+      with_alerts.alerts = std::move(fresh_alerts);
+      published = publishSnapshot(std::move(with_alerts));
+    }
+    tracePoll(kStagePostAlerts);
   }
   if (have_time()) {
-    tracePoll("pre-weather");
+    tracePoll(kStagePreWeather);
     refreshWeather(cfg, http_opt_plain);  // DESIGN.md SS4.8: 10 min per location
+    tracePoll(kStagePostWeather);
   }
   if (have_time()) {
-    tracePoll("pre-bikes");
-    refreshBikes(cfg, http_opt_plain);    // DESIGN.md SS4.9: 5 min, 400 KB streamed
+    tracePoll(kStagePreBikes);
+    // The scanner borrows the same bytes the transit fetches used earlier in this cycle; they
+    // are done with them (transit_core PollBuffers).
+    refreshBikes(cfg, http_opt_plain, pollScratch());  // DESIGN.md SS4.9: 10 min, 400 KB streamed
+    tracePoll(kStagePostBikes);
   }
 
   // DESIGN.md SS9: feed every StopSnapshot to the tracker and append any resulting LogEvents to
@@ -1040,10 +1179,13 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // false, which suppresses a noshow rather than inventing one.
   if (cfg.device.logging) {
     syncTrackerRegistrations(cfg.stops);
-    tracePoll("pre-liveness");
+    tracePoll(kStagePreLiveness);
     refreshRouteLiveness(bus_like, http_opt, have_time);
+    tracePoll(kStagePostLiveness);
     std::vector<transit_stats::LogEvent> events;
-    for (const auto &stop : combined.stops) {
+    // The stops the poller published a moment ago, read through the pointer it kept rather than
+    // out of a second copy it was holding for exactly this (audit_runtime SS2).
+    for (const auto &stop : published->stops) {
       const StopConfig *sc = nullptr;
       for (const auto &s : cfg.stops) {
         if (s.key == stop.key) {
@@ -1059,10 +1201,16 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
       // no arrivals, which is how a network timeout produced `arrive` and `ghost` rows.
       if (tracker() != nullptr && now >= kSaneClockEpoch) tracker()->observe(stop, now, route_live, stop.ok, events);
     }
+    tracePoll(kStagePostTracker);  // `events` is built by now; the tracker itself is a fixed block
     if (now >= kSaneClockEpoch) {
       std::string month = currentLocalMonth();
       if (!events.empty()) {
-        annotateEvents(events, combined.alerts);
+        // The alerts on the Snapshot that is live right now - which is the list the second publish
+        // above put there when a feed answered, and the cached list otherwise. collectAlerts()'s
+        // return value differs from this only by entries for routes that are no longer configured,
+        // and annotateEvents() matches alerts to events BY ROUTE, so an unconfigured route has no
+        // event to annotate: the flag it writes is the same either way.
+        annotateEvents(events, published->alerts);
         uint32_t dropped = 0;
         for (const auto &ev : events) {
           std::string line = transit_stats::toCsv(ev);
@@ -1079,10 +1227,12 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
       }
       logBikeSamples(cfg, (time_t)now, month);
     }
+    tracePoll(kStagePostSd);  // after every toCsv()/appendLine() and the Indego samples
   }
 
   evictUnconfiguredSummaries(cfg.stops);
   logHeapHeartbeat();
+  tracePoll(kStageCycleEnd);
   return deadline_ms;
 }
 
@@ -1145,6 +1295,12 @@ void pollerTask(void * /*arg*/) {
     try {
       deadline = pollOnce(consecutive_failures);
     } catch (const std::bad_alloc &) {
+      // The optional tail (alerts, weather, bikes, liveness, SD) has no catch of its own, so this
+      // is where a throw from any of them lands. Stamped here, the ring's previous entry names
+      // which of them was live - "pre-bikes, oom-cycle" is the Indego stream, "post-weather,
+      // oom-cycle" is the liveness fetch, and so on (diag branch).
+      heapTraceMark(kStageOomCycle);
+      g_failed_polls++;
       Serial.printf("[net_poller] out of memory during the poll cycle (free %u, largest %u); short retry\n",
                     (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
       consecutive_failures = std::min<uint32_t>(consecutive_failures + 1, 4);
@@ -1193,6 +1349,7 @@ void pollerTask(void * /*arg*/) {
     } else {
       wedged_polls = 0;
     }
+    g_wedged_polls = wedged_polls;  // diag branch: mirrored so /api/debug/ui can read it
 
     // Blocks until the deadline, but wakes immediately if requestRepoll() gives the semaphore
     // (DESIGN.md SS7: PUT /api/config "triggers immediate re-poll").
@@ -1210,7 +1367,24 @@ void pollerTask(void * /*arg*/) {
       // inside the window with nothing refreshing it. The loop itself cannot livelock - it exits on
       // a deadline the previous cycle computed from a bounded interval - so stamping here cannot
       // hide a stuck poller.
-      if (idleWorkHasHeadroom() && runQueuedProxyJob()) {
+      //
+      // The gate is passed IN rather than asked first (audit_runtime SS4, ranked recommendation 2).
+      // `idleWorkHasHeadroom() && runQueuedProxyJob()` short-circuited, so on a heap that could no
+      // longer clear the gate the queue was never even read: the job sat there for the rest of the
+      // device's uptime holding a paused request whose server-side timeout the library had turned
+      // off, and once both slots were held every later stats/proxy request got a permanent "proxy
+      // worker busy". Dequeuing is always allowed; the gate now decides only whether the job is
+      // RUN or answered 503, which the client retries.
+      rearmHeapReserveIfSafe();  // see pollOnce(): the other safe context, four times a second
+      // TWO questions, not one (proxy_queue.h, admission.h). idleWorkHasHeadroom() is about this
+      // instant; inFlightRequests() is about what is ABOUT to be allocated. rc2 asked only the
+      // first and started a ~9 KB stats scan at the start of a seven-request burst, while those
+      // requests still had their documents and send buffers ahead of them - and the board crashed
+      // in the library's deferred header assembly. A job waits for the burst to pass instead;
+      // "<= 1" rather than "== 0" because the job's OWN paused request is one of the in-flight
+      // ones and would otherwise block itself forever.
+      const bool quiet = inFlightRequests() <= 1;
+      if (runQueuedProxyJob(quiet && idleWorkHasHeadroom())) {
         notePollerProgress();
         if ((int32_t)(millis() - deadline) >= 0) break;
       }
@@ -1229,8 +1403,41 @@ bool preallocateTracker() {
   return tracker() != nullptr;
 }
 
+std::vector<uint8_t> *pollScratch() {
+  return g_poll_buffers != nullptr ? &g_poll_buffers->scratch : nullptr;
+}
+
+bool preallocatePollBuffers() {
+  if (g_poll_buffers == nullptr) {
+    g_poll_buffers = new (std::nothrow) transit::PollBuffers();
+    if (g_poll_buffers != nullptr) {
+      try {
+        g_poll_buffers->reserveAll();
+      } catch (const std::bad_alloc &) {
+        // Unreserved is still usable - the buffer is simply grown on demand, which is the old
+        // behaviour. Nothing here may throw past setup().
+        Serial.println("[net_poller] shared poll scratch not reserved (out of memory)");
+      }
+    }
+  }
+  // The transport's own BusSchedules buffer (see g_sched_raw). 4 KB is the cap makeHttpGetEx
+  // enforces, so reserving it here means that branch never reallocates.
+  try {
+    g_sched_raw.reserve(4096);
+  } catch (const std::bad_alloc &) {
+    Serial.println("[net_poller] BusSchedules buffer not reserved (out of memory)");
+  }
+  Serial.printf("[heap] poll_scratch %u B + sched %u B\n",
+                (unsigned)(g_poll_buffers != nullptr ? g_poll_buffers->scratch.capacity() : 0),
+                (unsigned)g_sched_raw.capacity());
+  return g_poll_buffers != nullptr;
+}
+
 void initNetPoller() {
   captureRestartNote();  // before Wi-Fi, before anything else can reset the board
+  // diag branch: lets transit_core stamp the heap at its own stage boundaries (source.h). One
+  // function-pointer store, done before any poll can run.
+  transit::setPollTraceHook(&transitCoreTrace);
   if (g_mutex == nullptr) {
     g_mutex = xSemaphoreCreateMutex();
   }
@@ -1332,13 +1539,6 @@ std::shared_ptr<const transit::Snapshot> snapshotPtr() {
   return copy;
 }
 
-transit::Snapshot getSnapshot() {
-  // The copy is made from the shared pointer, OUTSIDE the lock. Kept for callers that genuinely
-  // want a private value; the display task and /api/state both take the pointer instead.
-  std::shared_ptr<const transit::Snapshot> p = snapshotPtr();
-  return p ? *p : transit::Snapshot{};
-}
-
 PollStatus getPollStatus() {
   PollStatus copy;
   if (takeShared(g_mutex, kStatusWaitMs)) {
@@ -1358,6 +1558,7 @@ bool tryGetPollStatus(PollStatus *out) {
   try {
     *out = g_status;  // copies a std::string, so it can throw; the mutex must not be lost with it
   } catch (const std::bad_alloc &) {
+    heapTraceMark(kStageOomStatus);  // diag branch
     giveShared(g_mutex);
     throw;  // loop()'s guard in main.cpp skips the frame
   }
@@ -1432,5 +1633,10 @@ StopSummaryView getStopSummary(const std::string &stop_key) {
   }
   return view;
 }
+
+// ---- Instrument readouts (diag branch, net_poller.h) -----------------------------------------
+uint32_t snapshotsLive() { return g_snapshots_live.load(); }
+uint32_t failedPolls() { return g_failed_polls; }
+uint32_t wedgedPolls() { return g_wedged_polls; }
 
 }  // namespace transit_app

@@ -134,7 +134,16 @@
  * and can't be drawn in chunks. */
 
 /*The target buffer size for simple layer chunks.*/
-#define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (24 * 1024)   /*[bytes]*/
+/* 8 KB, not LVGL's default 24 KB (0.3.1). This is the size LVGL ASKS lv_malloc() for when it has
+ * to buffer a widget into a simple layer, and it comes out of LV_MEM_SIZE - which is 36 KB in
+ * total and, with a four-stop arrivals page up, has single-digit kilobytes free (firmware/sim's
+ * pool sweep: `pio run -e ui-sim-pool && .pio/build/ui-sim-pool/program /tmp/x pool`). A 24 KB
+ * request out of that pool can never succeed, so the number was not a target, it was a guaranteed
+ * failure that LVGL then retried in smaller chunks. 8 KB is 2,048 RGB565 pixels - six full rows of
+ * a 320-wide panel - which is a real chunk, and it can actually be had. No static RAM either way:
+ * the buffer is allocated on demand, only for a widget with style_opa < 255 or a non-normal blend
+ * mode, and freed again. */
+#define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (8 * 1024)   /*[bytes]*/
 
 #define LV_USE_DRAW_SW 1
 /* Blend targets this project never draws into (no images, no layers in these formats): each
@@ -898,6 +907,13 @@ extern "C" {
 #define LV_USE_IMGFONT 0
 
 /*1: Enable an observer pattern implementation*/
+/* Keep this at 0 unless something actually needs it, and not only for the flash: lv_observer.c is
+ * the LAST caller of the deprecated lv_obj_add_flag()/lv_obj_remove_flag() anywhere in this image
+ * (lv_observer.c:1374,1377). Those emit LV_LOG_DEPRECATED at runtime - LV_LOG_WARN_ONCE, i.e. one
+ * "[Warn] ... Deprecated" serial line per call site - and the device suite's
+ * "Z serial: no LVGL warnings" check counts exactly those lines. Our own call sites were all moved
+ * to the dedicated lv_obj_set_<flag>()/lv_obj_is_<flag>() API in 0.3.1-rc3; turning the observer on
+ * would put two of them back. */
 #define LV_USE_OBSERVER 0
 
 /*1: Enable Pinyin input method*/

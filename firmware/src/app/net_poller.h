@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "transit_core/model.h"
 #include "transit_stats/summary.h"
@@ -42,6 +43,20 @@ void startNetPoller(uint32_t poll_seconds);
 // setup(), before Wi-Fi. Returns false (and logging stays disabled) if the allocation failed.
 bool preallocateTracker();
 
+// Allocates the poll cycle's shared byte scratch (6 KB, transit_core PollBuffers) and the
+// transport's BusSchedules buffer (4 KB), for the same reason and at the same moment as
+// preallocateTracker(): both are multi-kilobyte CONTIGUOUS requests, and on this board the largest
+// free block - not the free heap - is what runs out (DESIGN.md SS5 "the poll working set",
+// SS12.1). One buffer serves the GTFS-RT entity buffer, then every buffered JSON response, then
+// the Indego feed scanner, because none of them is live at the same time as another. Returns false
+// if the allocation failed, in which case each cycle falls back to per-call buffers exactly as
+// before - a poll that is likelier to fail, not one that cannot run.
+bool preallocatePollBuffers();
+
+// The shared byte scratch itself, for the one consumer that is not inside transit_core: the Indego
+// feed scanner (bike_service.h). Null until preallocatePollBuffers() has succeeded.
+std::vector<uint8_t> *pollScratch();
+
 // Creates the poller task (12 KB stack) and its primitives without starting to poll. Call early
 // in setup(), before Wi-Fi, for the same heap-fragmentation reason as preallocateTracker().
 void initNetPoller();
@@ -65,9 +80,6 @@ void requestRepoll(bool data_changed = true);
 // pointer that task last held, so the screen redraws last frame's arrivals rather than blanking.
 std::shared_ptr<const transit::Snapshot> snapshotPtr();
 
-// A private COPY of the latest Snapshot. Prefer snapshotPtr() unless the caller really needs to own
-// or modify one: this allocates the whole thing. The copy is made outside the lock.
-transit::Snapshot getSnapshot();
 
 // Returns a copy of the latest poll diagnostics, safe to call from any task. Waits up to 1 s for
 // the poller's mutex on a non-display task. NOT for the LVGL task - see tryGetPollStatus().
@@ -178,5 +190,22 @@ struct StopSummaryView {
 // view this task read for THIS STOP, so a busy lock costs a second of staleness rather than
 // replacing a panel of statistics with "loading..." and putting it back on the next tick.
 StopSummaryView getStopSummary(const std::string &stop_key);
+
+// ---------------------------------------------------------------------------------------------
+// Instrument readouts (diag branch, 2026-09-17). All three are reported by GET /api/debug/ui, the
+// one endpoint outside refuseIfLowHeap()'s 503 gate, so they can still be read on a board whose
+// heap has already gone. None of them allocates or takes a lock.
+//
+// How many published Snapshots are alive right now. The audit's expected value is 3 during a
+// cycle's optional tail - the poller's working copy, the published one and the display task's
+// last-good reference, at 4-8 KB each - so a reading that climbs past that is a reference nobody
+// is releasing, which is the difference between "fragmented" and "leaking".
+uint32_t snapshotsLive();
+// Cycles that reported failure since boot, cumulative. On the observed failure loop this climbs by
+// one every 30 s once the first fetch has thrown.
+uint32_t failedPolls();
+// pollerTask's live wedge tally: consecutive failed cycles with a largest block under 6 KB. Reaches
+// 15 and the board reboots itself, so this is how far through the ~10 minute loop a sample is.
+uint32_t wedgedPolls();
 
 }  // namespace transit_app

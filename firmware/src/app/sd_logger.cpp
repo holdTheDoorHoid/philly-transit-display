@@ -367,17 +367,6 @@ bool streamLogLines(const std::string &filename, const std::function<bool(const 
 #endif
 }
 
-File openLogFile(const std::string &filename) {
-#ifdef BOARD_HAS_TF
-  if (!isMounted()) return File();
-  std::string path = logFilePath(filename);
-  return SD.open(path.c_str(), FILE_READ);
-#else
-  (void)filename;
-  return File();
-#endif
-}
-
 bool acquireLogReader() {
   bool expected = false;
   return g_log_reader_busy.compare_exchange_strong(expected, true);

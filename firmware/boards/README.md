@@ -96,7 +96,47 @@ choice is made at compile time so each board links only one big font: `lv_conf.h
 
 ## `LVGL_BUFFER_PIXELS` on the 3.5" boards
 
-`esp32-3248S035R.json` and `esp32-3248S035C.json` size the draw buffer at 1/20 of the screen
-(7,680 px, 15 KB) rather than the 1/16 used earlier; the 4 KB went back to the heap when the
-2026-09-14 features shrank it (firmware/README.md). Rendering a full screen takes a few more
-flushes; not visible in practice.
+`esp32-3248S035R.json` and `esp32-3248S035C.json` size the draw buffer at **1/30** of the screen
+(5,120 px, 10 KB): `/16` first became `/20` (7,680 px, 15 KB) when the 2026-09-14 features needed
+the 4 KB back, and `/30` in 0.3.1 for the same reason again - it is 5,120 B of the ESP32's
+byte-addressable heap, allocated once at `smartdisplay_init()` and held for the life of the
+device, on a board whose largest free block is the resource that runs out (DESIGN.md SS12.1).
+`ST7796_SPI_BUS_MAX_TRANSFER_SZ` is written in terms of `LVGL_BUFFER_PIXELS`, so the SPI DMA
+descriptor count follows it automatically and needs no separate edit.
+
+The cost is flush count: 30 partial flushes per full repaint instead of 20, at an unchanged
+24 MHz pixel clock. The observable is `tick_ms_max` in `GET /api/debug/ui` (21 ms on the owner's
+board at `/20`, with a page rebuild as the expensive case) - re-measure it after flashing rather
+than assuming. The 240-tall boards stay at `/16`: their quarter is 9.6 KB to begin with, and they
+are not the board this was measured on.
+
+## `LV_MEM_SIZE` stays at 36 KB (0.3.1)
+
+Every KB of LVGL's static pool (`firmware/include/lv_conf.h`) is a KB the heap never gets, so
+shrinking it to 28 KB was the largest single item in the 2026-09-17 RAM audit. It is **not** being
+taken, and the reason is the arrivals page: the owner wants up to four stops on it, and four stops
+is already at the edge at 36 KB.
+
+Measured with the host pool sweep, which scales its pool to board-equivalent bytes
+(`pio run -e ui-sim-pool && .pio/build/ui-sim-pool/program /tmp/x pool`, `kHostToBoard` in
+`sim/sim_main.cpp`), on the 320x480 panel:
+
+| board-equivalent pool | 4-stop arrivals page | pool free with it up | panels left off |
+|---:|---:|---:|---:|
+| 37,847 B (the sweep's own 56 KB build, ~1 KB more than a board) | 31,638 B | 2,640 B | none |
+| 36,864 B (the real pool) | 25,687 B | 9,392 B | **1** |
+| 34,816 B (the proposed 34 KB) | 25,714 B | 6,248 B | **1** |
+
+Read the last two rows carefully: the page gets *cheaper* because `main_screen.cpp`'s panel guard
+is leaving a panel OFF - a stop the owner configured does not appear. So 34 KB does not buy a
+tighter fit, it buys a missing panel, and it is 2 KB further from the four-stop case rather than
+nearer. 28 KB is further still.
+
+The margin at 36 KB is thin enough to be worth saying out loud: a four-stop page sits within about
+a kilobyte of the guard on this arithmetic, and `kHostToBoard` itself is a 0.66 fit with a 1.5 %
+spread. `GET /api/debug/ui`'s `lv_free`, `lv_page_cost` and `lv_page_refusals` are what settle it on
+the hardware; `lv_tight` goes true when the page that is up left under ~3 KB.
+
+What did change is `LV_DRAW_LAYER_SIMPLE_BUF_SIZE`, 24 KB -> 8 KB (`lv_conf.h`): that is the size
+LVGL asks this same 36 KB pool for when it buffers a widget into a simple layer, and 24 KB out of a
+pool with single-digit kilobytes free could never be granted. It costs no static RAM either way.

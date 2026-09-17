@@ -54,7 +54,26 @@ class StatusStream {
   static constexpr size_t kMaxFeatureBytes = 6144;
 
   // Reserves the one-feature scratch buffer up front so it never reallocates mid-stream.
-  StatusStream() { feature_buf_.reserve(kMaxFeatureBytes); }
+  StatusStream() { own_feature_buf_.reserve(kMaxFeatureBytes); }
+
+  // Puts the scanner back into its just-constructed state - parse state, filter, matched stations
+  // and counters - while KEEPING the feature buffer's capacity, so one stream object can scan a
+  // new feed every refresh instead of asking the allocator for its buffer again.
+  void reset();
+
+  // Scan into a buffer the CALLER owns, instead of this object's own.
+  //
+  // The one-feature buffer is 6 KB that is live only while push() is running. On the ESP32 that
+  // makes it the ideal thing to share: the firmware hands the same bytes to the GTFS-RT decoder
+  // during the TripUpdates fetch, to each buffered JSON response after it, and to this scanner
+  // later in the same cycle, so ONE reservation covers a whole poll instead of four
+  // (DESIGN.md 5, "the poll working set"). `borrowed` must outlive the scan; nullptr (the default
+  // state) puts the scanner back on its own buffer.
+  //
+  // A pointer to the vector and not to its bytes, deliberately: whoever else uses this buffer may
+  // grow it, and a borrow of the container survives a reallocation that a borrow of the storage
+  // would not.
+  void setFeatureBuffer(std::vector<uint8_t>* borrowed);
 
   // Restricts reported stations to these ids. An empty filter (the default) reports nothing.
   // Call before push(); not safe to change mid-stream.
@@ -103,7 +122,12 @@ class StatusStream {
   bool in_string_ = false;
   bool escape_ = false;
   bool feature_oversized_ = false;
-  std::vector<uint8_t> feature_buf_;
+  // Reached through featureBuf() so it can be the caller's (setFeatureBuffer) rather than
+  // own_feature_buf_, which stays empty and unreserved while a borrow is in place.
+  std::vector<uint8_t>& featureBuf() { return borrowed_feature_buf_ != nullptr ? *borrowed_feature_buf_ : own_feature_buf_; }
+  const std::vector<uint8_t>& featureBuf() const { return borrowed_feature_buf_ != nullptr ? *borrowed_feature_buf_ : own_feature_buf_; }
+  std::vector<uint8_t> own_feature_buf_;
+  std::vector<uint8_t>* borrowed_feature_buf_ = nullptr;
 
   std::vector<int> filter_ids_;     // as configured, for reference
   std::vector<int> remaining_ids_;  // filter ids not yet matched; empties out as features match

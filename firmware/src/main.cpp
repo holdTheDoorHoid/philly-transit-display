@@ -2,24 +2,31 @@
 //
 // setup() brings up every subsystem in the order DESIGN.md's firmware
 // skeleton task lays out: display/LVGL, LittleFS + config, Wi-Fi (captive
-// portal on first boot), NTP, mDNS, the web server, the SD card, the RGB
+// portal on first boot), NTP, mDNS, the SD card, the web server, the RGB
 // status LED, then the background tasks. loop() just pumps LVGL (see
 // esp32_smartdisplay's own README, "Step 7") and ui::tick() at ~1 Hz.
+//
+// The SD card is mounted BEFORE the web server since 0.3.1: that mount is one
+// ~12.5 KB contiguous calloc and this board's constraint is the largest free
+// block, so it goes first (see its own comment below, audit_static SS9.7).
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <esp32_smartdisplay.h>
 #include <esp_mac.h>
+#include <esp_bt.h>
 #include <esp_heap_caps.h>
 
 #include <ctime>
 #include <new>
 
 #include "app/auth.h"
+#include "app/bike_service.h"
 #include "app/config_store.h"
 #include "app/cxx_exception_pool.h"
 #include "app/http_fetch.h"
+#include "app/heap_reserve.h"
 #include "app/hw_probe.h"
 #include "app/net_poller.h"
 #include "app/poller_liveness.h"
@@ -188,9 +195,49 @@ void heapStage(const char *stage) {
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
+// Hands libbt's static data back to the heap, before anything else has allocated (audit_static
+// SS4.1, top-10 item 3). This is NOT esp_bt_controller_mem_release(), which Arduino's
+// initArduino() already calls unconditionally before setup() (esp32-hal-misc.c:309, via the weak
+// btInUse() stub - no BT library is linked here) and which has therefore already given back the
+// four BT ROM regions; calling that again gains nothing. esp_bt_mem_release() does all of that
+// AND `_bt_bss` + `_bt_data`, and on this image `_bt_data` is 4,464 bytes of .dram0.data -
+// libbt's hli_vectors table (4,380 B) plus 84 B from bt.c - that nothing releases today. On a
+// board whose largest free block is the resource that runs out, a new ~4.4 KB contiguous heap
+// region is not a rounding error.
+//
+// Read from the disassembly rather than from the docs, and stated honestly: the call first re-runs
+// the controller/ROM release (idempotent - esp_bt_controller_rom_mem_release keeps a bitmask of
+// what is left) and then returns early on a non-zero result from the first areas pair, both
+// members of which are below heap_caps_add_region()'s minimum and yield ESP_ERR_INVALID_SIZE,
+// which esp_bt_mem_release_area maps to ESP_OK. The static analysis says it succeeds; this has
+// never run on this hardware. So the device says so itself: the return code and the 8-bit free
+// heap either side of the call go on the boot log, and if it fails the failure mode is "no gain",
+// not a crash. It is irreversible (no BT this boot) - which is correct here: nothing in this
+// firmware uses Bluetooth, and DESIGN.md SS11 has no plan to.
+void releaseBluetoothMemory() {
+#if defined(CONFIG_BT_ENABLED) && defined(SOC_BT_SUPPORTED)
+  const size_t before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  const esp_err_t err = esp_bt_mem_release(ESP_BT_MODE_BTDM);
+  const size_t after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  const int32_t gain = (int32_t)after - (int32_t)before;
+  Serial.printf("[heap] bt_release err=%d (%s) free8 %u -> %u (%+d) largest=%u\n", (int)err,
+                esp_err_to_name(err), (unsigned)before, (unsigned)after, (int)gain,
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  // ...and where it can be READ: the serial console cannot be captured on this bench (opening the
+  // port resets the board), so GET /api/debug/ui carries the same two numbers.
+  transit_app::noteBluetoothRelease((int)err, gain);
+#else
+  Serial.println("[heap] bt_release skipped: no Bluetooth controller in this build");
+  transit_app::noteBluetoothRelease(-1, 0);
+#endif
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
+  // First, before the display's 15 KB draw buffer and everything after it: whatever this returns
+  // to the heap is most useful while the heap is still one run.
+  releaseBluetoothMemory();
   transit_app::hwProbeEarly();
 
   smartdisplay_init();
@@ -231,6 +278,23 @@ void setup() {
   if (!transit_app::preallocateTracker()) {
     log_e("main: could not allocate the arrival tracker; SD logging disabled");
   }
+  // The poll cycle's working set, for exactly the same reason and at exactly the same moment
+  // (DESIGN.md SS5 "the poll working set"): the GTFS-RT entity and retention buffers, the response
+  // body buffers and the schedule parse block are each a multi-kilobyte CONTIGUOUS request, and on
+  // this board the largest free block - not the free heap - is what runs out. A failure here is a
+  // slower poll, not a broken one: transit_core builds them per call as it always did.
+  if (!transit_app::preallocatePollBuffers()) {
+    log_e("main: could not reserve the poll working set; each cycle will allocate its own");
+  }
+  if (!transit_app::preallocateBikeStream(transit_app::pollScratch())) {
+    log_e("main: could not reserve the Indego feed scanner; each refresh will allocate its own");
+  }
+  // The kilobyte that lets the device still SAY "out of memory" when it is out of memory
+  // (app/heap_reserve.h: a coredump on 2026-09-17 caught guarded()'s own 503 throwing out of its
+  // catch handler and terminating). Armed here, with the others, before Wi-Fi.
+  Serial.printf("[heap] oom_reserve %s (%u B)\n",
+                transit_app::armHeapReserve() ? "armed" : "NOT ARMED (out of memory)",
+                (unsigned)transit_app::kHeapReserveBytes);
   transit_app::initNetPoller();
   transit_app::startProxyWorker();
   heapStage("tasks");
@@ -264,6 +328,23 @@ void setup() {
   }
   g_applied_name = cfg.device.name;
 
+  // BEFORE the web server, since 0.3.1 (audit_static SS9.7). Mounting the card is one
+  // ~12.5 KB CONTIGUOUS calloc - esp_vfs_fat_register() allocates the FATFS context and both FIL
+  // slots in a single block (sizeof(FATFS) 4,152 + 2 x sizeof(FIL) 4,136, measured) - and it is the
+  // largest single allocation this device makes after boot. Asking for it after the web server has
+  // started meant asking for it from a heap the AsyncWebServer had already been allocating out of;
+  // here it comes off one that is still close to one run. Nothing in startWebServer() needs the
+  // card: its SD-backed routes (/api/log/*, /api/stats) only touch sd_logger at request time, long
+  // after this. The `[heap] sd-pre` / `[heap] sd-begin` pair printed inside mountSd() is what says
+  // whether the block was there, and the stage lines below still bracket what they name.
+  transit_app::SdStatus sd = transit_app::mountSd();
+  if (sd.mounted) {
+    log_i("main: SD mounted, %.1f MB free", (double)sd.free_bytes / (1024.0 * 1024.0));
+  } else {
+    log_w("main: SD not mounted (no card, or unreadable) - logging disabled until one is inserted and the device reboots");
+  }
+  heapStage("sd");
+
   transit_app::startWebServer([](bool data_changed) {
     transit_app::requestRepoll(data_changed);
     transit_app::ui::onConfigChanged(transit_app::getActiveConfig());  // applied on the LVGL task
@@ -271,18 +352,9 @@ void setup() {
   });
   heapStage("web");
 
-  transit_app::SdStatus sd = transit_app::mountSd();
-  if (sd.mounted) {
-    log_i("main: SD mounted, %.1f MB free", (double)sd.free_bytes / (1024.0 * 1024.0));
-  } else {
-    log_w("main: SD not mounted (no card, or unreadable) - logging disabled until one is inserted and the device reboots");
-  }
-
   // RGB LED status (DESIGN.md SS3): steady-state is "off"; net_poller.cpp
   // flashes green on a good poll and holds red on a failed one from here on.
   transit_app::setStatusLed(LedState::Off);
-
-  heapStage("sd");
 
   transit_app::ui::init(cfg);
   transit_app::ui::applyBrightness(cfg.device.brightness);

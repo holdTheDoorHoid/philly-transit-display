@@ -22,6 +22,9 @@ void test_gtfsrt_empty_body_is_complete_not_truncated();
 void test_gtfsrt_malformed_entity_is_counted_not_fatal();
 void test_gtfsrt_trip_level_canceled_is_surfaced();
 void test_gtfsrt_fixture_updates_carry_the_header_timestamp();
+void test_gtfsrt_reset_decodes_a_second_feed_identically();
+void test_gtfsrt_reset_clears_a_half_parsed_feed();
+void test_gtfsrt_reset_grows_the_entity_cap_when_asked();
 
 // test_timeparse.cpp
 void test_bus_schedule_time_edt();
@@ -55,6 +58,10 @@ void test_parse_transitview_caps_vehicles();
 void test_parse_transitview_truncates_long_identifiers();
 void test_parse_transitview_absurd_numbers_do_not_overflow();
 void test_rail_line_lookup_by_code_or_display_name();
+void test_first_upcoming_schedule_time_matches_the_parser();
+void test_first_upcoming_schedule_time_skips_entries_already_past();
+void test_first_upcoming_schedule_time_reads_the_wrong_service_day_fixture();
+void test_first_upcoming_schedule_time_tolerates_junk_and_truncation();
 
 // test_merge.cpp
 void test_merge_stop_joins_rt_and_tv_by_trip_id();
@@ -111,6 +118,11 @@ void test_poll_bus_stops_501_with_a_valid_body_still_succeeds();
 void test_poll_bus_stops_valid_empty_feed_succeeds();
 void test_poll_rail_stops_one_failed_station_is_local_to_that_station();
 void test_poll_rail_stops_malformed_json_is_a_failure();
+void test_poll_buffers_keep_their_capacity_across_cycles();
+void test_poll_buffers_do_not_change_what_a_cycle_produces();
+void test_poll_buffers_return_an_oversized_body_buffer();
+void test_poll_buffers_remove_the_large_contiguous_requests();
+void test_poll_buffers_hand_the_same_storage_to_the_indego_scanner();
 
 int main(int argc, char** argv) {
   (void)argc;
@@ -132,6 +144,9 @@ int main(int argc, char** argv) {
   RUN_TEST(test_gtfsrt_malformed_entity_is_counted_not_fatal);
   RUN_TEST(test_gtfsrt_trip_level_canceled_is_surfaced);
   RUN_TEST(test_gtfsrt_fixture_updates_carry_the_header_timestamp);
+  RUN_TEST(test_gtfsrt_reset_decodes_a_second_feed_identically);
+  RUN_TEST(test_gtfsrt_reset_clears_a_half_parsed_feed);
+  RUN_TEST(test_gtfsrt_reset_grows_the_entity_cap_when_asked);
 
   RUN_TEST(test_bus_schedule_time_edt);
   RUN_TEST(test_bus_schedule_time_est);
@@ -163,6 +178,10 @@ int main(int argc, char** argv) {
   RUN_TEST(test_parse_transitview_truncates_long_identifiers);
   RUN_TEST(test_parse_transitview_absurd_numbers_do_not_overflow);
   RUN_TEST(test_rail_line_lookup_by_code_or_display_name);
+  RUN_TEST(test_first_upcoming_schedule_time_matches_the_parser);
+  RUN_TEST(test_first_upcoming_schedule_time_skips_entries_already_past);
+  RUN_TEST(test_first_upcoming_schedule_time_reads_the_wrong_service_day_fixture);
+  RUN_TEST(test_first_upcoming_schedule_time_tolerates_junk_and_truncation);
 
   RUN_TEST(test_merge_stop_joins_rt_and_tv_by_trip_id);
   RUN_TEST(test_merge_stop_drops_stale_arrivals);
@@ -217,6 +236,12 @@ int main(int argc, char** argv) {
   RUN_TEST(test_poll_bus_stops_valid_empty_feed_succeeds);
   RUN_TEST(test_poll_rail_stops_one_failed_station_is_local_to_that_station);
   RUN_TEST(test_poll_rail_stops_malformed_json_is_a_failure);
+
+  RUN_TEST(test_poll_buffers_keep_their_capacity_across_cycles);
+  RUN_TEST(test_poll_buffers_do_not_change_what_a_cycle_produces);
+  RUN_TEST(test_poll_buffers_return_an_oversized_body_buffer);
+  RUN_TEST(test_poll_buffers_remove_the_large_contiguous_requests);
+  RUN_TEST(test_poll_buffers_hand_the_same_storage_to_the_indego_scanner);
 
   return UNITY_END();
 }

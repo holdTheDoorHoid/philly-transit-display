@@ -125,9 +125,9 @@ void setMeter(lv_obj_t *meter, bool has_on_time, float pct, lv_color_t color) {
 void setHidden(lv_obj_t *o, bool hidden) {
   if (o == nullptr) return;
   if (hidden) {
-    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(o, true);
   } else {
-    lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_hidden(o, false);
   }
 }
 
@@ -151,7 +151,7 @@ lv_obj_t *createStatsScreen(const Config &cfg) {
   lv_obj_set_style_pad_all(screen, 0, 0);
   lv_obj_set_style_border_width(screen, 0, 0);
   lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
-  lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);  // DESIGN.md SS8: tap anywhere cycles pages
+  lv_obj_set_clickable(screen, true);  // DESIGN.md SS8: tap anywhere cycles pages
 
   auto *ctx = new StatsScreenCtx();
 
@@ -162,7 +162,7 @@ lv_obj_t *createStatsScreen(const Config &cfg) {
   lv_label_set_text_fmt(title, "Statistics  #%06x last 30 days#", (unsigned)colorHex(colorSubtext()));
   lv_obj_t *hint = makeLabel(header, fontSmall(h), colorSubtext());
   lv_label_set_text(hint, "tap for device info");
-  if (w < 300) lv_obj_add_flag(hint, LV_OBJ_FLAG_HIDDEN);  // 240 wide: the title alone fills the strip
+  if (w < 300) lv_obj_set_hidden(hint, true);  // 240 wide: the title alone fills the strip
 
   lv_obj_t *area = makePanelsArea(screen);
   const std::vector<transit::StopConfig> &stops = cfg.stops;

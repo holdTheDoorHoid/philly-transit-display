@@ -51,6 +51,13 @@ Epoch localToEpoch(int year, int month, int day, int hour, int minute, int secon
 // Parses BusSchedules' `DateCalender` field, e.g. "09/13/26 10:25 pm" (MM/DD/YY, 12-hour clock,
 // lowercase am/pm). The 2-digit year is interpreted as 2000+YY. Returns 0 and sets *ok=false
 // (if ok is non-null) on any parse failure; never throws.
+//
+// The NUL-terminated form is the real one and the std::string form calls it. A DateCalender value
+// is 17 characters, which is past libstdc++'s 15-character small-string buffer, so wrapping one in
+// a std::string to parse it is a heap allocation per entry - and the caller that scans a raw
+// BusSchedules body for its earliest trip (septa.h firstUpcomingScheduleTime) does that a dozen
+// times per fetch, on the poller task, with the fetch buffers still live.
+Epoch parseBusScheduleTime(const char* s, bool* ok = nullptr);
 Epoch parseBusScheduleTime(const std::string& s, bool* ok = nullptr);
 
 // Parses Arrivals' `sched_time`/`depart_time` fields, e.g. "2026-09-13 22:24:00.000"

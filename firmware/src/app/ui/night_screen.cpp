@@ -79,8 +79,8 @@ lv_obj_t *createNightScreen(const Config &cfg) {
   lv_obj_set_style_pad_row(screen, 6, 0);
   lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(screen, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_clickable(screen, true);
+  lv_obj_set_scrollable(screen, false);
 
   auto *ctx = new NightCtx();
 

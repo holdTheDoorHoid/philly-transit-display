@@ -1,6 +1,8 @@
 #include <unity.h>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 #include "fixture_path.h"
@@ -309,4 +311,67 @@ void test_rail_line_lookup_by_code_or_display_name() {
   TEST_ASSERT_NULL(findRailLineByName("NOPE"));
   TEST_ASSERT_NULL(findRailLineByName(""));
   TEST_ASSERT_NULL(findRailLineByName("PAO "));  // not trimmed here: the caller owns that
+}
+
+// --- Raw-body schedule scan (firstUpcomingScheduleTime) --------------------------------------
+//
+// The transport layer's service-day check. It reads the SAME field parseBusSchedules() does, off
+// the same bytes, without building a document or copying the body - so these tests pin it to the
+// parser's own answer rather than to a hand-written expectation.
+
+void test_first_upcoming_schedule_time_matches_the_parser() {
+  auto body = transit_test::readFixture("busschedules_21332.json");
+  ParseResult<SchedEntry> r = parseBusSchedules(body.data(), body.size());
+  TEST_ASSERT_TRUE(r.ok);
+  TEST_ASSERT_TRUE(r.items.size() >= 2);
+
+  Epoch earliest = 0;
+  for (const SchedEntry& e : r.items) {
+    if (earliest == 0 || e.scheduled < earliest) earliest = e.scheduled;
+  }
+  // "now" well before every entry in the fixture: the scan must find the same first trip.
+  TEST_ASSERT_EQUAL_INT64(earliest, firstUpcomingScheduleTime(body.data(), body.size(), earliest - 3600));
+}
+
+void test_first_upcoming_schedule_time_skips_entries_already_past() {
+  auto body = transit_test::readFixture("busschedules_21332.json");
+  ParseResult<SchedEntry> r = parseBusSchedules(body.data(), body.size());
+  TEST_ASSERT_TRUE(r.items.size() >= 2);
+  std::vector<Epoch> times;
+  for (const SchedEntry& e : r.items) times.push_back(e.scheduled);
+  std::sort(times.begin(), times.end());
+
+  // A minute past the first entry (beyond the 60 s grace) leaves the second as "first upcoming".
+  Epoch now = times[0] + 61;
+  TEST_ASSERT_EQUAL_INT64(times[1], firstUpcomingScheduleTime(body.data(), body.size(), now));
+  // Within the grace, the first entry still counts - the same rule fetchPlausibleSchedule() uses.
+  TEST_ASSERT_EQUAL_INT64(times[0], firstUpcomingScheduleTime(body.data(), body.size(), times[0] + 30));
+  // Past everything: nothing upcoming.
+  TEST_ASSERT_EQUAL_INT64(0, firstUpcomingScheduleTime(body.data(), body.size(), times.back() + 3600));
+}
+
+void test_first_upcoming_schedule_time_reads_the_wrong_service_day_fixture() {
+  // The fixture the sticky-cookie steering exists for (NOTES.md 9): a backend answering with
+  // tomorrow's first owl trips. Scanned against the day before, the first one is what comes back.
+  auto body = transit_test::readFixture("busschedules_21297_wrong_day.json");
+  bool ok = false;
+  Epoch expected = parseBusScheduleTime("09/15/26 12:32 am", &ok);
+  TEST_ASSERT_TRUE(ok);
+  TEST_ASSERT_EQUAL_INT64(expected, firstUpcomingScheduleTime(body.data(), body.size(), expected - 86400));
+}
+
+void test_first_upcoming_schedule_time_tolerates_junk_and_truncation() {
+  TEST_ASSERT_EQUAL_INT64(0, firstUpcomingScheduleTime(nullptr, 0, 0));
+  const char* empty = "";
+  TEST_ASSERT_EQUAL_INT64(0, firstUpcomingScheduleTime(reinterpret_cast<const uint8_t*>(empty), 0, 0));
+  // A body cut off in the middle of the value: no closing quote, so nothing is parsed and nothing
+  // reads past the end.
+  const char* cut = "{\"17\":[{\"DateCalender\":\"09\\/13\\/26 10:2";
+  TEST_ASSERT_EQUAL_INT64(0, firstUpcomingScheduleTime(reinterpret_cast<const uint8_t*>(cut), strlen(cut), 0));
+  // The key without the JSON around it, and a value that is not a date.
+  const char* junk = "\"DateCalender\":\"not a date\"";
+  TEST_ASSERT_EQUAL_INT64(0, firstUpcomingScheduleTime(reinterpret_cast<const uint8_t*>(junk), strlen(junk), 0));
+  // SEPTA's error body carries no DateCalender at all.
+  auto err = transit_test::readFixture("busschedules_error_400.json");
+  TEST_ASSERT_EQUAL_INT64(0, firstUpcomingScheduleTime(err.data(), err.size(), 0));
 }

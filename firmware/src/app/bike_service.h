@@ -1,5 +1,5 @@
 // Indego bike share (DESIGN.md SS4.9, SS6 "bike"): fetches Bicycle Transit's status feed on the
-// poller task every 5 minutes and keeps the configured stations for the UI and /api/state.
+// poller task every 10 minutes and keeps the configured stations for the UI and /api/state.
 // lib/indego_core scans the ~400 KB body feature by feature; nothing is buffered whole.
 #pragma once
 #include <cstdint>
@@ -11,8 +11,20 @@
 
 namespace transit_app {
 
-void refreshBikes(const Config &cfg, const transit::HttpGet &http);  // once per poll cycle; no-op when not due
+// `scratch`, when non-null, is the poller's shared byte buffer (transit_core PollBuffers): the
+// feed scanner borrows it for its 6 KB one-feature buffer instead of taking one of its own. By the
+// time this runs, the transit fetches that used the same bytes earlier in the cycle are done with
+// them. Null means the scanner owns its buffer, exactly as before.
+void refreshBikes(const Config &cfg, const transit::HttpGet &http,
+                  std::vector<uint8_t> *scratch = nullptr);  // once per poll cycle; no-op when not due
 void invalidateBikes();                                              // config changed
+
+// Allocates the feed scanner object itself at the same point in setup() as the other long-lived
+// objects, and hands it the shared scratch straight away so it never holds a 6 KB buffer of its own
+// - not even for the minute between boot and the first refresh. It is ~100 bytes thereafter; what
+// this buys is not the bytes but never constructing the scanner mid-cycle. Returns false if it
+// could not be had, in which case refreshBikes() builds one per refresh exactly as before.
+bool preallocateBikeStream(std::vector<uint8_t> *scratch = nullptr);
 
 struct BikeView {
   bool enabled = false;

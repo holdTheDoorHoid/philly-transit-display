@@ -185,7 +185,7 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
   lv_obj_set_style_pad_all(screen, 0, 0);
   lv_obj_set_style_border_width(screen, 0, 0);
   lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
-  lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);  // tap anywhere (except the reset target) cycles pages
+  lv_obj_set_clickable(screen, true);  // tap anywhere (except the reset target) cycles pages
 
   auto *ctx = new DeviceInfoCtx();
   ctx->mdns_host = cfg.device.name + ".local";
@@ -218,7 +218,7 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
   lv_label_set_text_fmt(title, "Device info  #%06x v" FIRMWARE_VERSION "#", (unsigned)colorHex(colorSubtext()));
   lv_obj_t *hint = makeLabel(header, fontSmall(h), colorSubtext());
   lv_label_set_text(hint, "tap for arrivals");
-  if (w < 300) lv_obj_add_flag(hint, LV_OBJ_FLAG_HIDDEN);  // 240 wide: the title alone fills the strip
+  if (w < 300) lv_obj_set_hidden(hint, true);  // 240 wide: the title alone fills the strip
 
   lv_obj_t *area = makePanelsArea(screen);
 
@@ -321,8 +321,8 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
   lv_obj_set_style_border_color(reset_target, colorSubtext(), 0);
   lv_obj_set_style_border_color(reset_target, colorLate(), LV_STATE_PRESSED);  // LVGL applies it while pressed
   lv_obj_set_style_pad_all(reset_target, reset_pad, 0);
-  lv_obj_remove_flag(reset_target, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_flag(reset_target, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_scrollable(reset_target, false);
+  lv_obj_set_clickable(reset_target, true);
   ctx->reset_label = makeLabel(reset_target, fontSmall(h), colorSubtext());
   lv_obj_set_width(ctx->reset_label, lv_pct(100));
   lv_obj_set_style_text_align(ctx->reset_label, LV_TEXT_ALIGN_CENTER, 0);
