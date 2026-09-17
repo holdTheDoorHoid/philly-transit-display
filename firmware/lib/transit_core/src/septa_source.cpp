@@ -346,6 +346,7 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
                                  : ("TripUpdates: " + o.error);
     }
   }
+  pollTrace(kPollTraceRtStream);  // 4,096 B entity buffer + ~4,800 B retained buffer are live here
   const std::vector<StopTimeUpdate>& rt_updates = stream.retained();
 
   struct RouteVehicles {
@@ -359,6 +360,7 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
     FetchOutcome o = src.fetchTransitViewEx(route, &tv, http);
     tv_ok_by_route.push_back({route, o.ok});
     tv_all.insert(tv_all.end(), tv.begin(), tv.end());
+    pollTrace(kPollTraceTransitView);  // once per route
   }
   auto tvOkFor = [&](const std::string& route) {
     for (const auto& p : tv_ok_by_route) {
@@ -393,6 +395,7 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
       }
     }
     sched_by_stop.push_back({stop_id, std::move(entries), ok});
+    pollTrace(kPollTraceSchedStop);  // once per stop, AFTER cache.put() has taken its long-lived copy
   }
   static const std::vector<SchedEntry> kEmptySched;
   auto schedFor = [&](const std::string& stop_id) -> const std::vector<SchedEntry>& {
@@ -424,6 +427,7 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
     sources.schedule_ok = schedOkFor(c.stop_id);
     snap.stops.push_back(mergeStop(c, rt_for_stop, tv_for_stop, schedFor(c.stop_id), now, sources));
   }
+  pollTrace(kPollTraceMerge);  // the per-stop arrival vectors now exist; the fetch buffers still do too
 
   summarize(&snap, rt_error);
   return snap;

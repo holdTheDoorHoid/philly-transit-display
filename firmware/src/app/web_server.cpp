@@ -9,6 +9,8 @@
 #include <freertos/task.h>
 
 #include <cctype>
+#include <cstdio>   // snprintf() for the heap-trace rows (diag branch)
+#include <cstdlib>  // strtoul() for the heap-trace query params (diag branch)
 #include <cstring>
 #include <ctime>
 #include <memory>
@@ -19,6 +21,7 @@
 #include "cpu_yield.h"  // cpuStretchMsMax() for /api/debug/ui (DESIGN.md SS12.1)
 #include "cxx_exception_pool.h"
 #include "demo_data.h"
+#include "heap_trace.h"  // the poll-cycle heap ring for /api/debug/ui (diag branch)
 #include "host_match.h"
 #include "json_response.h"
 #include "net_poller.h"
@@ -998,6 +1001,62 @@ void handleProxySchedule(AsyncWebServerRequest *request) {
   queueScheduleProxy(request, request->getParam("stop_id")->value().c_str());
 }
 
+// ---------------------------------------------------------------------------------------------
+// The heap instrument's readout side (diag branch, 2026-09-17). heap_trace.h has the why.
+//
+// THE CONSTRAINT THAT SHAPES ALL OF THIS: /api/debug/ui is deliberately outside refuseIfLowHeap()
+// and is the only endpoint that still answers on a board whose largest block is under 4 KB. The
+// trace must therefore not be the thing that stops it answering. So the rows are rendered by hand
+// into a fixed .bss buffer and injected with serialized(), NOT built as nested JsonArrays: 32 rows
+// of four numbers would be ~160 ArduinoJson slots, i.e. two or three more 1,024 B pool chunks, and
+// a pool that cannot grow makes the document overflow, which sendJson() correctly turns into a 503.
+// ArduinoJson copies a serialized() value into one StringNode, so the added heap cost is a single
+// contiguous block of what the rows actually measure - about 700 B at 32 rows - and nothing else.
+//
+// 32 rows and not the ring's full 64 for the same reason: the response body is copied twice on the
+// way out (the serialised String, then AsyncBasicResponse's own copy of it), so every byte here is
+// two contiguous bytes at the worst moment. A sampler passes `since` and gets only new rows, which
+// is a few hundred bytes per poll; `?n=64` is there for a one-off full dump on a healthy board.
+constexpr size_t kTraceMaxRows = 32;
+// "[65535,22,1048576,1048576]," is 27 characters; 32 B a row is slack, not a measurement.
+char g_trace_json[kTraceMaxRows * 32 + 8];
+
+const char *renderTrace(uint32_t since, size_t want, uint32_t *first_seq, size_t *count) {
+  if (want == 0 || want > kTraceMaxRows) want = kTraceMaxRows;
+  HeapTraceEntry rows[kTraceMaxRows];  // 384 B on the AsyncTCP task's 8 KB stack, freed on return
+  size_t n = heapTraceRead(since, rows, want, first_seq);
+  size_t at = 0;
+  g_trace_json[at++] = '[';
+  size_t written = 0;
+  for (size_t i = 0; i < n; i++) {
+    int w = snprintf(g_trace_json + at, sizeof(g_trace_json) - at - 2, "%s[%u,%u,%u,%u]", i ? "," : "",
+                     (unsigned)rows[i].cycle, (unsigned)rows[i].stage, (unsigned)rows[i].free8,
+                     (unsigned)rows[i].largest);
+    if (w <= 0 || (size_t)w >= sizeof(g_trace_json) - at - 2) break;  // cannot happen at these widths
+    at += (size_t)w;
+    written++;
+  }
+  g_trace_json[at++] = ']';
+  g_trace_json[at] = '\0';
+  *count = written;
+  return g_trace_json;
+}
+
+// uxTaskGetStackHighWaterMark by task name: the smallest number of stack BYTES that task has ever
+// had left (StackType_t is a byte on this port, which is why net_poller.cpp's own stack_free line
+// reads in bytes too). Looked up by name rather than by a stored handle because two of the three
+// tasks are not ours - "loopTask" is the Arduino core's and "async_tcp" is AsyncTCP's. A task that
+// does not exist yet reports 0. Neither call allocates.
+uint32_t taskStackHwm(const char *name) {
+  TaskHandle_t h = xTaskGetHandle(name);
+  return h == nullptr ? 0 : (uint32_t)uxTaskGetStackHighWaterMark(h);
+}
+
+uint32_t queryU32(AsyncWebServerRequest *request, const char *name, uint32_t fallback) {
+  if (!request->hasParam(name)) return fallback;
+  return (uint32_t)strtoul(request->getParam(name)->value().c_str(), nullptr, 10);
+}
+
 // DESIGN.md SS12.1: the deterministic on-device proof of the C++ emergency exception pool
 // (cxx_exception_pool.cpp). Takes the heap away in shrinking blocks until even a 16-byte allocation
 // fails, then forces a std::bad_alloc: with no pool, __cxa_allocate_exception cannot get the ~100
@@ -1341,6 +1400,44 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["ver_res"] = d.ver_res;
     doc["heap"] = ESP.getFreeHeap();
     doc["largest_block"] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+    // ---- The heap instrument (diag branch, 2026-09-17) ---------------------------------------
+    // `heap` above stays ESP.getFreeHeap() because clients parse it, and it is MALLOC_CAP_INTERNAL:
+    // it includes ~33.7 KB of 32-bit-word-only IRAM heap that malloc() will never hand out for a
+    // buffer or a string, so it sits beside an 8-bit largest_block reading two different heaps.
+    // heap_8bit is the one that can be compared with largest_block, and min_free8 is how close the
+    // board has ever come to nothing at all - a value the trace ring cannot show, because the
+    // trough may fall between two stages.
+    doc["heap_8bit"] = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    doc["min_free8"] = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    doc["uptime_s"] = (uint32_t)(millis() / 1000);
+    doc["reset_reason"] = (int)esp_reset_reason();  // 3 = SW restart, i.e. a self-heal reboot
+    // How many published Snapshots are alive (net_poller.h). Three during a cycle's tail is the
+    // expected reading; a number that climbs is a reference nobody is releasing.
+    doc["snapshots_live"] = snapshotsLive();
+    doc["failed_polls"] = failedPolls();
+    doc["wedged_polls"] = wedgedPolls();  // 15 reboots the board
+    doc["proxy_queue_depth"] = proxyQueueDepth();  // pinned at 2 = the audit's stuck-queue wedge
+    // Bytes of stack each task has never gone below. Rules a stack that has quietly eaten into the
+    // heap in or out before any of the heap numbers are interpreted.
+    JsonObject hwm = doc["stack_hwm"].to<JsonObject>();
+    hwm["loopTask"] = taskStackHwm("loopTask");
+    hwm["async_tcp"] = taskStackHwm("async_tcp");
+    hwm["net_poller"] = taskStackHwm("net_poller");
+    // The ring. ?since=<trace_seq from the last sample> returns only what is new, which is what a
+    // sampler should use; ?n=1..32 caps the rows; ?stages=1 adds the id->name table (left out of
+    // the routine sample because it is ~300 B of body that never changes).
+    uint32_t first_seq = 0;
+    size_t rows = 0;
+    const uint32_t since = queryU32(request, "since", 0);
+    doc["trace"] = serialized(renderTrace(since, (size_t)queryU32(request, "n", kTraceMaxRows), &first_seq, &rows));
+    doc["trace_first"] = first_seq;  // sequence number of trace[0]; > since means the ring wrapped
+    doc["trace_rows"] = (uint32_t)rows;
+    doc["trace_seq"] = heapTraceSeq();  // pass this back as ?since= next time
+    if (request->hasParam("stages")) {
+      JsonArray stages = doc["trace_stages"].to<JsonArray>();
+      for (size_t i = 0; i < kHeapTraceStageCount; i++) stages.add(kHeapTraceStages[i]);
+    }
     sendJson(request, 200, doc);
   }));
   g_server.on("/api/debug/tap", HTTP_POST, [](AsyncWebServerRequest *request) {

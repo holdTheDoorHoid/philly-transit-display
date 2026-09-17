@@ -37,4 +37,10 @@ void queueStatsRequest(AsyncWebServerRequest *request, const std::string &stop_k
 // (every stop and Indego station, DESIGN.md SS9.3).
 void queueOverviewRequest(AsyncWebServerRequest *request, int days);
 
+// How many jobs are sitting on the queue right now (diag branch). GET /api/debug/ui reports it: the
+// queue is drained ONLY by the poller's idle slice, behind a free8/largest-block gate the wedged
+// heap can no longer clear, so a depth pinned at the queue length (2) is a permanent starvation and
+// not a busy moment - and every entry in it is holding a paused request open with no timeout.
+uint32_t proxyQueueDepth();
+
 }  // namespace transit_app

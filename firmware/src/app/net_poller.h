@@ -179,4 +179,21 @@ struct StopSummaryView {
 // replacing a panel of statistics with "loading..." and putting it back on the next tick.
 StopSummaryView getStopSummary(const std::string &stop_key);
 
+// ---------------------------------------------------------------------------------------------
+// Instrument readouts (diag branch, 2026-09-17). All three are reported by GET /api/debug/ui, the
+// one endpoint outside refuseIfLowHeap()'s 503 gate, so they can still be read on a board whose
+// heap has already gone. None of them allocates or takes a lock.
+//
+// How many published Snapshots are alive right now. The audit's expected value is 3 during a
+// cycle's optional tail - the poller's working copy, the published one and the display task's
+// last-good reference, at 4-8 KB each - so a reading that climbs past that is a reference nobody
+// is releasing, which is the difference between "fragmented" and "leaking".
+uint32_t snapshotsLive();
+// Cycles that reported failure since boot, cumulative. On the observed failure loop this climbs by
+// one every 30 s once the first fetch has thrown.
+uint32_t failedPolls();
+// pollerTask's live wedge tally: consecutive failed cycles with a largest block under 6 KB. Reaches
+// 15 and the board reboots itself, so this is how far through the ~10 minute loop a sample is.
+uint32_t wedgedPolls();
+
 }  // namespace transit_app

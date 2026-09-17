@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "config_store.h"
+#include "heap_trace.h"
 #include "http_fetch.h"
 #include "json_response.h"
 #include "sd_logger.h"
@@ -360,6 +361,7 @@ void runJob(const ProxyJob &job) {
       runFetchJob(job);
     }
   } catch (const std::bad_alloc &) {
+    heapTraceMark(kStageOomProxy);  // diag branch
     Serial.printf("[proxy] out of memory running a queued job (free %u)\n", (unsigned)ESP.getFreeHeap());
     if (auto r = lockRequest(job)) r->send(503, "application/json", "{\"error\":\"out of memory, try again\"}");
   }
@@ -411,6 +413,14 @@ void queueOverviewRequest(AsyncWebServerRequest *request, int days) {
   if (days < 1) days = kDefaultStatsDays;
   if (days > kMaxStatsDays) days = kMaxStatsDays;
   enqueue(request, ProxyKind::Overview, std::string(), days);
+}
+
+// diag branch (audit SS4): jobs are only ever removed by runQueuedProxyJob(), which the poller
+// calls behind idleWorkHasHeadroom() - a gate a low heap can no longer clear. A depth that sticks
+// at kQueueLen is that wedge, and each stuck entry pins a paused AsyncWebServerRequest with its
+// server-side timeout disabled. One uxQueueMessagesWaiting() call; allocates nothing.
+uint32_t proxyQueueDepth() {
+  return g_queue == nullptr ? 0 : (uint32_t)uxQueueMessagesWaiting(g_queue);
 }
 
 void queueStatsRequest(AsyncWebServerRequest *request, const std::string &stop_key, int days) {

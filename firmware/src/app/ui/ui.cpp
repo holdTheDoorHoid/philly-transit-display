@@ -606,13 +606,16 @@ void tick() {
   // takeShared(): this task does not wait at all; 50 ms is what any OTHER task gets (ui_lock.h).
   // A miss just means the new config is applied on the next tick, a second later - g_pending
   // stays set.
-  if (g_pending && takeShared(g_pending_mutex, 50)) {
-    if (g_pending) {
+  if (g_pending) {
+    // SharedLock and not take/give: `next = g_pending_cfg` copies a Config (nine std::strings per
+    // stop), so it allocates and can throw, and a throw past a bare giveShared() would strand this
+    // mutex for good (ui_lock.h). Same wait, same miss accounting, same "apply it next tick".
+    SharedLock lk(g_pending_mutex, 50);
+    if (lk && g_pending) {
       next = g_pending_cfg;
       g_pending = false;
       apply = true;
     }
-    giveShared(g_pending_mutex);
   }
   if (apply) {
     bool rotate = next.device.rotation != g_cfg.device.rotation;
@@ -716,9 +719,9 @@ void tick() {
   d.ver_res = lv_display_get_vertical_resolution(disp);
   // Same policy: a miss leaves GET /api/debug/ui reading the previous tick's snapshot of the UI,
   // which is a 1 Hz sample of a 1 Hz value.
-  if (takeShared(g_pending_mutex, 20)) {
-    g_debug = d;
-    giveShared(g_pending_mutex);
+  {
+    SharedLock lk(g_pending_mutex, 20);  // g_debug = d copies five strings and two string vectors
+    if (lk) g_debug = d;
   }
 }
 
@@ -727,10 +730,8 @@ UiDebug debugSnapshot() {
   // 500 ms, not 200: this is how the device suite watches the panel, including while the UI task
   // is mid-rebuild and holding core 1, and a timeout here answers a default-constructed UiDebug -
   // an all-zero pool reading that looks like data. Seen intermittently at 200 ms on 2026-09-16.
-  if (g_pending_mutex && xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-    d = g_debug;
-    xSemaphoreGive(g_pending_mutex);
-  }
+  SharedLock lk(g_pending_mutex, SharedLock::RawWait{500});  // the copy below can throw
+  if (lk) d = g_debug;
   return d;
 }
 
@@ -787,10 +788,10 @@ void applyInvert(bool invert) {
 
 void onConfigChanged(const Config &cfg) {
   if (g_pending_mutex == nullptr) return;  // before init(): main.cpp applies the boot config itself
-  if (xSemaphoreTake(g_pending_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+  SharedLock lk(g_pending_mutex, SharedLock::RawWait{200});  // a whole Config copy: it can throw
+  if (lk) {
     g_pending_cfg = cfg;
     g_pending = true;
-    xSemaphoreGive(g_pending_mutex);
   }
 }
 

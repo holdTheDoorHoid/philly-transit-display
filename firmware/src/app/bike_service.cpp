@@ -8,6 +8,7 @@
 #include <new>
 #include <utility>
 
+#include "heap_trace.h"
 #include "ui_lock.h"
 
 namespace transit_app {
@@ -109,6 +110,7 @@ BikeView getBikes() {
   try {
     v = g_view;  // copies a string per station: small, but it allocates, so it can throw
   } catch (const std::bad_alloc &) {
+    heapTraceMark(kStageOomBikes);  // diag branch
     giveShared(mutex());
     throw;  // loop()'s guard in main.cpp skips the frame; guarded() answers 503 on the web task
   }
