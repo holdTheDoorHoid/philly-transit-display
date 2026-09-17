@@ -1344,7 +1344,15 @@ void pollerTask(void * /*arg*/) {
       // inside the window with nothing refreshing it. The loop itself cannot livelock - it exits on
       // a deadline the previous cycle computed from a bounded interval - so stamping here cannot
       // hide a stuck poller.
-      if (idleWorkHasHeadroom() && runQueuedProxyJob()) {
+      //
+      // The gate is passed IN rather than asked first (audit_runtime SS4, ranked recommendation 2).
+      // `idleWorkHasHeadroom() && runQueuedProxyJob()` short-circuited, so on a heap that could no
+      // longer clear the gate the queue was never even read: the job sat there for the rest of the
+      // device's uptime holding a paused request whose server-side timeout the library had turned
+      // off, and once both slots were held every later stats/proxy request got a permanent "proxy
+      // worker busy". Dequeuing is always allowed; the gate now decides only whether the job is
+      // RUN or answered 503, which the client retries.
+      if (runQueuedProxyJob(idleWorkHasHeadroom())) {
         notePollerProgress();
         if ((int32_t)(millis() - deadline) >= 0) break;
       }

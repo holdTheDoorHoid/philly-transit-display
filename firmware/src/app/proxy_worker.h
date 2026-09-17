@@ -16,9 +16,18 @@ namespace transit_app {
 // Creates the job queue. Call once, early (main.cpp).
 void startProxyWorker();
 
-// Runs at most one queued job on the calling task (net_poller calls this between polls).
-// Returns false when the queue was empty.
-bool runQueuedProxyJob();
+// Takes at most one job off the queue on the calling task (net_poller calls this between polls)
+// and disposes of it. Returns false when the queue was empty.
+//
+// `may_start_heavy` separates two questions that used to be one (audit_runtime SS4, ranked
+// recommendation 2). "May I DEQUEUE?" is always yes: a job left on the queue holds a paused
+// AsyncWebServerRequest whose server-side timeout the library has switched off, so it waits
+// forever, it pins a request object, an AsyncClient and an lwIP pcb, and once both slots are held
+// every later stats/proxy request is answered "proxy worker busy" for the rest of the device's
+// uptime. "May I START a job that allocates a ~9 KB StatsAggregator?" is a separate question, and
+// when the answer is no the job is dequeued and answered 503 - which the client retries - rather
+// than left where nothing can reach it. A job whose client has already gone is dropped either way.
+bool runQueuedProxyJob(bool may_start_heavy);
 
 // Queues a Stops proxy job for `route` and takes ownership of `request` (the caller must not
 // touch it again). Responds 200 with SEPTA's JSON verbatim, or 502 {"error"} on any failure
@@ -37,10 +46,11 @@ void queueStatsRequest(AsyncWebServerRequest *request, const std::string &stop_k
 // (every stop and Indego station, DESIGN.md SS9.3).
 void queueOverviewRequest(AsyncWebServerRequest *request, int days);
 
-// How many jobs are sitting on the queue right now (diag branch). GET /api/debug/ui reports it: the
-// queue is drained ONLY by the poller's idle slice, behind a free8/largest-block gate the wedged
-// heap can no longer clear, so a depth pinned at the queue length (2) is a permanent starvation and
-// not a busy moment - and every entry in it is holding a paused request open with no timeout.
+// How many jobs are sitting on the queue right now. GET /api/debug/ui reports it. It used to be
+// able to pin at the queue length (2) forever, because the queue was drained only behind a
+// free8/largest-block gate a wedged heap could no longer clear; since runQueuedProxyJob() dequeues
+// unconditionally that is no longer reachable, and a depth that stays at 2 now means the poller
+// itself has stopped running its idle slices.
 uint32_t proxyQueueDepth();
 
 }  // namespace transit_app

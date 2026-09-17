@@ -1099,18 +1099,29 @@ void handleDebugOom(AsyncWebServerRequest *request) {
 
 // Static list embedded in firmware (transit_core/rail_stations.h) - no network needed, so this
 // runs directly on the web server's own task.
+//
+// Streamed, not sendJson()'d (audit_runtime SS5, ranked recommendation 6): 149 station names is a
+// ~2-4 KB body, and sendJson() serialises it into a String and then hands that to
+// AsyncBasicResponse, which copies it - two body-sized CONTIGUOUS blocks, on the device whose
+// largest free block is the thing that runs out. sendJsonStreamed() moves the document into the
+// response and serialises it straight into each 2,872 B send chunk, so the only contiguous block
+// is that chunk buffer. Same reasoning, same helper, as /api/state and /api/config.
 void handleRailStations(AsyncWebServerRequest *request) {
+  if (refuseIfLowHeap(request)) return;
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
   for (size_t i = 0; i < transit::kRailStationCount; ++i) {
     arr.add(transit::kRailStationNames[i]);
   }
-  sendJson(request, 200, doc);
+  sendJsonStreamed(request, doc);
 }
 
 // DESIGN.md SS9.3: queued to proxy_worker.cpp's task since it streams one or more monthly CSV
 // files off SD (never instant, and never something to do on the async server's own task).
 void handleGetStats(AsyncWebServerRequest *request) {
+  // Entry gate, like /api/state and /api/config: a queued job that cannot be started is worse
+  // than a 503, because pausing the request turns its server-side timeout off (audit_runtime SS4).
+  if (refuseIfLowHeap(request)) return;
   if (!request->hasParam("stop")) {
     sendError(request, 400, "stop is required");
     return;
@@ -1350,7 +1361,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
       request->send(503, "application/json", "{\"error\":\"out of memory, retry\"}");
     }
   });
-  g_server.on("/api/reboot", HTTP_POST, handlePostReboot);
+  g_server.on("/api/reboot", HTTP_POST, guarded(handlePostReboot));
   // Test hooks (DESIGN.md SS7): what the screen is doing, and a simulated touch.
   g_server.on("/api/debug/ui", HTTP_GET, guarded([](AsyncWebServerRequest *request) {
     ui::UiDebug d = ui::debugSnapshot();
@@ -1443,18 +1454,18 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     }
     sendJson(request, 200, doc);
   }));
-  g_server.on("/api/debug/tap", HTTP_POST, [](AsyncWebServerRequest *request) {
+  g_server.on("/api/debug/tap", HTTP_POST, guarded([](AsyncWebServerRequest *request) {
     if (!requirePin(request)) return;  // it changes what the screen shows, so it is state-changing
     ui::requestTap();
     request->send(200, "application/json", "{\"ok\":true}");
-  });
+  }));
   // POST /api/debug/page?page=main|night|stats|device (or the same word as the whole body): drive
   // the page cycle from the LAN without a finger on the panel. It exists because the LVGL pool is
   // the one thing the native simulator cannot reproduce - firmware/sim builds with a 512 KB
   // LV_MEM_SIZE for 64-bit pointers - so the peak a page transition reaches has to be measured on
   // the hardware, and that needs thirty cycles, not thirty taps. ui::requestPage() only sets a
   // flag the LVGL task reads in tick(); nothing here touches an lv_obj from the web server task.
-  g_server.on("/api/debug/page", HTTP_POST, [](AsyncWebServerRequest *request) {
+  g_server.on("/api/debug/page", HTTP_POST, guarded([](AsyncWebServerRequest *request) {
     if (!requirePin(request)) return;  // it changes what the screen shows, like /api/debug/tap
     std::string page;
     if (request->hasParam("page")) {
@@ -1469,7 +1480,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
       return;
     }
     request->send(200, "application/json", "{\"ok\":true}");
-  }, nullptr, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  }), nullptr, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
     // A raw body ("stats"), which is what curl -d sends. It is only PARSED here - the PIN check
     // lives in the handler above, which runs after this, and applying the page from an unchecked
     // body would be an auth bypass. Short by construction, so one chunk is the only case worth
@@ -1486,22 +1497,27 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     buf[n] = '\0';
     request->_tempObject = buf;
   });
-  g_server.on("/api/debug/oom", HTTP_POST, handleDebugOom);  // SS12.1 exception-pool proof; PIN-gated
-  g_server.on("/api/wifi/reset", HTTP_POST, handlePostWifiReset);
+  g_server.on("/api/debug/oom", HTTP_POST, guarded(handleDebugOom));  // SS12.1 exception-pool proof; PIN-gated
+  g_server.on("/api/wifi/reset", HTTP_POST, guarded(handlePostWifiReset));
 
-  g_server.on("/api/proxy/stops", HTTP_GET, handleProxyStops);
-  g_server.on("/api/proxy/schedule", HTTP_GET, handleProxySchedule);
-  g_server.on("/api/rail/stations", HTTP_GET, handleRailStations);
+  g_server.on("/api/proxy/stops", HTTP_GET, guarded(handleProxyStops));
+  g_server.on("/api/proxy/schedule", HTTP_GET, guarded(handleProxySchedule));
+  g_server.on("/api/rail/stations", HTTP_GET, guarded(handleRailStations));
   startProxyWorker();
 
   // Registered before /api/stats: ESPAsyncWebServer matches handler URIs by prefix, so the
   // longer path has to come first or handleGetStats answers it with "stop is required".
-  g_server.on("/api/stats/overview", HTTP_GET, [](AsyncWebServerRequest *request) {
+  g_server.on("/api/stats/overview", HTTP_GET, guarded([](AsyncWebServerRequest *request) {
+    // The same entry gate the other heavy reads take (refuseIfLowHeap). This endpoint needed MORE
+    // memory than /api/state and had no gate at all, so on a low heap it degraded into silence -
+    // the request was queued, paused (which turns its server-side timeout off) and never reached,
+    // and the client waited until IT gave up (audit_runtime SS4). A prompt 503 is the right answer.
+    if (refuseIfLowHeap(request)) return;
     int days = request->hasParam("days") ? atoi(request->getParam("days")->value().c_str()) : 7;
     queueOverviewRequest(request, days);
-  });
-  g_server.on("/api/stats", HTTP_GET, handleGetStats);
-  g_server.on("/api/log/index", HTTP_GET, handleLogIndex);
+  }));
+  g_server.on("/api/stats", HTTP_GET, guarded(handleGetStats));
+  g_server.on("/api/log/index", HTTP_GET, guarded(handleLogIndex));
   // "/api/log/<file>.csv" - matched with a regex-free prefix check in onNotFound below instead of
   // a wildcard pattern, to keep the matcher simple.
 
@@ -1515,12 +1531,12 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
   });
 #endif
 
-  g_server.onNotFound([](AsyncWebServerRequest *request) {
+  g_server.onNotFound(guarded([](AsyncWebServerRequest *request) {
     if (request->url().startsWith("/api/log/") && handleLogDownload(request)) {
       return;
     }
     request->send(404, "application/json", "{\"error\":\"not found\"}");
-  });
+  }));
 
   g_server.begin();
   log_i("web_server: listening on port 80");

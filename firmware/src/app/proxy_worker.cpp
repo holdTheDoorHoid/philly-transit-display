@@ -5,6 +5,7 @@
 #include <new>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -20,6 +21,7 @@
 #include "heap_trace.h"
 #include "http_fetch.h"
 #include "json_response.h"
+#include "proxy_queue.h"
 #include "sd_logger.h"
 #include "transit_core/septa_source.h"
 #include "transit_stats/aggregate.h"
@@ -373,6 +375,9 @@ void enqueue(AsyncWebServerRequest *request, ProxyKind kind, const std::string &
     sendError(request, 503, "proxy worker busy, try again");
     return;
   }
+  if (request->client() == nullptr || !request->client()->connected()) {
+    return;  // already gone: queuing it would pause a request nobody is waiting on
+  }
   // ESPAsyncWebServer replies 501 "Handler did not handle the request" unless a handler that
   // defers its response pauses the request (request continuation).
   auto *job = new (std::nothrow) ProxyJob{kind, param, days, request->pause()};
@@ -392,12 +397,36 @@ void startProxyWorker() {
   }
 }
 
-bool runQueuedProxyJob() {
+bool runQueuedProxyJob(bool may_start_heavy) {
   if (g_queue == nullptr) return false;
   ProxyJob *job = nullptr;
   if (xQueueReceive(g_queue, &job, 0) != pdTRUE) return false;
+  // Dequeued: from here the job is disposed of on every path. It used to be possible for one to
+  // sit on the queue for the rest of the device's uptime, because the only caller was behind a
+  // heap gate a wedged heap could not clear - and a queued job holds a paused request whose
+  // server-side timeout ESPAsyncWebServer switched off when it paused it, so nothing else could
+  // ever end it either (audit_runtime SS4).
   std::unique_ptr<ProxyJob> owner(job);
-  runJob(*owner);
+  switch (decideQueuedJob(requestStillAlive(*owner), may_start_heavy)) {
+    case QueuedJobAction::DropClientGone:
+      // The client gave up or went away. Nothing to answer, so drop the job rather than spend
+      // seconds of network or SD work for nobody.
+      break;
+    case QueuedJobAction::Refuse503:
+      // Not enough heap to start a ~9 KB StatsAggregator or a 400 KB proxy fetch right now. A
+      // prompt 503 is the cheaper answer and it RELEASES the paused request, whose server-side
+      // deadline pause() switched off, instead of leaving it open with nothing able to end it.
+      Serial.printf("[proxy] refusing a queued job: not enough heap to start it (free8 %u, largest %u)\n",
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+      if (auto r = lockRequest(*owner)) {
+        r->send(503, "application/json", "{\"error\":\"low memory, retry\"}");
+      }
+      break;
+    case QueuedJobAction::Run:
+      runJob(*owner);
+      break;
+  }
   return true;
 }
 
