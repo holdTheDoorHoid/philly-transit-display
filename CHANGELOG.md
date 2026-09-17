@@ -2,6 +2,76 @@
 
 ## v0.3.1 - 2026-09-17
 
+A memory pass on the owner's board after v0.3.0 had been running for a day. Nothing here changes
+what the display shows; all of it changes whether it keeps showing it.
+
+- **A board with a real stop list could fall into a reboot loop roughly every ten minutes, and
+  under the conditions that caused it, this release stops it.** On the morning of 2026-09-17 the
+  owner's own board (two stops on route 17, alerts, weather, per-stop notes, two Indego stations,
+  SD logging, polling every 30 s) ran healthy for three to four and a half minutes after boot, then
+  a poll failed with "out of memory during fetch" - not because memory was low (36 KB was still
+  free) but because the single largest unbroken piece of it had crumbled to 11.7 KB. A poll cycle
+  needs about 12 KB in one piece to complete: a 4 KB buffer for the real-time feed, about 4.8 KB
+  held in reserve for it, up to 4 KB for a schedule reply plus a full second copy of it, and 3 KB to
+  parse it. Once the largest piece falls under what one cycle needs, every later poll fails the same
+  way, and after 15 failures in a row the board's own safety net restarts it - so it did, roughly
+  every ten minutes, for as long as the condition lasted. The exact trigger was not reproduced, but
+  SEPTA's schedule service was answering with the wrong day at the time, which makes the firmware
+  retry a stop's schedule up to twelve times every two minutes - the leading suspect, stated as
+  such rather than as a certainty. The fix does not ask the board to use less memory; it asks it to
+  stop breaking memory into pieces. Six small buffers a poll used to build fresh, one after another,
+  are things a board only ever needs one of at a time, so there is now one 6,144-byte buffer handed
+  from step to step instead of six separate ones. An earlier attempt (measured on the owner's board
+  for five minutes, never shipped) instead made all six permanently resident: it did stop the
+  fragmentation, but cost 13 KB off the board's resting free memory to do it, which turned out to be
+  a worse trade and was reverted. Measured over 30 minutes and 60 poll cycles on the shipping
+  design: free memory at the start of every poll held at 39-40.7 KB (v0.3.0 started around 40.5 KB
+  but was trending down over time), the largest free piece never dropped below 22.5 KB, the
+  real-time feed step now costs about 6 KB of free memory instead of about 10, the Indego step no
+  longer leaves anything behind between polls (it used to hold onto as much as 17.6 KB until the
+  cycle ended), and across the whole run there were zero failed polls, zero out-of-memory stages,
+  the number of arrival snapshots alive at once held steady at one, and the background job queue
+  never backed up.
+- **The web page no longer hangs instead of answering when the board is busy.** Asking the board's
+  Stats page for its numbers had no check for low memory, and the request sat in a two-slot queue
+  that was only looked at again once the board had 16 KB free with 12 KB of it in one piece - so on
+  a board that was already struggling, the request never got any answer at all, and it tied up one
+  of the two queue slots for good. Both Stats routes now get the same "not enough memory right now,
+  try again" check every other heavy request already had, and the queue itself is now always looked
+  at and always answers something, one way or another, instead of sometimes just sitting there.
+- **Replying "out of memory" could itself run the board out of memory and crash it - found from a
+  saved crash report, not from a live board - and now can't.** When a request failed because memory
+  was too tight, the board's own reply saying so needed about 100 bytes to build, and on a board
+  that tight, even that could fail, with nothing left to catch it - the one kind of crash this
+  firmware's usual safety nets cannot reach. The fix sets aside 1 KB before Wi-Fi even starts and
+  holds it in reserve for exactly this, so an "out of memory" reply can (almost) always be built. If
+  it still can't be, the connection is now closed politely instead of crashing the board, and the
+  web app already treats a closed connection as worth retrying.
+- **Settings changed in this release, all owner-approved:** the drawing buffer on the 3.5" boards
+  shrank from a twentieth of the screen to a thirtieth (frees 5,120 bytes of memory); each stop now
+  keeps track of 8 upcoming trips instead of 12 (frees about 3.6 KB; a stop whose feed shows more
+  than eight trips at once will drop the ones farthest out first); the Indego bike-share count now
+  refreshes every 10 minutes instead of every 5 (it is the single most expensive thing a poll does);
+  and LVGL's drawing-layer scratch space shrank from 24 KB to 8 KB. The screen's overall drawing
+  memory pool is unchanged at 36 KB, specifically so four-stop configurations keep fitting - a
+  four-stop arrivals page needs about 31.7 KB of it. Alerts, mDNS and the crowding display are
+  unchanged.
+- New numbers on the device's own diagnostics page (`GET /api/debug/ui`): byte-addressable free
+  memory and its lowest point since boot, a per-stage memory trace, how many arrival snapshots are
+  alive at once, counts of failed and stuck polls, how deep the background job queue is, how much
+  headroom is left on each task's stack, whether the emergency out-of-memory reply reserve is
+  currently held, how many replies were dropped because even that reserve wasn't enough, and
+  whether releasing the Bluetooth radio's memory at boot actually worked and how much it returned
+  (confirmed on the device: +4,028 bytes).
+- **Known residual:** during the 400 KB Indego bike-share download, free memory still dips as low
+  as 2,220 bytes at its worst moment since boot (v0.3.0: 1,452 B; an earlier, unshipped attempt at
+  this same fix: 696 B). It has not caused a failure in any run so far and is called out here so it
+  is not mistaken for a new problem if it is seen again.
+
+## v0.3.0 - 2026-09-16
+
+### Release-candidate fixes (shipped in v0.3.0; written up under "Unreleased" at the time)
+
 Seven defects found reading the v0.3.0 release candidate end to end. Four of them could restart or
 boot-loop a display in someone's home; the rest are safety nets that were not quite doing what
 their comments said.
@@ -108,73 +178,6 @@ their comments said.
   nothing about it - and a test run that hit the lockout with no wrong PIN anywhere in it had no
   evidence to go on. The lockout now always prints, and each wrong PIN prints the page it was aimed
   at, so the next time this happens it names the culprit instead of leaving a count.
-
-A second pass, after the fixes above were already running on the owner's board.
-
-- **A board with a real stop list could fall into a reboot loop roughly every ten minutes, and
-  under the conditions that caused it, this release stops it.** On the morning of 2026-09-17 the
-  owner's own board (two stops on route 17, alerts, weather, per-stop notes, two Indego stations,
-  SD logging, polling every 30 s) ran healthy for three to four and a half minutes after boot, then
-  a poll failed with "out of memory during fetch" - not because memory was low (36 KB was still
-  free) but because the single largest unbroken piece of it had crumbled to 11.7 KB. A poll cycle
-  needs about 12 KB in one piece to complete: a 4 KB buffer for the real-time feed, about 4.8 KB
-  held in reserve for it, up to 4 KB for a schedule reply plus a full second copy of it, and 3 KB to
-  parse it. Once the largest piece falls under what one cycle needs, every later poll fails the same
-  way, and after 15 failures in a row the board's own safety net restarts it - so it did, roughly
-  every ten minutes, for as long as the condition lasted. The exact trigger was not reproduced, but
-  SEPTA's schedule service was answering with the wrong day at the time, which makes the firmware
-  retry a stop's schedule up to twelve times every two minutes - the leading suspect, stated as
-  such rather than as a certainty. The fix does not ask the board to use less memory; it asks it to
-  stop breaking memory into pieces. Six small buffers a poll used to build fresh, one after another,
-  are things a board only ever needs one of at a time, so there is now one 6,144-byte buffer handed
-  from step to step instead of six separate ones. An earlier attempt (measured on the owner's board
-  for five minutes, never shipped) instead made all six permanently resident: it did stop the
-  fragmentation, but cost 13 KB off the board's resting free memory to do it, which turned out to be
-  a worse trade and was reverted. Measured over 30 minutes and 60 poll cycles on the shipping
-  design: free memory at the start of every poll held at 39-40.7 KB (v0.3.0 started around 40.5 KB
-  but was trending down over time), the largest free piece never dropped below 22.5 KB, the
-  real-time feed step now costs about 6 KB of free memory instead of about 10, the Indego step no
-  longer leaves anything behind between polls (it used to hold onto as much as 17.6 KB until the
-  cycle ended), and across the whole run there were zero failed polls, zero out-of-memory stages,
-  the number of arrival snapshots alive at once held steady at one, and the background job queue
-  never backed up.
-- **The web page no longer hangs instead of answering when the board is busy.** Asking the board's
-  Stats page for its numbers had no check for low memory, and the request sat in a two-slot queue
-  that was only looked at again once the board had 16 KB free with 12 KB of it in one piece - so on
-  a board that was already struggling, the request never got any answer at all, and it tied up one
-  of the two queue slots for good. Both Stats routes now get the same "not enough memory right now,
-  try again" check every other heavy request already had, and the queue itself is now always looked
-  at and always answers something, one way or another, instead of sometimes just sitting there.
-- **Replying "out of memory" could itself run the board out of memory and crash it - found from a
-  saved crash report, not from a live board - and now can't.** When a request failed because memory
-  was too tight, the board's own reply saying so needed about 100 bytes to build, and on a board
-  that tight, even that could fail, with nothing left to catch it - the one kind of crash this
-  firmware's usual safety nets cannot reach. The fix sets aside 1 KB before Wi-Fi even starts and
-  holds it in reserve for exactly this, so an "out of memory" reply can (almost) always be built. If
-  it still can't be, the connection is now closed politely instead of crashing the board, and the
-  web app already treats a closed connection as worth retrying.
-- **Settings changed in this release, all owner-approved:** the drawing buffer on the 3.5" boards
-  shrank from a twentieth of the screen to a thirtieth (frees 5,120 bytes of memory); each stop now
-  keeps track of 8 upcoming trips instead of 12 (frees about 3.6 KB; a stop whose feed shows more
-  than eight trips at once will drop the ones farthest out first); the Indego bike-share count now
-  refreshes every 10 minutes instead of every 5 (it is the single most expensive thing a poll does);
-  and LVGL's drawing-layer scratch space shrank from 24 KB to 8 KB. The screen's overall drawing
-  memory pool is unchanged at 36 KB, specifically so four-stop configurations keep fitting - a
-  four-stop arrivals page needs about 31.7 KB of it. Alerts, mDNS and the crowding display are
-  unchanged.
-- New numbers on the device's own diagnostics page (`GET /api/debug/ui`): byte-addressable free
-  memory and its lowest point since boot, a per-stage memory trace, how many arrival snapshots are
-  alive at once, counts of failed and stuck polls, how deep the background job queue is, how much
-  headroom is left on each task's stack, whether the emergency out-of-memory reply reserve is
-  currently held, how many replies were dropped because even that reserve wasn't enough, and
-  whether releasing the Bluetooth radio's memory at boot actually worked and how much it returned
-  (confirmed on the device: +4,028 bytes).
-- **Known residual:** during the 400 KB Indego bike-share download, free memory still dips as low
-  as 2,220 bytes at its worst moment since boot (v0.3.0: 1,452 B; an earlier, unshipped attempt at
-  this same fix: 696 B). It has not caused a failure in any run so far and is called out here so it
-  is not mistaken for a new problem if it is seen again.
-
-## v0.3.0 - 2026-09-16
 
 - **The display now notices when it has quietly stopped fetching arrivals, and restarts itself.**
   It already restarted itself when its memory got so chopped up that every fetch failed — but that
