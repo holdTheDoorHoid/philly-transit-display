@@ -56,13 +56,43 @@ what the display shows; all of it changes whether it keeps showing it.
   memory pool is unchanged at 36 KB, specifically so four-stop configurations keep fitting - a
   four-stop arrivals page needs about 31.7 KB of it. Alerts, mDNS and the crowding display are
   unchanged.
+- **A burst of concurrent web requests could still crash the board, and this is a fourth kind of
+  out-of-memory crash neither fix above can reach.** The on-device suite that fires seven requests
+  at once (four status checks, a stops lookup, a 30-day usage report and the page script) found it:
+  the web server library assembles a reply's list of headers *after* our own code has already
+  returned - deep inside its own request-parsing, on a call stack with no handler of ours anywhere
+  above it - so when that small allocation failed with memory already at zero, the board crashed
+  rather than answering. Both the 1 KB reserve and the nested catch described above only cover
+  allocations our own code makes; this one is the library's own, and nothing written in this
+  firmware can catch it. (v0.3.0 never hit this, because its usage-report request used to get stuck
+  in the queue and never actually ran under load; the fix for that, above, means it now does - and
+  that combination is what exposed this one.) The fix turns away new connections before that can
+  happen: an incoming connection is refused immediately, before anything is allocated for it, once
+  free memory drops under about 7.9 KB, the largest free piece drops under about 4.3 KB, or more
+  than 5 replies are already being built at once. The web app already retries a connection that gets
+  refused this way, so a very busy board may briefly turn away extra requests instead of crashing.
+- **The Stats/proxy background job no longer starts in the middle of one of those bursts.** Its
+  check was "is there enough memory right now" - true at the very start of a burst, a moment before
+  several requests already in flight claim their share of it. The job now also waits for those
+  in-flight requests to clear before starting, and a job that has to wait keeps its place at the
+  front of the queue rather than being dropped; if it is still waiting after about 6 seconds it
+  answers "try again" instead of waiting indefinitely.
+- The screen code's 12 remaining uses of LVGL's older show/hide/click/scroll calls, which log a
+  warning every time they run, are now switched to LVGL's current dedicated calls. No behavior
+  change - it clears the "no warnings on the serial console" check the on-device suite counts. (The
+  host-side screen simulator pins an older LVGL version than the boards build against, and that
+  older version has no dedicated calls to switch to, so a small compatibility header keeps the
+  simulator building. That version gap between simulator and board predates this change and is
+  unrelated to it.)
 - New numbers on the device's own diagnostics page (`GET /api/debug/ui`): byte-addressable free
   memory and its lowest point since boot, a per-stage memory trace, how many arrival snapshots are
   alive at once, counts of failed and stuck polls, how deep the background job queue is, how much
   headroom is left on each task's stack, whether the emergency out-of-memory reply reserve is
-  currently held, how many replies were dropped because even that reserve wasn't enough, and
-  whether releasing the Bluetooth radio's memory at boot actually worked and how much it returned
-  (confirmed on the device: +4,028 bytes).
+  currently held, how many replies were dropped because even that reserve wasn't enough, whether
+  releasing the Bluetooth radio's memory at boot actually worked and how much it returned (confirmed
+  on the device: +4,028 bytes), and - new with the burst-crash fix above - how many replies are
+  being built right now, how many incoming connections have been turned away, and the cap that
+  triggers a refusal.
 - **Known residual:** during the 400 KB Indego bike-share download, free memory still dips as low
   as 2,220 bytes at its worst moment since boot (v0.3.0: 1,452 B; an earlier, unshipped attempt at
   this same fix: 696 B). It has not caused a failure in any run so far and is called out here so it

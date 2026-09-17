@@ -2102,7 +2102,7 @@ deliberately under the ~8 s a client waits) and then becomes a 503: a queued job
 request whose server-side timeout the library switched off, so "wait" must always become an answer.
 That is the hang above, and it does not come back.
 
-**A fourth case was in ESPAsyncWebServer's own middleware plumbing, and it is fixed by not having
+**A fifth case was in ESPAsyncWebServer's own middleware plumbing, and it is fixed by not having
 any middleware (2026-09-16).** It belongs in this list because it is where a reader will look for
 it, and because the shape is the one this section keeps meeting: a throw that the pool and the
 warming make *catchable* while nothing anywhere catches it. The release candidate's device suite
