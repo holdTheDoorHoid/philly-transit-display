@@ -137,7 +137,13 @@ struct Config {
   int version = 1;
   DeviceConfig device;
   std::vector<transit::StopConfig> stops;
-  bool alerts = true;
+  // DEFAULT OFF since 0.3.2-rc1 (owner decision). Alerts cost a fetch per configured route every
+  // five minutes, a second Snapshot publish whenever one answers, and a cache that is one of only
+  // two things on this device that legitimately holds data across cycles - and most of what they
+  // bring back is visible only in the web UI and the log. A saved config that carries the key
+  // keeps whatever it says; only a config that never had one takes this default, which is why
+  // this is schema-compatible and needs no migration.
+  bool alerts = false;
   WeatherConfig weather;
   DueConfig due;
   std::vector<ProfileConfig> profiles;

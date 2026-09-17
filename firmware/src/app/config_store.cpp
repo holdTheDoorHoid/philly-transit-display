@@ -247,7 +247,9 @@ Config defaultConfig() {
   Config cfg;
   cfg.version = 1;
   cfg.device = DeviceConfig{};  // struct defaults already match DESIGN.md SS6
-  cfg.alerts = true;
+  // Off by default since 0.3.2-rc1 (owner decision) - see config_store.h. A first-boot device gets
+  // no alerts fetch at all until someone turns them on in Settings.
+  cfg.alerts = false;
 
   StopConfig southbound;
   southbound.key = "17-21332";
@@ -685,7 +687,11 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
     }
   }
 
-  result.alerts = doc["alerts"] | true;
+  // `| false` since 0.3.2-rc1: this fallback only applies to a config that has no "alerts" key at
+  // all, which every config this firmware has ever SAVED does have (toJson always writes it). So
+  // an existing device keeps exactly what it chose; a hand-written or pre-0.2 config gets the new
+  // default, which is the same answer defaultConfig() gives.
+  result.alerts = doc["alerts"] | false;
   JsonVariantConst weather = doc["weather"];
   result.weather.enabled = weather["enabled"] | true;
   result.weather.per_stop = weather["per_stop"] | true;

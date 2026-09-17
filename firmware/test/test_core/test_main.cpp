@@ -123,6 +123,7 @@ void test_poll_rail_stops_malformed_json_is_a_failure();
 void test_poll_buffers_keep_their_capacity_across_cycles();
 void test_poll_buffers_do_not_change_what_a_cycle_produces();
 void test_poll_buffers_return_an_oversized_body_buffer();
+void test_a_poll_cycle_never_fetches_alerts();
 void test_poll_buffers_remove_the_large_contiguous_requests();
 void test_poll_buffers_keep_the_typed_blocks_across_cycles();
 void test_poll_buffers_size_retention_from_the_config();
@@ -248,6 +249,7 @@ int main(int argc, char** argv) {
   RUN_TEST(test_poll_buffers_keep_their_capacity_across_cycles);
   RUN_TEST(test_poll_buffers_do_not_change_what_a_cycle_produces);
   RUN_TEST(test_poll_buffers_return_an_oversized_body_buffer);
+  RUN_TEST(test_a_poll_cycle_never_fetches_alerts);
   RUN_TEST(test_poll_buffers_remove_the_large_contiguous_requests);
   RUN_TEST(test_poll_buffers_keep_the_typed_blocks_across_cycles);
   RUN_TEST(test_poll_buffers_size_retention_from_the_config);

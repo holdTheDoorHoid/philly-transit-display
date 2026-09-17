@@ -1183,7 +1183,7 @@ ESP Web Tools `manifest.json` under `flasher/` for GitHub Pages (offsets 0x1000 
       "show": 2
     }
   ],
-  "alerts": true,
+  "alerts": false,
   "weather": { "enabled": true, "per_stop": true, "units": "f" },
   "due": { "enabled": true, "minutes": 3, "led": true, "screen": true, "chime": false },
   "profiles": [
@@ -1273,6 +1273,14 @@ path is returned.
   defaults — that is the intended behaviour for an existing device, not a migration, and the web
   form's fallbacks match it so it cannot show as off while the device has it on. §12.1 explains
   what it is for and, as importantly, what it is not.
+- `alerts` defaults to **false** since 0.3.2-rc1 (owner decision). A saved config that carries the
+  key keeps whatever it says — and every config this firmware has ever written carries it, because
+  `toJson()` always emits it — so only a hand-written or pre-0.2 config takes the new default.
+  Alerts cost a fetch per configured route every five minutes, a second Snapshot publish whenever
+  one answers, and a cache that is one of only two things on this device that legitimately holds
+  data across cycles, while most of what they bring back is visible only in the web UI and the log.
+  With them off, `collectAlerts()` clears the cache and returns immediately without a fetch
+  (`net_poller.cpp`), so `cachedAlerts()` is empty and every published Snapshot carries no alerts.
 - Strings: `device.name` ≤ 32 and, after lower-casing ("slugifying"), only `[a-z0-9-]` and no
   leading or trailing `-` — it is the mDNS hostname, and a character DNS cannot carry is refused
   rather than guessed at; `device.tz` ≤ 64; every per-stop string (`key`, `route`, `stop_id`,

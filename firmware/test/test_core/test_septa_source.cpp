@@ -760,6 +760,34 @@ void test_poll_buffers_return_an_oversized_body_buffer() {
   TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(buf.scratch.size()));
 }
 
+void test_a_poll_cycle_never_fetches_alerts() {
+  // 0.3.2-rc1 turned `alerts` off by default (owner decision), so it is worth pinning what "off"
+  // actually costs: nothing on the arrivals path. The alerts fetch is not part of pollBusStops()
+  // at all - it is net_poller.cpp's collectAlerts(), on its own 5-minute cadence, behind
+  // `if (!alerts_enabled) { clear the cache; return {}; }` - and a poll cycle must therefore never
+  // reach an Alerts URL whatever the config says. Recorded here rather than in the firmware
+  // because this is the layer a host test can hold, and because the separation is the thing that
+  // makes "off" free rather than merely quiet.
+  std::vector<std::string> seen;
+  auto bodies = twoStopRoutes();
+  HttpGet recording = [&seen, bodies](const std::string& url,
+                                      std::function<bool(const uint8_t*, size_t)> onData) -> int {
+    seen.push_back(url);
+    return makePreloadedHttp(bodies)(url, std::move(onData));
+  };
+  FakeScheduleCache cache;
+  Snapshot snap = pollBusStops(twoStopConfigs(), 1789352300, adaptHttpGet(recording), cache, nullptr);
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(snap.stops.size()));
+  TEST_ASSERT_TRUE(!seen.empty());
+  for (const std::string& url : seen) {
+    TEST_ASSERT_TRUE_MESSAGE(url.find("/api/Alerts/") == std::string::npos,
+                              "a poll cycle fetched an Alerts URL");
+  }
+  // And the Snapshot a cycle produces carries no alerts of its own: they are attached by the
+  // caller, from its cache, which is empty when the setting is off.
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(snap.alerts.size()));
+}
+
 void test_poll_buffers_remove_the_large_contiguous_requests() {
   HttpGetEx http = adaptHttpGet(makePreloadedHttp(twoStopRoutes()));
   std::vector<StopConfig> configs = twoStopConfigs();
