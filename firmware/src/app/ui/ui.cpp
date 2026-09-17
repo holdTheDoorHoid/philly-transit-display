@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <ctime>
 #include <memory>
+#include <utility>
 
 #include "../demo_data.h"
 #include "../due_alert.h"
@@ -607,12 +608,18 @@ void tick() {
   // A miss just means the new config is applied on the next tick, a second later - g_pending
   // stays set.
   if (g_pending) {
-    // SharedLock and not take/give: `next = g_pending_cfg` copies a Config (nine std::strings per
-    // stop), so it allocates and can throw, and a throw past a bare giveShared() would strand this
-    // mutex for good (ui_lock.h). Same wait, same miss accounting, same "apply it next tick".
+    // SharedLock and not take/give: whatever happens under this lock must not be able to strand it
+    // (ui_lock.h). The handover used to be `next = g_pending_cfg`, a COPY of a whole Config - nine
+    // std::strings per stop - which allocated, could throw, and then left the copy behind in
+    // g_pending_cfg for the life of the device: ~1.2 KB of small blocks held permanently after any
+    // config save, for a value that has already been consumed (runtime audit SS5, "a second copy of
+    // anything"). Moving it hands the buffers over instead: no allocation, nothing to throw, and
+    // g_pending_cfg is left empty - the strings and the stop vector are released here rather than
+    // the next time a save happens to overwrite them. It is only ever read under `g_pending`, and
+    // onConfigChanged() copy-assigns a fresh Config into it, which a moved-from object accepts.
     SharedLock lk(g_pending_mutex, 50);
     if (lk && g_pending) {
-      next = g_pending_cfg;
+      next = std::move(g_pending_cfg);
       g_pending = false;
       apply = true;
     }
