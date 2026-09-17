@@ -288,8 +288,18 @@ bool fetchPlausibleSchedule(SeptaSource& src, const std::string& stop_id, Epoch 
   std::vector<SchedEntry> best;
   Epoch best_first = 0;
   bool any_ok = false;
+  // ONE `fetched` for every attempt, not one per attempt. This loop is the outer half of a nested
+  // retry - the firmware's own BusSchedules branch spends up to four attempts inside each of these
+  // three - and it is re-entered every two minutes for as long as SEPTA's stale backends keep
+  // answering with the next service day (net_poller.cpp kBusSchedulesSuspectRefreshMs). A vector
+  // declared inside the loop meant a fresh allocate-and-free of a whole schedule on every one of
+  // those attempts, while the GTFS-RT entity and retention buffers stayed live: the exact shape
+  // that takes a largest free block from 23.5 KB to 11.7 KB in a few minutes (DESIGN.md SS5, "the
+  // poll working set"). clear() keeps the capacity, and fetchScheduleEx() leaves it untouched on a
+  // failure, so an attempt that fails still reads as "nothing fetched" exactly as before.
+  std::vector<SchedEntry> fetched;
   for (int attempt = 0; attempt < kScheduleFetchAttempts; ++attempt) {
-    std::vector<SchedEntry> fetched;
+    fetched.clear();
     FetchOutcome o = src.fetchScheduleEx(stop_id, &fetched, http);
     // "The endpoint answered with a schedule" is tracked separately from "that schedule looked
     // plausible": an empty-but-valid answer still means the source is up, and a stop must not be
@@ -308,7 +318,11 @@ bool fetchPlausibleSchedule(SeptaSource& src, const std::string& stop_id, Epoch 
     Epoch first = earliestUpcoming(fetched, now);
     if (first == 0) continue;  // parse failure, or nothing upcoming: try again
     if (best_first == 0 || first < best_first) {
-      best = std::move(fetched);
+      // swap, not move-assign: `best` takes this answer and `fetched` takes whatever block `best`
+      // was holding, which the clear() above then reuses for the next attempt instead of freeing
+      // it and allocating again. The observable result is identical - `fetched` is cleared before
+      // it is next written, and `best` is moved into *out below.
+      best.swap(fetched);
       best_first = first;
     }
     if (best_first - now <= kSchedulePlausibleS) break;
