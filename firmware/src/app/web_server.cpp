@@ -532,7 +532,7 @@ void handleGetState(AsyncWebServerRequest *request) {
   Snapshot snap = buildDemoSnapshot((transit::Epoch)time(nullptr));
   serializeSnapshot(snap, cfg, doc.as<JsonObject>());
 #else
-  // snapshotPtr(), not getSnapshot(): this handler only READS the Snapshot, and borrowing the
+  // snapshotPtr(), and not a copy: this handler only READS the Snapshot, and borrowing the
   // poller's own costs neither a copy of every arrival in it nor a contiguous block to put that copy
   // in. On a device whose largest free block sits at 5 KB between polls that difference is the
   // difference between answering and answering 503 (DESIGN.md SS12.1), and it is also a whole

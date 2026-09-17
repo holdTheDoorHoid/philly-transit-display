@@ -89,13 +89,6 @@ std::vector<LogFileInfo> listLogFiles();
 // being handed on as two records. One damaged record costs exactly that record.
 bool streamLogLines(const std::string &filename, const std::function<bool(const char *, size_t)> &each);
 
-// Opens "/transit-log/<filename>" for reading and hands back the raw File, for
-// GET /api/log/<file>.csv's streamed download (AsyncWebServer's beginResponse(fs::FS&, path, ...)
-// reads it incrementally itself - this function does no buffering of its own). The returned File
-// evaluates false (operator bool()) if SD isn't mounted or the file doesn't exist; callers must
-// still call .close() on a valid one when done.
-File openLogFile(const std::string &filename);
-
 // ---- one reader at a time (F26) ---------------------------------------------------------------
 //
 // The SD mount is opened with max_open_files = 2 (mountSd), and the poller already holds one of

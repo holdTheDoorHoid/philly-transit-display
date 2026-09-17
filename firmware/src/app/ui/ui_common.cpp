@@ -16,9 +16,6 @@ void setTheme(const std::string &name) {
   g_dark = (name == "dark");
 }
 
-bool isDarkTheme() {
-  return g_dark;
-}
 
 // Light palette: every text colour clears WCAG AA (4.5:1) against the white panel background.
 // The first build shipped only the dark palette, which on a panel that needs colour inversion

@@ -14,7 +14,6 @@ namespace transit_app::ui {
 // default (config.device.theme, DESIGN.md SS6). Screens pick colours up when they are built, so
 // ui.cpp calls this before the first page build and again from rebuildScreens().
 void setTheme(const std::string &name);
-bool isDarkTheme();
 
 lv_color_t colorBg();
 lv_color_t colorPanelBg();

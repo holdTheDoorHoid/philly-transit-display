@@ -1500,13 +1500,6 @@ std::shared_ptr<const transit::Snapshot> snapshotPtr() {
   return copy;
 }
 
-transit::Snapshot getSnapshot() {
-  // The copy is made from the shared pointer, OUTSIDE the lock. Kept for callers that genuinely
-  // want a private value; the display task and /api/state both take the pointer instead.
-  std::shared_ptr<const transit::Snapshot> p = snapshotPtr();
-  return p ? *p : transit::Snapshot{};
-}
-
 PollStatus getPollStatus() {
   PollStatus copy;
   if (takeShared(g_mutex, kStatusWaitMs)) {

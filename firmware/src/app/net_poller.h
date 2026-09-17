@@ -74,9 +74,6 @@ void requestRepoll(bool data_changed = true);
 // pointer that task last held, so the screen redraws last frame's arrivals rather than blanking.
 std::shared_ptr<const transit::Snapshot> snapshotPtr();
 
-// A private COPY of the latest Snapshot. Prefer snapshotPtr() unless the caller really needs to own
-// or modify one: this allocates the whole thing. The copy is made outside the lock.
-transit::Snapshot getSnapshot();
 
 // Returns a copy of the latest poll diagnostics, safe to call from any task. Waits up to 1 s for
 // the poller's mutex on a non-display task. NOT for the LVGL task - see tryGetPollStatus().

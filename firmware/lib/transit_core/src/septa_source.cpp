@@ -259,11 +259,6 @@ int SeptaSource::fetchRealtime(GtfsRtStream& stream, HttpGet http) {
   return fetchRealtimeEx(stream, adaptHttpGet(std::move(http))).transport.status;
 }
 
-int SeptaSource::fetchTransitView(const std::string& route, std::vector<TvVehicle>* out,
-                                   HttpGet http) {
-  return fetchTransitViewEx(route, out, adaptHttpGet(std::move(http))).transport.status;
-}
-
 int SeptaSource::fetchSchedule(const std::string& stop_id, std::vector<SchedEntry>* out,
                                 HttpGet http) {
   return fetchScheduleEx(stop_id, out, adaptHttpGet(std::move(http))).transport.status;
@@ -272,11 +267,6 @@ int SeptaSource::fetchSchedule(const std::string& stop_id, std::vector<SchedEntr
 int SeptaSource::fetchAlerts(Mode mode, const std::string& route, std::vector<transit::Alert>* out,
                               HttpGet http) {
   return fetchAlertsEx(mode, route, out, adaptHttpGet(std::move(http))).transport.status;
-}
-
-int SeptaSource::fetchRailArrivals(const std::string& station, std::vector<RailArrival>* out,
-                                    HttpGet http) {
-  return fetchRailArrivalsEx(station, out, adaptHttpGet(std::move(http))).transport.status;
 }
 
 namespace {

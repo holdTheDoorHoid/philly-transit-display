@@ -136,13 +136,10 @@ class SeptaSource : public TransitSource {
   int fetchAlerts(Mode mode, const std::string& route, std::vector<transit::Alert>* out,
                    HttpGet http) override;
 
-  // Not part of the portable TransitSource interface (no other agency modeled in this project
-  // has an equivalent endpoint): TransitView vehicle positions for one route. Same out-param
-  // contract as fetchSchedule (unmodified on failure).
-  int fetchTransitView(const std::string& route, std::vector<TvVehicle>* out, HttpGet http);
-
-  // Regional Rail Arrivals for one station. Same out-param contract as fetchSchedule.
-  int fetchRailArrivals(const std::string& station, std::vector<RailArrival>* out, HttpGet http);
+  // TransitView vehicle positions and Regional Rail Arrivals have no legacy status-code form:
+  // neither is part of the portable TransitSource interface (no other agency modeled in this
+  // project has an equivalent endpoint), so there was nothing to keep them for and nothing ever
+  // called them - see fetchTransitViewEx()/fetchRailArrivalsEx() below.
 
   // Completeness-aware forms. `ok` means "usable data": for the realtime feed, a body that
   // arrived whole and framed correctly (GtfsRtStream::finish() == FeedStatus::Complete); for the
