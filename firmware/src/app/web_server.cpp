@@ -145,6 +145,12 @@ class GatedWebServer : public AsyncWebServer {
             // no header list, no send buffer. The client sees a closed connection, which the web
             // app's resilientRead() already treats as retryable (DESIGN.md SS10.2) and the device
             // suite counts against its refusal budget alongside the empty-200 shape.
+            //
+            // Since 0.3.2-rc1 this can no longer be reached with `live == 0`: admission.h admits
+            // the only connection whatever the heap says, because refusing it locked the owner's
+            // board out of /api/debug/ui and /api/reboot for five minutes on 2026-09-17 with a
+            // 3,444 B largest block. A refusal here therefore always means "something else is
+            // already being served".
             g_admission_refusals.fetch_add(1, std::memory_order_relaxed);
             c->abort();
             delete c;

@@ -2089,6 +2089,22 @@ no send buffer. `src/app/admission.h` holds the rule as pure arithmetic (host-te
   `HostGuardHandler::canHandle()`, both on the AsyncTCP task, so it needs no lock;
   `in_flight_requests`, `admission_refusals` and `max_in_flight_requests` report it on
   `GET /api/debug/ui`.
+- **The floors apply only under contention: the only connection is always admitted (0.3.2-rc1).**
+  rc3's rule applied both heap floors unconditionally, and on the owner's board at v0.3.1 that
+  turned a fragmented heap into a total lockout. Measured 2026-09-17, uptime 2,646 s: the largest
+  free block had fallen to **3,444 B**, under `kAcceptMinLargestBlock` (4,308), so the accept path
+  refused **every** new connection - `GET /api/debug/ui`, which is deliberately outside
+  `refuseIfLowHeap()` so that it still answers when the heap is gone, and `POST /api/reboot`, which
+  is the recovery path, along with everything else. The board answered ping and nothing else until
+  the heap-wedge self-heal rebooted it five minutes later. That is a worse outcome than the crash
+  the floors prevent, and it is not a trade that had to be made: the rc2 abort needed **seven**
+  requests alive at once, and a single request cannot reproduce it - nothing else is competing for
+  the heap, and if its own reply will not fit, `guarded()` catches the throw and answers 503 out of
+  the 1 KB reserve. The floors are therefore a statement about *contention*, and with no contention
+  they have nothing to say. The rule is now: `in_flight >= cap` refuses (unchanged);
+  `in_flight == 0` admits whatever the heap says; otherwise both floors apply exactly as before.
+  The count cap is unchanged at 5. `test_admission` pins the four-row table so a future edit that
+  reinstates the lockout fails on the host rather than on the hardware.
 
 **And the background jobs had to stop starting inside a burst.** The same run showed why a heap gate
 alone is the wrong question: `[proxy] refusing a queued job: not enough heap to start it (free8

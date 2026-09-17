@@ -63,11 +63,43 @@ constexpr size_t kAcceptMinLargestBlock = 4308;  // 1.5 x 2,872, rounded off the
 // revisit the budget with the owner, not to loosen the floors.
 constexpr uint32_t kMaxInFlightRequests = 5;
 
-// The whole decision. `in_flight` is how many AsyncWebServerRequest objects are alive right now;
-// `free8`/`largest` are MALLOC_CAP_8BIT readings taken on the accept path.
+// THE GUARANTEED SERVICE LEVEL: ONE REQUEST AT A TIME, ALWAYS (0.3.2-rc1).
+//
+// What rc3's rule did, measured on the owner's board at v0.3.1 on 2026-09-17 (uptime 2,646 s):
+// the heap fragmented until the largest free block was 3,444 B, which is below
+// kAcceptMinLargestBlock, and from that moment the accept path refused EVERY new connection. The
+// board answered ping and refused all HTTP - including `GET /api/debug/ui`, the one endpoint
+// deliberately kept outside refuseIfLowHeap() precisely so it still answers when the heap is gone
+// (web_server.cpp), and `POST /api/reboot`, which is the recovery path. The only way out was the
+// heap-wedge self-heal, five minutes later, with nobody able to even look at the device in the
+// meantime.
+//
+// That is a worse failure than the one admission control exists to prevent. The crash it prevents
+// needs SEVERAL requests alive at once: rc2 died with seven of them holding documents, response
+// objects and 2,872 B send buffers. ONE request cannot reproduce it - there is no burst, nothing
+// else is about to allocate, and if that single request's own reply cannot be built, guarded()
+// catches the throw and answers 503 out of the 1 KB reserve (heap_reserve.h). So the heap floors
+// are a statement about CONTENTION, and with no contention they have nothing to say.
+//
+// Hence: the floors apply only when at least one request is already in flight. At in_flight == 0
+// the connection is always admitted. The count cap is unchanged and still hard at
+// kMaxInFlightRequests.
+//
+// The rule table, which is what test_admission pins:
+//
+//   in_flight == 0                      -> admit, whatever the heap says
+//   1 <= in_flight < cap, heap ok       -> admit
+//   1 <= in_flight < cap, either floor  -> refuse (the burst defence, unchanged)
+//   in_flight >= cap                    -> refuse, whatever the heap says (unchanged)
+//
+// `in_flight` is how many AsyncWebServerRequest objects are alive right now; `free8`/`largest` are
+// MALLOC_CAP_8BIT readings taken on the accept path.
 constexpr bool admitConnection(uint32_t in_flight, size_t free8, size_t largest) {
-  return in_flight < kMaxInFlightRequests && free8 >= kAcceptMinFree8 &&
-         largest >= kAcceptMinLargestBlock;
+  if (in_flight >= kMaxInFlightRequests) return false;
+  // The only connection there is. Refusing it buys nothing - nothing else is competing for the
+  // heap - and costs the device its diagnostics and its reboot endpoint.
+  if (in_flight == 0) return true;
+  return free8 >= kAcceptMinFree8 && largest >= kAcceptMinLargestBlock;
 }
 
 }  // namespace transit_app
