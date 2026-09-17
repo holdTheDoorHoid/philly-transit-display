@@ -1339,7 +1339,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | `POST /api/ota` | multipart `firmware` field; reboots on success. One at a time. No file → 400 `no firmware file`; too little heap or a fragmented one → 503 naming which check failed; an image built for a different board → 400 `firmware is for a different board (expected <board>)`; larger than the OTA slot → 413. Answers 200 only after the final chunk arrived *and* `Update.end()` succeeded |
 | `POST /api/reboot`, `POST /api/wifi/reset` | Maintenance |
 | `POST /api/pin` | Body `{"pin":"new"}`, authenticated with the **current** PIN in `X-Pin`. New PIN: 4–32 printable ASCII, no whitespace. → `{"ok":true}`, or 400 with the rule that was broken. No reset-by-network path: recovery is the serial console or the device info screen (§12) |
-| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB. Also `lock_misses`, `tick_ms`/`tick_ms_max` (§5) and `cpu_stretch_ms_max` — the longest the poller task has run a CPU-bound loop without letting IDLE0 in, since boot, against the task watchdog's 5,000 ms (§12.1). Since 0.3.1 also `heap_8bit` and `min_free8` (the byte-addressable free heap now, and the lowest it has ever been — §2.1), `snapshots_live`, `failed_polls`, `wedged_polls`, `proxy_queue_depth`, `stack_hwm` per task, and `oom_replies_dropped` / `heap_reserve_held` (§12.1, "the 503 for out of memory needs memory"), and `bt_release_rc` / `bt_release_gain_bytes` — `esp_bt_mem_release()`'s return code and the `MALLOC_CAP_8BIT` free-heap delta across it, reported here because the serial console cannot be captured on the owner's bench — and `in_flight_requests` / `admission_refusals` / `max_in_flight_requests` (§12.1, accept-time admission control). Since 0.3.2-rc1 also `scratch_max_bytes` / `scratch_reserve_bytes` / `scratch_capacity` / `scratch_grows` — the largest response body ever buffered, what the shared poll scratch is reserved at, and how often a body went past it (§5); `heap8_info` (`heap_caps_get_info(MALLOC_CAP_8BIT)`: `total_blocks`/`free_blocks`/`allocated_blocks`/`largest_free_block`/`minimum_free_bytes` — 40 KB free in one piece and 40 KB free in thirty pieces read identically on every other line here, and this is the difference); `sched_cache_bytes` / `alerts_cache_bytes` / `snapshot_bytes` / `retained_slots` / `tv_slots`; and `?log=1` for the 240-row per-cycle memory log (`cycle_log`, `cycle_log_first`, `cycle_log_rows`, `cycle_log_seq`, `cycle_log_cap`), which returns the log INSTEAD of `trace` because the two share a render buffer. Each log row is `[uptime_s, free8, largest, min_free8, flags]` at poll-start, flags being 1 schedule refetch, 2 alerts fetch, 4 weather, 8 bikes, 16 out of memory, 32 poll failed, 64 clock unsynced |
+| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB. Also `lock_misses`, `tick_ms`/`tick_ms_max` (§5) and `cpu_stretch_ms_max` — the longest the poller task has run a CPU-bound loop without letting IDLE0 in, since boot, against the task watchdog's 5,000 ms (§12.1). Since 0.3.1 also `heap_8bit` and `min_free8` (the byte-addressable free heap now, and the lowest it has ever been — §2.1), `snapshots_live`, `failed_polls`, `wedged_polls`, `proxy_queue_depth`, `stack_hwm` per task, and `oom_replies_dropped` / `heap_reserve_held` (§12.1, "the 503 for out of memory needs memory"), and `bt_release_rc` / `bt_release_gain_bytes` — `esp_bt_mem_release()`'s return code and the `MALLOC_CAP_8BIT` free-heap delta across it, reported here because the serial console cannot be captured on the owner's bench — and `in_flight_requests` / `admission_refusals` / `max_in_flight_requests` (§12.1, accept-time admission control). Since 0.3.2-rc1 also `scratch_max_bytes` / `scratch_reserve_bytes` / `scratch_capacity` / `scratch_grows` — the largest response body ever buffered, what the shared poll scratch is reserved at, and how often a body went past it (§5); `heap8_info` (`heap_caps_get_info(MALLOC_CAP_8BIT)`: `total_blocks`/`free_blocks`/`allocated_blocks`/`largest_free_block`/`minimum_free_bytes` — 40 KB free in one piece and 40 KB free in thirty pieces read identically on every other line here, and this is the difference); `sched_cache_bytes` / `alerts_cache_bytes` / `snapshot_bytes` / `retained_slots` / `tv_slots`; and `?log=1` for the 240-row per-cycle memory log (`cycle_log`, `cycle_log_first`, `cycle_log_rows`, `cycle_log_seq`, `cycle_log_cap`), which returns the log INSTEAD of `trace` because the two share a render buffer. Each log row is `[uptime_s, free8, largest, min_free8, flags]` at poll-start, flags being 1 schedule refetch, 2 alerts fetch, 4 weather, 8 bikes, 16 out of memory, 32 poll failed, 64 clock unsynced. Also `oom_streak` / `wedge_reason` / `oom_polls_before_reboot` (§12.1, the self-heal tallies) |
 | `POST /api/debug/tap` | Test hook (PIN-protected: it changes what the screen shows): simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
 | `POST /api/debug/page` | Test hook (PIN-protected, same reason): go straight to `main` \| `night` \| `stats` \| `device`, named in `?page=`, a `page=` form field or the raw body. Performs exactly the transition a tap does, queued for the LVGL task like `/api/debug/tap` — nothing builds an `lv_obj` on the web server task. It exists because LVGL pool exhaustion cannot be reproduced in the simulator's 512 KB pool (§8) and measuring it wants thirty cycles, not thirty taps |
 | `POST /api/debug/oom` | Test hook (PIN-protected: it starves every other task for under a millisecond): exhausts the heap on purpose, forces a `std::bad_alloc`, frees everything and answers `{"caught":true,"blocks":N,"largest":B,"free_before":X,"free_after":Y}` - the deterministic proof of the emergency exception pool (§12.1). `largest` under ~100 means the exception object could only have come from the pool; without the pool the request reboots the device. Run it on a **fresh boot**: it then also proves the first-throw path (§12.1), which on a task that has already thrown answers `caught:true` either way |
@@ -2148,6 +2148,57 @@ no send buffer. `src/app/admission.h` holds the rule as pure arithmetic (host-te
   `in_flight == 0` admits whatever the heap says; otherwise both floors apply exactly as before.
   The count cap is unchanged at 5. `test_admission` pins the four-row table so a future edit that
   reinstates the lockout fails on the host rather than on the hardware.
+
+**The heap-wedge self-heal did not fire, and the reason was the failure backoff (0.3.2-rc1).** On
+2026-09-17 the owner's board sat with every poll failing at `oom-transit`, largest free block
+3,444–4,596 B, `wedged_polls` reading 4 at 15:50 — and it was still in that state at 16:07, when it
+had to be hard-reset over USB. The expectation was "15 wedged polls at 30 s → a restart by 15:56".
+The trace, because the answer is not the obvious one:
+
+1. **The tally was not being reset.** `wedged_polls` = 4 was correct; only about four cycles had
+   failed by then. (`failed_polls` = 11 counts every failure since boot, not consecutive ones.)
+2. `getPollStatus()` returning a default-constructed `PollStatus` on a lock miss does not break the
+   rule either: `PollStatus::ok` defaults to **false**, which is the direction that *advances* the
+   tally. Ruled out.
+3. The second publish of a cycle copies `last_poll_ok` from the published Snapshot, so it cannot
+   overwrite a failure with a success. Ruled out.
+4. **The failure backoff.** A failed poll drives `nextIntervalS()`'s backoff, which saturates at
+   `kBaseBackoffS << 3` = **240 s**. Fifteen consecutive failed polls is therefore
+   30 + 60 + 120 + 12 × 240 = **51 minutes**, not seven and a half. The board was doing exactly
+   what was written; the threshold had been written against a cadence a failing board does not run
+   at. The old comment's "which with the failure backoff is several minutes" was out by a factor
+   of eight.
+5. The poller-stall net in `main.cpp` could not help and was not meant to — the poller *was*
+   completing cycles, and that net's window is a multiple of the interval the poller is actually
+   running at, backoff included, so it stretches with the backoff too.
+
+`src/app/wedge_policy.h` now holds the rule, pure and host-tested (`test_wedge`, 8 cases), with two
+tallies:
+
+- **Out-of-memory cycles are counted directly, at the catch site.** A cycle that caught
+  `std::bad_alloc` knows that about itself; the old rule threw that fact away and re-derived it
+  from a largest-block reading taken afterwards, which is a second condition that can lapse on its
+  own. **Three consecutive** such cycles restart the board — about 3½ minutes with the backoff,
+  against the 51 the old rule really cost. A lossless restart beats a stale display: the arrivals
+  are refetched within seconds of boot, the stats log is on the SD card and the config on LittleFS,
+  and the RTC note records why (`last_restart.reason` = `heap_oom`).
+- **The old failed-poll-plus-small-block rule is kept at fifteen** as the slower backstop for a
+  wedge that never throws. Its condition can also be met by an ordinary SEPTA outage on a board
+  whose heap merely happens to be busy, so it must stay hard to trip.
+
+Both tallies stand down and are *forgotten* during an OTA, for the reason the liveness net does the
+same. `oom_streak`, `wedged_polls` and `wedge_reason` on `GET /api/debug/ui` say how close each is.
+The wedge check reads a lock-free mirror of the cycle's own verdict rather than calling
+`getPollStatus()`, which takes the poller's lock and copies a `std::string` on a line that has no
+`try` above it.
+
+**The error-reply reserve could not come back either.** Through the whole wedge `heap_reserve_held`
+read false: free8 17–20 KB with a 3,444 B largest block is under *both* of the old re-arm
+thresholds (20,480 and 4,340), so the kilobyte that exists to make an out-of-memory 503 possible was
+unavailable in exactly the state it is for. The floors are now **13,556** free8 — the smallest value
+on the 512-byte lattice that still clears `kMinHeavyResponseFree8` by more than the reserve is big,
+which is why it is not simply 12 KB — and **2,292** for the block, twice the 1,024 B the reserve
+actually has to be carved out of rather than the 4.2× it was.
 
 **Two hours of per-cycle history, because the trigger is still unknown (0.3.2-rc1).** The per-stage
 ring (`heap_trace.h`) holds 64 entries, which on a healthy path is **three cycles**. It is what

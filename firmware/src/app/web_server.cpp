@@ -25,6 +25,7 @@
 #include "cxx_exception_pool.h"
 #include "demo_data.h"
 #include "cycle_log.h"  // the per-cycle memory log served by /api/debug/ui?log=1
+#include "wedge_policy.h"  // kOomPollsBeforeReboot for /api/debug/ui
 #include "heap_trace.h"  // the poll-cycle heap ring for /api/debug/ui (diag branch)
 #include "host_match.h"
 #include "heap_reserve.h"
@@ -158,6 +159,14 @@ class GatedWebServer : public AsyncWebServer {
             // board out of /api/debug/ui and /api/reboot for five minutes on 2026-09-17 with a
             // 3,444 B largest block. A refusal here therefore always means "something else is
             // already being served".
+            // abort(), not close(): AsyncClient::abort() calls tcp_abort(), which sends an RST
+            // and frees the pcb immediately, so a refused connection leaves NOTHING behind -
+            // no TIME_WAIT, no lwIP pcb held for two minutes out of the sixteen this build has.
+            // A graceful close would FIN and park a pcb in TIME_WAIT, and a client polling a
+            // refusing server every ten seconds would then exhaust them. Checked against
+            // AsyncTCP's own source: abort() nulls _pcb, so the destructor's _close() is skipped
+            // and the delete below is not a double free; _error_cb/_discard_cb are still null on a
+            // connection this new, so nothing can delete the client out from under us either.
             g_admission_refusals.fetch_add(1, std::memory_order_relaxed);
             c->abort();
             delete c;
@@ -613,6 +622,9 @@ void handleGetState(AsyncWebServerRequest *request) {
     } else if (note.reason == SelfHeal::HeapWedge) {
       reason = "heap_wedge";
       snprintf(detail, sizeof(detail), "%u failed polls, largest free block %u B", (unsigned)note.a, (unsigned)note.b);
+    } else if (note.reason == SelfHeal::HeapOom) {
+      reason = "heap_oom";
+      snprintf(detail, sizeof(detail), "%u consecutive out-of-memory polls, largest free block %u B", (unsigned)note.a, (unsigned)note.b);
     } else if (note.reason == SelfHeal::LvglPool) {
       reason = "lvgl_pool";
       snprintf(detail, sizeof(detail), "LVGL pool exhausted: %u B free, %u B high-water", (unsigned)note.a, (unsigned)note.b);
@@ -1637,7 +1649,15 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     // reference nobody is releasing.
     doc["snapshots_live"] = snapshotsLive();
     doc["failed_polls"] = failedPolls();
-    doc["wedged_polls"] = wedgedPolls();  // 15 reboots the board
+    doc["wedged_polls"] = wedgedPolls();  // the non-throwing wedge tally; 15 reboots the board
+    // The OOM tally and which rule is currently saying something (wedge_policy.h). THREE
+    // consecutive out-of-memory cycles reboot, counted from the catch sites rather than re-derived
+    // from a heap reading afterwards - the correction that came out of the 2026-09-17 wedge, where
+    // the old rule would have taken fifty-one minutes to fire because a failed poll backs the
+    // interval off to 240 s.
+    doc["oom_streak"] = oomStreak();
+    doc["wedge_reason"] = wedgeReason();
+    doc["oom_polls_before_reboot"] = (uint32_t)kOomPollsBeforeReboot;
     doc["proxy_queue_depth"] = proxyQueueDepth();  // pinned at 2 = the audit's stuck-queue wedge
     // Error replies that could not be built at all and ended in a closed connection instead
     // (heap_reserve.h). Should be zero; a number that moves means the heap reached a state where

@@ -162,16 +162,20 @@ enum class SelfHeal : uint8_t {
   HeapWedge = 1,  // pollerTask's consecutive-failed-polls + tiny-largest-block reboot
   PollStall = 2,  // main.cpp's liveness net: the poller did nothing for pollerStallTimeoutMs()
   LvglPool = 3,   // ui/lv_assert_hook.cpp: LVGL's pool ran out and there is no safe way to continue
+  HeapOom = 4,    // pollerTask: three consecutive cycles caught std::bad_alloc (wedge_policy.h).
+                  // Distinct from HeapWedge on purpose - "the cycle could not get memory" is a
+                  // fact the cycle reported, while HeapWedge is an inference from a heap reading
+                  // after a failed poll, and the two want telling apart in a restart note.
 };
 // captureRestartNote() validates the stored value against this; keep it equal to the last entry.
-constexpr SelfHeal kSelfHealMax = SelfHeal::LvglPool;
+constexpr SelfHeal kSelfHealMax = SelfHeal::HeapOom;
 
 struct RestartNote {
   SelfHeal reason = SelfHeal::None;
   uint32_t uptime_s = 0;  // how long that boot had been up
-  uint32_t a = 0;         // HeapWedge: consecutive failed polls. PollStall: seconds of silence.
+  uint32_t a = 0;         // HeapWedge/HeapOom: consecutive polls. PollStall: seconds of silence.
                           // LvglPool: LVGL pool bytes free when the assert fired.
-  uint32_t b = 0;         // HeapWedge: largest free block, bytes. PollStall: active interval, s.
+  uint32_t b = 0;         // HeapWedge/HeapOom: largest free block, bytes. PollStall: interval, s.
                           // LvglPool: the pool's high-water mark, bytes.
 };
 
@@ -237,5 +241,16 @@ uint32_t failedPolls();
 // pollerTask's live wedge tally: consecutive failed cycles with a largest block under 6 KB. Reaches
 // 15 and the board reboots itself, so this is how far through the ~10 minute loop a sample is.
 uint32_t wedgedPolls();
+
+// The OOM tally (wedge_policy.h): consecutive cycles that caught std::bad_alloc. THREE reboots the
+// board - about three and a half minutes once the failure backoff has stretched the interval -
+// against the fifteen the old rule wanted, which with that same backoff was fifty-one minutes.
+// Reported as `oom_streak` on GET /api/debug/ui.
+uint32_t oomStreak();
+
+// Which self-heal rule has something to say about the cycle that just ended, as a short word for
+// GET /api/debug/ui: "none", "oom" or "starved". It is not a prediction - a streak of one is still
+// "oom" - it is what the tallies currently hold.
+const char *wedgeReason();
 
 }  // namespace transit_app

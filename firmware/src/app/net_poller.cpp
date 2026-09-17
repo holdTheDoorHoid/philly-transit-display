@@ -22,6 +22,7 @@
 #include "cxx_exception_pool.h"
 #include "heap_reserve.h"
 #include "cycle_log.h"
+#include "wedge_policy.h"
 #include "heap_trace.h"
 #include "http_fetch.h"
 #include "sd_logger.h"
@@ -882,6 +883,18 @@ struct CountedSnapshot : Snapshot {
 // sample in the ~10 minute cycle the board is repeating.
 volatile uint32_t g_failed_polls = 0;
 volatile uint32_t g_wedged_polls = 0;
+// diag: the OOM tally and which rule last had something to say (wedge_policy.h), mirrored so
+// /api/debug/ui can read them. `g_cycle_oom` is the fact ONE cycle knows about itself: set at the
+// catch sites, cleared at the top of the next cycle, read once when the cycle is stamped.
+volatile uint32_t g_oom_streak = 0;
+volatile uint8_t g_wedge_reason = 0;
+volatile bool g_cycle_oom = false;
+// The cycle's own verdict, mirrored so the wedge check does not have to call getPollStatus() -
+// which takes the poller's lock and copies a std::string, i.e. it can BLOCK and it can throw
+// std::bad_alloc, on a line that sits outside pollerTask's try block. An uncaught throw there is
+// std::terminate. Set false at the top of every cycle, so a cycle that threw before reaching the
+// verdict counts as failed.
+volatile bool g_cycle_ok = false;
 
 // Publishes a Snapshot to every reader (UI, web server) and moves the LED with it. Called more
 // than once per cycle (F12): the arrivals go out the moment they exist, and again when the alerts
@@ -1060,6 +1073,8 @@ void evictUnconfiguredSummaries(const std::vector<StopConfig> &stops) {
 // so the header cheerfully reported them as fresh. The arrivals are the product; they are
 // published the instant they exist, and everything else runs afterwards on its own clock.
 uint32_t pollOnce(uint32_t &consecutive_failures) {
+  g_cycle_oom = false;  // this cycle's own out-of-memory fact, read when it is stamped
+  g_cycle_ok = false;   // ...and its verdict, set below once the stops have been summarized
   heapTraceBeginCycle();  // bumps the cycle number, then stamps kStagePollStart
 #ifdef TRANSIT_HEAP_TRACE
   Serial.printf("[poll-heap] %-13s free8=%u largest=%u\n", kHeapTraceStages[kStagePollStart],
@@ -1114,6 +1129,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
     // allocation that failed rather than only the call that contained it (diag branch).
     heapTraceMark(kStageOomTransit);
     cycleLogFlag(kCycleOom);
+    g_cycle_oom = true;  // counted directly, not re-derived from a heap reading (wedge_policy.h)
     out_of_memory = true;
   }
   if (out_of_memory) {
@@ -1158,6 +1174,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   std::shared_ptr<const Snapshot> published = publishSnapshot(std::move(combined));
   tracePoll(kStagePostTransit);
   if (!poll_ok) g_failed_polls++;
+  g_cycle_ok = poll_ok;
   cycleLogFlag((poll_ok ? 0 : kCycleFailed) | (g_last_poll_unsynced ? kCycleUnsynced : 0));
 
   // From here on everything is optional. The next transit poll's deadline is fixed first, so each
@@ -1300,30 +1317,31 @@ void pollerTask(void * /*arg*/) {
     Serial.println("[net_poller] clock not synced after 45 s; polling anyway, schedules are not cached and logging waits for a sane clock");
   }
   uint32_t consecutive_failures = 0;
-  // Self-heal for a wedged heap (found 2026-09-15). A no-PSRAM ESP32 whose heap has been
-  // fragmented into tiny pieces - e.g. by a long burst of rapid config saves, each of which
-  // rebuilds the whole LVGL screen, interleaved with active polling - can reach a state where
-  // ~50 KB is free but the largest block is ~2 KB, too small for any fetch buffer. Every poll then
-  // fails with a caught bad_alloc (the board stays up and honest, but shows nothing new), and
-  // nothing defragments a running heap. The one recovery is what a person would do: power-cycle.
+  // Self-heal for a wedged heap (found 2026-09-15, rewritten 0.3.2-rc1). A no-PSRAM ESP32 whose
+  // heap has been fragmented into tiny pieces can reach a state where ~50 KB is free but the
+  // largest block is a few KB, too small for any fetch buffer. Every poll then fails (the board
+  // stays up and honest, but shows nothing new), and nothing defragments a running heap. The one
+  // recovery is what a person would do: power-cycle.
   //
-  // WHAT THIS DOES NOT COVER (established on hardware 2026-09-16, DESIGN.md SS12.1): it counts
-  // cycles that COMPLETE AND REPORT FAILURE. It sits after pollOnce() returns, so a poller that
-  // stops completing cycles at all never reaches it and the counter freezes rather than climbing;
-  // and the `else` below zeroes the tally whenever either condition lapses, so one cycle whose
-  // largest block bounced back over the threshold wipes fourteen. That gap is why the liveness
-  // stamp below exists and why main.cpp's display loop watches it. The two are independent nets:
-  // this one catches a heap that has wedged while the poller still runs, that one catches a
-  // poller that has stopped. Neither replaces the other.
+  // The RULE now lives in wedge_policy.h, pure and host-tested, and its header carries the full
+  // trace of why the old inline version sat on a wedged board for seventeen minutes on 2026-09-17
+  // without restarting it. The short version: it counted only cycles that COMPLETE AND REPORT
+  // FAILURE with a small largest block, and a failed cycle drives nextIntervalS()'s backoff to
+  // 240 s - so fifteen of them is fifty-one minutes, not the seven and a half everyone assumed.
   //
-  // Guard tightly so this only ever fires on a genuine wedge, never on an ordinary SEPTA outage:
-  //   * largest block below kWedgeLargestBlock (a normal idle board sits ~20-30 KB) - a SEPTA
-  //     outage leaves the heap healthy, so that case keeps its normal backoff and never reboots;
-  //   * AND that condition held across kWedgePollsBeforeReboot consecutive failed polls, which
-  //     with the failure backoff is several minutes, so a brief blip cannot trigger it.
-  constexpr size_t kWedgeLargestBlock = 6 * 1024;
-  constexpr uint32_t kWedgePollsBeforeReboot = 15;
-  uint32_t wedged_polls = 0;
+  // Two tallies now. An out-of-memory cycle counts DIRECTLY, from the fact the cycle knows about
+  // itself (g_cycle_oom, set at the catch sites), with no heap comparison that could lapse
+  // independently, and three consecutive ones restart the board - about three and a half minutes
+  // with the backoff. The old failed-poll-plus-small-block rule is kept at fifteen as the slower
+  // backstop for a wedge that never throws, because that condition can also be met by an ordinary
+  // SEPTA outage and must stay hard to trip.
+  //
+  // WHAT THIS STILL DOES NOT COVER (established on hardware 2026-09-16, DESIGN.md SS12.1): both
+  // tallies only advance on cycles that COMPLETE. A poller that stops completing cycles at all
+  // freezes them. That gap is why main.cpp's liveness net exists and it is unchanged: this one
+  // catches a heap that has wedged while the poller still runs, that one catches a poller that has
+  // stopped. Neither replaces the other.
+  WedgeState wedge;
   for (;;) {
     // pollOnce() publishes the arrivals as soon as it has them and returns the deadline it set
     // for the next cycle (F12), so the interval is derived once, in the place that also budgets
@@ -1343,6 +1361,7 @@ void pollerTask(void * /*arg*/) {
       // oom-cycle" is the liveness fetch, and so on (diag branch).
       heapTraceMark(kStageOomCycle);
       cycleLogFlag(kCycleOom);
+      g_cycle_oom = true;  // the optional tail ran out of memory; the cycle still counts as OOM
       g_failed_polls++;
       Serial.printf("[net_poller] out of memory during the poll cycle (free %u, largest %u); short retry\n",
                     (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -1370,32 +1389,43 @@ void pollerTask(void * /*arg*/) {
     cycleLogEnd();
 
     // HAZARD: a firmware upload, exactly as in main.cpp's liveness net. An OTA takes the heap for
-    // the length of a ~1.7 MB write, which is precisely the condition this counter looks for, and
-    // `wedged_polls` carries across an upload, so a device already near the threshold could restart
-    // itself mid-Update.write(). That is not a brick - the boot partition only switches at
-    // Update.end(true), so a half-written inactive slot is inert and the device comes back on the
-    // image it already had - but it throws away the owner's upload at the worst moment and looks
-    // like a crash. Stand down while one is running, and forget the count rather than resume it:
-    // whatever the heap was doing before the upload is not evidence about what it is doing after.
+    // the length of a ~1.7 MB write, which is precisely the condition these counters look for, and
+    // a tally that carried across an upload could restart the board mid-Update.write(). That is
+    // not a brick - the boot partition only switches at Update.end(true), so a half-written
+    // inactive slot is inert and the device comes back on the image it already had - but it throws
+    // away the owner's upload at the worst moment and looks like a crash. nextWedgeState() zeroes
+    // both tallies while one is running and forgets the count rather than resuming it.
     //
-    // Wedge detection otherwise (see above): a failed poll while the largest free block is
-    // critically small. getPollStatus() reflects what pollOnce() just published.
-    if (otaBusy()) {
-      wedged_polls = 0;
-    } else if (!getPollStatus().ok && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < kWedgeLargestBlock) {
-      if (++wedged_polls >= kWedgePollsBeforeReboot) {
-        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        Serial.printf("[net_poller] heap wedged: %u consecutive failed polls with largest block < %u B (free %u); rebooting to recover\n",
-                      (unsigned)wedged_polls, (unsigned)kWedgeLargestBlock, (unsigned)ESP.getFreeHeap());
-        noteSelfHealRestart(SelfHeal::HeapWedge, wedged_polls, (uint32_t)largest);
-        Serial.flush();
-        vTaskDelay(pdMS_TO_TICKS(200));
-        ESP.restart();
-      }
-    } else {
-      wedged_polls = 0;
+    // The OOM tally is fed by g_cycle_oom - the fact this cycle knows about itself, set inside the
+    // catch handlers - and NOT by a largest-block comparison taken afterwards. That is the whole
+    // correction of 0.3.2-rc1: the old rule re-derived "this cycle ran out of memory" from a heap
+    // reading, which is a second condition that can lapse on its own. wedge_policy.h has the
+    // trace. g_cycle_ok supplies the non-throwing rule's "did the poll fail" half - mirrored from
+    // pollOnce() rather than read back through getPollStatus(), which takes a lock and copies a
+    // std::string on a line that has no try block above it.
+    const size_t largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    wedge = nextWedgeState(wedge, otaBusy(), g_cycle_oom, g_cycle_ok, largest_after);
+    const WedgeReason verdict = wedgeVerdict(wedge);
+    if (verdict != WedgeReason::None) {
+      const bool oom = verdict == WedgeReason::OutOfMemory;
+      Serial.printf("[net_poller] heap wedged (%s): %u consecutive %s polls, largest block %u B (free %u); rebooting to recover\n",
+                    oom ? "out of memory" : "starved",
+                    (unsigned)(oom ? wedge.oom_streak : wedge.starved_streak),
+                    oom ? "out-of-memory" : "failed", (unsigned)largest_after,
+                    (unsigned)ESP.getFreeHeap());
+      noteSelfHealRestart(oom ? SelfHeal::HeapOom : SelfHeal::HeapWedge,
+                          oom ? wedge.oom_streak : wedge.starved_streak, (uint32_t)largest_after);
+      Serial.flush();
+      vTaskDelay(pdMS_TO_TICKS(200));
+      ESP.restart();
     }
-    g_wedged_polls = wedged_polls;  // diag branch: mirrored so /api/debug/ui can read it
+    // Mirrored so /api/debug/ui can say how close the board is to each threshold, and which rule
+    // has something to say about the cycle that just ended.
+    g_wedged_polls = wedge.starved_streak;
+    g_oom_streak = wedge.oom_streak;
+    g_wedge_reason = (uint8_t)(wedge.oom_streak > 0   ? WedgeReason::OutOfMemory
+                               : wedge.starved_streak > 0 ? WedgeReason::Starved
+                                                          : WedgeReason::None);
 
     // Blocks until the deadline, but wakes immediately if requestRepoll() gives the semaphore
     // (DESIGN.md SS7: PUT /api/config "triggers immediate re-poll").
@@ -1740,5 +1770,16 @@ StopSummaryView getStopSummary(const std::string &stop_key) {
 uint32_t snapshotsLive() { return g_snapshots_live.load(); }
 uint32_t failedPolls() { return g_failed_polls; }
 uint32_t wedgedPolls() { return g_wedged_polls; }
+
+uint32_t oomStreak() { return g_oom_streak; }
+
+const char *wedgeReason() {
+  switch ((WedgeReason)g_wedge_reason) {
+    case WedgeReason::OutOfMemory: return "oom";
+    case WedgeReason::Starved: return "starved";
+    case WedgeReason::None:
+    default: return "none";
+  }
+}
 
 }  // namespace transit_app
