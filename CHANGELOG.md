@@ -1,6 +1,12 @@
 # Changelog
 
-## v0.3.2 - 2026-09-17
+## v0.3.2-rc2 - 2026-09-17 (release candidate)
+
+**rc1 of this release was flashed at 17:00 and rolled back within minutes.** It did what it set
+out to do and still left about 12 KB less free memory than v0.3.1 - enough that several requests
+came back "low memory" during testing and the board came within 156 bytes of nothing at all. rc2
+takes most of that back with the four-stop limit below and stops the reply buffer growing on a
+board that is already short. Nothing in rc2 has been flashed or measured on a device.
 
 v0.3.1 shipped today at 15:07. By about forty minutes of uptime the owner's board had crumbled
 into the same kind of lockout it was built to prevent - and this time it also locked the door,
@@ -59,13 +65,26 @@ release states that plainly and fixes what it exposed.
   replies stayed big. It now grows once, keeps the larger size, and is capped at 10 KB so a
   runaway reply still cannot become permanent. Nothing is cut short to make this true: a busy-hour
   vehicle list can honestly run 8-9 KB, and the board now tracks the biggest reply it has ever seen
-  so that number, not a guess, can set the buffer size later.
+  so that number, not a guess, can set the buffer size later. Two corrections after rc1 was
+  measured: the cap is 8 KB, not 10 - the biggest reply the board actually saw was 7,035 bytes -
+  and the buffer only keeps the larger size when there is at least 30 KB free at the time. On a
+  board that is already short it is handed back, because growing what the display holds
+  permanently is the last thing a short board needs.
 
 - **The out-of-memory reply reserve can now come back on a fragmented board.** It used to only
   re-arm once free memory reached 20 KB with a 4.3 KB largest piece - both worse than what the
   board actually had during the 15:50 lockout, so the reserve stayed empty the whole time it was
   needed. It now re-arms at about 13.5 KB free with a 2.3 KB piece, which is reachable even on a
   heap crumbled this badly.
+
+- **The display now shows a maximum of four stops, down from eight.** Four is the number it could
+  always actually draw - a fifth panel does not fit the screen's drawing memory and was refused at
+  the moment it was needed, with a note on the page. The limit now says so up front: the Settings
+  page stops you at four and the display refuses a saved setting with more, instead of accepting
+  something it cannot show. It also gives about 4 KB of memory back, because the arrival-history
+  tracker no longer keeps room for eight stops. If you have a display configured with more than
+  four, remove the extras before updating - the update will otherwise fall back to your previous
+  saved settings.
 
 - **Two hours of memory history, so the trigger can finally be caught.** The display keeps one
   line per poll for the last 240 polls - memory free, largest unbroken piece, the lowest either
@@ -76,8 +95,11 @@ release states that plainly and fixes what it exposed.
 
 **Known residual:** what actually triggers the fragmentation is still not identified - the
 two-hour memory log above exists specifically to catch it in the act next time. And by design,
-this release's resting free-memory floor sits about 8 KB lower than v0.3.1's, which is the
-deliberate cost of the fix above.
+this release's resting free-memory floor sits about 8.4 KB lower than v0.3.1's - roughly 31-32 KB
+where v0.3.1 rested at 39-40 KB - which is the deliberate cost of the fix above. That figure is
+stated after measurement, not before it: rc1 claimed 8 KB, counted only the memory the poll cycle
+holds, and left out the 4.5 KB the new memory log occupies; the real gap was about 12 KB until the
+four-stop limit gave 4 KB of it back.
 
 ## v0.3.1 - 2026-09-17
 
