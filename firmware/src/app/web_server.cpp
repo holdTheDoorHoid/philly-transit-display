@@ -495,19 +495,6 @@ bool hostAllowed(const AsyncWebServerRequest *request) {
   return hostNamesDevice(host, g_host_name);
 }
 
-// Reboots shortly after the current request's response has had a chance to
-// go out - calling ESP.restart() directly inside the handler risks cutting
-// the HTTP response off mid-flight.
-void scheduleRestart() {
-  xTaskCreate(
-    [](void *) {
-      vTaskDelay(pdMS_TO_TICKS(300));
-      ESP.restart();
-    },
-    "restart", 2048, nullptr, 1, nullptr
-  );
-}
-
 // Admission floor for the heap-heavy read handlers (/api/state copies the whole Snapshot plus
 // weather and bike views into a JsonDocument; /api/config serializes the whole config): refuse with
 // a fixed-literal 503 (needs almost no heap) when memory is clearly too low to build the response.
@@ -625,6 +612,10 @@ void handleGetState(AsyncWebServerRequest *request) {
     } else if (note.reason == SelfHeal::HeapOom) {
       reason = "heap_oom";
       snprintf(detail, sizeof(detail), "%u consecutive out-of-memory polls, largest free block %u B", (unsigned)note.a, (unsigned)note.b);
+    } else if (note.reason == SelfHeal::Nightly) {
+      reason = "nightly";
+      snprintf(detail, sizeof(detail), "scheduled nightly restart at %02u:%02u after %u h up",
+               (unsigned)(note.a / 60), (unsigned)(note.a % 60), (unsigned)(note.b / 3600));
     } else if (note.reason == SelfHeal::LvglPool) {
       reason = "lvgl_pool";
       snprintf(detail, sizeof(detail), "LVGL pool exhausted: %u B free, %u B high-water", (unsigned)note.a, (unsigned)note.b);
@@ -1813,6 +1804,21 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
 }
 
 bool otaBusy() { return g_ota.busy; }
+
+// Reboots shortly after the current request's response has had a chance to go out - calling
+// ESP.restart() directly inside the handler risks cutting the HTTP response off mid-flight.
+// Declared in web_server.h since 0.3.2-rc1 so main.cpp's nightly restart can use the same path
+// (nightly_restart.h): it has no response to protect, but it wants the same grace for whatever
+// the poller or the display task happens to be in the middle of.
+void scheduleRestart() {
+  xTaskCreate(
+    [](void *) {
+      vTaskDelay(pdMS_TO_TICKS(300));
+      ESP.restart();
+    },
+    "restart", 2048, nullptr, 1, nullptr
+  );
+}
 
 uint32_t inFlightRequests() { return g_in_flight_count.load(std::memory_order_relaxed); }
 

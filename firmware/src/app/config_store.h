@@ -46,6 +46,16 @@ struct QuietConfig {
   uint16_t wake_seconds = 30;
 };
 
+// DESIGN.md SS6 "nightly_restart" (SS12.1): a deliberate restart at a chosen hour of the night.
+// ON by default. This board has no PSRAM and nothing defragments a running heap, so a boot is the
+// only defragmentation it has; taking one at 03:30, when nobody is reading a transit display,
+// costs a few seconds of uptime and starts every day on a heap in one piece. It is a MITIGATION,
+// not a fix - see nightly_restart.h and DESIGN.md SS12.1.
+struct NightlyRestartConfig {
+  bool enabled = true;
+  std::string time = "03:30";  // local "HH:MM", the same form as quiet.start/end
+};
+
 // DESIGN.md SS6 "night": clock page when nothing is due within after_min.
 struct NightConfig {
   bool enabled = true;
@@ -120,6 +130,7 @@ struct DeviceConfig {
   std::string crowding_icons = "seats";
   QuietConfig quiet;
   NightConfig night;
+  NightlyRestartConfig nightly_restart;
 };
 
 struct Config {

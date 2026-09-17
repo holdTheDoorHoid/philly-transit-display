@@ -52,6 +52,7 @@ struct DeviceInfoCtx {
   lv_obj_t *pin_label;
   lv_obj_t *sd_label;
   lv_obj_t *heap_label;
+  lv_obj_t *nightly_label = nullptr;  // only built when the setting is on AND the line fits
   lv_obj_t *reset_label;
   std::string mdns_host;
   uint32_t press_start_ms = 0;
@@ -210,6 +211,11 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
   int32_t card_h = 12 + lh + source_lines * (lh + 2);
   int32_t area_h = h - headerHeight(h) - 8;
   bool sources_card = h >= 320 && area_h - net_h - dev_h - reset_h - 4 * 4 >= card_h;
+  // One extra line in the device panel for the nightly restart (DESIGN.md SS12.1), and only if it
+  // fits AFTER everything already on the page - the Data sources card is decided above and is not
+  // displaced by it. A 240-tall board never has the room, which is the same answer that card gets.
+  bool nightly_line = cfg.device.nightly_restart.enabled &&
+                       area_h - net_h - dev_h - reset_h - 4 * 4 - (sources_card ? card_h : 0) >= lh + 2;
 
   // ---- Header ----
   lv_obj_t *header = makeHeader(screen, h);
@@ -286,6 +292,15 @@ lv_obj_t *createDeviceInfoScreen(const Config &cfg) {
   }
   ctx->sd_label = captionedLine(dev, h);
   ctx->heap_label = captionedLine(dev, h);
+  if (nightly_line) {
+    // Static text, set once: the time cannot change without a config save, and a save rebuilds
+    // this screen. Nothing in update() has to touch it.
+    ctx->nightly_label = captionedLine(dev, h);
+    char line[64];
+    snprintf(line, sizeof line, "#%06x restart#  nightly at %s",
+             (unsigned)colorHex(colorSubtext()), cfg.device.nightly_restart.time.c_str());
+    lv_label_set_text(ctx->nightly_label, line);
+  }
 
   // ---- Data sources: one line per feed the config has on ----
   if (sources_card) {

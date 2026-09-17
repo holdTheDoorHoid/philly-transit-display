@@ -29,6 +29,8 @@
 #include "app/heap_reserve.h"
 #include "app/hw_probe.h"
 #include "app/net_poller.h"
+#include "app/nightly_restart.h"
+#include "daypart_core/daypart.h"
 #include "app/poller_liveness.h"
 #include "app/proxy_worker.h"
 #include "app/sd_logger.h"
@@ -172,6 +174,44 @@ void checkPollerLiveness() {
   Serial.flush();
   delay(200);
   ESP.restart();
+}
+
+// DESIGN.md SS12.1 / nightly_restart.h: the deliberate restart, checked once a minute from the
+// display task. Nothing here allocates or blocks; the setting is two aligned words the poller
+// republishes every cycle, and the clock read is localtime_r on a stack struct.
+//
+// It runs OUTSIDE loop()'s bad_alloc guard, alongside checkPollerLiveness() and for the same
+// reason: the frame the display loop skips because it could not allocate is exactly the frame in
+// which this is most worth doing.
+void checkNightlyRestart() {
+  static int last_minute = -1;
+  if (!transit_app::nightlyRestartEnabled()) return;
+  time_t now = time(nullptr);
+  struct tm lt;
+  // Before NTP the local time is 1970 and "03:30" would match at a moment that has nothing to do
+  // with 03:30. The same threshold net_poller.cpp's clockIsSane() uses (kSaneClockEpoch,
+  // 2023-11-14): repeated rather than exported, because that one is a file-local helper with five
+  // other callers inside its own translation unit and widening its scope for this would be the
+  // larger change.
+  constexpr time_t kSaneClockEpoch = 1700000000;
+  if (now < kSaneClockEpoch || localtime_r(&now, &lt) == nullptr) return;
+  const int now_minute = lt.tm_hour * 60 + lt.tm_min;
+  const uint32_t uptime_s = (uint32_t)(millis() / 1000U);
+  const bool fire = transit_app::shouldRestartNightly(
+    true, transit_app::nightlyRestartMinute(), now_minute, last_minute, uptime_s,
+    transit_app::otaBusy());
+  // Stamped whether or not it fired, so the rule's "once a minute" guard holds: a minute that was
+  // considered and declined must not be considered again forty passes later.
+  last_minute = now_minute;
+  if (!fire) return;
+  Serial.printf("[restart] nightly restart at %02d:%02d\n", lt.tm_hour, lt.tm_min);
+  // Recorded before the restart is scheduled, so GET /api/state's last_restart says "nightly"
+  // rather than leaving an unexplained ESP_RST_SW on the next boot. `a` is the minute of day it
+  // was set to, `b` the uptime in seconds it reached - both useful if it ever fires at the wrong
+  // time.
+  transit_app::noteSelfHealRestart(transit_app::SelfHeal::Nightly, (uint32_t)now_minute, uptime_s);
+  Serial.flush();
+  transit_app::scheduleRestart();
 }
 
 std::string wifiApName() {
@@ -319,6 +359,15 @@ void setup() {
   }
   configTzTime(cfg.device.tz.c_str(), "pool.ntp.org");
   g_applied_tz = cfg.device.tz;
+  // The nightly restart is armed from the loaded config here, not left until the first poll cycle
+  // republishes it (nightly_restart.h). It could not fire for the first hour either way - the
+  // uptime guard sees to that - but the setting should be true from boot rather than default.
+  transit_app::setNightlyRestart(cfg.device.nightly_restart.enabled,
+                                 daypart::parseClock(cfg.device.nightly_restart.time));
+  if (cfg.device.nightly_restart.enabled) {
+    Serial.printf("[restart] nightly restart armed for %s local\n",
+                  cfg.device.nightly_restart.time.c_str());
+  }
 
   if (MDNS.begin(cfg.device.name.c_str())) {
     MDNS.addService("http", "tcp", 80);
@@ -406,4 +455,5 @@ void loop() {
   // could not allocate is exactly the frame in which the poller is most likely to be stuck, so the
   // liveness check must not be skipped with it. Nothing in it allocates.
   checkPollerLiveness();
+  checkNightlyRestart();
 }

@@ -1141,7 +1141,8 @@ ESP Web Tools `manifest.json` under `flasher/` for GitHub Pages (offsets 0x1000 
     "crowding": "words",
     "crowding_icons": "seats",
     "quiet": { "enabled": false, "start": "23:00", "end": "06:00", "brightness": 0, "wake_seconds": 30 },
-    "night": { "enabled": true, "after_min": 60 }
+    "night": { "enabled": true, "after_min": 60 },
+    "nightly_restart": { "enabled": true, "time": "03:30" }
   },
   "stops": [
     {
@@ -1264,6 +1265,14 @@ path is returned.
   `ticker_speed` 5–200, `quiet.brightness` 0–50, `quiet.wake_seconds` 5–300, `night.after_min`
   15–240, `due.minutes` 1–15, `stops[].show` 1–4, `stops[].alt_after_min` 5–60 (when `alt_of` is
   set), `bike.stations[].id` ≥ 1. `lat`/`lng` must be finite and within ±90 / ±180.
+- Clock strings: `quiet.start`, `quiet.end`, `nightly_restart.time` and every `profiles[].start` /
+  `profiles[].end` are local `"HH:MM"`, 24-hour, validated the same way and parsed by the same
+  `daypart::parseClock()`.
+- `device.nightly_restart` (0.3.2-rc1) is `{ "enabled": true, "time": "03:30" }` and is **on by
+  default**. A config saved by older firmware carries no such block and gets exactly those
+  defaults — that is the intended behaviour for an existing device, not a migration, and the web
+  form's fallbacks match it so it cannot show as off while the device has it on. §12.1 explains
+  what it is for and, as importantly, what it is not.
 - Strings: `device.name` ≤ 32 and, after lower-casing ("slugifying"), only `[a-z0-9-]` and no
   leading or trailing `-` — it is the mDNS hostname, and a character DNS cannot carry is refused
   rather than guessed at; `device.tz` ≤ 64; every per-stop string (`key`, `route`, `stop_id`,
@@ -2148,6 +2157,33 @@ no send buffer. `src/app/admission.h` holds the rule as pure arithmetic (host-te
   `in_flight == 0` admits whatever the heap says; otherwise both floors apply exactly as before.
   The count cap is unchanged at 5. `test_admission` pins the four-row table so a future edit that
   reinstates the lockout fails on the host rather than on the hardware.
+
+**The nightly restart, and the honest sentence about it (owner decision, 0.3.2-rc1).**
+`device.nightly_restart` restarts the board at a chosen local time, **on by default at 03:30**.
+`src/app/nightly_restart.h` holds the rule, pure and host-tested (`test_nightly`, 8 cases);
+`main.cpp` reads the clock once a second from the display task, outside `loop()`'s `bad_alloc`
+guard and beside the liveness check, and goes out through the same `scheduleRestart()` the reboot
+endpoint uses.
+
+**It is a mitigation, not a fix, and this document should not be read as saying otherwise.** This
+board has no PSRAM, a ~100–160 KB heap, and nothing that defragments a running one. Two releases of
+work have gone into the per-cycle contiguous demand and 0.3.2-rc1 removes every request above
+~1.2 KB from a cache-hit cycle — and none of that is a guarantee, because fragmentation is
+cumulative and the trigger is still unknown: the owner's board rested at a 22.5 KB largest block for
+thirty-five minutes and was at 3,444 B forty minutes later, and nothing in the record says why. A
+boot is the only defragmentation this hardware has. Taking one at 03:30, when nobody is reading a
+transit display, costs a few seconds of uptime and starts every day on a heap in one piece. It does
+not excuse leaving the real cause unfound, which is what the per-cycle log above exists for.
+
+The guards are each there for a specific failure: **one minute, once** (the check acts only on the
+transition into the matching minute, so a slow minute cannot fire it twice); **uptime > 1 h**
+(without it a board that boots at 03:29 restarts at 03:30, comes up, and can loop); **a sane clock**
+(before NTP the local time is 1970 and "03:30" matches a moment with nothing to do with 03:30); and
+**not during an OTA** (the same hazard the wedge and liveness nets stand down for). An unparseable
+time parses to −1 and the rule treats −1 as *never* — for a rule that restarts the device, the
+failure direction is always "do not restart". The restart is recorded in the RTC note, so
+`GET /api/state`'s `last_restart.reason` reads `nightly` rather than leaving a bare `ESP_RST_SW`
+for someone to puzzle over.
 
 **The heap-wedge self-heal did not fire, and the reason was the failure backoff (0.3.2-rc1).** On
 2026-09-17 the owner's board sat with every poll failing at `oom-transit`, largest free block

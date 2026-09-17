@@ -364,6 +364,10 @@ bool validateConfig(const Config &cfg, ConfigError &err) {
     err = {"quiet.start and quiet.end must be HH:MM", "device.quiet.start"};
     return false;
   }
+  if (!validClock(cfg.device.nightly_restart.time)) {
+    err = {"nightly_restart.time must be HH:MM", "device.nightly_restart.time"};
+    return false;
+  }
   if (cfg.device.quiet.brightness > 50) {
     err = {"quiet.brightness must be between 0 and 50", "device.quiet.brightness"};
     return false;
@@ -491,6 +495,9 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
   JsonObject night = device["night"].to<JsonObject>();
   night["enabled"] = cfg.device.night.enabled;
   night["after_min"] = cfg.device.night.after_min;
+  JsonObject nightly = device["nightly_restart"].to<JsonObject>();
+  nightly["enabled"] = cfg.device.nightly_restart.enabled;
+  nightly["time"] = cfg.device.nightly_restart.time;
 
   JsonArray stops = doc["stops"].to<JsonArray>();
   for (const StopConfig &s : cfg.stops) {
@@ -612,6 +619,15 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   result.device.night.enabled = night["enabled"] | true;
   if (!readInt(night, "after_min", 15, 240, 60, "device.night.after_min", n, err)) return false;
   result.device.night.after_min = (uint16_t)n;
+  // Added in 0.3.2-rc1. A saved config written before it has no such block, and both members then
+  // take their struct defaults - enabled, 03:30 - which is the intended behaviour for an existing
+  // device, not a migration.
+  JsonVariantConst nightly = device["nightly_restart"];
+  result.device.nightly_restart.enabled = nightly["enabled"] | true;
+  if (!readStr(nightly, "time", kMaxClockLen, "03:30", "device.nightly_restart.time",
+               result.device.nightly_restart.time, err)) {
+    return false;
+  }
 
   JsonVariantConst stops = doc["stops"];
   if (!stops.isNull()) {

@@ -21,6 +21,7 @@
 #include "config_store.h"
 #include "cxx_exception_pool.h"
 #include "heap_reserve.h"
+#include "daypart_core/daypart.h"  // parseClock() for device.nightly_restart
 #include "cycle_log.h"
 #include "wedge_policy.h"
 #include "heap_trace.h"
@@ -896,6 +897,13 @@ volatile bool g_cycle_oom = false;
 // verdict counts as failed.
 volatile bool g_cycle_ok = false;
 
+// device.nightly_restart, published for the display task (nightly_restart.h). Two aligned words,
+// written by the poller task and read once a second by loopTask: a single aligned 32-bit
+// store/load is atomic on the ESP32, and neither value is meaningful without the other only in the
+// sense that `enabled` gates it, so there is nothing to tear.
+volatile bool g_nightly_enabled = true;
+volatile int32_t g_nightly_minute = 210;  // 03:30, matching NightlyRestartConfig's default
+
 // Publishes a Snapshot to every reader (UI, web server) and moves the LED with it. Called more
 // than once per cycle (F12): the arrivals go out the moment they exist, and again when the alerts
 // that belong to the same Snapshot arrive.
@@ -1091,6 +1099,11 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // that can afford to be told "not yet".
   rearmHeapReserveIfSafe();
   Config cfg = getActiveConfig();
+  // Republished every cycle so a saved change reaches the display task within one poll
+  // (nightly_restart.h). daypart::parseClock returns -1 on anything malformed, which the rule
+  // treats as "never", so a bad value can only disable the restart, never mistime it.
+  setNightlyRestart(cfg.device.nightly_restart.enabled,
+                    daypart::parseClock(cfg.device.nightly_restart.time));
   transit::HttpGetEx http = makeHttpGetEx(kFetchTimeoutMs);
   transit::HttpGetEx http_opt = makeHttpGetEx(kOptionalFetchTimeoutMs);
   transit::HttpGet http_opt_plain = plainFrom(http_opt);
@@ -1528,6 +1541,15 @@ MemorySizes getMemorySizes() {
   m.tv_capacity = g_poll_buffers != nullptr ? (uint32_t)g_poll_buffers->tv.capacity() : 0;
   return m;
 }
+
+void setNightlyRestart(bool enabled, int minute_of_day) {
+  g_nightly_minute = (int32_t)minute_of_day;
+  g_nightly_enabled = enabled;
+}
+
+bool nightlyRestartEnabled() { return g_nightly_enabled; }
+
+int nightlyRestartMinute() { return (int)g_nightly_minute; }
 
 ScratchStats getScratchStats() {
   ScratchStats s;

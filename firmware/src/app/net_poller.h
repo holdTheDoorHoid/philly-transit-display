@@ -87,6 +87,15 @@ struct MemorySizes {
 };
 MemorySizes getMemorySizes();
 
+// Publishes device.nightly_restart in a form the display task can read every second without a
+// lock or an allocation (nightly_restart.h): the enabled flag and the time as minutes since local
+// midnight, -1 when it is unset or unparseable. Called from setup() with the loaded config and
+// again from every poll cycle, so a saved change takes effect within one poll rather than needing
+// a restart of its own - which would be a peculiar way to apply a restart setting.
+void setNightlyRestart(bool enabled, int minute_of_day);
+bool nightlyRestartEnabled();
+int nightlyRestartMinute();
+
 // Creates the poller task (12 KB stack) and its primitives without starting to poll. Call early
 // in setup(), before Wi-Fi, for the same heap-fragmentation reason as preallocateTracker().
 void initNetPoller();
@@ -166,9 +175,12 @@ enum class SelfHeal : uint8_t {
                   // Distinct from HeapWedge on purpose - "the cycle could not get memory" is a
                   // fact the cycle reported, while HeapWedge is an inference from a heap reading
                   // after a failed poll, and the two want telling apart in a restart note.
+  Nightly = 5,    // main.cpp: the scheduled nightly restart (nightly_restart.h). Not a self-heal
+                  // at all, but it lands in the same note for the same reason - a bare
+                  // ESP_RST_SW with no explanation is the thing this note exists to prevent.
 };
 // captureRestartNote() validates the stored value against this; keep it equal to the last entry.
-constexpr SelfHeal kSelfHealMax = SelfHeal::HeapOom;
+constexpr SelfHeal kSelfHealMax = SelfHeal::Nightly;
 
 struct RestartNote {
   SelfHeal reason = SelfHeal::None;
