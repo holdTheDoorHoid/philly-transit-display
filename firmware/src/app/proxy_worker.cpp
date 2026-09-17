@@ -55,6 +55,10 @@ struct ProxyJob {
   // Weak pointer from AsyncWebServerRequest::pause(): the server keeps the request alive until we
   // send (or the client aborts, in which case lock() returns null and we drop the job).
   AsyncWebServerRequestPtr request;
+  // Idle slices this job has been put back (proxy_queue.h). LAST in the struct on purpose:
+  // enqueue() builds a ProxyJob with a brace initialiser, so a field added in the middle would
+  // silently shift every argument after it.
+  uint8_t deferrals = 0;
 };
 
 QueueHandle_t g_queue = nullptr;
@@ -408,7 +412,7 @@ bool runQueuedProxyJob(bool may_start_heavy) {
   // server-side timeout ESPAsyncWebServer switched off when it paused it, so nothing else could
   // ever end it either (audit_runtime SS4).
   std::unique_ptr<ProxyJob> owner(job);
-  switch (decideQueuedJob(requestStillAlive(*owner), may_start_heavy)) {
+  switch (decideQueuedJob(requestStillAlive(*owner), may_start_heavy, owner->deferrals)) {
     case QueuedJobAction::DropClientGone:
       // The client gave up or went away. Nothing to answer, so drop the job rather than spend
       // seconds of network or SD work for nobody.
@@ -424,6 +428,23 @@ bool runQueuedProxyJob(bool may_start_heavy) {
         sendUnderPressure(r.get(), 503, "{\"error\":\"low memory, retry\"}");
       }
       break;
+    case QueuedJobAction::Defer: {
+      // Put it back at the FRONT, so a waiting job keeps its place rather than being overtaken,
+      // and hand ownership back to the queue. Bounded by kMaxJobDeferrals, after which the case
+      // above answers 503 - "defer" must never become the queue hang this rule replaced.
+      ++owner->deferrals;
+      ProxyJob *again = owner.get();
+      if (xQueueSendToFront(g_queue, &again, 0) == pdTRUE) {
+        owner.release();  // the queue owns it once more
+        return false;     // no work done this slice
+      }
+      // The queue just gave this job up, so putting it back cannot fail - but if it somehow does,
+      // answering is better than leaking it.
+      if (auto r = lockRequest(*owner)) {
+        sendUnderPressure(r.get(), 503, "{\"error\":\"low memory, retry\"}");
+      }
+      break;
+    }
     case QueuedJobAction::Run:
       runJob(*owner);
       break;

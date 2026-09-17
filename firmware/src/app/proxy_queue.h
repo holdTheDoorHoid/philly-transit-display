@@ -34,20 +34,41 @@ namespace transit_app {
 
 // What runQueuedProxyJob() does with the job it just took off the queue.
 enum class QueuedJobAction {
-  Run,             // the client is still there and there is heap to work with
+  Run,             // the client is still there and there is room to work
   DropClientGone,  // nobody to answer: drop it rather than spend seconds of work on it
-  Refuse503,       // answer "low memory, retry" now, and release the paused request
+  Defer,           // not now - put it back at the FRONT and look again next idle slice
+  Refuse503,       // waited long enough: answer "low memory, retry" and release the request
 };
 
+// How many idle slices a job may be put back before it is answered 503 instead. The idle slice is
+// a 250 ms semaphore wait (net_poller.cpp pollerTask), so this is roughly six seconds of waiting -
+// deliberately shorter than the ~8 s the device suite gives a request, so the board answers rather
+// than letting the client time out. Bounded, so "defer" can never become the old queue hang.
+constexpr uint8_t kMaxJobDeferrals = 24;
+
 // `client_alive`: the paused request still has a connected client.
-// `may_start_heavy`: the caller's heap gate (net_poller.cpp idleWorkHasHeadroom()) says a job's
-// own allocations can be attempted right now.
+// `may_start_heavy`: the caller says a job's own allocations can be attempted right now - on this
+//   firmware that is idleWorkHasHeadroom() AND no burst of web requests in flight (below).
+// `deferrals`: how many idle slices this job has already been put back.
 //
-// Note the order: a dead client wins over a low heap, because answering it is impossible and
-// dropping it is free. Neither answer is ever "leave it on the queue" - that option is gone.
-constexpr QueuedJobAction decideQueuedJob(bool client_alive, bool may_start_heavy) {
-  return !client_alive ? QueuedJobAction::DropClientGone
-                        : (may_start_heavy ? QueuedJobAction::Run : QueuedJobAction::Refuse503);
+// WHY "may_start_heavy" GREW A SECOND INPUT (0.3.1-rc3). rc2 asked only the heap gate, which is a
+// statement about this instant, and started a ~9 KB StatsAggregator scan whenever free8 was 16 KB
+// with a 12 KB block - true at the START of a seven-request burst and false a moment later, once
+// those requests had built their documents and send buffers. The device suite crashed there
+// (admission.h has the backtrace). A job must not start while a burst is alive, however healthy
+// the heap looks at the instant it is asked, so the caller now also requires that essentially
+// nothing else is in flight - and a job that cannot start WAITS rather than being refused
+// immediately, because the burst is over in seconds and the Stats page would rather be slow than
+// wrong.
+//
+// A dead client still wins over everything: answering it is impossible and dropping it is free.
+// "Leave it on the queue indefinitely" is still not an option - Defer is bounded by
+// kMaxJobDeferrals and then becomes an answer.
+constexpr QueuedJobAction decideQueuedJob(bool client_alive, bool may_start_heavy,
+                                           uint8_t deferrals) {
+  return !client_alive  ? QueuedJobAction::DropClientGone
+         : may_start_heavy ? QueuedJobAction::Run
+         : (deferrals < kMaxJobDeferrals ? QueuedJobAction::Defer : QueuedJobAction::Refuse503);
 }
 
 }  // namespace transit_app

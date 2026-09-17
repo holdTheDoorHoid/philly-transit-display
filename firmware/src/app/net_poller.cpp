@@ -35,7 +35,7 @@
 #include "ui_lock.h"
 #include "weather_service.h"
 #include "bike_service.h"
-#include "web_server.h"  // otaBusy(): the wedge counter stands down during a firmware upload
+#include "web_server.h"  // otaBusy() for the wedge counter; inFlightRequests() for the job gate
 
 using transit::Alert;
 using transit::Mode;
@@ -1376,7 +1376,15 @@ void pollerTask(void * /*arg*/) {
       // worker busy". Dequeuing is always allowed; the gate now decides only whether the job is
       // RUN or answered 503, which the client retries.
       rearmHeapReserveIfSafe();  // see pollOnce(): the other safe context, four times a second
-      if (runQueuedProxyJob(idleWorkHasHeadroom())) {
+      // TWO questions, not one (proxy_queue.h, admission.h). idleWorkHasHeadroom() is about this
+      // instant; inFlightRequests() is about what is ABOUT to be allocated. rc2 asked only the
+      // first and started a ~9 KB stats scan at the start of a seven-request burst, while those
+      // requests still had their documents and send buffers ahead of them - and the board crashed
+      // in the library's deferred header assembly. A job waits for the burst to pass instead;
+      // "<= 1" rather than "== 0" because the job's OWN paused request is one of the in-flight
+      // ones and would otherwise block itself forever.
+      const bool quiet = inFlightRequests() <= 1;
+      if (runQueuedProxyJob(quiet && idleWorkHasHeadroom())) {
         notePollerProgress();
         if ((int32_t)(millis() - deadline) >= 0) break;
       }
