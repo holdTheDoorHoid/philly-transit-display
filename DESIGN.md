@@ -2099,7 +2099,7 @@ their `_M_manager` bodies contain no calls at all, which is libstdc++'s stored-l
 **Do not add a middleware back.** `g_server.addMiddleware(...)` is a one-line change that
 reintroduces an uncatchable reboot, and it will look completely reasonable to whoever writes it.
 
-A **third instance, and the one that matters for normal operation**, turned up on 2026-09-16 on a
+A **fourth instance, and the one that matters for normal operation**, turned up on 2026-09-16 on a
 clean `dcb6353` image with `/api/debug/oom` never fired once (the capture was grepped: the only
 `oom` matches are the bootloader's `ho 8 tail 4 room 4` line matching inside the word "room"). Free
 heap decayed to ~34.5 KB with the largest block down to 164 B under light polling, `main.cpp

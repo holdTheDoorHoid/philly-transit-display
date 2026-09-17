@@ -12,7 +12,7 @@ export PATH="$HOME/.platformio/penv/bin:$PATH"
 cd firmware
 pio run -e cyd-3248S035R        # the owner's board; see platformio.ini for the other envs
 pio run -e cyd-3248S035R-https  # the same board with the HTTPS prototype compiled in (DESIGN.md §2.1)
-pio test -e native              # transit_core + transit_stats + poller-liveness host tests (184 cases)
+pio test -e native              # transit_core + transit_stats + poller-liveness host tests (232 cases)
 pio run -e ui-sim               # host screenshot simulator (sim/README.md)
 pio run -e ui-sim-pool          # the same, with LVGL's pool scaled to the board's (DESIGN.md §8)
 ```
