@@ -781,7 +781,7 @@ check('E no reboot under 3x7 concurrent requests', u_after > u_before, (u_before
 #             MEMP_MEM_MALLOC every lwIP allocation is a plain malloc, so this is the SAME
 #             fragmentation one layer lower down - too little heap to build a connection object, so
 #             there is no handler to answer 503 politely. Not connection-count exhaustion: nothing
-#             here caps concurrent clients.
+#             here capped concurrent clients before v0.3.1; the server now caps in-flight requests at 5 (GatedWebServer).
 empties = sum(1 for r in outcomes for o in r if o.startswith('200 0'))
 aborted = sum(1 for r in outcomes for o in r if o.startswith('000'))
 check('E at most 2 refusals per round (empty 200 or aborted connection; known limit, firmware/README.md)',
