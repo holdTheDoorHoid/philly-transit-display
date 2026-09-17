@@ -339,31 +339,14 @@ bool isSeptaErrorBody(const std::vector<uint8_t> &b) {
 }
 
 // Minutes until the earliest upcoming "DateCalender" in a BusSchedules body, or -1 if none
-// parsed. A cheap scan over the raw JSON (the entries are ~90 bytes each and there are at most a
-// dozen) so the fetch layer can judge SEPTA's service day per backend and steer the sticky
-// cookie before transit_core ever parses the body. Mirrors fetchPlausibleSchedule()'s test.
+// parsed. The scan itself is transit_core's (septa.h firstUpcomingScheduleTime) and runs over the
+// body vector IN PLACE. It used to start with `std::string text(body.begin(), body.end())` - a
+// second full copy of a body capped at 4 KB, i.e. a second contiguous block of up to 4 KB asked
+// for while the GTFS-RT entity buffer, the retention buffer and the body itself were all still
+// live (audit_runtime SS3 #12, ranked recommendation 7) - plus two small strings per entry.
 long firstUpcomingMinutes(const std::vector<uint8_t> &body) {
-  static const char kKey[] = "\"DateCalender\":\"";
-  const size_t klen = sizeof(kKey) - 1;
   transit::Epoch now = (transit::Epoch)time(nullptr);
-  transit::Epoch best = 0;
-  std::string text(body.begin(), body.end());
-  size_t pos = 0;
-  while ((pos = text.find(kKey, pos)) != std::string::npos) {
-    pos += klen;
-    size_t end = text.find('"', pos);
-    if (end == std::string::npos) break;
-    std::string raw = text.substr(pos, end - pos);
-    std::string unescaped;
-    for (size_t i = 0; i < raw.size(); ++i) {
-      if (raw[i] == '\\' && i + 1 < raw.size() && raw[i + 1] == '/') continue;  // "09\/15\/26"
-      unescaped.push_back(raw[i]);
-    }
-    bool ok = false;
-    transit::Epoch t = transit::parseBusScheduleTime(unescaped, &ok);
-    if (ok && t >= now - 60 && (best == 0 || t < best)) best = t;
-    pos = end;
-  }
+  transit::Epoch best = transit::firstUpcomingScheduleTime(body.data(), body.size(), now);
   if (best == 0) return -1;
   return (long)((best - now) / 60);
 }

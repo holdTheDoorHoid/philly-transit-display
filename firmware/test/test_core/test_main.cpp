@@ -55,6 +55,10 @@ void test_parse_transitview_caps_vehicles();
 void test_parse_transitview_truncates_long_identifiers();
 void test_parse_transitview_absurd_numbers_do_not_overflow();
 void test_rail_line_lookup_by_code_or_display_name();
+void test_first_upcoming_schedule_time_matches_the_parser();
+void test_first_upcoming_schedule_time_skips_entries_already_past();
+void test_first_upcoming_schedule_time_reads_the_wrong_service_day_fixture();
+void test_first_upcoming_schedule_time_tolerates_junk_and_truncation();
 
 // test_merge.cpp
 void test_merge_stop_joins_rt_and_tv_by_trip_id();
@@ -163,6 +167,10 @@ int main(int argc, char** argv) {
   RUN_TEST(test_parse_transitview_truncates_long_identifiers);
   RUN_TEST(test_parse_transitview_absurd_numbers_do_not_overflow);
   RUN_TEST(test_rail_line_lookup_by_code_or_display_name);
+  RUN_TEST(test_first_upcoming_schedule_time_matches_the_parser);
+  RUN_TEST(test_first_upcoming_schedule_time_skips_entries_already_past);
+  RUN_TEST(test_first_upcoming_schedule_time_reads_the_wrong_service_day_fixture);
+  RUN_TEST(test_first_upcoming_schedule_time_tolerates_junk_and_truncation);
 
   RUN_TEST(test_merge_stop_joins_rt_and_tv_by_trip_id);
   RUN_TEST(test_merge_stop_drops_stale_arrivals);

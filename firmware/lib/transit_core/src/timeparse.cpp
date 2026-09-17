@@ -114,8 +114,16 @@ Epoch localToEpoch(int year, int month, int day, int hour, int minute, int secon
 // Hand-rolled rather than sscanf(): newlib's scanf family costs ~15 KB of flash on the ESP32 and
 // these are the only callers in the firmware.
 Epoch parseBusScheduleTime(const std::string& s, bool* ok) {
+  return parseBusScheduleTime(s.c_str(), ok);
+}
+
+Epoch parseBusScheduleTime(const char* s, bool* ok) {
+  if (s == nullptr) {
+    if (ok) *ok = false;
+    return 0;
+  }
   int mm = 0, dd = 0, yy = 0, hh = 0, mi = 0;
-  const char* p = s.c_str();
+  const char* p = s;
   skipSpaces(p);
   bool good = readInt(p, mm, 2) && expect(p, '/') && readInt(p, dd, 2) && expect(p, '/') && readInt(p, yy, 4);
   if (good) {

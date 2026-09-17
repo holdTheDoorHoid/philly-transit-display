@@ -126,6 +126,20 @@ ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len);
 // match.
 ParseResult<SchedEntry> parseBusSchedules(const uint8_t* data, size_t len);
 
+// The earliest still-upcoming `DateCalender` in a RAW BusSchedules body, as epoch seconds, or 0
+// if the body carries none that parse. "Still upcoming" is `>= now - 60`, the same one-minute
+// grace fetchPlausibleSchedule() uses, so the two agree about which trip is first.
+//
+// This is a byte scan over the response exactly as it arrived: no JsonDocument, no copy of the
+// body, and no std::string per entry (the value is unescaped into a stack buffer - SEPTA sends
+// "09\/15\/26 12:32 am"). It exists because the firmware has to judge SEPTA's service day at the
+// TRANSPORT layer, before transit_core parses anything: only that layer sees which backend
+// answered, and only a fresh connection without the sticky cookie can land on a different one
+// (NOTES.md 9). The app-side version of this made `std::string text(body.begin(), body.end())` -
+// a second full copy of a body that is capped at 4 KB, asked for as one contiguous block while
+// the GTFS-RT entity and retention buffers were still live (audit_runtime SS3 #12).
+Epoch firstUpcomingScheduleTime(const uint8_t* data, size_t len, Epoch now);
+
 // Parses an Alerts response: a JSON array of per-route alert objects (possibly empty - SEPTA
 // also silently returns `[]` for a syntactically-valid-but-wrong `routes=` value, which is
 // indistinguishable from "no current alerts"; see NOTES.md). `Alert::text` prefers the `advisory`
