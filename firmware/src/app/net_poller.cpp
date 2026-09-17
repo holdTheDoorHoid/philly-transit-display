@@ -204,7 +204,7 @@ uint32_t strHeapBytes(const std::string &s) {
 }
 
 // ---- BusSchedules cache (DESIGN.md SS4.7: "cached 10 min", "also on config change") ----------
-// At most kMaxStops (8, config_store.h) distinct stop_ids, matching the config's own cap; a
+// At most kMaxStops (4, config_store.h) distinct stop_ids, matching the config's own cap; a
 // linear scan over <=8 entries is cheaper than a map for this size.
 class AppScheduleCache : public transit::ScheduleCache {
  public:
@@ -773,7 +773,7 @@ void logBikeSamples(const Config &cfg, time_t now, const std::string &month) {
 // One long-lived ArrivalTracker across the device's uptime (DESIGN.md SS9.1); registerStop() is
 // idempotent so it's safe to re-run on every config change. Heap-allocated on first use rather
 // than a plain global/static instance: ArrivalTracker's own header doc puts sizeof(ArrivalTracker)
-// at ~8 KB on the target (kMaxTrackedStops * StopState, each holding a kMaxTrackedTripsPerStop
+// at 4,232 B on the target (kMaxTrackedStops * StopState = 4 x 1,056 B, each holding a kMaxTrackedTripsPerStop
 // array; it was ~12 KB before the slot count dropped from 12 to 8 in 0.3.1), which
 // is fine for the heap (~200KB free at boot per firmware/README.md) but overflows the ESP32's
 // fixed static .bss/.data budget if declared as a file-scope object - confirmed by hitting

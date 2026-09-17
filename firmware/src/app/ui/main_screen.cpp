@@ -348,8 +348,10 @@ lv_obj_t *createMainScreen(const Config &cfg) {
   }
   lv_label_set_text(ctx->ticker_label, "");
 
-  // LVGL pool guard (ui.cpp's "LVGL pool safety" note, DESIGN.md SS8). DESIGN.md SS6 allows eight
-  // stops (config_store.h kMaxStops) and eight of these panels do not fit LVGL's 36 KB pool: on
+  // LVGL pool guard (ui.cpp's "LVGL pool safety" note, DESIGN.md SS8). DESIGN.md SS6 allows four
+  // stops since 0.3.2-rc2 (config_store.h kMaxStops), which is the number this pool can draw - the
+  // cap was lowered from eight partly BECAUSE of this guard. It stays, because the fit is still
+  // marginal and a config may still ask for more panels than the pool has room for: on
   // cyd-3248S035R a three-row panel measured ~6.2 KB and the whole four-stop arrivals page 31,656 B
   // of a 36,864 B pool, so the fifth stop is already over. This page is the FIRST thing built, at
   // boot, before anything has measured what it costs, so ui.cpp's remembered-cost check has nothing

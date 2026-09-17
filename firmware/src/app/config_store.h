@@ -17,7 +17,20 @@ constexpr const char *kConfigPath = "/config.json";
 // /config.json. loadConfig() falls back to .prev when /config.json is missing or unreadable.
 constexpr const char *kConfigTmpPath = "/config.json.tmp";
 constexpr const char *kConfigPrevPath = "/config.prev.json";
-constexpr size_t kMaxStops = 8;  // DESIGN.md SS6: "Maximum 8 stops."
+// FOUR since 0.3.2-rc2, and it is a product decision that happens to be the memory decision too.
+//
+// The owner's answer to "how many stops does this display show" is four, and the hardware has been
+// saying the same thing for a while: LVGL's 36 KB pool fits a four-stop arrivals page at 31,656 B
+// and refuses the fifth panel (main_screen.cpp's guard exists for exactly that), which is why the
+// pool sweep in 0.3.1 kept the pool at 36 KB rather than trimming it. Making the cap match what the
+// screen can actually draw turns a run-time refusal into a save-time error with a clear message,
+// and it lets everything sized off this number shrink with it - kMaxTrackedStops above all
+// (transit_stats/tracker.h), which is 1,056 B of heap per slot and gives back 4,224 B.
+//
+// It is a REDUCTION of a documented limit, so it is stated plainly: a saved config with five to
+// eight stops is refused by validateConfig() on load and the device falls back to /config.prev.json
+// or the default. No device is known to have more than two.
+constexpr size_t kMaxStops = 4;  // DESIGN.md SS6: "Maximum 4 stops."
 
 // Board build flag (firmware/boards/*.json): whether this board's panel shows correct colours
 // only with the controller's inversion command on. Off for every vendored board (the owner's

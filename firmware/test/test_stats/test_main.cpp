@@ -552,17 +552,21 @@ static void test_tracker_memory_bound_eviction(void) {
   {
     ArrivalTracker tracker;
     std::vector<LogEvent> out;
-    for (int i = 1; i <= 9; i++) {  // one more than kMaxTrackedStops (8)
+    // Written against kMaxTrackedStops rather than a literal, so it holds at whatever the cap is -
+    // it was 8 until 0.3.2-rc2 and is 4 now, and a test that hard-codes the number is a test that
+    // stops testing the thing the moment the number moves.
+    const int over = (int)transit_stats::kMaxTrackedStops + 1;
+    for (int i = 1; i <= over; i++) {  // one more than kMaxTrackedStops
       transit::StopSnapshot snap;
       snap.key = "K" + std::to_string(i);
       tracker.observe(snap, 7000000000 + i, true, true, out);
     }
-    TEST_ASSERT_EQUAL_UINT8(8, tracker.trackedStopCount());
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)transit_stats::kMaxTrackedStops, tracker.trackedStopCount());
     TEST_ASSERT_TRUE(tracker.evictedStopCount() >= 1);
 
     StopCounters ctr;
     TEST_ASSERT_FALSE(tracker.getStopCounters("K1", ctr));  // least-recently-touched, evicted
-    TEST_ASSERT_TRUE(tracker.getStopCounters("K9", ctr));   // most recent, retained
+    TEST_ASSERT_TRUE(tracker.getStopCounters("K" + std::to_string(over), ctr));  // most recent, retained
   }
 }
 

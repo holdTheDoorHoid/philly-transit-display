@@ -1107,16 +1107,22 @@ function stopTitlePreview(s) {
   return `${s.label || s.route || ''} → ${s.headsign || ''}`;
 }
 
+// The stop cap, in one place. Four since 0.3.2-rc2: it is the owner's product decision and also
+// what the display's LVGL pool can actually draw (a fifth panel does not fit), and the firmware
+// refuses a save with more - so this must agree with config_store.h's kMaxStops or the form would
+// let someone build a config the device rejects.
+const MAX_STOPS = 4;
+
 function drawStopList() {
   const card = h('div', { class: 'card' });
   card.append(h('div', { class: 'row between' },
-    h('h2', {}, `Configured stops (${liveConfig.stops.length}/8)`),
+    h('h2', {}, `Configured stops (${liveConfig.stops.length}/${MAX_STOPS})`),
     h('button', {
-      class: 'primary', disabled: liveConfig.stops.length >= 8,
+      class: 'primary', disabled: liveConfig.stops.length >= MAX_STOPS,
       onclick: () => { wizard = { step: 'mode' }; drawStops(); },
     }, '+ Add stop')));
-  if (liveConfig.stops.length >= 8) {
-    card.append(h('p', { class: 'small muted' }, 'Maximum of 8 stops reached. Remove one to add another.'));
+  if (liveConfig.stops.length >= MAX_STOPS) {
+    card.append(h('p', { class: 'small muted' }, `This display shows up to ${MAX_STOPS} stops, and that is how many you have. Remove one to add another.`));
   }
   const list = h('div', {});
   liveConfig.stops.forEach((s, i) => {
@@ -2235,7 +2241,7 @@ function buildOverviewTable(data, stopsCfg, selectedStop, onSelect) {
     card.append(hint(`${totalSamples} arrival${totalSamples === 1 ? '' : 's'} across all stops in this window.${inf}`));
   }
   // The log keeps rows for stops that are no longer configured; the aggregator has fixed
-  // room for 8 stops and 3 stations and drops the rest rather than evicting a live one.
+  // room for 4 stops and 3 stations and drops the rest rather than evicting a live one.
   // Say so, so a missing row does not read as missing data.
   const exStops = Number(data.excluded_stops) || 0;
   const exBikes = Number(data.excluded_bikes) || 0;
