@@ -907,6 +907,13 @@ extern "C" {
 #define LV_USE_IMGFONT 0
 
 /*1: Enable an observer pattern implementation*/
+/* Keep this at 0 unless something actually needs it, and not only for the flash: lv_observer.c is
+ * the LAST caller of the deprecated lv_obj_add_flag()/lv_obj_remove_flag() anywhere in this image
+ * (lv_observer.c:1374,1377). Those emit LV_LOG_DEPRECATED at runtime - LV_LOG_WARN_ONCE, i.e. one
+ * "[Warn] ... Deprecated" serial line per call site - and the device suite's
+ * "Z serial: no LVGL warnings" check counts exactly those lines. Our own call sites were all moved
+ * to the dedicated lv_obj_set_<flag>()/lv_obj_is_<flag>() API in 0.3.1-rc3; turning the observer on
+ * would put two of them back. */
 #define LV_USE_OBSERVER 0
 
 /*1: Enable Pinyin input method*/

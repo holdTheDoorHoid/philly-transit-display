@@ -13,6 +13,46 @@ namespace transit_app::ui {
 // Selects the palette every colour*() below returns: "dark", or anything else for the light
 // default (config.device.theme, DESIGN.md SS6). Screens pick colours up when they are built, so
 // ui.cpp calls this before the first page build and again from rebuildScreens().
+// ---- LVGL flag API compatibility (0.3.1-rc3) -------------------------------------------------
+//
+// LVGL 9.6 deprecated lv_obj_add_flag()/lv_obj_remove_flag()/lv_obj_has_flag() in favour of
+// per-flag setters and getters. The deprecation is not only a compile warning: each of those
+// functions calls LV_LOG_DEPRECATED, which is LV_LOG_WARN_ONCE, so every call site that runs emits
+// a "[Warn] ... Deprecated" line on the serial console - and the device suite's
+// "Z serial: no LVGL warnings" check counts exactly those lines (it saw twelve: four per function,
+// one per distinct call site reached).
+//
+// So every call site here uses the new API. The shim exists because the two build families resolve
+// DIFFERENT LVGL versions - the board envs take `lvgl/lvgl@^9.2.2`, which currently resolves to
+// 9.6.0, while the host screenshot simulator pins 9.5.0 exactly (platformio.ini) - and the new
+// names do not exist in 9.5. Rather than move either pin (the sim's pool sweep is calibrated
+// against measurements taken on the board, so changing its LVGL is not a free edit), the older
+// version gets inline wrappers with the same names. They compile to the identical calls the code
+// used before, warnings and all - which is correct, because on 9.5 there is nothing to warn about.
+//
+// Worth knowing, and reported rather than fixed here: the simulator therefore renders against a
+// different LVGL than the firmware runs. That predates this change and is a question for whoever
+// next re-fits sim/sim_main.cpp's kHostToBoard.
+#if LVGL_VERSION_MAJOR > 9 || (LVGL_VERSION_MAJOR == 9 && LVGL_VERSION_MINOR >= 6)
+// The dedicated API is present; nothing to do.
+#else
+static inline void lv_obj_set_hidden(lv_obj_t *obj, bool en) {
+  if (en) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+  else lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+}
+static inline bool lv_obj_is_hidden(const lv_obj_t *obj) {
+  return lv_obj_has_flag(const_cast<lv_obj_t *>(obj), LV_OBJ_FLAG_HIDDEN);
+}
+static inline void lv_obj_set_clickable(lv_obj_t *obj, bool en) {
+  if (en) lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+  else lv_obj_remove_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+}
+static inline void lv_obj_set_scrollable(lv_obj_t *obj, bool en) {
+  if (en) lv_obj_add_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+  else lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+}
+#endif
+
 void setTheme(const std::string &name);
 
 lv_color_t colorBg();
