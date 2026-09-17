@@ -13,10 +13,13 @@
 #include <cstdlib>  // strtoul() for the heap-trace query params (diag branch)
 #include <cstring>
 #include <ctime>
+#include <array>
+#include <atomic>
 #include <memory>
 #include <new>
 
 #include "auth.h"
+#include "admission.h"
 #include "config_store.h"
 #include "cpu_yield.h"  // cpuStretchMsMax() for /api/debug/ui (DESIGN.md SS12.1)
 #include "cxx_exception_pool.h"
@@ -67,7 +70,111 @@ namespace transit_app {
 
 namespace {
 
-AsyncWebServer g_server(80);
+// ---- Admission control at accept time (admission.h, DESIGN.md SS12.1) -------------------------
+//
+// The fourth uncatchable-OOM instance: the library assembles a response's header list LATER, from
+// inside _parseLine, on a frame with no handler of ours above it, so neither the 1 KB reserve nor
+// oom_reply.h's nested try/catch can reach the allocation that crashed the device suite's section E
+// burst. admission.h has the backtrace and the arithmetic. The only lever left is to refuse the
+// connection before ANYTHING is built for it.
+//
+// HOW IN-FLIGHT REQUESTS ARE COUNTED, and why it is weak_ptrs rather than a counter. The obvious
+// design - increment at accept, decrement on disconnect - has nowhere to put the decrement:
+// AsyncWebServerRequest's constructor overwrites every AsyncClient callback, and the one user hook
+// the library offers, request->onDisconnect(), is a SINGLE slot that three call sites in this
+// firmware already own (the proxy file lease, the OTA guard and the log-download lease). Taking it
+// would break them; chaining would need a per-request registry.
+//
+// AsyncWebServerRequest::create() hands back a shared_ptr whose control block IS the request's
+// lifetime - _onDisconnect() drops the self-reference and the object destructs. A weak_ptr to it
+// therefore expires exactly when the request is gone, needs no hook, collides with nothing, and
+// costs no allocation to copy or test. Sweeping the array is the count.
+//
+// TASK SAFETY: every touch of g_in_flight_slots happens on the AsyncTCP task (the accept callback
+// and HostGuardHandler::canHandle), so the array needs no lock. g_in_flight_count is the atomic
+// snapshot the poller task reads for its job gate; it can be a few milliseconds stale, which for a
+// gate that only has to say "is a burst happening" is fine.
+std::array<std::weak_ptr<AsyncWebServerRequest>, kMaxInFlightRequests + 3> g_in_flight_slots;
+std::atomic<uint32_t> g_in_flight_count{0};
+std::atomic<uint32_t> g_admission_refusals{0};
+
+// Drops expired slots and returns how many requests are alive. AsyncTCP task only. Allocates
+// nothing and cannot throw: weak_ptr::expired() and reset() only touch an existing control block.
+uint32_t sweepInFlight() {
+  uint32_t live = 0;
+  for (auto &slot : g_in_flight_slots) {
+    if (slot.expired()) {
+      slot.reset();
+    } else {
+      ++live;
+    }
+  }
+  g_in_flight_count.store(live, std::memory_order_relaxed);
+  return live;
+}
+
+// Records a newly admitted request in the first free slot. The array is larger than the cap, so
+// after a successful admission there is always one; if there somehow is not, the request still
+// runs - it is simply not counted, which errs toward serving rather than refusing.
+void rememberInFlight(const std::shared_ptr<AsyncWebServerRequest> &r) {
+  for (auto &slot : g_in_flight_slots) {
+    if (slot.expired()) {
+      slot = r;
+      g_in_flight_count.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+// AsyncWebServer with the accept path replaced. `_server` is protected in the library, so a
+// subclass can re-register the AsyncServer's onClient callback; the base constructor installs the
+// library's version first and this one replaces it. The body below is the library's own
+// (WebServer.cpp's constructor), with the admission check in front of it and a try/catch around
+// it - the library's version has neither, and a throw on this task is std::terminate.
+class GatedWebServer : public AsyncWebServer {
+ public:
+  explicit GatedWebServer(uint16_t port) : AsyncWebServer(port) {
+    _server.onClient(
+      [](void *s, AsyncClient *c) {
+        if (c == nullptr) return;
+        try {
+          const uint32_t live = sweepInFlight();
+          if (!admitConnection(live, heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                                heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))) {
+            // Zero allocations on this path, which is the entire point: no request, no response,
+            // no header list, no send buffer. The client sees a closed connection, which the web
+            // app's resilientRead() already treats as retryable (DESIGN.md SS10.2) and the device
+            // suite counts against its refusal budget alongside the empty-200 shape.
+            g_admission_refusals.fetch_add(1, std::memory_order_relaxed);
+            c->abort();
+            delete c;
+            return;
+          }
+          c->setRxTimeout(3);  // the library's own value
+          std::shared_ptr<AsyncWebServerRequest> r =
+            AsyncWebServerRequest::create(static_cast<AsyncWebServer *>(s), c);
+          if (!r) {
+            c->abort();
+            delete c;
+            return;
+          }
+          rememberInFlight(r);
+        } catch (const std::bad_alloc &) {
+          // create() allocates with nothrow, but the request's constructor builds Strings and
+          // std::functions. The library runs this callback with no catch above it anywhere, so
+          // without this a throw here is std::terminate - the same shape as everything else in
+          // DESIGN.md SS12.1's list.
+          g_admission_refusals.fetch_add(1, std::memory_order_relaxed);
+          c->abort();
+          delete c;
+        }
+      },
+      this
+    );
+  }
+};
+
+GatedWebServer g_server(80);
 
 const char *statusToString(Status s) {
   switch (s) {
@@ -1321,6 +1428,11 @@ class HostGuardHandler : public AsyncWebHandler {
     // overwhelmingly a bad_alloc, i.e. exactly when the heap is gone. Pay it here, on request
     // number one, while the heap is healthy. One pthread_getspecific per request thereafter.
     transit_app::warmExceptionGlobals("async_tcp");
+    // Refresh the in-flight count here as well as at accept. Requests finish between connections,
+    // and this is the only other place that runs on the AsyncTCP task for every request - without
+    // it the poller's job gate would read a count that only ever moved when a NEW connection
+    // arrived. Allocates nothing (admission control, above).
+    sweepInFlight();
     // Claims the request only when the Host is NOT one of ours, so the real routes are reached
     // exactly as before. hostAllowed() allocates nothing and cannot throw (host_match.h), which is
     // what makes it safe to call from here: an exception escaping canHandle() would unwind into
@@ -1457,6 +1569,13 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     // which is what says whether libbt's 4,464 B really joined the heap.
     doc["bt_release_rc"] = bluetoothReleaseRc();
     doc["bt_release_gain_bytes"] = bluetoothReleaseGainBytes();
+    // Admission control (admission.h). `in_flight` is how many AsyncWebServerRequest objects are
+    // alive; `admission_refusals` counts connections closed at accept because the cap or a heap
+    // floor said no. A refusal is a working defence, not a fault - but a number that climbs while
+    // nobody is bursting means a floor is too high or the sweep is not seeing completions.
+    doc["in_flight_requests"] = inFlightRequests();
+    doc["admission_refusals"] = admissionRefusals();
+    doc["max_in_flight_requests"] = (uint32_t)kMaxInFlightRequests;
     // Bytes of stack each task has never gone below. Rules a stack that has quietly eaten into the
     // heap in or out before any of the heap numbers are interpreted.
     JsonObject hwm = doc["stack_hwm"].to<JsonObject>();
@@ -1568,5 +1687,9 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
 }
 
 bool otaBusy() { return g_ota.busy; }
+
+uint32_t inFlightRequests() { return g_in_flight_count.load(std::memory_order_relaxed); }
+
+uint32_t admissionRefusals() { return g_admission_refusals.load(std::memory_order_relaxed); }
 
 }  // namespace transit_app
