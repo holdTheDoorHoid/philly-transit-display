@@ -134,7 +134,16 @@
  * and can't be drawn in chunks. */
 
 /*The target buffer size for simple layer chunks.*/
-#define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (24 * 1024)   /*[bytes]*/
+/* 8 KB, not LVGL's default 24 KB (0.3.1). This is the size LVGL ASKS lv_malloc() for when it has
+ * to buffer a widget into a simple layer, and it comes out of LV_MEM_SIZE - which is 36 KB in
+ * total and, with a four-stop arrivals page up, has single-digit kilobytes free (firmware/sim's
+ * pool sweep: `pio run -e ui-sim-pool && .pio/build/ui-sim-pool/program /tmp/x pool`). A 24 KB
+ * request out of that pool can never succeed, so the number was not a target, it was a guaranteed
+ * failure that LVGL then retried in smaller chunks. 8 KB is 2,048 RGB565 pixels - six full rows of
+ * a 320-wide panel - which is a real chunk, and it can actually be had. No static RAM either way:
+ * the buffer is allocated on demand, only for a widget with style_opa < 255 or a non-normal blend
+ * mode, and freed again. */
+#define LV_DRAW_LAYER_SIMPLE_BUF_SIZE    (8 * 1024)   /*[bytes]*/
 
 #define LV_USE_DRAW_SW 1
 /* Blend targets this project never draws into (no images, no layers in these formats): each

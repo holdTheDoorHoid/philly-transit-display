@@ -224,9 +224,9 @@ before `ui::init()` has built the three real ones and the device reboots out of 
 way - do not move the QR anywhere that coexists with the arrivals page. Static RAM the heap no
 longer gets, so three other things were shrunk the same day to keep ~75-80 KB of heap free at
 runtime with a 40+ KB largest block: the arrival tracker keeps 8 trips per stop instead of 12
-(`transit_stats/tracker.h`, ~5 KB), the 3.5" draw buffer is 1/20 of the screen instead of 1/16
-(board JSON, ~4 KB), and the UI caches the visible-stop list per build instead of copying the
-stop vector several times a second.
+(`transit_stats/tracker.h`, ~4 KB), the 3.5" draw buffer is 1/20 of the screen instead of 1/16
+(board JSON, ~4 KB - and 1/30 since 0.3.1, another 5 KB), and the UI caches the visible-stop list
+per build instead of copying the stop vector several times a second.
 
 Concurrency limit: the async web server handles one request at a time but queues the responses,
 and with this little heap the fourth of four *simultaneous* `/api/state` requests can go out as
@@ -344,9 +344,9 @@ Rules that fell out of this, all learned the hard way (each one was a boot loop 
   (`acquireLogReader()` in `sd_logger.h`) and a second concurrent one is refused with a 503.
 - Nothing on the LVGL task touches SD or the network. The stats page's `getStopSummary()` returns
   a cached value plus its age; the poller recomputes one stop per idle slice.
-- LVGL's static pool is 36 KB (`LV_MEM_SIZE`); the draw buffer is 1/20 of the screen in RGB565 on
-  the 3.5" boards (`LVGL_BUFFER_PIXELS` in `boards/*.json`). The `[lvmem]` lines show pool usage —
-  at boot, and one per page built.
+- LVGL's static pool is 36 KB (`LV_MEM_SIZE`) and stays there — see `boards/README.md`; the draw
+  buffer is 1/30 of the screen in RGB565 on the 3.5" boards (`LVGL_BUFFER_PIXELS` in
+  `boards/*.json`). The `[lvmem]` lines show pool usage — at boot, and one per page built.
 - **One page is resident at a time** (DESIGN.md §8). LVGL 9.5 does not survive running that pool
   out: `lv_obj_class.c` writes each new child straight after an unchecked `lv_realloc()`. So every
   page transition frees the page it is leaving before it builds the next one, the night page
