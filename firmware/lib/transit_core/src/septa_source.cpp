@@ -259,7 +259,15 @@ FetchOutcome SeptaSource::fetchTransitViewAppendEx(const std::string& route,
   // Relevant vehicles that did not fit kMaxTvVehicles. Accumulated since boot rather than per
   // cycle, because the question it answers - "is 16 slots enough for this config?" - is not a
   // question about one cycle.
-  if (buffers_ != nullptr && parsed.dropped > 0) buffers_->tv_dropped += parsed.dropped;
+  //
+  // ONLY WHEN A FILTER IS INSTALLED, and this is not a detail. The one caller that brings no
+  // filter is the firmware's route-liveness refresh (net_poller.cpp refreshRouteLiveness), which
+  // fetches a whole route's fleet for the single question `!tv.empty()`. A rush-hour Route 17
+  // carries 20-30 vehicles, so an unfiltered fetch overflows a 16-slot cap by design and counting
+  // it would make tv_dropped climb on every liveness refresh - reading "the cap is too small"
+  // when nothing anybody wanted was lost. The metric means "a vehicle a configured stop could
+  // have used did not fit", and that only has a meaning on a filtered call.
+  if (buffers_ != nullptr && filter.active() && parsed.dropped > 0) buffers_->tv_dropped += parsed.dropped;
 
   FetchOutcome o;
   o.transport = t;

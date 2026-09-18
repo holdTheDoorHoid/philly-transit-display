@@ -866,6 +866,76 @@ void test_poll_buffers_keep_the_typed_blocks_across_cycles() {
   TEST_ASSERT_EQUAL_size_t(retained_cap, buf.retained.capacity());
 }
 
+namespace {
+
+// A TransitView body with `n` vehicles, trips "0".."n-1", and an HttpGetEx that replays it for any
+// URL. Built inline rather than as a fixture because the point is the CAP, and no captured SEPTA
+// response is big enough to reach it.
+std::string makeTvBody(size_t n) {
+  std::string body = "{\"bus\":[";
+  for (size_t i = 0; i < n; ++i) {
+    if (i) body += ",";
+    body += "{\"trip\":\"" + std::to_string(i) + "\",\"VehicleID\":\"v\",\"late\":0}";
+  }
+  body += "]}";
+  return body;
+}
+
+bool keepListedTrip(const std::string& trip, const void* ctx) {
+  const auto* wanted = static_cast<const std::vector<std::string>*>(ctx);
+  for (const auto& t : *wanted) {
+    if (t == trip) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+// tv_dropped MEANS "a vehicle a configured stop could have used did not fit" - and that only has a
+// meaning on a filtered fetch. The one caller that brings no filter is the firmware's route
+// liveness refresh (net_poller.cpp), which pulls a whole route's fleet to answer `!tv.empty()`; a
+// rush-hour Route 17 overflows a 16-slot cap on that path by design, and counting it would make
+// tv_dropped climb on every refresh while nothing anybody wanted was lost.
+void test_tv_dropped_counts_relevant_vehicles_only() {
+  const std::string body = makeTvBody(40);
+  HttpGetEx http = adaptHttpGet([body](const std::string&,
+                                        std::function<bool(const uint8_t*, size_t)> onData) -> int {
+    onData(reinterpret_cast<const uint8_t*>(body.data()), body.size());
+    return 200;
+  });
+
+  PollBuffers buf;
+  buf.reserveAll();
+  SeptaSource src(&buf);
+
+  // Unfiltered - the liveness path. The cap bites (24 over) and NOTHING is counted.
+  std::vector<TvVehicle> out;
+  FetchOutcome o = src.fetchTransitViewAppendEx("17", &out, http);
+  TEST_ASSERT_TRUE(o.ok);
+  TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(kMaxTvVehicles),
+                            static_cast<uint32_t>(out.size()));
+  TEST_ASSERT_EQUAL_UINT32(0, buf.tv_dropped);
+
+  // Filtered, wanting 20 of the 40. Sixteen fit; the four that did not ARE counted, because those
+  // four are vehicles a configured stop's realtime updates named.
+  std::vector<std::string> wanted;
+  for (size_t i = 0; i < 40; i += 2) wanted.push_back(std::to_string(i));
+  out.clear();
+  o = src.fetchTransitViewAppendEx("17", &out, http, TvFilter(&keepListedTrip, &wanted));
+  TEST_ASSERT_TRUE(o.ok);
+  TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(kMaxTvVehicles),
+                            static_cast<uint32_t>(out.size()));
+  TEST_ASSERT_EQUAL_UINT32(20 - static_cast<uint32_t>(kMaxTvVehicles), buf.tv_dropped);
+
+  // ...and a filtered fetch that fits adds nothing, which is the state the owner's config is in.
+  std::vector<std::string> few{"1", "3", "5"};
+  out.clear();
+  o = src.fetchTransitViewAppendEx("17", &out, http, TvFilter(&keepListedTrip, &few));
+  TEST_ASSERT_TRUE(o.ok);
+  TEST_ASSERT_EQUAL_UINT32(3, static_cast<uint32_t>(out.size()));
+  TEST_ASSERT_EQUAL_UINT32(20 - static_cast<uint32_t>(kMaxTvVehicles), buf.tv_dropped);  // unchanged
+}
+
 void test_poll_buffers_size_retention_from_the_config() {
   // 8 slots per configured (stop, route) pair, not the stream's 32-slot default cap: that is what
   // makes the block 2.4 KB on the owner's two-stop config instead of 4.9 KB. Growth only.

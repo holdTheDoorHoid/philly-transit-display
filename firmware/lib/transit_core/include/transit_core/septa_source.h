@@ -141,7 +141,9 @@ struct PollBuffers {
   // GET /api/debug/ui. It should stay at zero: 16 slots is twice what the owner's two-stop
   // config can retain realtime updates for. A number that moves is this cap biting on a real
   // config and is the signal to raise kMaxTvVehicles - which is why the count exists rather than
-  // the cap simply being generous.
+  // the cap simply being generous. Only FILTERED fetches contribute: an unfiltered one (the
+  // route-liveness refresh) overflows the cap on any busy route by design, and counting that
+  // would drown the signal.
   uint32_t tv_dropped = 0;
 
   static constexpr size_t kScratchReserve = 6144;
@@ -255,7 +257,9 @@ class SeptaSource : public TransitSource {
   //
   // `filter` (septa.h TvFilter) decides which vehicles are built at all; the default keeps every
   // one, which is what refreshRouteLiveness() and the host tests want. When a PollBuffers is
-  // attached, relevant vehicles that did not fit the cap are added to PollBuffers::tv_dropped.
+  // attached AND a filter is installed, relevant vehicles that did not fit the cap are added to
+  // PollBuffers::tv_dropped; an unfiltered call never adds to it, because on such a call the cap
+  // says nothing about relevance (see the .cpp).
   FetchOutcome fetchTransitViewAppendEx(const std::string& route, std::vector<TvVehicle>* out,
                                          HttpGetEx http, const TvFilter& filter = TvFilter());
   FetchOutcome fetchRailArrivalsEx(const std::string& station, std::vector<RailArrival>* out,
