@@ -629,14 +629,25 @@ void tick() {
   //
   // activeConfigPtr() takes its lock under the zero-tick rule on this task and keeps a LastGood of
   // the pointer (ui_lock.h, config_store.cpp). A miss returns the pointer we are already holding,
-  // so `next != g_cfg_ptr` is false, `g_pending` stays set, and the save lands on the next tick a
-  // second later. That is the same "a miss costs one frame" contract every other accessor has -
-  // and it is why the comparison is against the POINTER and not against a flag the lock might not
-  // have let us clear.
+  // so `next != g_cfg_ptr` is false and the flag is put back for the next tick. That is the same
+  // "a miss costs one frame" contract every other accessor has - and it is why the test is on the
+  // POINTER and not on whether the call succeeded, which a miss makes indistinguishable.
+  //
+  // THE FLAG IS CLEARED BEFORE THE READ, NOT AFTER, and the order is the whole correctness of the
+  // handover. Clearing afterwards loses a save to this interleaving: this task reads the pointer
+  // (still A), the web task then publishes B and sets the flag, and this task then clears it -
+  // leaving the store on B, the screens on A, and nothing to say so until the next save. Clearing
+  // first inverts that: a publish landing any time after the clear re-arms the flag, and the worst
+  // case is one redundant read next tick.
   if (g_pending) {
+    g_pending = false;
     std::shared_ptr<const Config> next = activeConfigPtr();
-    if (next && next != g_cfg_ptr) {
-      g_pending = false;
+    if (!next || next == g_cfg_ptr) {
+      // A lock miss, almost always - config_store publishes a fresh pointer on every save, so
+      // "unchanged" here means the read did not get through. Look again next tick; uiLockMisses()
+      // on GET /api/debug/ui is what says how often that happens.
+      g_pending = true;
+    } else {
       const bool rotate = next->device.rotation != cfg().device.rotation;
       const bool invert = next->device.invert_colors != cfg().device.invert_colors;
       // The outgoing Config is released by this assignment - nothing else holds it once the store
