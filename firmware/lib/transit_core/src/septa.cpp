@@ -234,7 +234,8 @@ ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len) {
   return result;
 }
 
-void parseTransitViewAppend(ParseResult<TvVehicle>* out, const uint8_t* data, size_t len) {
+void parseTransitViewAppend(ParseResult<TvVehicle>* out, const uint8_t* data, size_t len,
+                             const TvFilter& filter) {
   ParseResult<TvVehicle>& result = *out;
   // Reset the verdict fields but NOT items: this appends (see the header). A failed parse below
   // therefore leaves whatever the caller had accumulated exactly as it was.
@@ -275,7 +276,9 @@ void parseTransitViewAppend(ParseResult<TvVehicle>* out, const uint8_t* data, si
 
   // A vehicle list has no "nearest" ordering to prefer (these are positions, not arrival times),
   // so the cap keeps the first kMaxTvVehicles in wire order and counts the rest - and since
-  // 0.3.2-rc1 it counts the caller's whole accumulated list, not just this route's share.
+  // 0.3.2-rc1 it counts the caller's whole accumulated list, not just this route's share. Since
+  // 0.3.2-rc3 the cap is 16 rather than 32, which is affordable precisely because `filter` has
+  // already removed the vehicles no configured stop can use.
   //
   // Growing from 8 by doubling was the 2026-09-15 fix for a 48-slot reserve() that bad_alloc'd
   // against a 10-20 KB largest free block. It halved the peak and did not remove it: a rush-hour
@@ -286,12 +289,21 @@ void parseTransitViewAppend(ParseResult<TvVehicle>* out, const uint8_t* data, si
   // of this library.
   if (result.items.capacity() < 8) result.items.reserve(8);
   for (JsonObjectConst v : arr) {
+    // The trip id first and on its own, because it is both the filter key and the only field a
+    // rejected vehicle costs (kMaxIdChars is 48, but a real SEPTA trip id is 3-8 characters, so
+    // this string is inside std::string's small-buffer and allocates nothing). Everything else -
+    // eight more strings - is built only for a vehicle something will actually read.
+    std::string trip = capId(jsonToString(v["trip"]));
+    // Filtered BEFORE the cap. A vehicle the merge can never look up is not "dropped": it was
+    // never wanted, and counting it would make `dropped` read as "the cap is too small" on every
+    // rush-hour route. Only a RELEVANT vehicle that did not fit is a drop (see TvFilter).
+    if (!filter.keep(trip)) continue;
     if (result.items.size() >= kMaxTvVehicles) {
       ++result.dropped;
       continue;
     }
     TvVehicle tv;
-    tv.trip = capId(jsonToString(v["trip"]));
+    tv.trip = std::move(trip);
     tv.vehicle_id = capId(jsonToString(v["VehicleID"]));
     tv.late = static_cast<int>(jsonToInt64(v["late"]));
     tv.destination = capId(jsonToString(v["destination"]));

@@ -1630,6 +1630,11 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
       doc["snapshot_bytes"] = ms.snapshot_bytes;
       doc["retained_slots"] = ms.retained_capacity;
       doc["tv_slots"] = ms.tv_capacity;
+      // Relevant vehicles the 16-slot list could not hold, since boot (septa.h kMaxTvVehicles).
+      // It should stay at zero; a number that moves is the cap biting on this config, not a
+      // rush-hour route - vehicles no configured stop can join to are never counted here because
+      // they are never built (septa.h TvFilter).
+      doc["tv_dropped"] = ms.tv_dropped;
     }
     doc["uptime_s"] = (uint32_t)(millis() / 1000);
     doc["reset_reason"] = (int)esp_reset_reason();  // 3 = SW restart, i.e. a self-heal reboot

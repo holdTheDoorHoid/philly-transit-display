@@ -1543,6 +1543,7 @@ MemorySizes getMemorySizes() {
   }
   m.retained_capacity = g_poll_buffers != nullptr ? (uint32_t)g_poll_buffers->retained.capacity() : 0;
   m.tv_capacity = g_poll_buffers != nullptr ? (uint32_t)g_poll_buffers->tv.capacity() : 0;
+  m.tv_dropped = g_poll_buffers != nullptr ? g_poll_buffers->tv_dropped : 0;
   return m;
 }
 

@@ -54,13 +54,58 @@ struct ParseResult {
 // what a transit display actually needs (the soonest arrivals - a far-future row is worthless
 // next to the next bus). Real payloads are far under these numbers, so nothing is dropped in
 // normal operation; see ParseResult::dropped when it is.
-constexpr size_t kMaxTvVehicles = 32;     // one route's tracked vehicles (real: 5-25)
+// One CYCLE's tracked vehicles that a configured stop can actually use - not one route's whole
+// fleet. 32 until 0.3.2-rc3, when the parse gained a filter (TvFilter below) that keeps only the
+// vehicles the merge will look up: a rush-hour Route 17 carries 20-30 vehicles, but the owner's
+// two stops retain at most 8 GTFS-RT updates per (stop, route) pair, so at most 16 of those
+// vehicles are ever read. 16 * 176 B = 2,816 B resident instead of 5,632 B. Vehicles past the cap
+// that DID match the filter are counted in ParseResult::dropped and reported as `tv_dropped` on
+// GET /api/debug/ui, so a config this number is too small for says so rather than going quiet.
+constexpr size_t kMaxTvVehicles = 16;     // relevant tracked vehicles per cycle (real: 2-8)
 constexpr size_t kMaxSchedEntries = 24;   // BusSchedules entries per stop, nearest kept (real: 4-12)
 constexpr size_t kMaxRailArrivals = 24;   // Arrivals trains per station, nearest kept (real: 10)
 constexpr size_t kMaxAlerts = 16;         // alert objects per route (real: 0-2)
 // Longest identifier/label string retained from any SEPTA response; longer values are truncated.
 // The real ids are 3-8 characters and the longest headsign seen is ~20 ("Lansdale/Doylestown").
 constexpr size_t kMaxIdChars = 48;
+
+// Which of a TransitView response's vehicles are worth building at all (0.3.2-rc3).
+//
+// WHAT merge.cpp ACTUALLY USES A TvVehicle FOR, which is what this filter is derived from:
+// exactly one thing. findTvByTrip() finds the vehicle whose `trip` equals a GTFS-RT
+// StopTimeUpdate's trip_id, and the caller then reads five fields off it - late, timestamp,
+// vehicle_id, destination, seats. Both call sites are inside mergeStop()'s loop over the retained
+// realtime updates, so there is no other path into the vector. A vehicle whose trip id is not in
+// those updates is never read by anything, and building it costs nine std::strings that are freed
+// unexamined at the end of the cycle.
+//
+// NOT BY DIRECTION, and that is worth saying because it is the filter one reaches for first and
+// it is wrong here: TvVehicle::direction is a compass word ("Southbound") while
+// StopConfig::direction is a GTFS direction_id ("0"/"1"). Two different id spaces, with no
+// mapping anywhere in this project, so comparing them would be a guess dressed as a filter. Nor
+// by route: TransitView is fetched per route already, so every vehicle in a response is on a
+// configured route by construction. The trip id is the join key the merge uses and it is the only
+// honest filter available.
+//
+// A plain function pointer plus a context pointer rather than a std::function, so installing a
+// filter allocates nothing at all, and the predicate is handed the trip id before the TvVehicle
+// exists - a rejected vehicle costs one scan of the retained updates and not one allocation.
+// A default-constructed TvFilter keeps everything, which is what every caller that brings its own
+// vector (host tests, refreshRouteLiveness(), any other consumer of this library) gets.
+class TvFilter {
+ public:
+  using Predicate = bool (*)(const std::string& trip, const void* ctx);
+
+  TvFilter() = default;
+  TvFilter(Predicate pred, const void* ctx) : pred_(pred), ctx_(ctx) {}
+
+  bool active() const { return pred_ != nullptr; }
+  bool keep(const std::string& trip) const { return pred_ == nullptr || pred_(trip, ctx_); }
+
+ private:
+  Predicate pred_ = nullptr;
+  const void* ctx_ = nullptr;
+};
 
 // One vehicle from TransitView/index.php?route=<route> (DESIGN.md 4.3).
 struct TvVehicle {
@@ -127,7 +172,13 @@ ParseResult<TvVehicle> parseTransitView(const uint8_t* data, size_t len);
 // 2,816 B and then 5,632 B, both contiguous, both while the entity buffer and the retention block
 // were live (DESIGN.md SS5, septa_source.h PollBuffers).
 // parseTransitView() above is this with a fresh result.
-void parseTransitViewAppend(ParseResult<TvVehicle>* out, const uint8_t* data, size_t len);
+//
+// `filter` decides which vehicles are BUILT (see TvFilter). It is applied before the cap, so
+// ParseResult::dropped counts only vehicles that were relevant and did not fit - a filtered-out
+// vehicle is not "dropped", it was never wanted. The default keeps everything, so every existing
+// caller behaves exactly as it did.
+void parseTransitViewAppend(ParseResult<TvVehicle>* out, const uint8_t* data, size_t len,
+                             const TvFilter& filter = TvFilter());
 
 // Parses a BusSchedules response: normally `{"<route>": [...], ...}` (usually one key), or
 // `{"error": "..."}` on SEPTA's well-documented transient-failure responses (DESIGN.md 4.4;

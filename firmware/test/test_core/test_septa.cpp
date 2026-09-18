@@ -222,6 +222,24 @@ ParseResult<TvVehicle> parseTvString(const std::string& s) {
   return parseTransitView(reinterpret_cast<const uint8_t*>(s.data()), s.size());
 }
 
+ParseResult<TvVehicle> parseTvString(const std::string& s, const TvFilter& filter) {
+  ParseResult<TvVehicle> r;
+  parseTransitViewAppend(&r, reinterpret_cast<const uint8_t*>(s.data()), s.size(), filter);
+  return r;
+}
+
+// A TvFilter over an explicit list of trip ids - the shape pollBusStops() builds from the
+// retained GTFS-RT updates, with the vector spelled out instead of decoded from a feed.
+bool tripIsListed(const std::string& trip, const void* ctx) {
+  const auto* wanted = static_cast<const std::vector<std::string>*>(ctx);
+  for (const auto& t : *wanted) {
+    if (t == trip) return true;
+  }
+  return false;
+}
+
+bool tripIsNeverWanted(const std::string&, const void*) { return false; }
+
 }  // namespace
 
 // A real BusSchedules answer is 4-12 entries; nothing stops it from being thousands, and an
@@ -374,4 +392,87 @@ void test_first_upcoming_schedule_time_tolerates_junk_and_truncation() {
   // SEPTA's error body carries no DateCalender at all.
   auto err = transit_test::readFixture("busschedules_error_400.json");
   TEST_ASSERT_EQUAL_INT64(0, firstUpcomingScheduleTime(err.data(), err.size(), 0));
+}
+
+// --- The TransitView trip filter (0.3.2-rc3) ---------------------------------------------------
+//
+// mergeStop() reaches a TvVehicle only through findTvByTrip(tv, u.trip_id), for a `u` drawn from
+// the retained GTFS-RT updates. So a vehicle whose trip id is not in those updates is never read,
+// and building it is nine std::strings spent on nothing. These pin the three behaviours that
+// makes safe: what it keeps, what a rejection is NOT, and how it interacts with the cap.
+
+void test_parse_transitview_filter_keeps_only_the_wanted_trips() {
+  auto body = transit_test::readFixture("transitview_17.json");
+  // The fixture carries two vehicles, trips 3667 (Southbound) and 3585 (Northbound).
+  ParseResult<TvVehicle> all = parseTransitView(body.data(), body.size());
+  TEST_ASSERT_TRUE(all.ok);
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(all.items.size()));
+
+  std::vector<std::string> wanted{"3667"};
+  ParseResult<TvVehicle> r;
+  parseTransitViewAppend(&r, body.data(), body.size(), TvFilter(&tripIsListed, &wanted));
+  TEST_ASSERT_TRUE(r.ok);
+  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(r.items.size()));
+  TEST_ASSERT_EQUAL_STRING("3667", r.items[0].trip.c_str());
+  // And the vehicle that IS kept is built whole - the filter decides membership, never content.
+  TEST_ASSERT_EQUAL_STRING("7477", r.items[0].vehicle_id.c_str());
+  TEST_ASSERT_EQUAL_INT(13, r.items[0].late);
+  TEST_ASSERT_EQUAL_STRING("20th-Johnston", r.items[0].destination.c_str());
+  TEST_ASSERT_EQUAL_STRING("EMPTY", r.items[0].seats.c_str());
+  TEST_ASSERT_EQUAL_INT64(1789352300, r.items[0].timestamp);
+}
+
+void test_parse_transitview_default_filter_keeps_every_vehicle() {
+  // The default is what refreshRouteLiveness() and every other consumer of this library gets, and
+  // it must behave exactly as the parse did before the filter existed.
+  auto body = transit_test::readFixture("transitview_17.json");
+  ParseResult<TvVehicle> r;
+  parseTransitViewAppend(&r, body.data(), body.size(), TvFilter());
+  TEST_ASSERT_TRUE(r.ok);
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(r.items.size()));
+  TEST_ASSERT_EQUAL_UINT32(0, r.dropped);
+}
+
+void test_parse_transitview_a_filtered_out_vehicle_is_not_a_drop() {
+  // THE DISTINCTION `tv_dropped` DEPENDS ON. `dropped` means "this config wanted it and the cap
+  // had no room" - the reading that says kMaxTvVehicles is too small. A vehicle no configured stop
+  // can join to was never wanted, so counting it would make `tv_dropped` report a full cap on
+  // every rush-hour route and mean nothing.
+  auto body = transit_test::readFixture("transitview_17.json");
+  ParseResult<TvVehicle> r = parseTvString(
+      std::string(reinterpret_cast<const char*>(body.data()), body.size()),
+      TvFilter(&tripIsNeverWanted, nullptr));
+  TEST_ASSERT_TRUE(r.ok);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(r.items.size()));
+  TEST_ASSERT_EQUAL_UINT32(0, r.dropped);
+}
+
+void test_parse_transitview_the_cap_counts_only_vehicles_the_filter_wanted() {
+  // 40 vehicles on the wire; the filter wants the 20 with even trip ids. 16 of those fit
+  // kMaxTvVehicles, so four are dropped - and the 20 the filter rejected are not in that number.
+  std::string body = "{\"bus\":[";
+  std::vector<std::string> wanted;
+  for (size_t i = 0; i < 40; ++i) {
+    if (i) body += ",";
+    body += "{\"trip\":\"" + std::to_string(i) + "\",\"VehicleID\":\"v\",\"late\":0}";
+    if (i % 2 == 0) wanted.push_back(std::to_string(i));
+  }
+  body += "]}";
+  TEST_ASSERT_EQUAL_UINT32(20, static_cast<uint32_t>(wanted.size()));
+
+  ParseResult<TvVehicle> r = parseTvString(body, TvFilter(&tripIsListed, &wanted));
+  TEST_ASSERT_TRUE(r.ok);
+  TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(kMaxTvVehicles),
+                            static_cast<uint32_t>(r.items.size()));
+  TEST_ASSERT_EQUAL_UINT32(20 - static_cast<uint32_t>(kMaxTvVehicles), r.dropped);
+  // Kept in wire order, and every survivor is one the filter asked for.
+  for (size_t i = 0; i < r.items.size(); ++i) {
+    TEST_ASSERT_EQUAL_STRING(std::to_string(i * 2).c_str(), r.items[i].trip.c_str());
+  }
+}
+
+// The resident list is 16 slots since 0.3.2-rc3 and the reason is the filter, so pin the number
+// itself: an edit that raises it is an edit to the resting floor and should have to say so here.
+void test_transitview_cap_is_sixteen_slots() {
+  TEST_ASSERT_EQUAL_UINT32(16, static_cast<uint32_t>(kMaxTvVehicles));
 }

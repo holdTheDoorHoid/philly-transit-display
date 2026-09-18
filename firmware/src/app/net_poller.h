@@ -84,6 +84,12 @@ struct MemorySizes {
   uint32_t snapshot_bytes = 0;      // the currently published Snapshot
   uint32_t retained_capacity = 0;   // PollBuffers::retained slots (DESIGN.md SS5)
   uint32_t tv_capacity = 0;         // PollBuffers::tv slots
+  // Vehicles that WERE relevant to a configured stop and did not fit PollBuffers::tv, since boot
+  // (septa.h kMaxTvVehicles, 16 since 0.3.2-rc3). Zero on the owner's config by construction -
+  // two stops can retain at most 16 realtime updates and only a vehicle matching one of those is
+  // kept at all - so a number that moves means the cap is biting on a real config and is the
+  // signal to raise it.
+  uint32_t tv_dropped = 0;
 };
 MemorySizes getMemorySizes();
 

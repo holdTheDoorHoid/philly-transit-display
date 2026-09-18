@@ -110,8 +110,10 @@ void addUnique(std::vector<std::string>& v, const std::string& item) {
 void PollBuffers::reserveAll(size_t scratch_bytes) {
   scratch_reserve = scratch_bytes;
   scratch.reserve(scratch_bytes);
-  // The TransitView list is sized at the parser's own cap: a rush-hour Route 17 carries 20-30
-  // vehicles, and any shorter reservation just reintroduces the doubling this exists to remove.
+  // The TransitView list is sized at the parser's own cap, which since 0.3.2-rc3 is 16 slots
+  // (2,816 B) and not 32 (5,632 B). What made 32 necessary was that the parse kept every vehicle
+  // on the route; the trip-id filter keeps only the ones a configured stop's retained realtime
+  // updates can join to, and that is bounded by the updates, not by how busy the route is.
   tv.reserve(kMaxTvVehicles);
 }
 
@@ -242,7 +244,8 @@ FetchOutcome SeptaSource::fetchTransitViewEx(const std::string& route,
 }
 
 FetchOutcome SeptaSource::fetchTransitViewAppendEx(const std::string& route,
-                                                    std::vector<TvVehicle>* out, HttpGetEx http) {
+                                                    std::vector<TvVehicle>* out, HttpGetEx http,
+                                                    const TvFilter& filter) {
   std::vector<uint8_t> own_body;
   std::vector<uint8_t>& body = buffers_ != nullptr ? buffers_->scratch : own_body;
   FetchResult t = fetchBuffered(septaTransitViewUrl(route), http, &body, buffers_);
@@ -252,7 +255,11 @@ FetchOutcome SeptaSource::fetchTransitViewAppendEx(const std::string& route,
   ParseResult<TvVehicle> parsed;
   parsed.items.swap(*out);
   const size_t before = parsed.items.size();
-  if (!body.empty()) parseTransitViewAppend(&parsed, body.data(), body.size());
+  if (!body.empty()) parseTransitViewAppend(&parsed, body.data(), body.size(), filter);
+  // Relevant vehicles that did not fit kMaxTvVehicles. Accumulated since boot rather than per
+  // cycle, because the question it answers - "is 16 slots enough for this config?" - is not a
+  // question about one cycle.
+  if (buffers_ != nullptr && parsed.dropped > 0) buffers_->tv_dropped += parsed.dropped;
 
   FetchOutcome o;
   o.transport = t;
@@ -509,8 +516,33 @@ Snapshot pollBusStops(const std::vector<StopConfig>& configs, Epoch now, HttpGet
   std::vector<TvVehicle> own_tv;
   std::vector<TvVehicle>& tv_all = buffers != nullptr ? buffers->tv : own_tv;
   tv_all.clear();
+  // ...AND ONLY THE VEHICLES THIS CONFIG CAN USE (0.3.2-rc3). mergeStop() reaches a TvVehicle
+  // through exactly one door - findTvByTrip(tv, u.trip_id), for a `u` drawn from `rt_updates` -
+  // so a vehicle whose trip id is not in the retained updates is never read by anything. The
+  // retained updates are already filtered to the configured routes and stops (setRouteFilter /
+  // setStopFilter above), which makes "its trip is in rt_updates" exactly "it is relevant to a
+  // configured stop", and it is the join key the merge itself uses rather than a proxy for it.
+  //
+  // The scan is linear over rt_updates (16 entries for the owner's two stops) per candidate
+  // vehicle, on a string compare that fails on the first character almost always. That is cheap
+  // against the nine std::strings it saves building and freeing.
+  //
+  // A failed or empty TripUpdates feed leaves rt_updates empty and this filter then keeps
+  // nothing - which is correct rather than a degradation: with no realtime updates the merge
+  // never calls findTvByTrip() at all, so an unfiltered vehicle list would be built, carried
+  // through the cycle and read by no one.
+  struct TripInRetained {
+    static bool keep(const std::string& trip, const void* ctx) {
+      const auto* updates = static_cast<const std::vector<StopTimeUpdate>*>(ctx);
+      for (const auto& u : *updates) {
+        if (u.trip_id == trip) return true;
+      }
+      return false;
+    }
+  };
+  const TvFilter tv_filter(&TripInRetained::keep, &rt_updates);
   for (const auto& route : rt_routes) {
-    FetchOutcome o = src.fetchTransitViewAppendEx(route, &tv_all, http);
+    FetchOutcome o = src.fetchTransitViewAppendEx(route, &tv_all, http, tv_filter);
     tv_ok_by_route.push_back({route, o.ok});
     pollTrace(kPollTraceTransitView);  // once per route
   }

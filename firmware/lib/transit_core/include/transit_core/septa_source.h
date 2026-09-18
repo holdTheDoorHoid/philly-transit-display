@@ -99,10 +99,12 @@ struct FetchOutcome {
 // nothing else. The rc1 lesson (holding memory permanently lowers the floor) still stands, so the
 // cost is stated rather than waved at: `retained` is sized from the CONFIG, 8 slots per configured
 // bus/trolley (stop, route) pair rather than the 32-slot default cap, which is 16 slots ~ 2.4 KB
-// for the owner's two Route 17 stops; `tv` is the full kMaxTvVehicles ~ 5.6 KB because a rush-hour
-// Route 17 really does carry 20-30 vehicles and a short reservation would just reintroduce the
-// doubling it exists to remove. Together about 8 KB off the resting floor, against removing every
-// per-cycle contiguous request above ~1.2 KB on a cache-hit cycle.
+// for the owner's two Route 17 stops; `tv` is the full kMaxTvVehicles, which since 0.3.2-rc3 is
+// 16 slots ~ 2.8 KB rather than 32 ~ 5.6 KB. The thing that made 32 look necessary was that the
+// parse kept a rush-hour Route 17's whole fleet; with the trip-id filter (septa.h TvFilter) it
+// keeps only the vehicles a configured stop's retained realtime updates can join to, which is
+// bounded by those updates and not by how busy the route is. Together about 5 KB off the resting
+// floor, against removing every per-cycle contiguous request above ~1.2 KB on a cache-hit cycle.
 //
 // WHAT IS STILL PER-CYCLE, deliberately: the BusSchedules parse block
 // (std::vector<SchedEntry>, kMaxSchedEntries * ~128 B = 3,072 B). It is asked for only on a
@@ -130,8 +132,17 @@ struct PollBuffers {
 
   // The TransitView vehicle list for a whole cycle - every configured route's vehicles appended
   // into one vector, which fetchTransitViewAppendEx() parses straight into. Reserved at
-  // kMaxTvVehicles so a rush-hour route cannot make it double.
+  // kMaxTvVehicles so a rush-hour route cannot make it double. Since 0.3.2-rc3 that is 16 slots
+  // (2,816 B) rather than 32 (5,632 B), because the parse now keeps only the vehicles a
+  // configured stop's realtime updates can actually join to (septa.h TvFilter).
   std::vector<TvVehicle> tv;
+
+  // Relevant vehicles that did not fit kMaxTvVehicles, since boot. Reported as `tv_dropped` on
+  // GET /api/debug/ui. It should stay at zero: 16 slots is twice what the owner's two-stop
+  // config can retain realtime updates for. A number that moves is this cap biting on a real
+  // config and is the signal to raise kMaxTvVehicles - which is why the count exists rather than
+  // the cap simply being generous.
+  uint32_t tv_dropped = 0;
 
   static constexpr size_t kScratchReserve = 6144;
   // How far the scratch reservation is allowed to RATCHET UP when a response body turns out to be
@@ -241,8 +252,12 @@ class SeptaSource : public TransitSource {
   // poll cycle holds ONE TvVehicle vector instead of a per-route one plus the accumulated one
   // (0.3.2-rc1). `*out` is left exactly as it was if the fetch or the parse fails, which is the
   // same contract fetchTransitViewEx() has always had. kMaxTvVehicles applies to the total.
+  //
+  // `filter` (septa.h TvFilter) decides which vehicles are built at all; the default keeps every
+  // one, which is what refreshRouteLiveness() and the host tests want. When a PollBuffers is
+  // attached, relevant vehicles that did not fit the cap are added to PollBuffers::tv_dropped.
   FetchOutcome fetchTransitViewAppendEx(const std::string& route, std::vector<TvVehicle>* out,
-                                         HttpGetEx http);
+                                         HttpGetEx http, const TvFilter& filter = TvFilter());
   FetchOutcome fetchRailArrivalsEx(const std::string& station, std::vector<RailArrival>* out,
                                     HttpGetEx http);
 
