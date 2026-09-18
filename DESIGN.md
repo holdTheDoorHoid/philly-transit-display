@@ -2174,7 +2174,50 @@ path, though, and for one route that matters: the chain does not run until a req
 been parsed (§12, "Cross-site and rebinding"), so `handleOtaUpload()` warms on its own entry too.
 Without that, a device whose *first* request is a firmware upload ran `checkPin()`, the heap gates,
 `Update.begin()` and `otaFail()`'s `std::string` concatenations on a task that had never thrown -
-precisely the cold-first-throw shape above. Warming only makes the throw catchable, so the upload
+precisely the cold-first-throw shape above.
+
+**And a fourth task, which is not ours, and which every release until 0.3.2-rc4 left cold: lwIP's
+own `tiT`.** Decoded from the 0.3.2-rc3 device-suite serial capture, core 0, during section A's
+`POST /api/debug/oom` on a cold boot — i.e. with the heap deliberately taken to zero:
+
+```
+tcpip_thread <- sys_check_timeouts <- tcp_slowtmr
+  <- AsyncTCP_detail::tcp_poll (AsyncTCP.cpp:454)
+  <- operator new(nothrow) <- operator new <- __cxa_throw
+  <- __cxa_get_globals <- std::terminate
+```
+
+The middle of that is the trap, and it is worth stating on its own line because it reads like a
+contradiction: **libstdc++ implements nothrow `new` as a `try`/`catch` around the *throwing*
+`new`** — `__try { return ::operator new(sz); } __catch(...) { return nullptr; }`. So
+`new (std::nothrow) T` is not a non-throwing allocation; it is a throw and a catch, and it needs the
+calling task's `__cxa_eh_globals` exactly like any other throw. AsyncTCP allocates that way in
+**every one of its lwIP raw callbacks** — `tcp_poll`, `tcp_recv`, `tcp_sent`, `tcp_error`,
+`tcp_connected`, the DNS callback, and `tcp_accept` (which allocates an `AsyncClient` as well) —
+and lwIP runs all of them on the tcpip task. The first allocation failure anywhere in AsyncTCP's
+lwIP half therefore reaches the un-warmed `__cxa_get_globals` malloc with the heap already gone,
+and terminates.
+
+Nothing of ours runs on that task, which is why it stayed invisible: the trap is entirely inside
+library code, reached through a library callback, and the only thing this firmware can do is make
+sure the task is warm before it ever gets there.
+`warmExceptionGlobalsOnTcpipTask()` (`cxx_exception_pool.cpp`) posts `warmExceptionGlobals()` to
+lwIP with **`tcpip_callback_wait()`**, which runs it *on* the tcpip task and blocks the caller until
+it has returned — `tcpip_callback()`/`tcpip_try_callback()` return as soon as the message is queued,
+which would both scramble the boot log's ordering and make "it was warmed" unverifiable. `main.cpp`
+calls it immediately after `connectWifiOrPortal()`, because the tcpip task does not exist until the
+TCP/IP stack is up and both branches of that call (joined a network, or brought up the setup AP)
+start it. The boot line is `[heap] eh_globals warmed on tiT`, beside the other three.
+
+This has been present in every release. 0.3.2-rc3 is only the first build whose heap gates let
+`POST /api/debug/oom` exhaust the heap completely enough to reach it.
+
+**Checked and deliberately not warmed:** `esp_timer` (AsyncTCP touches it only for
+`esp_timer_get_time()`, never a callback, and this firmware registers no esp_timer callbacks) and
+`sys_evt` / the Arduino event task (no `WiFi.onEvent()` handler and no `esp_event` handler in this
+firmware, so no C++ throw exists there). Warming either would be warming a task on which nothing
+can throw. **If a future change registers a callback on any task not in this list, that task must
+warm itself, and this is the paragraph to add it to.** Warming only makes the throw catchable, so the upload
 callback is also wrapped in its own `bad_alloc` guard: nothing in ESPAsyncWebServer catches what
 escapes one, and `guarded()` does not reach it. Two details the implementation depends on and the
 file documents: GCC folds a `try { throw 0; } catch (int) {}` whose handler it can see into a plain

@@ -342,6 +342,20 @@ void setup() {
   transit_app::connectWifiOrPortal(wifiApName(), pumpLvgl);
   heapStage("wifi");
 
+  // The fourth task that can throw, and the only one we do not create: lwIP's own "tiT"
+  // (0.3.2-rc4, app/cxx_exception_pool.cpp has the decoded backtrace). AsyncTCP's lwIP raw
+  // callbacks - tcp_poll, tcp_recv, tcp_sent, tcp_error, tcp_accept, the DNS callback - all run
+  // there and all allocate with `new (std::nothrow)`, which libstdc++ implements as a try/catch
+  // around the THROWING new. So the first allocation failure in AsyncTCP's lwIP half is a real
+  // throw on a task that has never thrown, and it terminates on the ~16 B malloc inside
+  // __cxa_get_globals with the heap already gone. This warms it through lwIP's own callback
+  // mechanism, which is the only way onto that task.
+  //
+  // HERE and not earlier: the tcpip task does not exist until the TCP/IP stack is initialised,
+  // which connectWifiOrPortal() above is what causes. Both branches of that call (joined a network,
+  // or brought up the setup AP) start the stack, so the task is there either way.
+  transit_app::warmExceptionGlobalsOnTcpipTask();
+
   // Idempotent: wifi_portal.cpp already called this as soon as it powered the radio up (auth.h
   // explains why it has to be after that, not in setup()). Kept here so the dependency is visible
   // at the point the web server and the device info screen - both of which read the PIN - are

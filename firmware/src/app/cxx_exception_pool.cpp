@@ -69,10 +69,57 @@
 // stats jobs), and web_server.cpp's first-thing middleware for the AsyncTCP task, which the library
 // creates and we therefore cannot warm at its entry. The short-lived "restart" task (web_server.cpp)
 // only sleeps and reboots and never throws.
+//
+// ---------------------------------------------------------------------------------------------
+// AND THE FOURTH TASK, WHICH IS NOT OURS AND HAS BEEN UNCOVERED IN EVERY RELEASE UNTIL NOW:
+// lwIP's "tiT" (found 0.3.2-rc4, from the rc3 device-suite serial capture).
+//
+// Decoded backtrace, core 0, during section A's POST /api/debug/oom on a cold boot - i.e. with the
+// heap deliberately taken to zero:
+//
+//   tcpip_thread <- sys_check_timeouts <- tcp_slowtmr
+//     <- AsyncTCP_detail::tcp_poll (AsyncTCP.cpp:454)
+//     <- operator new(nothrow) <- operator new <- __cxa_throw
+//     <- __cxa_get_globals <- std::terminate
+//
+// Read the middle of that and the trap is plain: **libstdc++ implements nothrow new as a try/catch
+// around the THROWING new** -
+//
+//     void* operator new(size_t sz, const nothrow_t&) noexcept {
+//       __try { return ::operator new(sz); } __catch(...) { return nullptr; }
+//     }
+//
+// - so `new (std::nothrow) T` is not a non-throwing allocation at all. It is a throw and a catch,
+// and it needs the calling task's __cxa_eh_globals exactly like any other throw. AsyncTCP allocates
+// that way in every one of its lwIP raw callbacks (verified in AsyncTCP.cpp: tcp_poll:454,
+// tcp_recv:468, tcp_sent:493, tcp_error:516, the DNS callback:531, tcp_connected:429, and
+// tcp_accept:1577/1581 - the last of which allocates an AsyncClient), and lwIP runs every one of
+// those on the tcpip task. So the FIRST allocation failure anywhere in AsyncTCP's lwIP half hits
+// the un-warmed __cxa_get_globals malloc, with the heap by definition already gone, and terminates.
+//
+// Nothing of ours runs on that task, which is why this was invisible: the trap is entirely in
+// library code, reached through a library callback, and the only thing we can do about it is make
+// sure the task is warm before it ever gets there. warmExceptionGlobalsOnTcpipTask() does that by
+// posting warmExceptionGlobals() to lwIP with tcpip_callback_wait(), which runs it ON the tcpip
+// task and blocks until it has finished.
+//
+// It has been present in every release. rc3 is only the first build whose heap gate let
+// POST /api/debug/oom exhaust the heap completely enough to reach it.
+//
+// WHAT WAS CHECKED AND DELIBERATELY NOT WARMED. `esp_timer`: AsyncTCP touches esp_timer only for
+// esp_timer_get_time() (its millis()/micros()), never a callback, and this firmware registers no
+// esp_timer callbacks at all. `sys_evt` / the Arduino event task: this firmware registers no
+// WiFi.onEvent() handler and no esp_event handler, so nothing of ours can throw there. Warming
+// either would be warming a task on which no C++ throw exists - speculation rather than a fix.
+// **If a future change registers a callback on any task not listed above, that task must warm
+// itself, and this is the paragraph it should be added to.**
 #include "cxx_exception_pool.h"
 
 #include <Arduino.h>
 #include <cxxabi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <lwip/tcpip.h>
 
 extern "C" size_t __cxx_eh_arena_size_get(void) { return transit_app::kCxxExceptionPoolBytes; }
 
@@ -122,6 +169,45 @@ bool warmExceptionGlobals(const char *task_name) {
   Serial.printf("[heap] eh_globals warmed on %s (globals=%p, throw path %s, free %u)\n",
                 task_name ? task_name : "?", globals, threw ? "ok" : "MISSING",
                 (unsigned)ESP.getFreeHeap());
+  return true;
+}
+
+namespace {
+
+// FILE-SCOPE and not a stack struct, deliberately. tcpip_callback_wait() blocks until the callback
+// has run, so a local would normally be safe - but if the wait ever gained a timeout or lwIP
+// changed its contract, a callback arriving late would write through a dangling pointer on a task
+// we do not control. This runs exactly once at boot, so one static costs nothing and cannot dangle.
+volatile bool g_tcpip_warm_ran = false;
+
+void warmOnTcpipTask(void *) {
+  // Whatever lwIP's tcpip task is called in this build - CONFIG_LWIP_TCPIP_TASK_NAME, "tiT" by
+  // default. The name is only for the log line; the warming applies to whichever task actually runs
+  // this callback, which is the tcpip task by construction.
+  warmExceptionGlobals("tiT");
+  g_tcpip_warm_ran = true;
+}
+
+}  // namespace
+
+bool warmExceptionGlobalsOnTcpipTask(uint32_t timeout_ms) {
+  (void)timeout_ms;  // tcpip_callback_wait() blocks until the callback has run; see below.
+  g_tcpip_warm_ran = false;
+  // tcpip_callback_wait() and not tcpip_callback()/tcpip_try_callback(): the other two return as
+  // soon as the message is QUEUED, which would let boot race on past this and print the line out of
+  // order with the other three warmings - and, worse, would make "it was warmed" unverifiable.
+  // _wait blocks the caller (loopTask, in setup()) until the callback has returned on tiT.
+  const err_t e = tcpip_callback_wait(warmOnTcpipTask, nullptr);
+  if (e != ERR_OK) {
+    // Not fatal, and not silent. The likeliest cause is being called before the TCP/IP stack is up,
+    // which is a call-site ordering bug rather than a runtime condition.
+    Serial.printf("[heap] eh_globals NOT warmed on tiT: tcpip_callback_wait() = %d\n", (int)e);
+    return false;
+  }
+  if (!g_tcpip_warm_ran) {
+    Serial.println("[heap] eh_globals NOT warmed on tiT: callback did not run");
+    return false;
+  }
   return true;
 }
 
