@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.3.2-rc3 - 2026-09-17 (release candidate)
+
+**rc2 stopped the memory fragmenting and rc3 is about what that cost.** Over two hours and
+thirteen minutes of ordinary use, rc2 held the largest unbroken piece of memory at exactly the same
+value at the start of every single poll and never failed once - the first build that does that.
+But it rests about 7 KB lower on free memory than v0.3.1, and when the automated test suite hammers
+the Settings page - about 45 save-and-reload rounds in a few minutes, each one rebuilding the
+screen - the memory crumbled to 3 KB pieces with 19.5 KB still free, every reload came back "low
+memory, retry", two saves failed outright, and the board restarted itself in the middle of the run.
+
+rc3 gives about 11 KB of that floor back, and fixes the thing the Settings test was actually
+provoking. Nothing here changes what the display shows.
+
+- **Saving settings no longer scatters memory.** Every save used to make four separate copies of
+  the whole configuration - one to compare against, one for the display, one for the display to
+  keep, one for the record - and the display and the record each kept a copy permanently. Each
+  copy frees a dozen small fragments of memory and allocates a dozen more wherever there is room,
+  which is exactly how memory ends up in small pieces. There is now **one** configuration in
+  memory, and everything that reads it shares that one: a save allocates one and frees one, and
+  copies none. Loading the Settings page and reading the device status no longer copy it either.
+  A save also can no longer be silently dropped, which the old handover could do if it happened to
+  arrive while the screen was busy.
+
+- **The live vehicle list keeps only the vehicles that can actually appear on your screen.** The
+  display fetches every tracked vehicle on a route - 20 to 30 on Route 17 at rush hour - and then
+  uses only the handful matching a trip the live-arrivals feed named for your stops. It now checks
+  that before building each one, so a busy route costs the same as a quiet one, and the space set
+  aside for the list halves from 5.6 KB to 2.8 KB. If a real configuration ever needs more than the
+  16 slots, the board says so at `/api/debug/ui` (`tv_dropped`) rather than going quiet.
+
+- **The memory history is one hour instead of two** (240 lines to 120), which is 1.9 KB back. Both
+  times this board has crumbled it did so inside forty minutes of looking healthy, so an hour of
+  history still brackets it. Nothing about the format changed.
+
+- **Three smaller reclaims, 6.5 KB together.** The drawing buffer on the 3.5" screens is 1/40 of
+  the panel instead of 1/30 (2.5 KB) - the buffer is scratch space the screen is painted from, so a
+  smaller one means more paint passes per redraw and nothing else, and the redraw time should be
+  checked after updating. The polling task's working space drops from 10 KB to 8 KB (2 KB), sized
+  from what it has actually used: the deepest it has ever gone is 5.8 KB, measured both under the
+  test suite and across the two-hour run, and it still reports its own high-water mark so the
+  margin stays checkable. And nothing else was taken from the drawing memory, the stop limit or
+  the safety nets.
+
+- **The connection limit stops turning a busy moment into a refusal.** The board refuses new
+  connections when memory is low *and* it is already busy; that was applying from the second
+  connection, and during the suite's burst test it refused nine connections where six is the
+  allowance - the three extra were second connections arriving while memory happened to dip. Two
+  connections at once was never the situation the rule was written for (the crash it prevents took
+  seven), so the memory check now applies from the third connection onward. The hard limit of five
+  at once is unchanged, and a second connection whose reply will not fit still gets a polite "out
+  of memory, try again" rather than silence.
+
+**Expected, by arithmetic and not yet measured on hardware:** a resting free-memory floor around
+42-43 KB against rc2's 32 KB and v0.3.1's 39-40 KB, and no reopened demand for large unbroken
+pieces during a poll - the vehicle list is still set aside once and reused, just smaller. Read that
+carefully rather than as a free lunch: about half of it comes from the drawing buffer and the
+polling task's working space, which v0.3.1 had at full size too, so it is paid for in slower
+repaints and a thinner stack margin rather than handed back. The numbers that judge it are the same
+ones as last time: the largest free block at the start of each poll, the lowest free memory since
+boot, and now `tv_dropped` and the redraw time.
+
+Update space on the tightest board (the 3.5" capacitive model) is 13,478 bytes, above the 12 KB
+floor, down 652 bytes from rc2.
+
 ## v0.3.2-rc2 - 2026-09-17 (release candidate)
 
 **rc1 of this release was flashed at 17:00 and rolled back within minutes.** It did what it set

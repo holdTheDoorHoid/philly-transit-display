@@ -1147,6 +1147,44 @@ the levers in order are: the cycle log at 120 rows instead of 240 (+1,920 B, one
 instead of two), and the TransitView list back to per-cycle (+5,632 B, at the cost of one 5.6 KB
 request per route per cycle).
 
+**`0.3.2-rc3` buys ~10 KB of floor back, and half of it comes from outside the poll cycle.** rc2's
+run was the first on this board that did not fragment at all — but its resting floor is ~32 KB, and
+the device suite's **section B** (≈45 config `PUT`+`GET` pairs in a few minutes, each rebuilding
+the screen) took it to a **3,060 B largest block with ~19.5 KB still free**: every `GET` after a
+`PUT` answered "low memory, retry" from the 12 KB / 7,924 B idle-work gate, two `PUT`s failed
+outright, and the three-strike OOM self-heal rebooted the board mid-suite. The floor was the
+problem, and the config-save churn above was what walked it there.
+
+| | Δ resting free8 vs 0.3.2-rc2 | where it comes from |
+|---|---:|---|
+| cycle log 240 → 120 rows | **+1,920** | `.bss` |
+| TransitView list 32 → 16 slots (`TvFilter`) | **+2,816** | heap, resident |
+| 3.5" draw buffer `/30` → `/40` | **+2,560** | heap, permanent (`smartdisplay_init()`) |
+| `net_poller` task stack 10,240 → 8,192 B | **+2,048** | heap, permanent (task stack) |
+| the display's second resident `Config` | **≈ +1,200** | heap, resident *(the audit's figure, not a measurement — see below)* |
+| file-scope `Config` structs (3 → 1, `emptyConfig()`) | **+624** | `.bss`, measured from the link map |
+| **net vs rc2** | **≈ +11,100** | |
+| **expected resting floor** | **≈ 42–43 KB** | against rc2's measured 31.6–32.2 KB |
+
+**Which would put it slightly ABOVE v0.3.1's 39–40.7 KB, and that needs the honest caveat.** Half
+of this table is not rc2's residency being handed back — the draw buffer and the poller stack were
+the same size in v0.3.1, and taking 4.6 KB from them is a real cost paid elsewhere: more flush
+passes per repaint (§8, `tick_ms_max` unmeasured at `/40`) and ~2.3 KB of stack margin instead of
+~4.4 KB. The two lines that genuinely undo rc2 residency are the cycle log and the TransitView
+list, and together they are 4,736 B of the 8,384 rc2 spent. So the right way to read the number is
+"the same fragmentation fix, on a floor that is no longer paying for a two-hour log, a 32-vehicle
+list, a 10 KB draw buffer and a 10 KB stack" — not "the trade turned out to be free".
+
+**The `Config` line is the one estimate in the table and is marked as such.** `sizeof(Config)` is
+**336 B** on this target (from the image's DWARF), and the `.bss` saving is measured: three
+file-scope `Config`s became one shared `emptyConfig()`, and static RAM is **−2,544 B** against
+rc2 in the link map — 1,920 of it the cycle log, 624 the `Config` structs and the two `shared_ptr`s
+that replaced them. The ~1.2 KB is the
+*heap* the display's copy held — a `Config`'s strings and its stops vector — and it is the runtime
+audit's figure carried forward, not something this pass measured. The per-save churn it removes
+(four whole-`Config` copies, each scattering ~12 small blocks) is not in the table at all, because
+it is not a resting-floor number; it is the section-B number, and section B is where it will show.
+
 rc1's lesson is not repealed by any of this, it is respected — but it was nearly repeated, and the
 thing that nearly repeated it was counting only the heap.
 
@@ -2079,7 +2117,8 @@ Addendum (2026-09-15): C++ exceptions are enabled in this SDK (`-fexceptions`), 
 growth or `reserve()` that cannot get memory throws `std::bad_alloc`, and an uncaught throw is
 `std::terminate` = reboot. The largest free block between polls on the owner's board is only
 10-32 KB, so a cap-sized `reserve()` (a 64-update or 48-vehicle block is ~10 KB contiguous) turned
-into a boot loop. Rules: retention caps are small (32 feed updates, 32 vehicles) and vectors grow
+into a boot loop. Rules: retention caps are small (32 feed updates, and 16 vehicles since
+0.3.2-rc3 — 32 before it) and vectors grow
 from a few entries instead of reserving the cap; `pollOnce()`, queued proxy/stats jobs and
 `PUT /api/config` catch `std::bad_alloc` and report "out of memory" (a failed poll with per-stop
 errors, or a 503) rather than resetting. Measured after the fix: heap ~54 KB minimum during a
