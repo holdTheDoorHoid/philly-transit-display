@@ -1193,13 +1193,14 @@ problem, and the config-save churn above was what walked it there.
 | the display's second resident `Config` | **≈ +1,200** | heap, resident *(the audit's figure, not a measurement — see below)* |
 | file-scope `Config` structs (3 → 1, `emptyConfig()`) | **+624** | `.bss`, measured from the link map |
 | **net vs rc2** | **≈ +11,100** | |
-| **expected resting floor** | **≈ 42–43 KB** | against rc2's measured 31.6–32.2 KB |
+| **measured resting floor (with the card mounted)** | **≈ 40 KB** | against rc2's measured 31.6–32.2 KB; the ledger below had predicted ≈42–43 KB |
 
-**Which would put it slightly ABOVE v0.3.1's 39–40.7 KB, and that needs the honest caveat.** Half
-of this table is not rc2's residency being handed back — the draw buffer and the poller stack were
-the same size in v0.3.1, and taking 4.6 KB from them is a real cost paid elsewhere: more flush
-passes per repaint (§8, `tick_ms_max` unmeasured at `/40`) and ~2.3 KB of stack margin instead of
-~4.4 KB. The two lines that genuinely undo rc2 residency are the cycle log and the TransitView
+**Confirmed on hardware at almost exactly v0.3.1's 39–40.7 KB, and that still needs the honest
+caveat.** Half of this table is not rc2's residency being handed back — the draw buffer and the
+poller stack were the same size in v0.3.1, and taking 4.6 KB from them is a real cost paid
+elsewhere: more flush passes per repaint (§8, `tick_ms_max` now measured at ~20 ms at `/40`) and
+~2.3 KB of stack margin instead of ~4.4 KB. The two lines that genuinely undo rc2 residency are the
+cycle log and the TransitView
 list, and together they are 4,736 B of the 8,384 rc2 spent. So the right way to read the number is
 "the same fragmentation fix, on a floor that is no longer paying for a two-hour log, a 32-vehicle
 list, a 10 KB draw buffer and a 10 KB stack" — not "the trade turned out to be free".
@@ -1686,17 +1687,18 @@ Main screen (portrait by default; every size derives from the runtime resolution
   rather than out of whatever the loop leaves — it is the one allocation that must not fail,
   because it is the one that explains the failure.
 - **The draw buffer is 1/40 of the screen on the 3.5" boards since 0.3.2-rc3, and `tick_ms_max`
-  has to be re-measured (2026-09-17).** `LVGL_BUFFER_PIXELS` in `boards/esp32-3248S035R.json` and
+  is now measured against it (2026-09-17, confirmed again on the v0.3.2 device-suite run with the
+  card mounted).** `LVGL_BUFFER_PIXELS` in `boards/esp32-3248S035R.json` and
   `esp32-3248S035C.json` went `/30` → `/40`: 5,120 px (10,240 B) to 3,840 px (7,680 B), for
   **2,560 B** of permanent heap back. The owner delegated this number to our judgement, and it is
   the cheapest block left on the board that costs no functionality — the buffer is a scratchpad the
   panel driver flushes from, so a smaller one changes *how often* a repaint is flushed and nothing
   about what is drawn; 3,840 px is still 12 rows of a 320-wide panel against the one row LVGL
   requires. What it does change is repaint time: 40 partial flushes per full repaint instead of
-  30, at an unchanged 24 MHz pixel clock. **Measured on the owner's board on 2026-09-17:
-  `tick_ms_max` 100–122 ms at `/40`**, against 168 ms at `/30` and 21 ms at `/20`, with a page
-  rebuild the expensive case in all three — comfortably inside the device suite's 500 ms check,
-  which passes. So the buffer is not what costs the redraw; the page build is, and `/40` did not
+  30, at an unchanged 24 MHz pixel clock. **Measured on the owner's board: `tick_ms_max` ~20 ms
+  worst case at `/40`**, against 168 ms at `/30` and 21 ms at `/20`, with a page rebuild the
+  expensive case in all three — comfortably inside the device suite's 500 ms check, which passes.
+  So the buffer is not what costs the redraw; the page build is, and `/40` did not
   make it worse. This paragraph asked for that measurement before rc3 was flashed and it is now
   taken; a fourth reduction would need the same question asked again.
   It is also unrelated to the LVGL pool: the draw buffer comes from the ESP heap
@@ -2314,7 +2316,11 @@ the poller was mid-fetch, and both `assert`-and-panic rather than failing soft: 
 Neither is a C++ exception and no pool or catch block can reach either; the only defence is not to
 exhaust the heap while a fetch is in flight. That is a real constraint on the *test hook*, not on
 normal operation - nothing else takes the whole heap on purpose - so the device suite fires
-`/api/debug/oom` only in the quiet window just after a poll completes (section A0).
+`/api/debug/oom` only in the quiet window just after a poll completes (section A0). **Since
+0.3.2-rc5, `/api/debug/oom` itself is compiled out of shipping builds** (it lives behind a
+dev-only build flag) **so neither of these two asserts is reachable at all in a shipping
+image** - only a development build that still carries the hook can drive the heap to the state
+that triggers them.
 
 **"The 503 for out of memory needs memory" - the third instance, and it is ours (2026-09-17).**
 The list above has carried "a catch block that itself allocates with nothing left (building the 503

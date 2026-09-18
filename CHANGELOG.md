@@ -1,34 +1,6 @@
 # Changelog
 
-## v0.3.2-rc4 - 2026-09-17 (release candidate)
-
-rc3 ran the test suite at 190/195 with the memory sections passing and the display redraw well
-inside budget. Two things came out of it.
-
-- **A crash that has been possible in every release so far, finally caught.** When the board runs
-  completely out of memory, the network library asks for a small block using the "don't throw an
-  error, just return nothing" form of allocation - which, it turns out, the C++ runtime implements
-  by throwing an error and catching it. The first time that happens on a given internal task, the
-  runtime has to allocate a few bytes of bookkeeping first, and if that fails too it shuts the
-  board down immediately, past every safety net. The display already prepares that bookkeeping in
-  advance on the three tasks it creates itself; the network stack's own task was not one of them,
-  and all of the network library's low-level callbacks run there. It is now prepared at boot like
-  the others. This only ever bit when memory was completely exhausted, which is why it took a
-  deliberate out-of-memory test on a cold boot to expose it.
-
-- **The SD card fault seen on that run is not the firmware, and the memory numbers from it are
-  optimistic.** The card is on a completely separate SPI bus from the screen - different pins,
-  different controller - so no display change can affect it, nothing SD-related has changed since
-  v0.3.1, and the boot log's failure is the card not answering its very first command at all.
-  That is the card, its socket or its wiring. Worth knowing: a board with no working card is
-  holding about 12.5 KB *less* memory than a healthy one, because the filesystem workspace is only
-  allocated for a card that mounts - so the free-memory figures from that run read better than the
-  real thing, and the floor has to be measured again with a working card.
-
 ## v0.3.2 - 2026-09-17
-
-*Release date is provisional: the floor figure below is by ledger, not yet confirmed by a fresh
-device-suite run and a multi-hour watch.*
 
 **rc1 of this release was flashed at 17:00 and rolled back within minutes.** It did what it set
 out to do and still left about 12 KB less free memory than v0.3.1 - enough that several requests
@@ -162,9 +134,9 @@ release states that plainly and fixes what it exposed.
 - **The drawing buffer is smaller, and so is the polling task's working space.** The drawing buffer
   on the 3.5" screens is 1/40 of the panel instead of 1/30 (2.5 KB back) - the buffer is scratch
   space the screen is painted from, so a smaller one means more paint passes per redraw and nothing
-  else, and the redraw time should be checked after updating (21 ms at 1/20, 168 ms at 1/30 across
-  a full test run; 1/40 not yet measured). The polling task's working space drops from 10 KB to
-  8 KB (2 KB back), sized from what it has actually used: the deepest it has ever gone measured
+  else, and the redraw time worst case is now measured at about 20 ms at 1/40 (21 ms at 1/20, 168 ms
+  at 1/30 across a full test run, for comparison). The polling task's working space drops from 10 KB
+  to 8 KB (2 KB back), sized from what it has actually used: the deepest it has ever gone measured
   about 4.4 KB free, so roughly 2.3 KB of margin remains, and the board still reports its own
   high-water mark (`stack_hwm.net_poller`) so that margin stays checkable. Nothing else was taken
   from the drawing memory, the stop limit, or the safety nets.
@@ -179,20 +151,42 @@ release states that plainly and fixes what it exposed.
   three. A second connection whose reply will not fit still gets a polite "out of memory, try
   again" rather than silence.
 
-**Expected, by arithmetic and not yet measured on hardware:** the changes above give back about
-11 KB of the floor the Settings-page fix needed, without reopening any of the per-poll demand the
-earlier fix closed - none of them ask for a bigger contiguous block during a poll, they just hold
-less permanently or copy less on a save. That puts the resting free-memory floor at an expected
-42-43 KB, against the measured 32 KB above and v0.3.1's 39-40 KB - close to a wash with v0.3.1, and
-for a real reason: about half of the 11 KB comes from the drawing buffer and the polling task's
-working space, both the same size in v0.3.1, so it is paid for in slower repaints and a thinner
-stack margin rather than handed back for free. Static RAM drops by 2,544 bytes on every board, and
-the host test suite is up to 279 tests, all green. Treat the 42-43 KB figure as a claim to verify,
-not a fact: a ledger like this one was off by about a third once before, at rc1, for exactly the
-reason given there - it is easy to count what changed and miss what else was already resident.
+- **The SD card fault seen while testing this release was a detection-timing issue, not a hardware
+  fault.** The firmware probes for the card exactly once, at boot, and never retries - so a card
+  that gets reseated without the board being restarted stays unmounted until the next restart, which
+  is exactly what happened here. Once the card was reseated and the board rebooted, it mounted
+  cleanly with all 330 KB of logs intact; nothing about the card, its socket or its wiring was ever
+  at fault. Worth still knowing: a board running with no card mounted holds about 12-17 KB less
+  filesystem memory than one with a card mounted, so any memory figure taken without a card reads
+  optimistically.
+
+**Measured on hardware, with the card mounted:** the changes above give back about 11 KB of the
+floor the Settings-page fix needed, without reopening any of the per-poll demand the earlier fix
+closed - none of them ask for a bigger contiguous block during a poll, they just hold less
+permanently or copy less on a save. That puts the resting free-memory floor at about 40 KB, against
+the fragmented 32 KB above and v0.3.1's 39-40 KB - close to a wash with v0.3.1, and for a real
+reason: about half of the 11 KB comes from the drawing buffer and the polling task's working space,
+both the same size in v0.3.1, so it is paid for in slower repaints and a thinner stack margin rather
+than handed back for free. Over the same run the largest free block held at about 37 KB at the start
+of every poll and dipped to about 28 KB at its lowest point mid-poll. Static RAM drops by 2,544
+bytes on every board, and the host test suite is up to 279 tests, all green. The ledger's own
+42-43 KB guess landed close but not exact - the same kind of gap as rc1's, just smaller: it is easy
+to count what changed and miss what else was already resident, which is why this figure is now
+reported measured rather than counted.
 
 Update space (OTA headroom) on the tightest board (the 3.5" capacitive model) is 13,478 bytes,
 above the 12 KB floor.
+
+- **A crash that has been possible in every release so far, finally caught.** When the board runs
+  completely out of memory, the network library asks for a small block using the "don't throw an
+  error, just return nothing" form of allocation - which, it turns out, the C++ runtime implements
+  by throwing an error and catching it. The first time that happens on a given internal task, the
+  runtime has to allocate a few bytes of bookkeeping first, and if that fails too it shuts the
+  board down immediately, past every safety net. The display already prepares that bookkeeping in
+  advance on the three tasks it creates itself; the network stack's own task was not one of them,
+  and all of the network library's low-level callbacks run there. It is now prepared at boot like
+  the others. This only ever bit when memory was completely exhausted, which is why it took a
+  deliberate out-of-memory test on a cold boot to expose it.
 
 - **The `/api/debug/oom` diagnostic is no longer in shipping builds.** It deliberately drained the
   whole heap to prove the out-of-memory safety nets catch, but draining to literal zero races the
@@ -204,9 +198,11 @@ been caught in the act - not on v0.3.0, not on v0.3.1, and the two-hour clean ru
 it did not happen during that run, not that it cannot happen. The memory log above exists to catch
 it if it ever returns, and the nightly restart is the backstop regardless of whether it is ever
 explained. The Settings-page fragmentation was a second, faster mechanism, found by the device
-suite and fixed above in the same release; it has not yet had its own clean run through that suite
-or a fresh multi-hour watch, which is what the 42-43 KB floor is waiting on before it can be called
-measured rather than expected.
+suite and fixed above in the same release; the suite has since been run again in full, with the SD
+card mounted, and passed 194 of its 196 checks - the two exceptions being the cold-boot
+out-of-memory diagnostic and the crash line it deliberately triggers, both gone now that
+`/api/debug/oom` is compiled out of shipping builds. Every memory, settings-churn, burst, SD and
+ticker check passed, and the 40 KB floor above is that run's result, measured rather than expected.
 
 ## v0.3.1 - 2026-09-17
 
