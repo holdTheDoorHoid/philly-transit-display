@@ -1188,8 +1188,9 @@ it is not a resting-floor number; it is the section-B number, and section B is w
 rc1's lesson is not repealed by any of this, it is respected — but it was nearly repeated, and the
 thing that nearly repeated it was counting only the heap.
 
-Resident total: **19,328 B** (6,144 shared scratch + 4,096 transport buffer + the 1 KB error-reply
-reserve of §12.1 + these 8,064). Measured on the host with the allocation probe, a warm cache-hit
+Resident total: **16,512 B** (6,144 shared scratch + 4,096 transport buffer + the 1 KB error-reply
+reserve of §12.1 + the 5,248 above — 2,432 retention + 2,816 TransitView at 0.3.2-rc3's 16 slots,
+down from 8,064 at 32). Measured on the host with the allocation probe, a warm cache-hit
 cycle now makes **no** request of 2 KB or more at all; the largest single contiguous request left in
 such a cycle is an arrival vector at ~1.2 KB, and in a schedule-refetch cycle the 3,072 B parse
 block. `min_free8` on `GET /api/debug/ui` is the number that says whether the floor is right, and it
@@ -1253,7 +1254,7 @@ poller holds one Snapshot and not two through the optional tail (§12.1's `snaps
 `startWebServer()`, because the FAT mount is one ~12.5 KB contiguous `calloc` and should come off a
 heap the async web server has not been allocating out of yet.
 
-Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-16, with the §12 hardening, the screen pass, the LVGL pool safety work, the release-candidate fixes and the display task's lock policy (this §), the full feature set uses **1,862,942 B (98.0 %)** on `cyd-3248S035R` — 37,602 B of headroom — and 1,858,614 B (97.8 %) on `cyd-2432S024C`; the tightest env of all is the HTTPS prototype `cyd-3248S035R-https` (§2.1), which ships in no image. (This line read "93.9 % / 93.7 %, ~112 KB headroom" until 2026-09-16, which was the 2026-09-15 measurement left behind by three later passes — the same failure §2.1's threshold note describes, so the figures here are now absolute bytes with the date they were taken.) `firmware/README.md` carries the per-env table and ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
+Flash budget: the app slot is 1,900,544 bytes. As of `0.3.2-rc3` (2026-09-17), with the §12 hardening, the screen pass, the LVGL pool safety work, the release-candidate fixes and the display task's lock policy (this §), the full feature set uses **1,874,866 B (98.6 %)** on `cyd-3248S035R` — 25,678 B of headroom — and 1,870,654 B (98.4 %) on `cyd-2432S024C`; the tightest env of all is the HTTPS prototype `cyd-3248S035R-https` (§2.1), which ships in no image. (This line read "1,862,942 B / 98.0 %, 37,602 B headroom" as of 2026-09-16 — left behind by three further release-candidate passes, the exact recurrence the previous correction here warned about, so treat this as a figure to recheck after any change that touches flash rather than a fact to carry forward.) `firmware/README.md` carries the per-env table and ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
 
 Build/flash: `pio run -e cyd-3248S035R`, `pio run -e cyd-3248S035R -t upload --upload-port
 /dev/ttyUSB0`. Releases publish `bootloader.bin`, `partitions.bin`, `firmware.bin` per env plus an

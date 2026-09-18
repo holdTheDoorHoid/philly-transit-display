@@ -1,78 +1,23 @@
 # Changelog
 
-## v0.3.2-rc3 - 2026-09-17 (release candidate)
+## v0.3.2 - 2026-09-17
 
-**rc2 stopped the memory fragmenting and rc3 is about what that cost.** Over two hours and
-thirteen minutes of ordinary use, rc2 held the largest unbroken piece of memory at exactly the same
-value at the start of every single poll and never failed once - the first build that does that.
-But it rests about 7 KB lower on free memory than v0.3.1, and when the automated test suite hammers
-the Settings page - about 45 save-and-reload rounds in a few minutes, each one rebuilding the
-screen - the memory crumbled to 3 KB pieces with 19.5 KB still free, every reload came back "low
-memory, retry", two saves failed outright, and the board restarted itself in the middle of the run.
-
-rc3 gives about 11 KB of that floor back, and fixes the thing the Settings test was actually
-provoking. Nothing here changes what the display shows.
-
-- **Saving settings no longer scatters memory.** Every save used to make four separate copies of
-  the whole configuration - one to compare against, one for the display, one for the display to
-  keep, one for the record - and the display and the record each kept a copy permanently. Each
-  copy frees a dozen small fragments of memory and allocates a dozen more wherever there is room,
-  which is exactly how memory ends up in small pieces. There is now **one** configuration in
-  memory, and everything that reads it shares that one: a save allocates one and frees one, and
-  copies none. Loading the Settings page and reading the device status no longer copy it either.
-  A save also can no longer be silently dropped, which the old handover could do if it happened to
-  arrive while the screen was busy.
-
-- **The live vehicle list keeps only the vehicles that can actually appear on your screen.** The
-  display fetches every tracked vehicle on a route - 20 to 30 on Route 17 at rush hour - and then
-  uses only the handful matching a trip the live-arrivals feed named for your stops. It now checks
-  that before building each one, so a busy route costs the same as a quiet one, and the space set
-  aside for the list halves from 5.6 KB to 2.8 KB. If a real configuration ever needs more than the
-  16 slots, the board says so at `/api/debug/ui` (`tv_dropped`) rather than going quiet.
-
-- **The memory history is one hour instead of two** (240 lines to 120), which is 1.9 KB back. Both
-  times this board has crumbled it did so inside forty minutes of looking healthy, so an hour of
-  history still brackets it. Nothing about the format changed.
-
-- **Three smaller reclaims, 6.5 KB together.** The drawing buffer on the 3.5" screens is 1/40 of
-  the panel instead of 1/30 (2.5 KB) - the buffer is scratch space the screen is painted from, so a
-  smaller one means more paint passes per redraw and nothing else, and the redraw time should be
-  checked after updating. The polling task's working space drops from 10 KB to 8 KB (2 KB), sized
-  from what it has actually used: the deepest it has ever gone is 5.8 KB, measured both under the
-  test suite and across the two-hour run, and it still reports its own high-water mark so the
-  margin stays checkable. And nothing else was taken from the drawing memory, the stop limit or
-  the safety nets.
-
-- **The connection limit stops turning a busy moment into a refusal.** The board refuses new
-  connections when memory is low *and* it is already busy; that was applying from the second
-  connection, and during the suite's burst test it refused nine connections where six is the
-  allowance - the three extra were second connections arriving while memory happened to dip. Two
-  connections at once was never the situation the rule was written for (the crash it prevents took
-  seven), so the memory check now applies from the third connection onward. The hard limit of five
-  at once is unchanged, and a second connection whose reply will not fit still gets a polite "out
-  of memory, try again" rather than silence.
-
-**Expected, by arithmetic and not yet measured on hardware:** a resting free-memory floor around
-42-43 KB against rc2's 32 KB and v0.3.1's 39-40 KB, and no reopened demand for large unbroken
-pieces during a poll - the vehicle list is still set aside once and reused, just smaller. Read that
-carefully rather than as a free lunch: about half of it comes from the drawing buffer and the
-polling task's working space, which v0.3.1 had at full size too, so it is paid for in slower
-repaints and a thinner stack margin rather than handed back. The numbers that judge it are the same
-ones as last time: the largest free block at the start of each poll, the lowest free memory since
-boot, and now `tv_dropped` and the redraw time.
-
-Update space on the tightest board (the 3.5" capacitive model) is 13,478 bytes, above the 12 KB
-floor, down 652 bytes from rc2.
-
-## v0.3.2-rc2 - 2026-09-17 (release candidate)
+*Release date is provisional: the floor figure below is by ledger, not yet confirmed by a fresh
+device-suite run and a multi-hour watch.*
 
 **rc1 of this release was flashed at 17:00 and rolled back within minutes.** It did what it set
 out to do and still left about 12 KB less free memory than v0.3.1 - enough that several requests
 came back "low memory" during testing and the board came within 156 bytes of nothing at all. rc2
-takes most of that back with the four-stop limit below and stops the reply buffer growing on a
-board that is already short. rc2 was then flashed on the owner's board on 2026-09-17 and left
-running for two hours and thirteen minutes under the owner's own configuration - the numbers below
-are measured from that run, not predicted.
+took most of that back with the four-stop limit below and stopped the reply buffer growing on a
+board that is already short, then ran on the owner's board for two hours and thirteen minutes under
+his own configuration with the largest free block holding at exactly 14,324 bytes at the start of
+every single poll and never moving once - the first build in this project that did not fragment.
+**rc2 was not shipped either**: when the device regression suite hammered the Settings page - about
+45 save-and-reload rounds in a few minutes, each one rebuilding the screen - the memory crumbled to
+3,060-byte pieces with about 19.5 KB still free, every reload came back "low memory, retry", two
+saves failed outright, and the board restarted itself in the middle of the run. Its resting floor
+(about 32 KB) was also 7-11 KB below v0.3.1's. This release is what both failures cost, and it
+fixes the second one without giving back the first.
 
 v0.3.1 shipped today at 15:07. By about forty minutes of uptime the owner's board had crumbled
 into the same kind of lockout it was built to prevent - and this time it also locked the door,
@@ -158,25 +103,80 @@ release states that plainly and fixes what it exposed.
   four, remove the extras before updating - the update will otherwise fall back to your previous
   saved settings.
 
-- **Two hours of memory history, so the trigger can finally be caught.** The display keeps one
-  line per poll for the last 240 polls - memory free, largest unbroken piece, the lowest either
-  touched during that poll, and which optional steps ran - readable at `/api/debug/ui?log=1`. The
-  previous instrument held three polls, enough to name the failing step and nowhere near enough to
-  find what leads to it. Alongside it: the biggest reply ever received, how fragmented the memory
-  is, and how much the schedule and alert caches are holding.
+- **The memory history is one hour instead of two, so the trigger can finally be caught.** The
+  display keeps one line per poll for the last 120 polls - memory free, largest unbroken piece, the
+  lowest either touched during that poll, and which optional steps ran - readable at
+  `/api/debug/ui?log=1`. The very first version of this instrument held three polls, enough to name
+  the failing step and nowhere near enough to find what leads to it; two hours was the next cut, and
+  one hour is this release's, because both times this board has crumbled it did so inside forty
+  minutes of looking healthy, so an hour still brackets it, and the shorter log gives back about
+  1.9 KB toward the fix below. Alongside it: the biggest reply ever received, how fragmented the
+  memory is, and how much the schedule and alert caches are holding.
 
-**Known residual:** what actually triggers the fragmentation has still never been caught in the
-act - not on v0.3.0, not on v0.3.1. On v0.3.2, a two-hour watch on the owner's board (2026-09-17,
-two hours and thirteen minutes) showed no fragmentation at all: the largest free block held at
-14,324 bytes at the start of every poll for the entire run and never moved. That is not proof it
-cannot happen, only that this run did not see it. The two-hour memory log above
-(`/api/debug/ui?log=1`) exists to catch it if it ever returns, and the nightly restart is the
-backstop regardless of whether it is ever explained. By design, this release's resting
-free-memory floor measures about 32 KB against v0.3.1's 39-40 KB - the deliberate cost of the fix
-above, and close to the ~8.4 KB the ledger predicts. That figure was wrong once already: rc1
-claimed 8 KB, counted only the memory the poll cycle holds, and left out the 4.5 KB the new memory
-log occupies; the real gap was about 12 KB until the four-stop limit gave 4 KB of it back. This
-time it comes from a measured two-hour run on the shipping board, not an estimate.
+- **Saving settings no longer scatters memory.** Every save used to make four separate copies of
+  the whole configuration - one to compare against, one for the display, one for the display to
+  keep, one for the record - and the display and the record each kept a copy permanently. Each
+  copy frees a dozen small fragments of memory and allocates a dozen more wherever there is room,
+  which is exactly how memory ends up in small pieces - and forty-five save-and-reload rounds of
+  that, each rebuilding the screen, is what fragmented the heap during testing and made the
+  out-of-memory reserve above go missing right when it was needed. There is now **one**
+  configuration in memory, and everything that reads it shares that one: a save allocates one and
+  frees one, and copies none (about 1.2 KB back by estimate, not directly measured, plus far less
+  churn per save). Loading the Settings page and reading the device status no longer copy it
+  either. A save also can no longer be silently dropped, which the old handover could do if it
+  happened to arrive while the screen was busy.
+
+- **The live vehicle list keeps only the vehicles that can actually appear on your screen.** The
+  display fetches every tracked vehicle on a route - 20 to 30 on Route 17 at rush hour - and then
+  uses only the handful matching a trip the live-arrivals feed named for your stops. It now checks
+  that before building each one, so a busy route costs the same as a quiet one, and the space set
+  aside for the list halves from 5.6 KB to 2.8 KB (2.8 KB back). If a real configuration ever needs
+  more than the 16 slots, the board says so at `/api/debug/ui` (`tv_dropped`) rather than going
+  quiet.
+
+- **The drawing buffer is smaller, and so is the polling task's working space.** The drawing buffer
+  on the 3.5" screens is 1/40 of the panel instead of 1/30 (2.5 KB back) - the buffer is scratch
+  space the screen is painted from, so a smaller one means more paint passes per redraw and nothing
+  else, and the redraw time should be checked after updating (21 ms at 1/20, 168 ms at 1/30 across
+  a full test run; 1/40 not yet measured). The polling task's working space drops from 10 KB to
+  8 KB (2 KB back), sized from what it has actually used: the deepest it has ever gone measured
+  about 4.4 KB free, so roughly 2.3 KB of margin remains, and the board still reports its own
+  high-water mark (`stack_hwm.net_poller`) so that margin stays checkable. Nothing else was taken
+  from the drawing memory, the stop limit, or the safety nets.
+
+- **The connection limit stops turning a busy moment into a refusal.** The board refuses new
+  connections when memory is low *and* it is already busy; that was applying from the second
+  connection, and during the suite's burst test it refused nine connections where six is the
+  allowance - the three extra were second connections arriving while memory happened to dip. Two
+  connections at once was never the situation the rule was written for (the crash it prevents took
+  seven), so the memory check now applies from the third connection onward. The hard limit of five
+  at once is unchanged, so about two refusals per round are expected in that burst test instead of
+  three. A second connection whose reply will not fit still gets a polite "out of memory, try
+  again" rather than silence.
+
+**Expected, by arithmetic and not yet measured on hardware:** the changes above give back about
+11 KB of the floor the Settings-page fix needed, without reopening any of the per-poll demand the
+earlier fix closed - none of them ask for a bigger contiguous block during a poll, they just hold
+less permanently or copy less on a save. That puts the resting free-memory floor at an expected
+42-43 KB, against the measured 32 KB above and v0.3.1's 39-40 KB - close to a wash with v0.3.1, and
+for a real reason: about half of the 11 KB comes from the drawing buffer and the polling task's
+working space, both the same size in v0.3.1, so it is paid for in slower repaints and a thinner
+stack margin rather than handed back for free. Static RAM drops by 2,544 bytes on every board, and
+the host test suite is up to 279 tests, all green. Treat the 42-43 KB figure as a claim to verify,
+not a fact: a ledger like this one was off by about a third once before, at rc1, for exactly the
+reason given there - it is easy to count what changed and miss what else was already resident.
+
+Update space (OTA headroom) on the tightest board (the 3.5" capacitive model) is 13,478 bytes,
+above the 12 KB floor.
+
+**Known residual:** what actually triggers the slow, forty-minute fragmentation has still never
+been caught in the act - not on v0.3.0, not on v0.3.1, and the two-hour clean run above only shows
+it did not happen during that run, not that it cannot happen. The memory log above exists to catch
+it if it ever returns, and the nightly restart is the backstop regardless of whether it is ever
+explained. The Settings-page fragmentation was a second, faster mechanism, found by the device
+suite and fixed above in the same release; it has not yet had its own clean run through that suite
+or a fresh multi-hour watch, which is what the 42-43 KB floor is waiting on before it can be called
+measured rather than expected.
 
 ## v0.3.1 - 2026-09-17
 
