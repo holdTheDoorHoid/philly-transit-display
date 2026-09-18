@@ -987,10 +987,11 @@ a 200.
 scans for a summary, so downloads take a single-reader lease (`acquireLogReader()`); a second
 concurrent download gets a 503 rather than a truncated file.
 
-Memory rules: no full framebuffer; the LVGL partial buffer is **1/30** of the screen in RGB565 on
+Memory rules: no full framebuffer; the LVGL partial buffer is **1/40** of the screen in RGB565 on
 the 3.5" boards and 1/16 on the 240-tall ones (the library default of 1/4 with 3-byte pixels does
 not fit; `firmware/boards/README.md` has the history, including 1/20 → 1/30 in 0.3.1 for 5,120 B of
-heap — this line said "1/10" until then, which was never any board's value); large long-lived
+heap and 1/30 → 1/40 in 0.3.2-rc3 for 2,560 B more — this line said "1/10" until 0.3.1, which was
+never any board's value); large long-lived
 objects (`ArrivalTracker` **8,040 B** and `StatsAggregator` **8,744 B**, both measured on the target
 ABI rather than the "~16 KB / ~8 KB" this line used to carry) are heap-allocated, never file-scope
 globals, because the ESP32's static .bss budget is separate from and much smaller than the heap; one
@@ -1573,6 +1574,21 @@ Main screen (portrait by default; every size derives from the runtime resolution
   The `N more stops will not fit` caption is also built **before** the first panel and hidden,
   rather than out of whatever the loop leaves — it is the one allocation that must not fail,
   because it is the one that explains the failure.
+- **The draw buffer is 1/40 of the screen on the 3.5" boards since 0.3.2-rc3, and `tick_ms_max`
+  has to be re-measured (2026-09-17).** `LVGL_BUFFER_PIXELS` in `boards/esp32-3248S035R.json` and
+  `esp32-3248S035C.json` went `/30` → `/40`: 5,120 px (10,240 B) to 3,840 px (7,680 B), for
+  **2,560 B** of permanent heap back. The owner delegated this number to our judgement, and it is
+  the cheapest block left on the board that costs no functionality — the buffer is a scratchpad the
+  panel driver flushes from, so a smaller one changes *how often* a repaint is flushed and nothing
+  about what is drawn; 3,840 px is still 12 rows of a 320-wide panel against the one row LVGL
+  requires. What it does change is repaint time: 40 partial flushes per full repaint instead of
+  30, at an unchanged 24 MHz pixel clock. **`tick_ms_max` on `GET /api/debug/ui` is the number
+  that says whether that matters, and it has not been measured at `/40`.** The readings that
+  exist are 21 ms at `/20` and 168 ms across a full device-suite run at `/30`, with a page rebuild
+  the expensive case in both. This is the third consecutive release to shrink this buffer, and
+  each one lengthens a repaint, so the reading after flashing is the check — not this paragraph.
+  It is also unrelated to the LVGL pool: the draw buffer comes from the ESP heap
+  (`LVGL_BUFFER_MALLOC_FLAGS`), `LV_MEM_SIZE` is a separate 36 KB static pool and does not move.
 - Pool exhaustion has its own simulator environment, because the normal one cannot show it:
   `pio run -e ui-sim` builds with a 512 KB pool for 64-bit host pointers. `ui-sim-pool` scales
   `LV_MEM_SIZE` to the board's by the measured host/board ratio (0.66, fitted against six figures

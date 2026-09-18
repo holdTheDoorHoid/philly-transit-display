@@ -96,19 +96,27 @@ choice is made at compile time so each board links only one big font: `lv_conf.h
 
 ## `LVGL_BUFFER_PIXELS` on the 3.5" boards
 
-`esp32-3248S035R.json` and `esp32-3248S035C.json` size the draw buffer at **1/30** of the screen
-(5,120 px, 10 KB): `/16` first became `/20` (7,680 px, 15 KB) when the 2026-09-14 features needed
-the 4 KB back, and `/30` in 0.3.1 for the same reason again - it is 5,120 B of the ESP32's
-byte-addressable heap, allocated once at `smartdisplay_init()` and held for the life of the
-device, on a board whose largest free block is the resource that runs out (DESIGN.md SS12.1).
-`ST7796_SPI_BUS_MAX_TRANSFER_SZ` is written in terms of `LVGL_BUFFER_PIXELS`, so the SPI DMA
-descriptor count follows it automatically and needs no separate edit.
+`esp32-3248S035R.json` and `esp32-3248S035C.json` size the draw buffer at **1/40** of the screen
+(3,840 px, 7,680 B): `/16` first became `/20` (7,680 px, 15 KB) when the 2026-09-14 features needed
+the 4 KB back, `/30` in 0.3.1 for the same reason again, and `/40` in 0.3.2-rc3 - it is a
+permanent block of the ESP32's byte-addressable heap, allocated once at `smartdisplay_init()` and
+held for the life of the device, on a board whose largest free block is the resource that runs out
+(DESIGN.md SS12.1). `ST7796_SPI_BUS_MAX_TRANSFER_SZ` is written in terms of `LVGL_BUFFER_PIXELS`,
+so the SPI DMA descriptor count follows it automatically and needs no separate edit.
 
-The cost is flush count: 30 partial flushes per full repaint instead of 20, at an unchanged
+The `/30` -> `/40` step is 2,560 B and the owner delegated the size to our judgement. It is the
+cheapest remaining block on the board that costs no functionality at all: the buffer is a
+scratchpad the panel driver flushes from, so a smaller one changes how often a repaint is flushed
+and nothing about what is drawn. 3,840 px is 12 rows of a 320-wide panel, comfortably more than
+the one row LVGL requires.
+
+The cost is flush count: 40 partial flushes per full repaint instead of 30, at an unchanged
 24 MHz pixel clock. The observable is `tick_ms_max` in `GET /api/debug/ui` (21 ms on the owner's
-board at `/20`, with a page rebuild as the expensive case) - re-measure it after flashing rather
-than assuming. The 240-tall boards stay at `/16`: their quarter is 9.6 KB to begin with, and they
-are not the board this was measured on.
+board at `/20`, 168 ms across a full device-suite run at `/30` with a page rebuild as the
+expensive case) - **re-measure it after flashing rather than assuming**, because this is the third
+consecutive release to shrink this buffer and each one lengthens a repaint. The 240-tall boards
+stay at `/16`: their quarter is 9.6 KB to begin with, and they are not the board this was measured
+on.
 
 ## `LV_MEM_SIZE` stays at 36 KB (0.3.1)
 
