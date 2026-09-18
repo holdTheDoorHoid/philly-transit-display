@@ -111,12 +111,12 @@ and nothing about what is drawn. 3,840 px is 12 rows of a 320-wide panel, comfor
 the one row LVGL requires.
 
 The cost is flush count: 40 partial flushes per full repaint instead of 30, at an unchanged
-24 MHz pixel clock. The observable is `tick_ms_max` in `GET /api/debug/ui` (21 ms on the owner's
-board at `/20`, 168 ms across a full device-suite run at `/30` with a page rebuild as the
-expensive case) - **re-measure it after flashing rather than assuming**, because this is the third
-consecutive release to shrink this buffer and each one lengthens a repaint. The 240-tall boards
-stay at `/16`: their quarter is 9.6 KB to begin with, and they are not the board this was measured
-on.
+24 MHz pixel clock. The observable is `tick_ms_max` in `GET /api/debug/ui`, and it has now been
+taken at every size on the owner's board: **21 ms at `/20`, 168 ms at `/30`, 100-122 ms at `/40`**
+(2026-09-17), with a page rebuild as the expensive case throughout and the device suite's 500 ms
+check passing. The page build dominates, not the flush count, which is why `/40` is not slower than
+`/30`. A fourth reduction should still be measured rather than assumed. The 240-tall boards stay at
+`/16`: their quarter is 9.6 KB to begin with, and they are not the board this was measured on.
 
 ## `LV_MEM_SIZE` stays at 36 KB (0.3.1)
 

@@ -1693,11 +1693,12 @@ Main screen (portrait by default; every size derives from the runtime resolution
   panel driver flushes from, so a smaller one changes *how often* a repaint is flushed and nothing
   about what is drawn; 3,840 px is still 12 rows of a 320-wide panel against the one row LVGL
   requires. What it does change is repaint time: 40 partial flushes per full repaint instead of
-  30, at an unchanged 24 MHz pixel clock. **`tick_ms_max` on `GET /api/debug/ui` is the number
-  that says whether that matters, and it has not been measured at `/40`.** The readings that
-  exist are 21 ms at `/20` and 168 ms across a full device-suite run at `/30`, with a page rebuild
-  the expensive case in both. This is the third consecutive release to shrink this buffer, and
-  each one lengthens a repaint, so the reading after flashing is the check — not this paragraph.
+  30, at an unchanged 24 MHz pixel clock. **Measured on the owner's board on 2026-09-17:
+  `tick_ms_max` 100–122 ms at `/40`**, against 168 ms at `/30` and 21 ms at `/20`, with a page
+  rebuild the expensive case in all three — comfortably inside the device suite's 500 ms check,
+  which passes. So the buffer is not what costs the redraw; the page build is, and `/40` did not
+  make it worse. This paragraph asked for that measurement before rc3 was flashed and it is now
+  taken; a fourth reduction would need the same question asked again.
   It is also unrelated to the LVGL pool: the draw buffer comes from the ESP heap
   (`LVGL_BUFFER_MALLOC_FLAGS`), `LV_MEM_SIZE` is a separate 36 KB static pool and does not move.
 - Pool exhaustion has its own simulator environment, because the normal one cannot show it:
@@ -2230,13 +2231,35 @@ and terminates.
 Nothing of ours runs on that task, which is why it stayed invisible: the trap is entirely inside
 library code, reached through a library callback, and the only thing this firmware can do is make
 sure the task is warm before it ever gets there.
-`warmExceptionGlobalsOnTcpipTask()` (`cxx_exception_pool.cpp`) posts `warmExceptionGlobals()` to
-lwIP with **`tcpip_callback_wait()`**, which runs it *on* the tcpip task and blocks the caller until
-it has returned — `tcpip_callback()`/`tcpip_try_callback()` return as soon as the message is queued,
-which would both scramble the boot log's ordering and make "it was warmed" unverifiable. `main.cpp`
-calls it immediately after `connectWifiOrPortal()`, because the tcpip task does not exist until the
-TCP/IP stack is up and both branches of that call (joined a network, or brought up the setup AP)
-start it. The boot line is `[heap] eh_globals warmed on tiT`, beside the other three.
+`warmExceptionGlobalsOnTcpipTask()` (`cxx_exception_pool.cpp`) runs `warmExceptionGlobals()` on the
+tcpip task through lwIP's own callback mailbox. `main.cpp` calls it immediately after
+`connectWifiOrPortal()`, because the tcpip task does not exist until the TCP/IP stack is up and
+both branches of that call (joined a network, or brought up the setup AP) start it. The boot line
+is `[heap] eh_globals warmed on tiT`, beside the other three.
+
+**It is written the long way because of two traps in this SDK's lwIP configuration, and either
+would have shipped something worse than the bug.** Both were found by reading the framework's own
+`sdkconfig`, not on hardware:
+
+- **`tcpip_callback_wait()` would have been a silent no-op.** It is the obvious call — "run this on
+  the tcpip task and wait" — but this SDK has **`CONFIG_LWIP_TCPIP_CORE_LOCKING=y`**, and under core
+  locking lwIP does not post that message anywhere: it takes the core mutex and calls the function
+  **inline, on the calling task**. The callback would have run on `loopTask`, found it already warm,
+  returned `false` without printing, and the whole thing would have reported success having warmed
+  nothing — the same shape `throwOnce()` exists to prevent.
+- **Posting without the core lock would have aborted the boot.** `tcpip_callback()` and
+  `tcpip_try_callback()` both open with `LWIP_ASSERT_CORE_LOCKED()`, and with
+  **`CONFIG_LWIP_CHECK_THREAD_SAFETY=y`** and assertions enabled that assert is live — confirmed in
+  the built image, which shows the `sys_thread_tcpip()` check compiled into the call path.
+
+So the sequence is `LOCK_TCPIP_CORE()` → `tcpip_try_callback()` → `UNLOCK_TCPIP_CORE()`, and only
+then the wait. `tcpip_try_callback()` rather than `tcpip_callback()` because the latter uses a
+*blocking* `sys_mbox_post()`, and blocking on the mailbox while holding the very lock the tcpip task
+needs to drain it is a deadlock shape whether or not the mailbox is empty at boot. The wait is
+outside the lock for the same reason. **And then the part that does not depend on any of that being
+right:** the callback records which task it ran on and the caller compares it with its own handle,
+so a future SDK that changes the contract again prints
+`eh_globals NOT warmed on tiT: callback ran INLINE on the caller` instead of quietly doing nothing.
 
 This has been present in every release. 0.3.2-rc3 is only the first build whose heap gates let
 `POST /api/debug/oom` exhaust the heap completely enough to reach it.

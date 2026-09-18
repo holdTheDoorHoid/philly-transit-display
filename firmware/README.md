@@ -347,8 +347,8 @@ Rules that fell out of this, all learned the hard way (each one was a boot loop 
   a cached value plus its age; the poller recomputes one stop per idle slice.
 - LVGL's static pool is 36 KB (`LV_MEM_SIZE`) and stays there — see `boards/README.md`; the draw
   buffer is 1/40 of the screen in RGB565 on the 3.5" boards since 0.3.2-rc3, 7,680 B
-  (`LVGL_BUFFER_PIXELS` in `boards/*.json`; re-measure `tick_ms_max` after flashing - a smaller
-  buffer is more flushes per repaint). The `[lvmem]` lines show pool usage — at boot, and one per page built.
+  (`LVGL_BUFFER_PIXELS` in `boards/*.json`; measured 2026-09-17, `tick_ms_max` 100-122 ms at `/40`
+  against 168 ms at `/30` - the page build dominates, not the flush count). The `[lvmem]` lines show pool usage — at boot, and one per page built.
 - **One page is resident at a time** (DESIGN.md §8). LVGL 9.5 does not survive running that pool
   out: `lv_obj_class.c` writes each new child straight after an unchecked `lv_realloc()`. So every
   page transition frees the page it is leaving before it builds the next one, the night page

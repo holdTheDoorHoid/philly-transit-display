@@ -174,38 +174,77 @@ bool warmExceptionGlobals(const char *task_name) {
 
 namespace {
 
-// FILE-SCOPE and not a stack struct, deliberately. tcpip_callback_wait() blocks until the callback
-// has run, so a local would normally be safe - but if the wait ever gained a timeout or lwIP
-// changed its contract, a callback arriving late would write through a dangling pointer on a task
-// we do not control. This runs exactly once at boot, so one static costs nothing and cannot dangle.
-volatile bool g_tcpip_warm_ran = false;
+// FILE-SCOPE and not a stack struct, deliberately: if the wait below ever times out, a callback
+// arriving afterwards must not write through a dangling pointer on a task we do not control. This
+// runs exactly once at boot, so one static costs nothing and cannot dangle.
+SemaphoreHandle_t g_tcpip_warm_done = nullptr;
+TaskHandle_t g_tcpip_warm_ran_on = nullptr;
 
 void warmOnTcpipTask(void *) {
-  // Whatever lwIP's tcpip task is called in this build - CONFIG_LWIP_TCPIP_TASK_NAME, "tiT" by
-  // default. The name is only for the log line; the warming applies to whichever task actually runs
-  // this callback, which is the tcpip task by construction.
+  // WHICH TASK THIS ACTUALLY RAN ON, recorded rather than assumed - see the caller for why that is
+  // the whole safety of this function.
+  g_tcpip_warm_ran_on = xTaskGetCurrentTaskHandle();
+  // The name is only for the log line; the warming applies to whichever task runs this callback.
   warmExceptionGlobals("tiT");
-  g_tcpip_warm_ran = true;
+  if (g_tcpip_warm_done != nullptr) xSemaphoreGive(g_tcpip_warm_done);
 }
 
 }  // namespace
 
+// THE TWO TRAPS IN THIS FUNCTION, AND WHY IT IS WRITTEN THE LONG WAY (0.3.2-rc4). Both were found
+// by reading this SDK's own sdkconfig rather than on hardware, and either would have shipped
+// something worse than the bug being fixed.
+//
+// TRAP 1 - tcpip_callback_wait() would have been a SILENT NO-OP. It is the obvious choice ("run
+// this on the tcpip task and wait for it"), but this SDK is built with
+// CONFIG_LWIP_TCPIP_CORE_LOCKING=y, and under core locking lwIP does not post that message
+// anywhere: it takes the core mutex and calls the function INLINE, on the CALLING task. The
+// callback would have run on loopTask, found it already warm, returned false without printing, and
+// this function would have reported success having warmed nothing at all - exactly the shape
+// throwOnce()'s comment a few lines above warns about.
+//
+// TRAP 2 - posting without the core lock would have ABORTED THE BOOT. tcpip_callback() and
+// tcpip_try_callback() both open with LWIP_ASSERT_CORE_LOCKED(), and this SDK has
+// CONFIG_LWIP_CHECK_THREAD_SAFETY=y with assertions enabled, so that assert is live: calling either
+// from setup() without holding the lock is an abort, not a warning.
+//
+// Hence: take the core lock, post with tcpip_try_callback(), release the lock, THEN wait.
+// try_ and not tcpip_callback() because the latter uses a blocking sys_mbox_post() - and blocking
+// on the mailbox while holding the very lock the tcpip task needs to drain it is a deadlock shape,
+// empty mailbox at boot or not. The wait happens outside the lock for the same reason.
+//
+// And then the part that does not depend on any of the above being right: the callback records
+// WHICH TASK it ran on, and this compares it with the caller. If a future SDK changes the contract
+// again, that prints on the serial console instead of quietly doing nothing.
 bool warmExceptionGlobalsOnTcpipTask(uint32_t timeout_ms) {
-  (void)timeout_ms;  // tcpip_callback_wait() blocks until the callback has run; see below.
-  g_tcpip_warm_ran = false;
-  // tcpip_callback_wait() and not tcpip_callback()/tcpip_try_callback(): the other two return as
-  // soon as the message is QUEUED, which would let boot race on past this and print the line out of
-  // order with the other three warmings - and, worse, would make "it was warmed" unverifiable.
-  // _wait blocks the caller (loopTask, in setup()) until the callback has returned on tiT.
-  const err_t e = tcpip_callback_wait(warmOnTcpipTask, nullptr);
-  if (e != ERR_OK) {
-    // Not fatal, and not silent. The likeliest cause is being called before the TCP/IP stack is up,
-    // which is a call-site ordering bug rather than a runtime condition.
-    Serial.printf("[heap] eh_globals NOT warmed on tiT: tcpip_callback_wait() = %d\n", (int)e);
+  if (g_tcpip_warm_done == nullptr) g_tcpip_warm_done = xSemaphoreCreateBinary();
+  if (g_tcpip_warm_done == nullptr) {
+    Serial.println("[heap] eh_globals NOT warmed on tiT: no semaphore");
     return false;
   }
-  if (!g_tcpip_warm_ran) {
-    Serial.println("[heap] eh_globals NOT warmed on tiT: callback did not run");
+  g_tcpip_warm_ran_on = nullptr;
+  TaskHandle_t self = xTaskGetCurrentTaskHandle();
+
+  // LOCK_TCPIP_CORE()/UNLOCK_TCPIP_CORE() are defined unconditionally by <lwip/tcpip.h> - the real
+  // mutex under LWIP_TCPIP_CORE_LOCKING, empty macros without it - so this is correct either way.
+  LOCK_TCPIP_CORE();
+  const err_t e = tcpip_try_callback(warmOnTcpipTask, nullptr);
+  UNLOCK_TCPIP_CORE();
+  if (e != ERR_OK) {
+    // Not fatal, and not silent. Called before the TCP/IP stack is up is a call-site ordering bug;
+    // ERR_MEM means lwIP's MEMP_TCPIP_MSG_API pool or its mailbox was full, which at boot would be
+    // remarkable in itself.
+    Serial.printf("[heap] eh_globals NOT warmed on tiT: tcpip_try_callback() = %d\n", (int)e);
+    return false;
+  }
+  if (xSemaphoreTake(g_tcpip_warm_done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+    Serial.printf("[heap] eh_globals NOT warmed on tiT: no callback within %u ms\n",
+                  (unsigned)timeout_ms);
+    return false;
+  }
+  if (g_tcpip_warm_ran_on == self) {
+    // lwIP ran it inline on us. Whatever was warmed, it was not the tcpip task.
+    Serial.println("[heap] eh_globals NOT warmed on tiT: callback ran INLINE on the caller");
     return false;
   }
   return true;

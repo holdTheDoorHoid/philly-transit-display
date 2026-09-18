@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.2-rc4 - 2026-09-17 (release candidate)
+
+rc3 ran the test suite at 190/195 with the memory sections passing and the display redraw well
+inside budget. Two things came out of it.
+
+- **A crash that has been possible in every release so far, finally caught.** When the board runs
+  completely out of memory, the network library asks for a small block using the "don't throw an
+  error, just return nothing" form of allocation - which, it turns out, the C++ runtime implements
+  by throwing an error and catching it. The first time that happens on a given internal task, the
+  runtime has to allocate a few bytes of bookkeeping first, and if that fails too it shuts the
+  board down immediately, past every safety net. The display already prepares that bookkeeping in
+  advance on the three tasks it creates itself; the network stack's own task was not one of them,
+  and all of the network library's low-level callbacks run there. It is now prepared at boot like
+  the others. This only ever bit when memory was completely exhausted, which is why it took a
+  deliberate out-of-memory test on a cold boot to expose it.
+
+- **The SD card fault seen on that run is not the firmware, and the memory numbers from it are
+  optimistic.** The card is on a completely separate SPI bus from the screen - different pins,
+  different controller - so no display change can affect it, nothing SD-related has changed since
+  v0.3.1, and the boot log's failure is the card not answering its very first command at all.
+  That is the card, its socket or its wiring. Worth knowing: a board with no working card is
+  holding about 12.5 KB *less* memory than a healthy one, because the filesystem workspace is only
+  allocated for a card that mounts - so the free-memory figures from that run read better than the
+  real thing, and the floor has to be measured again with a working card.
+
 ## v0.3.2 - 2026-09-17
 
 *Release date is provisional: the floor figure below is by ledger, not yet confirmed by a fresh
