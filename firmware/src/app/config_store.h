@@ -261,6 +261,16 @@ bool tryGetActiveConfig(Config *out);
 // What happens under the mutex either way is a refcount bump, which cannot allocate and cannot
 // throw. Never null once setActiveConfig() has run; null before that.
 std::shared_ptr<const Config> activeConfigPtr();
-void setActiveConfig(Config cfg);
+// RETURNS the pointer it published, the same shape publishSnapshot() has (DESIGN.md SS5). A caller
+// that needs the new value afterwards - PUT /api/config serializes it back as the reply - uses
+// the return rather than reading activeConfigPtr() again: no second lock, no window in which a
+// concurrent save could answer the wrong document, and no null to handle. Never null.
+std::shared_ptr<const Config> setActiveConfig(Config cfg);
+
+// The struct defaults, as a borrowable reference - what an "empty Config" has always meant here.
+// One object for the whole firmware rather than a `static const Config` at each site that needs a
+// fallback for a null activeConfigPtr(): a Config is 336 B of .bss on this target (DWARF), and on
+// a board where the cycle log is being halved for 1,920 B, two of them is not a rounding error.
+const Config &emptyConfig();
 
 }  // namespace transit_app

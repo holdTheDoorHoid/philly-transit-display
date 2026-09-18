@@ -80,8 +80,7 @@ lv_obj_t *g_connecting_detail_label = nullptr;
 // applyRotation()/setTheme() are legitimately called from setup() before init() has run.
 std::shared_ptr<const Config> g_cfg_ptr;
 const Config &cfg() {
-  static const Config kNoConfig;  // the struct defaults, which is what an empty Config has always been
-  return g_cfg_ptr ? *g_cfg_ptr : kNoConfig;
+  return g_cfg_ptr ? *g_cfg_ptr : emptyConfig();  // config_store's one set of struct defaults
 }
 Page g_page = Page::Main;
 bool g_initialized = false;

@@ -563,8 +563,7 @@ void handleGetState(AsyncWebServerRequest *request) {
   // the published pointer keeps the object alive for the life of the handler and allocates
   // nothing. Same reasoning, same shape, as snapshotPtr() two lines below.
   std::shared_ptr<const Config> cfg_ptr = activeConfigPtr();
-  static const Config kNoConfig;
-  const Config &cfg = cfg_ptr ? *cfg_ptr : kNoConfig;
+  const Config &cfg = cfg_ptr ? *cfg_ptr : emptyConfig();
 
   JsonObject wifi = doc["wifi"].to<JsonObject>();
   wifi["ssid"] = WiFi.SSID();
@@ -759,19 +758,20 @@ void handlePutConfigInner(AsyncWebServerRequest *request, JsonVariant &json, con
   // allocated, one freed, none copied.
   std::shared_ptr<const Config> previous = activeConfigPtr();
   bool data_changed = previous ? dataSettingsChanged(*previous, cfg) : true;
-  const std::string new_name = cfg.device.name;  // read before the move; a short string, not a Config
-  setActiveConfig(std::move(cfg));
-  previous.reset();  // the outgoing Config is freed here, before the reply document is built
-  setHostName(new_name);  // a rename changes which Host headers are accepted (review F05)
+  // setActiveConfig() hands back what it published, so `cfg` can be moved into it and still be
+  // read afterwards - no second lock, and no window in which a concurrent save would make this
+  // request answer somebody else's document.
+  std::shared_ptr<const Config> published = setActiveConfig(std::move(cfg));
+  previous.reset();  // the Config this one replaced is freed here, before the reply is built
+  setHostName(published->device.name);  // a rename changes which Host headers are accepted (F05)
   if (onConfigChanged) {
     onConfigChanged(data_changed);
   }
   // Same streamed response as GET /api/config: the 16 KB request document is still alive here, so
   // this is the moment a second body copy hurt most (SS12.1). Serialized from the published
   // Config, which is where `cfg` now lives.
-  std::shared_ptr<const Config> published = activeConfigPtr();
   JsonDocument doc;
-  if (published) configToJson(*published, doc);
+  configToJson(*published, doc);
   sendJsonStreamed(request, doc);
 }
 

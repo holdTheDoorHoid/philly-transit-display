@@ -1001,6 +1001,11 @@ SemaphoreHandle_t activeMutex() {
 }
 }  // namespace
 
+const Config &emptyConfig() {
+  static const Config kEmpty;
+  return kEmpty;
+}
+
 std::shared_ptr<const Config> activeConfigPtr() {
   SemaphoreHandle_t mutex = activeMutex();
   // The display task's own last-good pointer, exactly as net_poller.cpp's snapshotPtr() keeps one
@@ -1056,7 +1061,7 @@ Config getActiveConfig() {
   return copy;
 }
 
-void setActiveConfig(Config cfg) {
+std::shared_ptr<const Config> setActiveConfig(Config cfg) {
   // BY VALUE AND MOVED. A caller that still needs its Config pays one copy here, exactly as it did
   // before; a caller that does not - PUT /api/config - std::move()s and pays none at all, so the
   // strings the request parsed become the published ones instead of being duplicated and thrown
@@ -1066,6 +1071,7 @@ void setActiveConfig(Config cfg) {
   // SS5): what happens under this mutex is a pointer exchange, never an allocation. `outgoing`
   // carries the old Config out so its destructor runs after the give rather than under it.
   std::shared_ptr<const Config> outgoing;
+  std::shared_ptr<const Config> published = next;  // a refcount bump, so the return survives the move
   SemaphoreHandle_t mutex = activeMutex();
   if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
     outgoing = std::move(g_active_config);
@@ -1077,9 +1083,11 @@ void setActiveConfig(Config cfg) {
   // through here, so this is the one place the fetch layer learns the transport policy - the
   // poller never has to know the key exists. validateConfig() already rejected unknown names.
   Transport policy;
-  std::shared_ptr<const Config> published = activeConfigPtr();
-  if (published && parseTransport(published->device.transport.c_str(), policy)) setTransportPolicy(policy);
+  if (parseTransport(published->device.transport.c_str(), policy)) setTransportPolicy(policy);
 #endif
+  // `outgoing` - the Config this one replaced - is destroyed here, on the caller's task, with the
+  // mutex long since given back.
+  return published;
 }
 
 }  // namespace transit_app
