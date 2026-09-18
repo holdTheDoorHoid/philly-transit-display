@@ -1169,6 +1169,45 @@ resident. `scratch_max_bytes`, `scratch_reserve_bytes` and `scratch_grows` on `G
 are the measurement that says whether `kScratchReserve` should simply be a different number in the
 source, which is better than either behaviour and which this firmware previously could not answer.
 
+**And the config is published the same way, for the same reason (0.3.2-rc3).** The Snapshot
+argument above was made in 0.3.1; the *config* was still being copied, and a config save is the
+one event that copies it several times in the same breath. Alive at once, part-way through a
+`PUT /api/config`: the request body, the parsed document, the newly built `Config`, a whole-Config
+copy taken only to answer `dataSettingsChanged()`, the copy assigned into `config_store`'s
+resident `Config`, the copy handed to the display task, the copy that task assigned into **its own
+resident `Config`**, and then the serialized reply document. Four Config copies, each freeing a
+Config's ~12 small string blocks and allocating ~12 more wherever the heap had room — and two
+`Config`s resident for the life of the device where one would do. That is the churn the device
+suite's config section provokes: ~45 `PUT`+`GET` pairs in a few minutes took the largest free
+block to **3,060 B with ~19.5 KB still free**, under the 12 KB idle-work gate, so every `GET`
+after a `PUT` answered "low memory, retry".
+
+`config_store` now owns **one** `Config`, held in a `shared_ptr<const Config>` and published by
+pointer:
+
+- `setActiveConfig()` takes its `Config` **by value and moves it into `make_shared`**, built
+  outside the lock and swapped in, so what happens under that mutex is a pointer exchange and the
+  outgoing `Config`'s destructor runs after the give. `PUT /api/config` `std::move`s into it, so
+  the strings the request parsed *become* the published ones rather than being duplicated and
+  thrown away. One `Config` allocated per save, one freed, none copied.
+- `activeConfigPtr()` is how the display task reads it — the zero-tick take with a
+  `LastGood<shared_ptr>`, exactly as `snapshotPtr()` does, so a miss costs one frame and never a
+  wait. **`ui.cpp` keeps no `Config` of its own at all**: it holds that pointer, and the screens
+  read through it.
+- The handover is one `volatile bool`. `ui::onConfigChanged()` takes no argument and cannot fail,
+  where the old one copied a whole `Config` under a 200 ms lock and **silently dropped the save**
+  when that timed out. `tick()` decides from the **pointer**, not the flag: a lock miss returns the
+  pointer the task already holds, so clearing the flag on a successful *call* would lose the save —
+  it clears only when the pointer differs. `test_ui_lock` pins both that and the move-out-first
+  rule, because a device cannot be asked to miss a lock on demand.
+- `GET /api/config`, `GET /api/state` and `setHostName()` borrow the pointer instead of copying,
+  which takes a whole `Config` copy off the `/api/state` burst path as well.
+
+Deliberately **not** converted: `net_poller.cpp` and `proxy_worker.cpp` still take a `Config` copy
+per cycle / per job. They are on the poller task, not on the path the suite fragments, and mixing
+them into this change would have made it a refactor rather than a fix. They remain the obvious
+next candidates if per-cycle churn ever needs to come down further.
+
 Two consequences follow the same rule and are worth stating where a reader will look for them.
 `publishSnapshot()` takes its Snapshot **by rvalue and returns the published pointer**, so the
 poller holds one Snapshot and not two through the optional tail (§12.1's `snapshots_live` says so:

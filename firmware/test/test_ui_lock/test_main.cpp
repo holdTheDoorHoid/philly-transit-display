@@ -8,6 +8,7 @@
 // default-constructed one.
 #include <unity.h>
 
+#include <memory>
 #include <string>
 
 #include "../../src/app/ui_lock.h"
@@ -104,6 +105,67 @@ void test_miss_counter_saturates(void) {
   TEST_ASSERT_EQUAL_UINT32(70000, lg.misses());
 }
 
+// THE CONFIG HANDOVER'S CORRECTNESS PROPERTY, in the one form the host can hold (0.3.2-rc3).
+//
+// ui::tick() no longer copies a Config across the handover: config_store publishes one
+// shared_ptr<const Config> and the display task borrows it through activeConfigPtr(), which is a
+// LastGood<shared_ptr> read exactly like snapshotPtr(). That makes a MISS indistinguishable from
+// "nothing changed" if you look at the return value alone - both hand back the pointer the task
+// already holds. So tick() must decide from the POINTER, not from the flag: `g_pending` is
+// cleared only when the pointer it gets back differs from the one it is rendering, which is what
+// makes a miss cost one tick of delay instead of losing the save entirely.
+//
+// The device cannot demonstrate a lock miss on demand; this can, and it is the same arithmetic.
+void test_a_missed_config_read_hands_back_the_pointer_you_already_have(void) {
+  LastGood<std::shared_ptr<int>> last;
+  auto boot = std::make_shared<int>(1);
+  auto saved = std::make_shared<int>(2);
+
+  // A successful read on the display task: the slot is assigned under the lock, then hit().
+  last.slot() = boot;
+  last.hit();
+  std::shared_ptr<int> held = last.value();
+  TEST_ASSERT_TRUE(held == boot);
+
+  // A MISS while a save is pending. The value handed back is the one already held, so a tick that
+  // cleared its pending flag here would drop the save for good.
+  last.miss();
+  TEST_ASSERT_TRUE(last.value() == held);
+  TEST_ASSERT_EQUAL_UINT32(1, last.misses());
+  TEST_ASSERT_TRUE(last.value() != saved);  // the pointer comparison tick() actually makes
+
+  // The next tick gets the lock and the new pointer arrives, which is when the flag may clear.
+  last.slot() = saved;
+  last.hit();
+  TEST_ASSERT_TRUE(last.value() == saved);
+  TEST_ASSERT_TRUE(last.value() != held);
+  TEST_ASSERT_EQUAL_UINT32(0, last.misses());
+}
+
+// And the reason the outgoing pointer is moved out of the slot before the new one is stored:
+// assigning over it would drop the last reference INSIDE the critical section, running a whole
+// Config's destructor there. Moved out first, the store is a refcount bump and the free happens
+// after the give. Use counts are what say so.
+void test_the_outgoing_config_is_released_outside_the_lock(void) {
+  LastGood<std::shared_ptr<int>> last;
+  auto published = std::make_shared<int>(7);
+  {
+    auto outgoing = std::make_shared<int>(6);
+    last.slot() = outgoing;
+    last.hit();
+    TEST_ASSERT_EQUAL_INT(2, (int)outgoing.use_count());  // the slot and this local
+
+    // What activeConfigPtr() does on the display task: move the slot's reference OUT, then store.
+    std::shared_ptr<int> carried = std::move(last.slot());
+    last.slot() = published;  // a refcount bump, nothing freed
+    last.hit();
+    TEST_ASSERT_EQUAL_INT(2, (int)published.use_count());
+    TEST_ASSERT_TRUE(carried == outgoing);
+    // `carried` dies at the end of this scope - i.e. after the give, in the real code.
+  }
+  TEST_ASSERT_TRUE(last.value() == published);
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_display_task_waits_zero);
@@ -113,5 +175,7 @@ int main(int, char **) {
   RUN_TEST(test_hit_resets_the_miss_run);
   RUN_TEST(test_partial_write_is_not_a_hit);
   RUN_TEST(test_miss_counter_saturates);
+  RUN_TEST(test_a_missed_config_read_hands_back_the_pointer_you_already_have);
+  RUN_TEST(test_the_outgoing_config_is_released_outside_the_lock);
   return UNITY_END();
 }

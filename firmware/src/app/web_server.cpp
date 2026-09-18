@@ -556,7 +556,15 @@ void handleGetState(AsyncWebServerRequest *request) {
   doc["heap_8bit"] = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   doc["largest_block_8bit"] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
-  Config cfg = getActiveConfig();
+  // BORROWED, not copied (0.3.2-rc3). getActiveConfig() hands back a whole Config - four stops,
+  // their profiles and every string in them - and this handler only reads it. On a burst of
+  // /api/state that copy was a Config per request, each one scattering ~12 small string blocks
+  // into whatever holes the heap had, which is the same churn config saves were doing. Holding
+  // the published pointer keeps the object alive for the life of the handler and allocates
+  // nothing. Same reasoning, same shape, as snapshotPtr() two lines below.
+  std::shared_ptr<const Config> cfg_ptr = activeConfigPtr();
+  static const Config kNoConfig;
+  const Config &cfg = cfg_ptr ? *cfg_ptr : kNoConfig;
 
   JsonObject wifi = doc["wifi"].to<JsonObject>();
   wifi["ssid"] = WiFi.SSID();
@@ -679,9 +687,17 @@ void handleGetState(AsyncWebServerRequest *request) {
 
 void handleGetConfig(AsyncWebServerRequest *request) {
   if (refuseIfLowHeap(request)) return;
-  Config cfg = getActiveConfig();
+  // Borrowed, not copied - and this is the GET half of the device suite's PUT+GET config section,
+  // so it is on the exact path whose ~45 rounds fragmented the heap to a 3,060 B largest block.
+  // Serializing straight out of the published Config removes a whole Config's worth of small
+  // allocations from every one of those rounds.
+  std::shared_ptr<const Config> cfg = activeConfigPtr();
+  if (!cfg) {
+    sendError(request, 503, "configuration not available yet", "");
+    return;
+  }
   JsonDocument doc;
-  configToJson(cfg, doc);
+  configToJson(*cfg, doc);
   sendJsonStreamed(request, doc);
 }
 
@@ -729,16 +745,33 @@ void handlePutConfigInner(AsyncWebServerRequest *request, JsonVariant &json, con
     sendError(request, 500, "failed to write config to LittleFS");
     return;
   }
-  bool data_changed = dataSettingsChanged(getActiveConfig(), cfg);
-  setActiveConfig(cfg);
-  setHostName(cfg.device.name);  // a rename changes which Host headers are accepted (review F05)
+  // WHAT A SAVE USED TO COST, AND WHY IT IS THE FRAGMENTATION (runtime audit rec #8). Alive at
+  // once, at this point in the handler: the request body, the parsed document, `cfg`, a
+  // whole-Config copy taken purely to answer dataSettingsChanged(), the copy assigned into
+  // config_store's resident Config, the copy handed to the display task, the copy that task
+  // assigned into ITS resident Config, and then the serialized reply document. Four Config copies,
+  // each freeing ~12 small string blocks and allocating ~12 more wherever the heap had room. The
+  // device suite's ~45 PUT+GET rounds are that, forty-five times over, and they took the largest
+  // free block to 3,060 B with ~19.5 KB still free.
+  //
+  // Now: the comparison BORROWS the published Config rather than copying it, and `cfg` is MOVED
+  // into the publish, so the strings this request parsed become the published ones. One Config
+  // allocated, one freed, none copied.
+  std::shared_ptr<const Config> previous = activeConfigPtr();
+  bool data_changed = previous ? dataSettingsChanged(*previous, cfg) : true;
+  const std::string new_name = cfg.device.name;  // read before the move; a short string, not a Config
+  setActiveConfig(std::move(cfg));
+  previous.reset();  // the outgoing Config is freed here, before the reply document is built
+  setHostName(new_name);  // a rename changes which Host headers are accepted (review F05)
   if (onConfigChanged) {
     onConfigChanged(data_changed);
   }
   // Same streamed response as GET /api/config: the 16 KB request document is still alive here, so
-  // this is the moment a second body copy hurt most (SS12.1).
+  // this is the moment a second body copy hurt most (SS12.1). Serialized from the published
+  // Config, which is where `cfg` now lives.
+  std::shared_ptr<const Config> published = activeConfigPtr();
   JsonDocument doc;
-  configToJson(cfg, doc);
+  if (published) configToJson(*published, doc);
   sendJsonStreamed(request, doc);
 }
 
@@ -1524,7 +1557,10 @@ ArRequestHandlerFunction guarded(ArRequestHandlerFunction fn) {
 }
 
 void startWebServer(std::function<void(bool)> onConfigChanged) {
-  setHostName(getActiveConfig().device.name);
+  {
+    std::shared_ptr<const Config> cfg = activeConfigPtr();
+    if (cfg) setHostName(cfg->device.name);
+  }
 
   // THE SERVER'S MIDDLEWARE CHAIN IS DELIBERATELY EMPTY. See HostGuardHandler above: this used to
   // be `g_server.addMiddleware(...)`, and that one registration was an uncatchable reboot path.

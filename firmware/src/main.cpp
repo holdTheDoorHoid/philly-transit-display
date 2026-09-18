@@ -396,7 +396,7 @@ void setup() {
 
   transit_app::startWebServer([](bool data_changed) {
     transit_app::requestRepoll(data_changed);
-    transit_app::ui::onConfigChanged(transit_app::getActiveConfig());  // applied on the LVGL task
+    transit_app::ui::onConfigChanged();  // one flag; the LVGL task picks up the published pointer
     g_apply_network_settings = true;                                   // mDNS/timezone, applied in loop()
   });
   heapStage("web");
@@ -405,7 +405,10 @@ void setup() {
   // flashes green on a good poll and holds red on a failed one from here on.
   transit_app::setStatusLed(LedState::Off);
 
-  transit_app::ui::init(cfg);
+  // The published pointer, not a copy of `cfg`: the display task borrows config_store's one
+  // Config for the life of the device instead of keeping a second resident one (config_store.h,
+  // "the active config is one object, published by pointer"). setActiveConfig(cfg) ran above.
+  transit_app::ui::init(transit_app::activeConfigPtr());
   transit_app::ui::applyBrightness(cfg.device.brightness);
   heapStage("ui");
   transit_app::ui::logMemory();

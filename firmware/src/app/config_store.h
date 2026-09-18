@@ -4,6 +4,7 @@
 #pragma once
 #include <ArduinoJson.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -235,6 +236,31 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err);
 // read never waits (ui_lock.h), so a false return there is ordinary and means "try next tick".
 Config getActiveConfig();
 bool tryGetActiveConfig(Config *out);
-void setActiveConfig(const Config &cfg);
+
+// THE ACTIVE CONFIG IS ONE OBJECT, PUBLISHED BY POINTER (0.3.2-rc3).
+//
+// setActiveConfig() takes its Config BY VALUE and moves it into a shared_ptr, so a save allocates
+// exactly ONE Config and the previous one is freed the moment the last reader drops it. Callers
+// that no longer need their copy should std::move() into it (PUT /api/config does) - that path
+// then makes no Config copy at all: the strings the request parsed are handed over rather than
+// duplicated.
+//
+// WHY THIS IS A MEMORY FIX AND NOT TIDINESS (runtime audit rec #8). Before it, a single save had
+// the request body, the parsed document, the serialized reply document, the newly parsed Config,
+// a whole-Config copy taken just to answer dataSettingsChanged(), a copy assigned into this
+// module's resident Config, a copy handed to the display task, and a copy assigned from that into
+// the display's own resident Config - all alive at once, and every one of them scattering a
+// Config's ~12 small string blocks into new places on the heap. That churn is the fragmentation
+// the device suite's section B provokes: ~45 config PUT+GET pairs in a few minutes took the
+// largest free block to 3,060 B with ~19.5 KB still free. Now a save allocates one Config and
+// frees one, and nothing copies one.
+//
+// activeConfigPtr() is how the DISPLAY task reads it: it follows the same rule as
+// net_poller.cpp's snapshotPtr() - a zero-tick take on the display task (ui_lock.h) with a
+// LastGood of the pointer it last held, so a miss costs one frame of staleness and never a wait.
+// What happens under the mutex either way is a refcount bump, which cannot allocate and cannot
+// throw. Never null once setActiveConfig() has run; null before that.
+std::shared_ptr<const Config> activeConfigPtr();
+void setActiveConfig(Config cfg);
 
 }  // namespace transit_app

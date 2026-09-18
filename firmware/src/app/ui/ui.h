@@ -2,6 +2,7 @@
 // DESIGN.md SS8: "Tap anywhere cycles Main -> Stats -> Device info -> Main."
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -14,7 +15,11 @@ namespace transit_app::ui {
 // replaces the arrivals page rather than sitting beside it. ui.cpp's "LVGL pool safety" comment
 // says why: LVGL 9.5 cannot survive lv_malloc() returning NULL mid-build, so the pool must never
 // get there. Call once, after smartdisplay_init()/lv_display_set_rotation() have run.
-void init(const Config &cfg);
+//
+// Takes the config BY POINTER (0.3.2-rc3): the display task borrows config_store's published
+// Config rather than keeping a second resident copy of it, so pass activeConfigPtr(). See
+// onConfigChanged() below for how a later save reaches the screens.
+void init(std::shared_ptr<const Config> config);
 
 // Full-screen "join this network, then open http://192.168.4.1" message, shown while the setup
 // portal is open (wifi_portal.cpp). Carries the AP's name, its WPA2 password in the big font, and
@@ -60,9 +65,16 @@ void applyInvert(bool invert);
 // init() only; afterwards onConfigChanged() applies it with the screen rebuild.
 void setTheme(const std::string &name);
 
-// Hands a new configuration to the UI from any task. The next tick() (LVGL task) applies
-// rotation and brightness and rebuilds the screens so new stops appear without a reboot.
-void onConfigChanged(const Config &cfg);
+// Tells the UI that a new configuration has been PUBLISHED (config_store::setActiveConfig), from
+// any task. The next tick() on the LVGL task picks the new pointer up, applies rotation and
+// brightness and rebuilds the screens, so new stops appear without a reboot.
+//
+// It takes no Config, and that is the point (0.3.2-rc3, runtime audit rec #8): the handover used
+// to be a whole-Config copy into a second resident Config on this side, under a 200 ms lock that
+// silently dropped the save when it timed out. Now it is one volatile store - no copy, no lock,
+// nothing that can throw and nothing that can fail. Call it AFTER setActiveConfig(), which
+// web_server.cpp does.
+void onConfigChanged();
 
 // Prints LVGL pool usage over serial (sizing LV_MEM_SIZE).
 void logMemory();
