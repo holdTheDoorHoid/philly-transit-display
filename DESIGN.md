@@ -695,7 +695,36 @@ Supported PlatformIO environments (board JSONs from `rzeldent/platformio-espress
 | `cyd-2432S024R` / `C` | ESP32-2432S024 | 2.4" 320x240 | XPT2046 / CST816S | Pins differ; lower priority. |
 | `native` | host | - | - | Unit tests for `transit_core` and `transit_stats`. |
 
-SD card: SPI (CS 5, MOSI 23, MISO 19, SCK 18 on the 2.8"; confirm for 3.5"). RGB LED pins 4/16/17
+**SD card: its own SPI peripheral, and this is worth knowing before blaming the display for it**
+(confirmed on `esp32-3248S035R` 2026-09-17). The card is on **`VSPI`/`SPI3_HOST`** — `CS 5,
+MOSI 23, MISO 19, SCK 18`, opened by `sd_logger.cpp` as `SPIClass g_sd_spi(VSPI)` and handed to
+`SD.begin(TF_CS, g_sd_spi, 4 MHz, "/sd", 2)`. The **panel and the touch controller share
+`SPI2_HOST`** — `MOSI 13, MISO 12, SCK 14`, CS 15 (ST7796) and 33 (XPT2046). **No pin, no host and
+no bus is common to the two**, and `ST7796_SPI_BUS_MAX_TRANSFER_SZ` — which tracks
+`LVGL_BUFFER_PIXELS`, §5 — is passed to `spi_bus_initialize(ST7796_SPI_HOST, …)` and nowhere else,
+so it sizes SPI2's DMA descriptors and cannot reach the card. A draw-buffer change is therefore
+never an explanation for an SD fault.
+
+What an SD fault looks like in the boot log, and what each line means: `sdCommand(): Card Failed!
+cmd: 0x00` is **CMD0 `GO_IDLE_STATE` receiving no response byte at all** — MISO never went low
+across the retry loop — which is the very first exchange with the card, before FATFS and before any
+allocation this firmware makes. `sdcard_mount(): f_mount failed: (3) The physical drive cannot
+work` is `FR_NOT_READY`, the downstream consequence. Both together mean the card did not answer:
+card, socket or wiring, not software.
+
+**A board with no working card is holding ~12.5 KB LESS heap than a healthy one**, which inflates
+every free-memory figure measured on it. `esp_vfs_fat_register()` allocates the FATFS context and
+both `FIL` slots in one ~12.5 KB block *before* `f_mount`, and `sdcard_mount()` calls
+`esp_vfs_fat_unregister_path()` on every failure path — so the block is taken and given straight
+back. Any resting-floor number taken while `sd.mounted` is false must be read as ~12.5 KB
+optimistic, and re-measured with the card working before it is compared with anything.
+
+The mount is attempted **once, at boot, and never retried** (§9.1): a transient failure therefore
+disables logging until the device is restarted. That is deliberate — the alternative is SPI traffic
+on the poller task for a condition that is almost always physical — but it is why one bad boot
+looks permanent for the life of that boot.
+
+RGB LED pins 4/16/17
 (active low) can show status: blue = connecting, green blink = poll ok, red = error.
 
 The UI must lay out from the runtime display resolution, not hardcoded 480x320.
