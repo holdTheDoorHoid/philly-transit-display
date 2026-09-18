@@ -1696,7 +1696,7 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     if (request->hasParam("log")) {
       // ?log=1: the per-cycle memory log (cycle_log.h) INSTEAD of the stage trace, because the two
       // share a render buffer and are never wanted in the same breath. ?since=<cycle_log_seq> and
-      // ?n=1..40 work the same way. Two hours of history at a 30 s cadence, which is what the
+      // ?n=1..40 work the same way. One hour of history at a 30 s cadence, which is what the
       // 64-entry stage ring - three cycles - cannot give.
       doc["cycle_log"] = serialized(renderCycleLog(since, (size_t)queryU32(request, "n", kCycleLogMaxRows), &first_seq, &rows));
       doc["cycle_log_first"] = first_seq;  // sequence number of cycle_log[0]; > since means it wrapped

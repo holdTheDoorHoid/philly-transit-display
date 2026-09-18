@@ -1,5 +1,5 @@
-// One row per poll cycle, two hours deep, so the thing that FRAGMENTS the heap can finally be
-// caught (0.3.2-rc1).
+// One row per poll cycle, one hour deep, so the thing that FRAGMENTS the heap can finally be
+// caught (0.3.2-rc1; 240 rows -> 120 in 0.3.2-rc3, see kCycleLogCap).
 //
 // THE QUESTION THIS EXISTS TO ANSWER, and why heap_trace.h cannot. The per-stage ring holds 64
 // entries, which on a healthy path is three cycles: it says precisely where inside a cycle the
@@ -9,15 +9,16 @@
 // time anyone looked they were free8 17-20 KB with a largest block of 3,444 B. The cycles in which
 // that happened had long since scrolled out of a 64-entry ring, and the trigger is still unknown.
 //
-// So: one 16-byte row per cycle, 240 of them - two hours at a 30 s cadence, considerably more once
+// So: one 16-byte row per cycle, 120 of them - one hour at a 30 s cadence, considerably more once
 // the failure backoff stretches the interval. Each row carries the poll-start free8 and largest
 // block (the two resting numbers whose decay is the symptom), the LOWEST free8 seen anywhere in
 // that cycle, and a flag word saying which optional work ran. A schedule refetch, an alerts fetch,
 // a weather fetch and the 400 KB Indego stream are the four things that do not happen every cycle,
 // so if the collapse correlates with one of them, this is the record that shows it.
 //
-// WHAT IT COSTS: 240 x 16 = 3,840 B of .bss and nothing on the heap, plus ~600 B of render buffer
-// shared with the trace ring's (web_server.cpp). Recording a row is a 16-byte store under the same
+// WHAT IT COSTS: 120 x 16 = 1,920 B of .bss and nothing on the heap, plus a render buffer shared
+// with the trace ring's, which the trace ring sizes (web_server.cpp kRenderBufBytes takes the
+// larger of the two, and 64 trace rows is the larger). Recording a row is a 16-byte store under the same
 // kind of portMUX the trace ring uses; noting a free8 sample is a compare and a store. No String,
 // no std::string, no allocation, on any path.
 //
@@ -55,8 +56,20 @@ struct CycleLogEntry {
   uint16_t flags;         // CycleFlag bits
 };
 
-// Two hours at 30 s. 240 * 16 = 3,840 B of .bss.
-constexpr size_t kCycleLogCap = 240;
+// One hour at 30 s. 120 * 16 = 1,920 B of .bss.
+//
+// IT WAS 240 (two hours) AND THE FLOOR COULD NOT AFFORD IT (0.3.2-rc3). On this chip .bss is
+// carved out of the same DRAM the heap is, so every byte of this ring is a byte off the resting
+// free8 floor - which is the thing 0.3.2 is trying to raise. rc2 measured a 31.6-32.2 KB resting
+// floor against v0.3.1's 39-40.7 KB, and the device suite's section B then fragmented it to a
+// 3,060 B largest block with ~19.5 KB free, which is under the idle-work gate. Halving the ring is
+// the cheapest 1,920 B on the board: it costs an hour of history and nothing else, and the ring
+// exists to catch a collapse that has twice happened inside forty minutes of a healthy rest.
+//
+// The WIRE FORMAT is unchanged - same 16-byte row, same five columns on
+// GET /api/debug/ui?log=1, same `cycle_log_cap` field reporting this number - so a sampler that
+// reads the log needs no change beyond noticing it wraps sooner.
+constexpr size_t kCycleLogCap = 120;
 
 // Scale factor for min_free8_64. 64 B units put 4 MB inside a uint16_t with 64 B of resolution,
 // which is far finer than anything this measurement is trying to resolve.

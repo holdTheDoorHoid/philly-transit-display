@@ -8,7 +8,7 @@ namespace transit_app {
 
 namespace {
 
-// .bss, not the heap - the whole point (cycle_log.h). 240 * 16 = 3,840 B.
+// .bss, not the heap - the whole point (cycle_log.h). 120 * 16 = 1,920 B.
 CycleLogEntry g_ring[kCycleLogCap];
 uint32_t g_seq = 0;  // rows filed since boot; g_ring[k % cap] holds sequence number k
 
