@@ -24,7 +24,21 @@
 namespace transit_stats {
 
 // Hard caps, per DESIGN's "never load a month into memory" / bounded-heap requirement.
-constexpr size_t kMaxTrackedStops = 8;          // matches config.json's 8-stop maximum (§6)
+// FOUR since 0.3.2-rc2, tracking config_store.h's kMaxStops, which became 4 in the same release
+// (the owner's "a maximum of four stops", and what LVGL's 36 KB pool can actually draw). This is
+// the single largest heap object on the device that is sized off the stop count, and it is
+// heap-allocated once at boot (net_poller.cpp preallocateTracker()).
+//
+// WHAT IT GIVES BACK, read out of the image's DWARF rather than estimated: sizeof(StopState) is
+// **1,056 B** on the ESP32 and sizeof(ArrivalTracker) is **4,232 B** at four slots, so the array is
+// the whole object bar 8 bytes and eight slots would be 8,456 B. Halving it returns **4,224 B**.
+//
+// Stated plainly because a larger figure was expected: 4,224 B is LESS than the 8,064 B that
+// 0.3.2-rc1 made resident to keep a poll cycle's contiguous demand down, so this does not pay for
+// that on its own - see DESIGN.md SS5 for the full ledger, .bss included. rc1 was measured taking
+// the resting floor to ~23 KB and driving min_free8 to 156 B on the owner's board, which is what
+// this release is trying to undo.
+constexpr size_t kMaxTrackedStops = 4;          // matches config.json's 4-stop maximum (§6)
 // 8, not 12, since 0.3.1 (owner decision, 2026-09-17). F19 had raised it from 8 to 12 to stop an
 // ordinary feed churning its slots; this gives ~4,000 B of the ESP32's heap back - 8 stops x 4
 // slots x ~124 B - on a board where the largest free block, not the free heap, is the resource

@@ -1107,16 +1107,22 @@ function stopTitlePreview(s) {
   return `${s.label || s.route || ''} → ${s.headsign || ''}`;
 }
 
+// The stop cap, in one place. Four since 0.3.2-rc2: it is the owner's product decision and also
+// what the display's LVGL pool can actually draw (a fifth panel does not fit), and the firmware
+// refuses a save with more - so this must agree with config_store.h's kMaxStops or the form would
+// let someone build a config the device rejects.
+const MAX_STOPS = 4;
+
 function drawStopList() {
   const card = h('div', { class: 'card' });
   card.append(h('div', { class: 'row between' },
-    h('h2', {}, `Configured stops (${liveConfig.stops.length}/8)`),
+    h('h2', {}, `Configured stops (${liveConfig.stops.length}/${MAX_STOPS})`),
     h('button', {
-      class: 'primary', disabled: liveConfig.stops.length >= 8,
+      class: 'primary', disabled: liveConfig.stops.length >= MAX_STOPS,
       onclick: () => { wizard = { step: 'mode' }; drawStops(); },
     }, '+ Add stop')));
-  if (liveConfig.stops.length >= 8) {
-    card.append(h('p', { class: 'small muted' }, 'Maximum of 8 stops reached. Remove one to add another.'));
+  if (liveConfig.stops.length >= MAX_STOPS) {
+    card.append(h('p', { class: 'small muted' }, `This display shows up to ${MAX_STOPS} stops, and that is how many you have. Remove one to add another.`));
   }
   const list = h('div', {});
   liveConfig.stops.forEach((s, i) => {
@@ -2235,7 +2241,7 @@ function buildOverviewTable(data, stopsCfg, selectedStop, onSelect) {
     card.append(hint(`${totalSamples} arrival${totalSamples === 1 ? '' : 's'} across all stops in this window.${inf}`));
   }
   // The log keeps rows for stops that are no longer configured; the aggregator has fixed
-  // room for 8 stops and 3 stations and drops the rest rather than evicting a live one.
+  // room for 4 stops and 3 stations and drops the rest rather than evicting a live one.
   // Say so, so a missing row does not read as missing data.
   const exStops = Number(data.excluded_stops) || 0;
   const exBikes = Number(data.excluded_bikes) || 0;
@@ -2612,6 +2618,19 @@ function buildSettingsForm(cfg, state) {
   tzCustom.classList.toggle('hidden', tzSelect.value !== '__custom__');
   tzSelect.addEventListener('change', () => tzCustom.classList.toggle('hidden', tzSelect.value !== '__custom__'));
 
+  // Nightly restart. `d.nightly_restart` is absent on a config saved by firmware older than
+  // 0.3.2-rc1, and the firmware reads a missing block as {enabled: true, time: '03:30'} - so the
+  // fallbacks here have to agree with that, or the form would offer to turn off something it was
+  // showing as off while the device had it on.
+  const nightly = d.nightly_restart || {};
+  const nightlyEnabled = h('input', { type: 'checkbox', id: 'set-nightly' });
+  nightlyEnabled.checked = nightly.enabled !== false;
+  const nightlyTime = h('input', { type: 'time', id: 'set-nightly-time', value: nightly.time || '03:30' });
+  const nightlyDeps = deps(nightlyTime);
+  const refreshNightly = () => setDeps(nightlyDeps, nightlyEnabled.checked);
+  nightlyEnabled.addEventListener('change', refreshNightly);
+  refreshNightly();
+
   // ---- Data ----
   const pollInput = h('input', { type: 'number', id: 'set-poll', min: 15, max: 120, value: d.poll_seconds });
   const loggingInput = h('input', { type: 'checkbox', id: 'set-logging' });
@@ -2888,7 +2907,7 @@ function buildSettingsForm(cfg, state) {
       'The ways the display gets your attention: SEPTA’s service alerts on the ticker, and a nudge when it is time to leave.',
       group(
         field(h('label', { class: 'inline toggle' }, alertsInput, ' Show service alerts'),
-          hint('Fetches SEPTA’s alerts and detours for your routes. The ticker settings below pick which of them are displayed.')),
+          hint('Fetches SEPTA’s alerts and detours for your routes. Off by default, because it costs memory the display is short of: one fetch per route every five minutes, kept in memory between polls. Most of what it brings back is only visible on this web page and in the log \u2014 the ticker settings below pick which of them also reach the screen.')),
         tickerDeps),
       group(
         field(h('label', { class: 'inline toggle' }, dueEnabled, ' Time to leave'),
@@ -2913,7 +2932,13 @@ function buildSettingsForm(cfg, state) {
       field(h('label', { for: 'set-name' }, 'Device name'), h('div', { class: 'row' }, nameInput, mdnsPreview),
         hint('What the device calls itself. It is also the web address of this page on your network: name.local in any browser at home.')),
       field(h('label', { for: 'set-tz' }, 'Timezone'), tzSelect, tzCustom,
-        hint('Every clock time the device shows is in this zone. Eastern is the right one for Philadelphia, and it changes for daylight saving on its own.'))),
+        hint('Every clock time the device shows is in this zone. Eastern is the right one for Philadelphia, and it changes for daylight saving on its own.')),
+      group(
+        field(h('label', { class: 'inline toggle' }, nightlyEnabled, ' Restart overnight'),
+          hint('The display restarts itself once a night, at the time below. It takes a few seconds and nothing is lost \u2014 the arrivals are back before you would notice. It is here because this board has a small memory that gets gradually chopped up the longer it runs, and restarting is the only way to tidy it. Leave it on unless you have a reason not to.')),
+        nightlyDeps),
+      field(h('label', { for: 'set-nightly-time' }, 'Restart at'), nightlyTime,
+        hint('Local time, on the clock above. Pick an hour you are certainly asleep.'))),
 
     buildPinBlock(state),
     buildFirmwareBlock(state),
@@ -2945,6 +2970,7 @@ function buildSettingsForm(cfg, state) {
           brightness: Number(quietBrightness.value), wake_seconds: Number(quietWake.value),
         },
         night: { enabled: nightEnabled.checked, after_min: Number(nightAfter.value) },
+        nightly_restart: { enabled: nightlyEnabled.checked, time: nightlyTime.value || '03:30' },
       },
       alerts: alertsInput.checked,
       weather: { enabled: wxEnabled.checked, per_stop: wxPerStop.checked, units: wxUnits.value },

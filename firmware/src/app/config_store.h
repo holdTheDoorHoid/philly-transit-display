@@ -4,6 +4,7 @@
 #pragma once
 #include <ArduinoJson.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -17,7 +18,20 @@ constexpr const char *kConfigPath = "/config.json";
 // /config.json. loadConfig() falls back to .prev when /config.json is missing or unreadable.
 constexpr const char *kConfigTmpPath = "/config.json.tmp";
 constexpr const char *kConfigPrevPath = "/config.prev.json";
-constexpr size_t kMaxStops = 8;  // DESIGN.md SS6: "Maximum 8 stops."
+// FOUR since 0.3.2-rc2, and it is a product decision that happens to be the memory decision too.
+//
+// The owner's answer to "how many stops does this display show" is four, and the hardware has been
+// saying the same thing for a while: LVGL's 36 KB pool fits a four-stop arrivals page at 31,656 B
+// and refuses the fifth panel (main_screen.cpp's guard exists for exactly that), which is why the
+// pool sweep in 0.3.1 kept the pool at 36 KB rather than trimming it. Making the cap match what the
+// screen can actually draw turns a run-time refusal into a save-time error with a clear message,
+// and it lets everything sized off this number shrink with it - kMaxTrackedStops above all
+// (transit_stats/tracker.h), which is 1,056 B of heap per slot and gives back 4,224 B.
+//
+// It is a REDUCTION of a documented limit, so it is stated plainly: a saved config with five to
+// eight stops is refused by validateConfig() on load and the device falls back to /config.prev.json
+// or the default. No device is known to have more than two.
+constexpr size_t kMaxStops = 4;  // DESIGN.md SS6: "Maximum 4 stops."
 
 // Board build flag (firmware/boards/*.json): whether this board's panel shows correct colours
 // only with the controller's inversion command on. Off for every vendored board (the owner's
@@ -44,6 +58,16 @@ struct QuietConfig {
   std::string end = "06:00";    // may be earlier than start (crosses midnight)
   uint8_t brightness = 0;       // 0..50 percent, 0 = off
   uint16_t wake_seconds = 30;
+};
+
+// DESIGN.md SS6 "nightly_restart" (SS12.1): a deliberate restart at a chosen hour of the night.
+// ON by default. This board has no PSRAM and nothing defragments a running heap, so a boot is the
+// only defragmentation it has; taking one at 03:30, when nobody is reading a transit display,
+// costs a few seconds of uptime and starts every day on a heap in one piece. It is a MITIGATION,
+// not a fix - see nightly_restart.h and DESIGN.md SS12.1.
+struct NightlyRestartConfig {
+  bool enabled = true;
+  std::string time = "03:30";  // local "HH:MM", the same form as quiet.start/end
 };
 
 // DESIGN.md SS6 "night": clock page when nothing is due within after_min.
@@ -120,13 +144,20 @@ struct DeviceConfig {
   std::string crowding_icons = "seats";
   QuietConfig quiet;
   NightConfig night;
+  NightlyRestartConfig nightly_restart;
 };
 
 struct Config {
   int version = 1;
   DeviceConfig device;
   std::vector<transit::StopConfig> stops;
-  bool alerts = true;
+  // DEFAULT OFF since 0.3.2-rc1 (owner decision). Alerts cost a fetch per configured route every
+  // five minutes, a second Snapshot publish whenever one answers, and a cache that is one of only
+  // two things on this device that legitimately holds data across cycles - and most of what they
+  // bring back is visible only in the web UI and the log. A saved config that carries the key
+  // keeps whatever it says; only a config that never had one takes this default, which is why
+  // this is schema-compatible and needs no migration.
+  bool alerts = false;
   WeatherConfig weather;
   DueConfig due;
   std::vector<ProfileConfig> profiles;
@@ -205,6 +236,41 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err);
 // read never waits (ui_lock.h), so a false return there is ordinary and means "try next tick".
 Config getActiveConfig();
 bool tryGetActiveConfig(Config *out);
-void setActiveConfig(const Config &cfg);
+
+// THE ACTIVE CONFIG IS ONE OBJECT, PUBLISHED BY POINTER (0.3.2-rc3).
+//
+// setActiveConfig() takes its Config BY VALUE and moves it into a shared_ptr, so a save allocates
+// exactly ONE Config and the previous one is freed the moment the last reader drops it. Callers
+// that no longer need their copy should std::move() into it (PUT /api/config does) - that path
+// then makes no Config copy at all: the strings the request parsed are handed over rather than
+// duplicated.
+//
+// WHY THIS IS A MEMORY FIX AND NOT TIDINESS (runtime audit rec #8). Before it, a single save had
+// the request body, the parsed document, the serialized reply document, the newly parsed Config,
+// a whole-Config copy taken just to answer dataSettingsChanged(), a copy assigned into this
+// module's resident Config, a copy handed to the display task, and a copy assigned from that into
+// the display's own resident Config - all alive at once, and every one of them scattering a
+// Config's ~12 small string blocks into new places on the heap. That churn is the fragmentation
+// the device suite's section B provokes: ~45 config PUT+GET pairs in a few minutes took the
+// largest free block to 3,060 B with ~19.5 KB still free. Now a save allocates one Config and
+// frees one, and nothing copies one.
+//
+// activeConfigPtr() is how the DISPLAY task reads it: it follows the same rule as
+// net_poller.cpp's snapshotPtr() - a zero-tick take on the display task (ui_lock.h) with a
+// LastGood of the pointer it last held, so a miss costs one frame of staleness and never a wait.
+// What happens under the mutex either way is a refcount bump, which cannot allocate and cannot
+// throw. Never null once setActiveConfig() has run; null before that.
+std::shared_ptr<const Config> activeConfigPtr();
+// RETURNS the pointer it published, the same shape publishSnapshot() has (DESIGN.md SS5). A caller
+// that needs the new value afterwards - PUT /api/config serializes it back as the reply - uses
+// the return rather than reading activeConfigPtr() again: no second lock, no window in which a
+// concurrent save could answer the wrong document, and no null to handle. Never null.
+std::shared_ptr<const Config> setActiveConfig(Config cfg);
+
+// The struct defaults, as a borrowable reference - what an "empty Config" has always meant here.
+// One object for the whole firmware rather than a `static const Config` at each site that needs a
+// fallback for a null activeConfigPtr(): a Config is 336 B of .bss on this target (DWARF), and on
+// a board where the cycle log is being halved for 1,920 B, two of them is not a rounding error.
+const Config &emptyConfig();
 
 }  // namespace transit_app

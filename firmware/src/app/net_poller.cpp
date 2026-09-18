@@ -21,6 +21,9 @@
 #include "config_store.h"
 #include "cxx_exception_pool.h"
 #include "heap_reserve.h"
+#include "daypart_core/daypart.h"  // parseClock() for device.nightly_restart
+#include "cycle_log.h"
+#include "wedge_policy.h"
 #include "heap_trace.h"
 #include "http_fetch.h"
 #include "sd_logger.h"
@@ -69,7 +72,30 @@ constexpr uint32_t kOptionalWorkReserveMs = 5000;
 // SDK-rebuild test pass has to re-measure it (DESIGN.md SS2.1 "Forced gate").
 constexpr uint32_t kTaskStackBytes = 12288;
 #else
-constexpr uint32_t kTaskStackBytes = 10240;
+// 8 KB, MEASURED RATHER THAN CHOSEN (0.3.2-rc3; 10,240 B before).
+//
+// uxTaskGetStackHighWaterMark() reports the smallest number of stack BYTES this task has ever had
+// left. On the owner's board at 10,240 B it read:
+//
+//   4,424 B free   under the device suite (the heaviest load this firmware sees)
+//   4,568-4,600 B  across a two-hour-thirteen-minute run of ordinary use
+//
+// so the deepest this task has ever actually gone is 10,240 - 4,424 = about 5.8 KB, and ordinary
+// use stays ~200 B shallower than that. 8,192 B leaves ~2.3 KB of headroom over the worst reading
+// there is - a wider margin than the 4 KB figure alone suggests, because the suite reading already
+// includes the deepest path the task has (a BusSchedules retry inside a full poll).
+//
+// The +2,048 B goes straight to the resting floor: a FreeRTOS task stack is a heap allocation
+// taken once at xTaskCreatePinnedToCore() and held for the life of the device.
+//
+// IT STAYS VERIFIABLE. taskStackHwm("net_poller") is still reported as stack_hwm.net_poller on
+// GET /api/debug/ui, and the per-cycle serial line below still prints stack_free, so the margin
+// after this change is a reading and not an argument. If that number ever approaches ~1 KB the
+// honest fix is to put the 2 KB back, not to trim what the task does.
+//
+// The HTTPS build above is NOT reduced: a TLS handshake adds 3-4 KB of mbedTLS scratch on this
+// same stack and has never been measured to completion on this hardware (see the caveat above).
+constexpr uint32_t kTaskStackBytes = 8192;
 #endif
 // Priority 1 (above IDLE0, below the ESP-IDF network/timer tasks) - the original value. It was
 // briefly dropped to 0 to stop HTTPClient's header busy-wait (Stream::timedRead, no yield to a
@@ -194,8 +220,14 @@ void captureRestartNote() {
   g_rtc_note.magic = 0;
 }
 
+// Only the bytes a std::string took from the HEAP: libstdc++ keeps up to 15 characters inside the
+// object itself, which every sizeof() term in getMemorySizes() has already counted.
+uint32_t strHeapBytes(const std::string &s) {
+  return s.capacity() > 15 ? (uint32_t)(s.capacity() + 1) : 0;
+}
+
 // ---- BusSchedules cache (DESIGN.md SS4.7: "cached 10 min", "also on config change") ----------
-// At most kMaxStops (8, config_store.h) distinct stop_ids, matching the config's own cap; a
+// At most kMaxStops (4, config_store.h) distinct stop_ids, matching the config's own cap; a
 // linear scan over <=8 entries is cheaper than a map for this size.
 class AppScheduleCache : public transit::ScheduleCache {
  public:
@@ -222,6 +254,28 @@ class AppScheduleCache : public transit::ScheduleCache {
   // DESIGN.md SS4.7: refresh "also on config change" - force every stop to be refetched on the
   // next poll rather than waiting out the 10 minute window.
   void invalidateAll() { entries_.clear(); }
+
+  // Roughly what this cache is holding, for GET /api/debug/ui (0.3.2-rc1). "Roughly" because
+  // walking every string's capacity is the only honest way and allocator headers are not counted -
+  // what it is for is watching a number that should be FLAT drift upwards, not accounting.
+  uint32_t bytes() const {
+    uint32_t n = (uint32_t)(entries_.capacity() * sizeof(Entry));
+    for (const auto &e : entries_) {
+      n += strBytes(e.stop_id);
+      n += (uint32_t)(e.entries.capacity() * sizeof(SchedEntry));
+      for (const auto &s : e.entries) {
+        n += strBytes(s.route) + strBytes(s.trip_id) + strBytes(s.direction) +
+             strBytes(s.direction_desc) + strBytes(s.stop_name);
+      }
+    }
+    return n;
+  }
+
+  // Only the bytes that came off the HEAP: libstdc++ keeps up to 15 characters inside the string
+  // object itself, which the sizeof() terms above have already counted.
+  static uint32_t strBytes(const std::string &s) {
+    return s.capacity() > 15 ? (uint32_t)(s.capacity() + 1) : 0;
+  }
 
  private:
   struct Entry {
@@ -403,6 +457,11 @@ transit::HttpGetEx makeHttpGetEx(uint32_t timeout_ms) {
     // BusSchedules is tiny (~1 KB) and flaky, so buffer it and retry on the error shape before
     // handing the consumer a single clean delivery; everything else streams straight through.
     if (url.find("BusSchedules") != std::string::npos) {
+      // This branch is only reached on a REFETCH - a cache hit never gets here - so it is the
+      // honest place to flag the cycle (cycle_log.h). A refetch is one 3,072 B parse block plus up
+      // to twelve URL fetches, and it is a prime suspect for the fragmentation the log exists to
+      // catch.
+      cycleLogFlag(kCycleSchedRefetch);
       transit::FetchResult result;
       constexpr int kAttempts = 4;
       for (int attempt = 0; attempt < kAttempts; ++attempt) {
@@ -585,8 +644,13 @@ void refreshRouteLiveness(const std::vector<StopConfig> &stops, const transit::H
     if (entry != nullptr && entry->fetched_ms != 0 && (millis() - entry->fetched_ms) < kLivenessRefreshMs) continue;
     if (have_time && !have_time()) break;
 
-    std::vector<TvVehicle> tv;
-    src.fetchTransitViewEx(s.route, &tv, http);
+    // The cycle's resident vehicle list, not a local one (0.3.2-rc1): pollBusStops() has long
+    // since returned and nothing reads it any more, and a local would be another per-cycle
+    // contiguous block of up to 5.6 KB for a question answered by `!tv.empty()`.
+    std::vector<TvVehicle> own_tv;
+    std::vector<TvVehicle> &tv = g_poll_buffers != nullptr ? g_poll_buffers->tv : own_tv;
+    tv.clear();
+    src.fetchTransitViewAppendEx(s.route, &tv, http);
     if (entry == nullptr) {
       g_liveness_cache.push_back({s.route, !tv.empty(), millis()});
     } else {
@@ -732,7 +796,7 @@ void logBikeSamples(const Config &cfg, time_t now, const std::string &month) {
 // One long-lived ArrivalTracker across the device's uptime (DESIGN.md SS9.1); registerStop() is
 // idempotent so it's safe to re-run on every config change. Heap-allocated on first use rather
 // than a plain global/static instance: ArrivalTracker's own header doc puts sizeof(ArrivalTracker)
-// at ~8 KB on the target (kMaxTrackedStops * StopState, each holding a kMaxTrackedTripsPerStop
+// at 4,232 B on the target (kMaxTrackedStops * StopState = 4 x 1,056 B, each holding a kMaxTrackedTripsPerStop
 // array; it was ~12 KB before the slot count dropped from 12 to 8 in 0.3.1), which
 // is fine for the heap (~200KB free at boot per firmware/README.md) but overflows the ESP32's
 // fixed static .bss/.data budget if declared as a file-scope object - confirmed by hitting
@@ -779,6 +843,10 @@ void logHeapHeartbeat() {
   size_t free_heap = ESP.getFreeHeap();
   size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  // stack_free is uxTaskGetStackHighWaterMark(): the LOWEST this task's free stack has ever been,
+  // not what is free now. It is what sized kTaskStackBytes at 8,192 B and it is how the margin
+  // stays checkable afterwards - the same number appears as stack_hwm.net_poller on
+  // GET /api/debug/ui. Expect ~2.3 KB; near 1 KB means the stack needs the 2 KB back.
   Serial.printf("[net_poller] free_heap=%u free8=%u largest_block=%u stack_free=%u\n", (unsigned)free_heap, (unsigned)free8,
                 (unsigned)largest, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
@@ -843,6 +911,25 @@ struct CountedSnapshot : Snapshot {
 // sample in the ~10 minute cycle the board is repeating.
 volatile uint32_t g_failed_polls = 0;
 volatile uint32_t g_wedged_polls = 0;
+// diag: the OOM tally and which rule last had something to say (wedge_policy.h), mirrored so
+// /api/debug/ui can read them. `g_cycle_oom` is the fact ONE cycle knows about itself: set at the
+// catch sites, cleared at the top of the next cycle, read once when the cycle is stamped.
+volatile uint32_t g_oom_streak = 0;
+volatile uint8_t g_wedge_reason = 0;
+volatile bool g_cycle_oom = false;
+// The cycle's own verdict, mirrored so the wedge check does not have to call getPollStatus() -
+// which takes the poller's lock and copies a std::string, i.e. it can BLOCK and it can throw
+// std::bad_alloc, on a line that sits outside pollerTask's try block. An uncaught throw there is
+// std::terminate. Set false at the top of every cycle, so a cycle that threw before reaching the
+// verdict counts as failed.
+volatile bool g_cycle_ok = false;
+
+// device.nightly_restart, published for the display task (nightly_restart.h). Two aligned words,
+// written by the poller task and read once a second by loopTask: a single aligned 32-bit
+// store/load is atomic on the ESP32, and neither value is meaningful without the other only in the
+// sense that `enabled` gates it, so there is nothing to tear.
+volatile bool g_nightly_enabled = true;
+volatile int32_t g_nightly_minute = 210;  // 03:30, matching NightlyRestartConfig's default
 
 // Publishes a Snapshot to every reader (UI, web server) and moves the LED with it. Called more
 // than once per cycle (F12): the arrivals go out the moment they exist, and again when the alerts
@@ -1021,6 +1108,8 @@ void evictUnconfiguredSummaries(const std::vector<StopConfig> &stops) {
 // so the header cheerfully reported them as fresh. The arrivals are the product; they are
 // published the instant they exist, and everything else runs afterwards on its own clock.
 uint32_t pollOnce(uint32_t &consecutive_failures) {
+  g_cycle_oom = false;  // this cycle's own out-of-memory fact, read when it is stamped
+  g_cycle_ok = false;   // ...and its verdict, set below once the stops have been summarized
   heapTraceBeginCycle();  // bumps the cycle number, then stamps kStagePollStart
 #ifdef TRANSIT_HEAP_TRACE
   Serial.printf("[poll-heap] %-13s free8=%u largest=%u\n", kHeapTraceStages[kStagePollStart],
@@ -1030,13 +1119,22 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   // Clears the working set for this cycle and gives back an oversized body buffer, if some
   // unusually large response grew one last cycle. Done HERE, at poll-start, because this is where
   // the largest free block is at its best (DESIGN.md SS5).
-  if (g_poll_buffers != nullptr) g_poll_buffers->beginCycle();
+  // The free8 reading is passed IN because transit_core has no Arduino: it gates the scratch
+  // ratchet, which must not grow the resident footprint on a heap that is already low (0.3.2-rc2).
+  if (g_poll_buffers != nullptr) {
+    g_poll_buffers->beginCycle(heap_caps_get_free_size(MALLOC_CAP_8BIT));
+  }
   // Take the error-reply reserve back if a 503 spent it and the heap has recovered since
   // (heap_reserve.h). Poll-start is one of the two contexts this is allowed from - the other is
   // the idle slice below - because neither is the handler that released it, and both are on a task
   // that can afford to be told "not yet".
   rearmHeapReserveIfSafe();
   Config cfg = getActiveConfig();
+  // Republished every cycle so a saved change reaches the display task within one poll
+  // (nightly_restart.h). daypart::parseClock returns -1 on anything malformed, which the rule
+  // treats as "never", so a bad value can only disable the restart, never mistime it.
+  setNightlyRestart(cfg.device.nightly_restart.enabled,
+                    daypart::parseClock(cfg.device.nightly_restart.time));
   transit::HttpGetEx http = makeHttpGetEx(kFetchTimeoutMs);
   transit::HttpGetEx http_opt = makeHttpGetEx(kOptionalFetchTimeoutMs);
   transit::HttpGet http_opt_plain = plainFrom(http_opt);
@@ -1074,6 +1172,8 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
     // per-stage marks above it, the ring then reads "...sched-stop, oom-transit", which names the
     // allocation that failed rather than only the call that contained it (diag branch).
     heapTraceMark(kStageOomTransit);
+    cycleLogFlag(kCycleOom);
+    g_cycle_oom = true;  // counted directly, not re-derived from a heap reading (wedge_policy.h)
     out_of_memory = true;
   }
   if (out_of_memory) {
@@ -1118,6 +1218,8 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
   std::shared_ptr<const Snapshot> published = publishSnapshot(std::move(combined));
   tracePoll(kStagePostTransit);
   if (!poll_ok) g_failed_polls++;
+  g_cycle_ok = poll_ok;
+  cycleLogFlag((poll_ok ? 0 : kCycleFailed) | (g_last_poll_unsynced ? kCycleUnsynced : 0));
 
   // From here on everything is optional. The next transit poll's deadline is fixed first, so each
   // piece of work can ask whether it still has room rather than finding out afterwards.
@@ -1142,6 +1244,7 @@ uint32_t pollOnce(uint32_t &consecutive_failures) {
     // Only when something actually came back: a cycle where every alert feed was still fresh must
     // not re-publish an identical Snapshot and reset the header's "updated N s ago".
     if (alerts_fetched) {
+      cycleLogFlag(kCycleAlertsFetch);
       // The second publish of the cycle, and the one place a copy of the stops is unavoidable: the
       // published Snapshot is const and shared (the display task holds a reference to it for up to
       // a second), so the alerts cannot be written into it. What changed is that this is now ONE
@@ -1258,30 +1361,31 @@ void pollerTask(void * /*arg*/) {
     Serial.println("[net_poller] clock not synced after 45 s; polling anyway, schedules are not cached and logging waits for a sane clock");
   }
   uint32_t consecutive_failures = 0;
-  // Self-heal for a wedged heap (found 2026-09-15). A no-PSRAM ESP32 whose heap has been
-  // fragmented into tiny pieces - e.g. by a long burst of rapid config saves, each of which
-  // rebuilds the whole LVGL screen, interleaved with active polling - can reach a state where
-  // ~50 KB is free but the largest block is ~2 KB, too small for any fetch buffer. Every poll then
-  // fails with a caught bad_alloc (the board stays up and honest, but shows nothing new), and
-  // nothing defragments a running heap. The one recovery is what a person would do: power-cycle.
+  // Self-heal for a wedged heap (found 2026-09-15, rewritten 0.3.2-rc1). A no-PSRAM ESP32 whose
+  // heap has been fragmented into tiny pieces can reach a state where ~50 KB is free but the
+  // largest block is a few KB, too small for any fetch buffer. Every poll then fails (the board
+  // stays up and honest, but shows nothing new), and nothing defragments a running heap. The one
+  // recovery is what a person would do: power-cycle.
   //
-  // WHAT THIS DOES NOT COVER (established on hardware 2026-09-16, DESIGN.md SS12.1): it counts
-  // cycles that COMPLETE AND REPORT FAILURE. It sits after pollOnce() returns, so a poller that
-  // stops completing cycles at all never reaches it and the counter freezes rather than climbing;
-  // and the `else` below zeroes the tally whenever either condition lapses, so one cycle whose
-  // largest block bounced back over the threshold wipes fourteen. That gap is why the liveness
-  // stamp below exists and why main.cpp's display loop watches it. The two are independent nets:
-  // this one catches a heap that has wedged while the poller still runs, that one catches a
-  // poller that has stopped. Neither replaces the other.
+  // The RULE now lives in wedge_policy.h, pure and host-tested, and its header carries the full
+  // trace of why the old inline version sat on a wedged board for seventeen minutes on 2026-09-17
+  // without restarting it. The short version: it counted only cycles that COMPLETE AND REPORT
+  // FAILURE with a small largest block, and a failed cycle drives nextIntervalS()'s backoff to
+  // 240 s - so fifteen of them is fifty-one minutes, not the seven and a half everyone assumed.
   //
-  // Guard tightly so this only ever fires on a genuine wedge, never on an ordinary SEPTA outage:
-  //   * largest block below kWedgeLargestBlock (a normal idle board sits ~20-30 KB) - a SEPTA
-  //     outage leaves the heap healthy, so that case keeps its normal backoff and never reboots;
-  //   * AND that condition held across kWedgePollsBeforeReboot consecutive failed polls, which
-  //     with the failure backoff is several minutes, so a brief blip cannot trigger it.
-  constexpr size_t kWedgeLargestBlock = 6 * 1024;
-  constexpr uint32_t kWedgePollsBeforeReboot = 15;
-  uint32_t wedged_polls = 0;
+  // Two tallies now. An out-of-memory cycle counts DIRECTLY, from the fact the cycle knows about
+  // itself (g_cycle_oom, set at the catch sites), with no heap comparison that could lapse
+  // independently, and three consecutive ones restart the board - about three and a half minutes
+  // with the backoff. The old failed-poll-plus-small-block rule is kept at fifteen as the slower
+  // backstop for a wedge that never throws, because that condition can also be met by an ordinary
+  // SEPTA outage and must stay hard to trip.
+  //
+  // WHAT THIS STILL DOES NOT COVER (established on hardware 2026-09-16, DESIGN.md SS12.1): both
+  // tallies only advance on cycles that COMPLETE. A poller that stops completing cycles at all
+  // freezes them. That gap is why main.cpp's liveness net exists and it is unchanged: this one
+  // catches a heap that has wedged while the poller still runs, that one catches a poller that has
+  // stopped. Neither replaces the other.
+  WedgeState wedge;
   for (;;) {
     // pollOnce() publishes the arrivals as soon as it has them and returns the deadline it set
     // for the next cycle (F12), so the interval is derived once, in the place that also budgets
@@ -1300,6 +1404,8 @@ void pollerTask(void * /*arg*/) {
       // which of them was live - "pre-bikes, oom-cycle" is the Indego stream, "post-weather,
       // oom-cycle" is the liveness fetch, and so on (diag branch).
       heapTraceMark(kStageOomCycle);
+      cycleLogFlag(kCycleOom);
+      g_cycle_oom = true;  // the optional tail ran out of memory; the cycle still counts as OOM
       g_failed_polls++;
       Serial.printf("[net_poller] out of memory during the poll cycle (free %u, largest %u); short retry\n",
                     (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -1322,34 +1428,48 @@ void pollerTask(void * /*arg*/) {
     g_cycle_end_ms = millis();
     g_progress_ms = g_cycle_end_ms;
     g_before_first_cycle = false;
+    // Files the per-cycle log row here for the same reason the stamp above is here: this is the
+    // ONE path every cycle takes, whatever happened inside it (cycle_log.h).
+    cycleLogEnd();
 
     // HAZARD: a firmware upload, exactly as in main.cpp's liveness net. An OTA takes the heap for
-    // the length of a ~1.7 MB write, which is precisely the condition this counter looks for, and
-    // `wedged_polls` carries across an upload, so a device already near the threshold could restart
-    // itself mid-Update.write(). That is not a brick - the boot partition only switches at
-    // Update.end(true), so a half-written inactive slot is inert and the device comes back on the
-    // image it already had - but it throws away the owner's upload at the worst moment and looks
-    // like a crash. Stand down while one is running, and forget the count rather than resume it:
-    // whatever the heap was doing before the upload is not evidence about what it is doing after.
+    // the length of a ~1.7 MB write, which is precisely the condition these counters look for, and
+    // a tally that carried across an upload could restart the board mid-Update.write(). That is
+    // not a brick - the boot partition only switches at Update.end(true), so a half-written
+    // inactive slot is inert and the device comes back on the image it already had - but it throws
+    // away the owner's upload at the worst moment and looks like a crash. nextWedgeState() zeroes
+    // both tallies while one is running and forgets the count rather than resuming it.
     //
-    // Wedge detection otherwise (see above): a failed poll while the largest free block is
-    // critically small. getPollStatus() reflects what pollOnce() just published.
-    if (otaBusy()) {
-      wedged_polls = 0;
-    } else if (!getPollStatus().ok && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < kWedgeLargestBlock) {
-      if (++wedged_polls >= kWedgePollsBeforeReboot) {
-        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        Serial.printf("[net_poller] heap wedged: %u consecutive failed polls with largest block < %u B (free %u); rebooting to recover\n",
-                      (unsigned)wedged_polls, (unsigned)kWedgeLargestBlock, (unsigned)ESP.getFreeHeap());
-        noteSelfHealRestart(SelfHeal::HeapWedge, wedged_polls, (uint32_t)largest);
-        Serial.flush();
-        vTaskDelay(pdMS_TO_TICKS(200));
-        ESP.restart();
-      }
-    } else {
-      wedged_polls = 0;
+    // The OOM tally is fed by g_cycle_oom - the fact this cycle knows about itself, set inside the
+    // catch handlers - and NOT by a largest-block comparison taken afterwards. That is the whole
+    // correction of 0.3.2-rc1: the old rule re-derived "this cycle ran out of memory" from a heap
+    // reading, which is a second condition that can lapse on its own. wedge_policy.h has the
+    // trace. g_cycle_ok supplies the non-throwing rule's "did the poll fail" half - mirrored from
+    // pollOnce() rather than read back through getPollStatus(), which takes a lock and copies a
+    // std::string on a line that has no try block above it.
+    const size_t largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    wedge = nextWedgeState(wedge, otaBusy(), g_cycle_oom, g_cycle_ok, largest_after);
+    const WedgeReason verdict = wedgeVerdict(wedge);
+    if (verdict != WedgeReason::None) {
+      const bool oom = verdict == WedgeReason::OutOfMemory;
+      Serial.printf("[net_poller] heap wedged (%s): %u consecutive %s polls, largest block %u B (free %u); rebooting to recover\n",
+                    oom ? "out of memory" : "starved",
+                    (unsigned)(oom ? wedge.oom_streak : wedge.starved_streak),
+                    oom ? "out-of-memory" : "failed", (unsigned)largest_after,
+                    (unsigned)ESP.getFreeHeap());
+      noteSelfHealRestart(oom ? SelfHeal::HeapOom : SelfHeal::HeapWedge,
+                          oom ? wedge.oom_streak : wedge.starved_streak, (uint32_t)largest_after);
+      Serial.flush();
+      vTaskDelay(pdMS_TO_TICKS(200));
+      ESP.restart();
     }
-    g_wedged_polls = wedged_polls;  // diag branch: mirrored so /api/debug/ui can read it
+    // Mirrored so /api/debug/ui can say how close the board is to each threshold, and which rule
+    // has something to say about the cycle that just ended.
+    g_wedged_polls = wedge.starved_streak;
+    g_oom_streak = wedge.oom_streak;
+    g_wedge_reason = (uint8_t)(wedge.oom_streak > 0   ? WedgeReason::OutOfMemory
+                               : wedge.starved_streak > 0 ? WedgeReason::Starved
+                                                          : WedgeReason::None);
 
     // Blocks until the deadline, but wakes immediately if requestRepoll() gives the semaphore
     // (DESIGN.md SS7: PUT /api/config "triggers immediate re-poll").
@@ -1405,6 +1525,72 @@ bool preallocateTracker() {
 
 std::vector<uint8_t> *pollScratch() {
   return g_poll_buffers != nullptr ? &g_poll_buffers->scratch : nullptr;
+}
+
+// Roughly how many heap bytes each long-lived structure is holding (0.3.2-rc1). Reported by
+// GET /api/debug/ui beside the heap figures so "free8 fell by 4 KB overnight" can be attributed to
+// something rather than guessed at. Only heap bytes are counted - a std::string of 15 characters
+// or fewer lives inside the object and is already in the sizeof() term - and allocator headers are
+// not, so these are lower bounds meant for watching drift, not for balancing the heap.
+MemorySizes getMemorySizes() {
+  MemorySizes m;
+  m.sched_cache_bytes = g_sched_cache.bytes();
+  for (const auto &e : g_alerts_cache) {
+    m.alerts_cache_bytes += (uint32_t)sizeof(AlertCacheEntry) + strHeapBytes(e.url);
+    m.alerts_cache_bytes += (uint32_t)(e.alerts.capacity() * sizeof(Alert));
+    for (const auto &a : e.alerts) {
+      m.alerts_cache_bytes += strHeapBytes(a.route) + strHeapBytes(a.text);
+      m.alerts_cache_bytes += (uint32_t)(a.detours.capacity() * sizeof(std::string));
+      for (const auto &d : a.detours) m.alerts_cache_bytes += strHeapBytes(d);
+    }
+  }
+  std::shared_ptr<const Snapshot> snap;
+  if (takeShared(g_mutex, kStatusWaitMs)) {
+    snap = g_snapshot;  // a refcount bump, not a copy
+    giveShared(g_mutex);
+  }
+  if (snap) {
+    uint32_t n = (uint32_t)sizeof(Snapshot) + strHeapBytes(snap->last_error);
+    n += (uint32_t)(snap->stops.capacity() * sizeof(StopSnapshot));
+    for (const auto &st : snap->stops) {
+      n += strHeapBytes(st.key) + strHeapBytes(st.error);
+      n += (uint32_t)(st.arrivals.capacity() * sizeof(transit::Arrival));
+      for (const auto &a : st.arrivals) {
+        n += strHeapBytes(a.trip) + strHeapBytes(a.vehicle) + strHeapBytes(a.destination) +
+             strHeapBytes(a.seats) + strHeapBytes(a.sched_trip);
+      }
+    }
+    n += (uint32_t)(snap->alerts.capacity() * sizeof(Alert));
+    for (const auto &a : snap->alerts) {
+      n += strHeapBytes(a.route) + strHeapBytes(a.text);
+      n += (uint32_t)(a.detours.capacity() * sizeof(std::string));
+      for (const auto &d : a.detours) n += strHeapBytes(d);
+    }
+    m.snapshot_bytes = n;
+  }
+  m.retained_capacity = g_poll_buffers != nullptr ? (uint32_t)g_poll_buffers->retained.capacity() : 0;
+  m.tv_capacity = g_poll_buffers != nullptr ? (uint32_t)g_poll_buffers->tv.capacity() : 0;
+  m.tv_dropped = g_poll_buffers != nullptr ? g_poll_buffers->tv_dropped : 0;
+  return m;
+}
+
+void setNightlyRestart(bool enabled, int minute_of_day) {
+  g_nightly_minute = (int32_t)minute_of_day;
+  g_nightly_enabled = enabled;
+}
+
+bool nightlyRestartEnabled() { return g_nightly_enabled; }
+
+int nightlyRestartMinute() { return (int)g_nightly_minute; }
+
+ScratchStats getScratchStats() {
+  ScratchStats s;
+  if (g_poll_buffers == nullptr) return s;
+  s.max_bytes = g_poll_buffers->scratch_max_bytes;
+  s.reserve_bytes = (uint32_t)g_poll_buffers->scratch_reserve;
+  s.capacity = (uint32_t)g_poll_buffers->scratch.capacity();
+  s.grows = g_poll_buffers->scratch_grows;
+  return s;
 }
 
 bool preallocatePollBuffers() {
@@ -1638,5 +1824,16 @@ StopSummaryView getStopSummary(const std::string &stop_key) {
 uint32_t snapshotsLive() { return g_snapshots_live.load(); }
 uint32_t failedPolls() { return g_failed_polls; }
 uint32_t wedgedPolls() { return g_wedged_polls; }
+
+uint32_t oomStreak() { return g_oom_streak; }
+
+const char *wedgeReason() {
+  switch ((WedgeReason)g_wedge_reason) {
+    case WedgeReason::OutOfMemory: return "oom";
+    case WedgeReason::Starved: return "starved";
+    case WedgeReason::None:
+    default: return "none";
+  }
+}
 
 }  // namespace transit_app

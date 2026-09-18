@@ -247,7 +247,9 @@ Config defaultConfig() {
   Config cfg;
   cfg.version = 1;
   cfg.device = DeviceConfig{};  // struct defaults already match DESIGN.md SS6
-  cfg.alerts = true;
+  // Off by default since 0.3.2-rc1 (owner decision) - see config_store.h. A first-boot device gets
+  // no alerts fetch at all until someone turns them on in Settings.
+  cfg.alerts = false;
 
   StopConfig southbound;
   southbound.key = "17-21332";
@@ -362,6 +364,10 @@ bool validateConfig(const Config &cfg, ConfigError &err) {
   }
   if (!validClock(cfg.device.quiet.start) || !validClock(cfg.device.quiet.end)) {
     err = {"quiet.start and quiet.end must be HH:MM", "device.quiet.start"};
+    return false;
+  }
+  if (!validClock(cfg.device.nightly_restart.time)) {
+    err = {"nightly_restart.time must be HH:MM", "device.nightly_restart.time"};
     return false;
   }
   if (cfg.device.quiet.brightness > 50) {
@@ -491,6 +497,9 @@ void configToJson(const Config &cfg, JsonDocument &doc) {
   JsonObject night = device["night"].to<JsonObject>();
   night["enabled"] = cfg.device.night.enabled;
   night["after_min"] = cfg.device.night.after_min;
+  JsonObject nightly = device["nightly_restart"].to<JsonObject>();
+  nightly["enabled"] = cfg.device.nightly_restart.enabled;
+  nightly["time"] = cfg.device.nightly_restart.time;
 
   JsonArray stops = doc["stops"].to<JsonArray>();
   for (const StopConfig &s : cfg.stops) {
@@ -612,6 +621,15 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
   result.device.night.enabled = night["enabled"] | true;
   if (!readInt(night, "after_min", 15, 240, 60, "device.night.after_min", n, err)) return false;
   result.device.night.after_min = (uint16_t)n;
+  // Added in 0.3.2-rc1. A saved config written before it has no such block, and both members then
+  // take their struct defaults - enabled, 03:30 - which is the intended behaviour for an existing
+  // device, not a migration.
+  JsonVariantConst nightly = device["nightly_restart"];
+  result.device.nightly_restart.enabled = nightly["enabled"] | true;
+  if (!readStr(nightly, "time", kMaxClockLen, "03:30", "device.nightly_restart.time",
+               result.device.nightly_restart.time, err)) {
+    return false;
+  }
 
   JsonVariantConst stops = doc["stops"];
   if (!stops.isNull()) {
@@ -669,7 +687,11 @@ bool jsonToConfig(const JsonVariant &doc, Config &cfg, ConfigError &err) {
     }
   }
 
-  result.alerts = doc["alerts"] | true;
+  // `| false` since 0.3.2-rc1: this fallback only applies to a config that has no "alerts" key at
+  // all, which every config this firmware has ever SAVED does have (toJson always writes it). So
+  // an existing device keeps exactly what it chose; a hand-written or pre-0.2 config gets the new
+  // default, which is the same answer defaultConfig() gives.
+  result.alerts = doc["alerts"] | false;
   JsonVariantConst weather = doc["weather"];
   result.weather.enabled = weather["enabled"] | true;
   result.weather.per_stop = weather["per_stop"] | true;
@@ -957,8 +979,19 @@ bool saveConfig(const Config &cfg) {
 }
 
 namespace {
+// The wait every task EXCEPT the display task gets on the active-config mutex. Unchanged from the
+// 1,000 ms this accessor has always used; the display task's is zero and comes from ui_lock.h.
+// What is held under it is now a pointer exchange rather than a Config copy, so nobody waits long
+// for it in the first place.
+constexpr uint32_t kActiveConfigWaitMs = 1000;
+
 SemaphoreHandle_t g_active_mutex = nullptr;
-Config g_active_config;
+// ONE Config, held by pointer (0.3.2-rc3, runtime audit rec #8). It used to be a resident
+// `Config g_active_config` that every save copy-assigned into, which meant a save freed a
+// Config's ~12 small string blocks and immediately allocated ~12 more in whatever holes the heap
+// had - and did it again for the display task's own resident copy. Publishing the pointer makes a
+// save allocate ONE Config and free one, with nothing copied in between.
+std::shared_ptr<const Config> g_active_config;
 
 SemaphoreHandle_t activeMutex() {
   if (g_active_mutex == nullptr) {
@@ -968,20 +1001,53 @@ SemaphoreHandle_t activeMutex() {
 }
 }  // namespace
 
+const Config &emptyConfig() {
+  static const Config kEmpty;
+  return kEmpty;
+}
+
+std::shared_ptr<const Config> activeConfigPtr() {
+  SemaphoreHandle_t mutex = activeMutex();
+  // The display task's own last-good pointer, exactly as net_poller.cpp's snapshotPtr() keeps one
+  // (ui_lock.h): touched only when onDisplayTask() is true, so it is per-task state and needs no
+  // lock of its own. On a miss the display keeps the config it is already rendering and tries
+  // again next tick, which is a second of staleness on a setting that has just been saved - not a
+  // wait, and not a blank panel.
+  static LastGood<std::shared_ptr<const Config>> ui_last;
+  if (onDisplayTask()) {
+    // `outgoing` matters for the same reason it does in snapshotPtr(): overwriting the slot in
+    // place would drop its reference to the PREVIOUS Config inside the critical section, and when
+    // that is the last reference, dropping it runs a whole Config's destructor there. Moving it
+    // out first makes the store a bare refcount bump and leaves the free until after the give.
+    std::shared_ptr<const Config> outgoing;
+    if (takeShared(mutex, kActiveConfigWaitMs)) {
+      outgoing = std::move(ui_last.slot());
+      ui_last.slot() = g_active_config;  // a refcount bump: no allocation, no free, cannot throw
+      ui_last.hit();
+      giveShared(mutex);
+    } else {
+      ui_last.miss();
+    }
+    return ui_last.value();  // `outgoing` is released here, with the lock long gone
+  }
+  std::shared_ptr<const Config> copy;
+  if (takeShared(mutex, kActiveConfigWaitMs)) {
+    copy = g_active_config;
+    giveShared(mutex);
+  }
+  return copy;
+}
+
 bool tryGetActiveConfig(Config *out) {
   if (out == nullptr) return false;
-  SemaphoreHandle_t mutex = activeMutex();
-  // 1 s for the poller and the web task, zero for the LVGL display task (ui_lock.h). A Config copy
-  // is the largest thing any of these accessors does under a lock - eight stops, their profiles and
-  // every string in them - so the display task waiting on it was never acceptable.
-  if (!takeShared(mutex, 1000)) return false;
-  try {
-    *out = g_active_config;
-  } catch (const std::bad_alloc &) {
-    giveShared(mutex);
-    throw;
-  }
-  giveShared(mutex);
+  // The pointer first, then the copy OUTSIDE the lock. The copy is the largest thing any of these
+  // accessors does - four stops, their profiles and every string in them - and it used to happen
+  // with the mutex held, so every other reader waited out somebody else's allocation. Holding a
+  // shared_ptr keeps the object alive for as long as this needs it without holding anything else
+  // up; a concurrent save simply publishes a new pointer beside it.
+  std::shared_ptr<const Config> p = activeConfigPtr();
+  if (!p) return false;
+  *out = *p;  // may throw bad_alloc; no lock is held, so nothing is stranded
   return true;
 }
 
@@ -995,10 +1061,21 @@ Config getActiveConfig() {
   return copy;
 }
 
-void setActiveConfig(const Config &cfg) {
+std::shared_ptr<const Config> setActiveConfig(Config cfg) {
+  // BY VALUE AND MOVED. A caller that still needs its Config pays one copy here, exactly as it did
+  // before; a caller that does not - PUT /api/config - std::move()s and pays none at all, so the
+  // strings the request parsed become the published ones instead of being duplicated and thrown
+  // away. make_shared puts the control block and the Config in one allocation.
+  std::shared_ptr<const Config> next = std::make_shared<const Config>(std::move(cfg));
+  // Built OUTSIDE the lock and swapped in, the same rule publishSnapshot() follows (DESIGN.md
+  // SS5): what happens under this mutex is a pointer exchange, never an allocation. `outgoing`
+  // carries the old Config out so its destructor runs after the give rather than under it.
+  std::shared_ptr<const Config> outgoing;
+  std::shared_ptr<const Config> published = next;  // a refcount bump, so the return survives the move
   SemaphoreHandle_t mutex = activeMutex();
   if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
-    g_active_config = cfg;
+    outgoing = std::move(g_active_config);
+    g_active_config = std::move(next);
     xSemaphoreGive(mutex);
   }
 #ifdef TRANSIT_HTTPS
@@ -1006,8 +1083,11 @@ void setActiveConfig(const Config &cfg) {
   // through here, so this is the one place the fetch layer learns the transport policy - the
   // poller never has to know the key exists. validateConfig() already rejected unknown names.
   Transport policy;
-  if (parseTransport(cfg.device.transport.c_str(), policy)) setTransportPolicy(policy);
+  if (parseTransport(published->device.transport.c_str(), policy)) setTransportPolicy(policy);
 #endif
+  // `outgoing` - the Config this one replaced - is destroyed here, on the caller's task, with the
+  // mutex long since given back.
+  return published;
 }
 
 }  // namespace transit_app

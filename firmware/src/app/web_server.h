@@ -34,6 +34,14 @@ void startWebServer(std::function<void(bool)> onConfigChanged = nullptr);
 // the whole upload.
 bool otaBusy();
 
+// Reboots shortly (~300 ms) after the current response has had a chance to go out, by way of a
+// tiny one-shot task - calling ESP.restart() inline risks cutting an HTTP reply off mid-flight.
+// POST /api/reboot, the Wi-Fi reset and a finished OTA all go through it; so does main.cpp's
+// nightly restart (nightly_restart.h), which has no response to protect but does want the same
+// "let whatever is in flight finish" grace. Callers that want GET /api/state to be able to say
+// WHY afterwards should call noteSelfHealRestart() first (net_poller.h).
+void scheduleRestart();
+
 // How many AsyncWebServerRequest objects are alive right now (admission.h). Read by the poller's
 // queued-job gate: a ~9 KB stats scan must not start while a burst of web requests is in flight,
 // which is what crashed the 0.3.1-rc2 device suite. A few milliseconds stale by construction,

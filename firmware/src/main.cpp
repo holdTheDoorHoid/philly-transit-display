@@ -29,6 +29,8 @@
 #include "app/heap_reserve.h"
 #include "app/hw_probe.h"
 #include "app/net_poller.h"
+#include "app/nightly_restart.h"
+#include "daypart_core/daypart.h"
 #include "app/poller_liveness.h"
 #include "app/proxy_worker.h"
 #include "app/sd_logger.h"
@@ -174,6 +176,44 @@ void checkPollerLiveness() {
   ESP.restart();
 }
 
+// DESIGN.md SS12.1 / nightly_restart.h: the deliberate restart, checked once a minute from the
+// display task. Nothing here allocates or blocks; the setting is two aligned words the poller
+// republishes every cycle, and the clock read is localtime_r on a stack struct.
+//
+// It runs OUTSIDE loop()'s bad_alloc guard, alongside checkPollerLiveness() and for the same
+// reason: the frame the display loop skips because it could not allocate is exactly the frame in
+// which this is most worth doing.
+void checkNightlyRestart() {
+  static int last_minute = -1;
+  if (!transit_app::nightlyRestartEnabled()) return;
+  time_t now = time(nullptr);
+  struct tm lt;
+  // Before NTP the local time is 1970 and "03:30" would match at a moment that has nothing to do
+  // with 03:30. The same threshold net_poller.cpp's clockIsSane() uses (kSaneClockEpoch,
+  // 2023-11-14): repeated rather than exported, because that one is a file-local helper with five
+  // other callers inside its own translation unit and widening its scope for this would be the
+  // larger change.
+  constexpr time_t kSaneClockEpoch = 1700000000;
+  if (now < kSaneClockEpoch || localtime_r(&now, &lt) == nullptr) return;
+  const int now_minute = lt.tm_hour * 60 + lt.tm_min;
+  const uint32_t uptime_s = (uint32_t)(millis() / 1000U);
+  const bool fire = transit_app::shouldRestartNightly(
+    true, transit_app::nightlyRestartMinute(), now_minute, last_minute, uptime_s,
+    transit_app::otaBusy());
+  // Stamped whether or not it fired, so the rule's "once a minute" guard holds: a minute that was
+  // considered and declined must not be considered again forty passes later.
+  last_minute = now_minute;
+  if (!fire) return;
+  Serial.printf("[restart] nightly restart at %02d:%02d\n", lt.tm_hour, lt.tm_min);
+  // Recorded before the restart is scheduled, so GET /api/state's last_restart says "nightly"
+  // rather than leaving an unexplained ESP_RST_SW on the next boot. `a` is the minute of day it
+  // was set to, `b` the uptime in seconds it reached - both useful if it ever fires at the wrong
+  // time.
+  transit_app::noteSelfHealRestart(transit_app::SelfHeal::Nightly, (uint32_t)now_minute, uptime_s);
+  Serial.flush();
+  transit_app::scheduleRestart();
+}
+
 std::string wifiApName() {
   // WiFi.macAddress() returns zeros before the Wi-Fi driver is started, so read
   // the factory MAC from efuse directly (observed "TransitDisplay-0000" otherwise).
@@ -302,6 +342,20 @@ void setup() {
   transit_app::connectWifiOrPortal(wifiApName(), pumpLvgl);
   heapStage("wifi");
 
+  // The fourth task that can throw, and the only one we do not create: lwIP's own "tiT"
+  // (0.3.2-rc4, app/cxx_exception_pool.cpp has the decoded backtrace). AsyncTCP's lwIP raw
+  // callbacks - tcp_poll, tcp_recv, tcp_sent, tcp_error, tcp_accept, the DNS callback - all run
+  // there and all allocate with `new (std::nothrow)`, which libstdc++ implements as a try/catch
+  // around the THROWING new. So the first allocation failure in AsyncTCP's lwIP half is a real
+  // throw on a task that has never thrown, and it terminates on the ~16 B malloc inside
+  // __cxa_get_globals with the heap already gone. This warms it through lwIP's own callback
+  // mechanism, which is the only way onto that task.
+  //
+  // HERE and not earlier: the tcpip task does not exist until the TCP/IP stack is initialised,
+  // which connectWifiOrPortal() above is what causes. Both branches of that call (joined a network,
+  // or brought up the setup AP) start the stack, so the task is there either way.
+  transit_app::warmExceptionGlobalsOnTcpipTask();
+
   // Idempotent: wifi_portal.cpp already called this as soon as it powered the radio up (auth.h
   // explains why it has to be after that, not in setup()). Kept here so the dependency is visible
   // at the point the web server and the device info screen - both of which read the PIN - are
@@ -319,6 +373,15 @@ void setup() {
   }
   configTzTime(cfg.device.tz.c_str(), "pool.ntp.org");
   g_applied_tz = cfg.device.tz;
+  // The nightly restart is armed from the loaded config here, not left until the first poll cycle
+  // republishes it (nightly_restart.h). It could not fire for the first hour either way - the
+  // uptime guard sees to that - but the setting should be true from boot rather than default.
+  transit_app::setNightlyRestart(cfg.device.nightly_restart.enabled,
+                                 daypart::parseClock(cfg.device.nightly_restart.time));
+  if (cfg.device.nightly_restart.enabled) {
+    Serial.printf("[restart] nightly restart armed for %s local\n",
+                  cfg.device.nightly_restart.time.c_str());
+  }
 
   if (MDNS.begin(cfg.device.name.c_str())) {
     MDNS.addService("http", "tcp", 80);
@@ -347,7 +410,7 @@ void setup() {
 
   transit_app::startWebServer([](bool data_changed) {
     transit_app::requestRepoll(data_changed);
-    transit_app::ui::onConfigChanged(transit_app::getActiveConfig());  // applied on the LVGL task
+    transit_app::ui::onConfigChanged();  // one flag; the LVGL task picks up the published pointer
     g_apply_network_settings = true;                                   // mDNS/timezone, applied in loop()
   });
   heapStage("web");
@@ -356,7 +419,10 @@ void setup() {
   // flashes green on a good poll and holds red on a failed one from here on.
   transit_app::setStatusLed(LedState::Off);
 
-  transit_app::ui::init(cfg);
+  // The published pointer, not a copy of `cfg`: the display task borrows config_store's one
+  // Config for the life of the device instead of keeping a second resident one (config_store.h,
+  // "the active config is one object, published by pointer"). setActiveConfig(cfg) ran above.
+  transit_app::ui::init(transit_app::activeConfigPtr());
   transit_app::ui::applyBrightness(cfg.device.brightness);
   heapStage("ui");
   transit_app::ui::logMemory();
@@ -406,4 +472,5 @@ void loop() {
   // could not allocate is exactly the frame in which the poller is most likely to be stuck, so the
   // liveness check must not be skipped with it. Nothing in it allocates.
   checkPollerLiveness();
+  checkNightlyRestart();
 }

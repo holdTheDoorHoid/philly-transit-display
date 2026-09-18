@@ -121,7 +121,10 @@ inline void giveShared(SemaphoreHandle_t m) { xSemaphoreGive(m); }
 // of them vectors of std::string - so a bad_alloc there walks out past the give and the mutex is
 // held for the rest of the device's life. Nothing ever takes it again: tick() stops applying config
 // changes, debugSnapshot() times out and hands GET /api/debug/ui an all-zero UiDebug that looks
-// like data, and onConfigChanged() silently drops every save. That is reachable precisely when the
+// like data, and the config handover silently drops every save. (That last one is historical since
+// 0.3.2-rc3: onConfigChanged() no longer takes a lock or copies anything - it sets one volatile
+// flag, and the display task reads config_store's published pointer. The other critical sections
+// are still exactly as described.) That is reachable precisely when the
 // heap troughs, which is when this endpoint is being read hardest.
 //
 // It changes no wait and no policy: the take is still takeShared()'s, misses are still counted the

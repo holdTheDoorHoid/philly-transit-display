@@ -22,6 +22,16 @@ std::vector<StopTimeUpdate> decodeTripUpdates(const std::vector<std::string>& ro
   return out;
 }
 
+// The TvFilter pollBusStops() builds: "keep a vehicle iff its trip id is one of the retained
+// GTFS-RT updates'". Spelled out here over a vector<StopTimeUpdate> exactly as it is there.
+bool tripIsInRetained(const std::string& trip, const void* ctx) {
+  const auto* updates = static_cast<const std::vector<StopTimeUpdate>*>(ctx);
+  for (const auto& u : *updates) {
+    if (u.trip_id == trip) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 // The TransitView and TripUpdates fixtures were captured within a minute of each other
@@ -665,4 +675,69 @@ void test_parse_signed_minutes_bounds_and_garbage() {
   checkStatus("3min", false, 0);
   checkStatus("min", false, 0);
   checkStatus("", false, 0);
+}
+
+// THE CLAIM THE 0.3.2-rc3 TRANSITVIEW FILTER RESTS ON: filtering the vehicle list down to the
+// trip ids the retained realtime updates carry changes NOTHING mergeStop() produces. It is a
+// claim about the merge, not about SEPTA, and it is checkable here rather than on hardware -
+// findTvByTrip() is the only door into the vector and it is only ever called with a `u.trip_id`
+// from `rt`, so a vehicle outside that set cannot reach any output field.
+//
+// If someone later makes the merge read a TvVehicle some other way - by direction, by next stop,
+// by proximity - this test is what fails, and it should: the filter would then be discarding data
+// the merge wanted.
+void test_transitview_trip_filter_changes_nothing_the_merge_reads() {
+  std::vector<StopTimeUpdate> rt = decodeTripUpdates({"17"}, {"21332", "21297"});
+  TEST_ASSERT_TRUE(rt.size() > 0);
+
+  auto tv_body = transit_test::readFixture("transitview_17.json");
+  ParseResult<TvVehicle> unfiltered = parseTransitView(tv_body.data(), tv_body.size());
+  TEST_ASSERT_TRUE(unfiltered.ok);
+
+  ParseResult<TvVehicle> filtered;
+  parseTransitViewAppend(&filtered, tv_body.data(), tv_body.size(),
+                          TvFilter(&tripIsInRetained, &rt));
+  TEST_ASSERT_TRUE(filtered.ok);
+  // The filter really did remove something, or this test proves nothing: the fixture's second
+  // vehicle (trip 3585, Northbound) has no retained update at these two stops.
+  TEST_ASSERT_TRUE(filtered.items.size() < unfiltered.items.size());
+  TEST_ASSERT_EQUAL_UINT32(0, filtered.dropped);
+
+  auto sched_body = transit_test::readFixture("busschedules_21332.json");
+  ParseResult<SchedEntry> sched = parseBusSchedules(sched_body.data(), sched_body.size());
+  TEST_ASSERT_TRUE(sched.ok);
+
+  StopConfig cfg;
+  cfg.key = "17-21332";
+  cfg.mode = Mode::Bus;
+  cfg.route = "17";
+  cfg.stop_id = "21332";
+  cfg.direction = "1";
+  cfg.headsign = "20th-Johnston";
+  Epoch now = 1789352300;
+
+  StopSnapshot a = mergeStop(cfg, rt, unfiltered.items, sched.items, now);
+  StopSnapshot b = mergeStop(cfg, rt, filtered.items, sched.items, now);
+
+  TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(a.arrivals.size()),
+                            static_cast<uint32_t>(b.arrivals.size()));
+  TEST_ASSERT_TRUE(a.arrivals.size() > 0);
+  TEST_ASSERT_EQUAL_INT64(a.source_ts, b.source_ts);
+  TEST_ASSERT_TRUE(a.health == b.health);
+  TEST_ASSERT_EQUAL_INT(a.ok ? 1 : 0, b.ok ? 1 : 0);
+  for (size_t i = 0; i < a.arrivals.size(); ++i) {
+    const Arrival& x = a.arrivals[i];
+    const Arrival& y = b.arrivals[i];
+    TEST_ASSERT_EQUAL_STRING(x.trip.c_str(), y.trip.c_str());
+    TEST_ASSERT_EQUAL_STRING(x.vehicle.c_str(), y.vehicle.c_str());
+    TEST_ASSERT_EQUAL_STRING(x.destination.c_str(), y.destination.c_str());
+    TEST_ASSERT_EQUAL_STRING(x.seats.c_str(), y.seats.c_str());
+    TEST_ASSERT_EQUAL_STRING(x.sched_trip.c_str(), y.sched_trip.c_str());
+    TEST_ASSERT_EQUAL_INT64(x.predicted, y.predicted);
+    TEST_ASSERT_EQUAL_INT64(x.scheduled, y.scheduled);
+    TEST_ASSERT_EQUAL_INT16(x.late_min, y.late_min);
+    TEST_ASSERT_EQUAL_INT(x.late_known ? 1 : 0, y.late_known ? 1 : 0);
+    TEST_ASSERT_EQUAL_INT((int)x.status, (int)y.status);
+    TEST_ASSERT_EQUAL_UINT16(x.stop_sequence, y.stop_sequence);
+  }
 }

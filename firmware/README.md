@@ -12,7 +12,7 @@ export PATH="$HOME/.platformio/penv/bin:$PATH"
 cd firmware
 pio run -e cyd-3248S035R        # the owner's board; see platformio.ini for the other envs
 pio run -e cyd-3248S035R-https  # the same board with the HTTPS prototype compiled in (DESIGN.md §2.1)
-pio test -e native              # transit_core + transit_stats + poller-liveness host tests (232 cases)
+pio test -e native              # transit_core + transit_stats + poller-liveness host tests (267 cases)
 pio run -e ui-sim               # host screenshot simulator (sim/README.md)
 pio run -e ui-sim-pool          # the same, with LVGL's pool scaled to the board's (DESIGN.md §8)
 ```
@@ -225,7 +225,8 @@ way - do not move the QR anywhere that coexists with the arrivals page. Static R
 longer gets, so three other things were shrunk the same day to keep ~75-80 KB of heap free at
 runtime with a 40+ KB largest block: the arrival tracker keeps 8 trips per stop instead of 12
 (`transit_stats/tracker.h`, ~4 KB), the 3.5" draw buffer is 1/20 of the screen instead of 1/16
-(board JSON, ~4 KB - and 1/30 since 0.3.1, another 5 KB), and the UI caches the visible-stop list
+(board JSON, ~4 KB - then 1/30 in 0.3.1 for another 5 KB, and 1/40 in 0.3.2-rc3 for 2,560 B
+more), and the UI caches the visible-stop list
 per build instead of copying the stop vector several times a second.
 
 Concurrency limit: the async web server handles one request at a time but queues the responses,
@@ -249,7 +250,7 @@ heap region that only 32-bit word access can reach, and `malloc()` never hands t
 | After | `free8` (usable) | `free` (`ESP.getFreeHeap()`) | Largest block |
 |---|---:|---:|---:|
 | display (LVGL + 19 KB draw buffer) | 183 KB | 216 KB | 110 KB |
-| config + arrival tracker (~12 KB) + poller task stack (10 KB) | 145 KB | 178 KB | 110 KB |
+| config + arrival tracker (~12 KB) + poller task stack (8 KB since 0.3.2-rc3, 10 KB when this row was measured) | 145 KB | 178 KB | 110 KB |
 | Wi-Fi connected | 94 KB | 127 KB | 86 KB |
 | web server, mDNS, SNTP | 67 KB | 100 KB | 61 KB |
 | SD card mounted | 36 KB | 69 KB | 32 KB |
@@ -345,8 +346,9 @@ Rules that fell out of this, all learned the hard way (each one was a boot loop 
 - Nothing on the LVGL task touches SD or the network. The stats page's `getStopSummary()` returns
   a cached value plus its age; the poller recomputes one stop per idle slice.
 - LVGL's static pool is 36 KB (`LV_MEM_SIZE`) and stays there — see `boards/README.md`; the draw
-  buffer is 1/30 of the screen in RGB565 on the 3.5" boards (`LVGL_BUFFER_PIXELS` in
-  `boards/*.json`). The `[lvmem]` lines show pool usage — at boot, and one per page built.
+  buffer is 1/40 of the screen in RGB565 on the 3.5" boards since 0.3.2-rc3, 7,680 B
+  (`LVGL_BUFFER_PIXELS` in `boards/*.json`; measured 2026-09-17, `tick_ms_max` 100-122 ms at `/40`
+  against 168 ms at `/30` - the page build dominates, not the flush count). The `[lvmem]` lines show pool usage — at boot, and one per page built.
 - **One page is resident at a time** (DESIGN.md §8). LVGL 9.5 does not survive running that pool
   out: `lv_obj_class.c` writes each new child straight after an unchecked `lv_realloc()`. So every
   page transition frees the page it is leaving before it builds the next one, the night page

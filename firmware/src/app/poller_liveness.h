@@ -18,7 +18,7 @@
 //   one schedule   fetchPlausibleSchedule x3, each through the         ~414 s   <- 12 URLs
 //                  BusSchedules wrapper's own x4 (net_poller.cpp)
 //   one stop       that, plus one TransitView URL                      ~450 s
-//   eight stops    config_store.h kMaxStops, and the poller polls
+//   four stops     config_store.h kMaxStops (4 since 0.3.2-rc2), and the poller polls
 //                  cfg.stops, not the visible subset                   ~60 MINUTES
 //
 // No window derived from the stop count can both cover that and still restart a genuinely frozen

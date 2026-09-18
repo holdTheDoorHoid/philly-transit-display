@@ -84,13 +84,33 @@ struct FetchOutcome {
 // setEntityBuffer, indego::StatusStream::setFeatureBuffer, and this struct's own `scratch` for the
 // buffered JSON bodies) and the next one takes it over.
 //
-// WHAT IS DELIBERATELY *NOT* IN HERE, and why. The GTFS-RT retention block
-// (std::vector<StopTimeUpdate>) and the BusSchedules parse block (std::vector<SchedEntry>) are
-// vectors of non-trivially-destructible types, so backing them with shared bytes would need a
-// custom allocator and a change to the types in this library's public API. They go back to being
-// allocated per cycle - one 4.6 KB request at rt-stream and one 3 KB request per schedule parse -
-// which is a size the measured resting largest block (~24 KB) carries comfortably. Keeping the
-// floor high is worth more than removing them.
+// THE TWO TYPED BLOCKS BESIDE IT (0.3.2-rc1), and why they are separate from the byte scratch.
+// The GTFS-RT retention block (std::vector<StopTimeUpdate>) and the TransitView vehicle list
+// (std::vector<TvVehicle>) are vectors of non-trivially-destructible values: they cannot be laid
+// over borrowed bytes without a custom allocator and a change to this library's public types. So
+// they are their own resident vectors here, lent out the same way - `retained` to
+// GtfsRtStream::setRetentionBuffer(), `tv` to fetchTransitViewAppendEx() as the destination it
+// parses straight into.
+//
+// They were per-cycle until 0.3.2-rc1 and that decision was measured wrong. On the owner's board
+// at v0.3.1 the resting largest block held above 22.5 KB for 35 healthy minutes and then
+// fragmented to 3,444 B, and from that point EVERY cycle failed at the first of them: the ring
+// read "pre-transit -> oom-transit" with nothing between, which is retainUpdates()' reserve() and
+// nothing else. The rc1 lesson (holding memory permanently lowers the floor) still stands, so the
+// cost is stated rather than waved at: `retained` is sized from the CONFIG, 8 slots per configured
+// bus/trolley (stop, route) pair rather than the 32-slot default cap, which is 16 slots ~ 2.4 KB
+// for the owner's two Route 17 stops; `tv` is the full kMaxTvVehicles, which since 0.3.2-rc3 is
+// 16 slots ~ 2.8 KB rather than 32 ~ 5.6 KB. The thing that made 32 look necessary was that the
+// parse kept a rush-hour Route 17's whole fleet; with the trip-id filter (septa.h TvFilter) it
+// keeps only the vehicles a configured stop's retained realtime updates can join to, which is
+// bounded by those updates and not by how busy the route is. Together about 5 KB off the resting
+// floor, against removing every per-cycle contiguous request above ~1.2 KB on a cache-hit cycle.
+//
+// WHAT IS STILL PER-CYCLE, deliberately: the BusSchedules parse block
+// (std::vector<SchedEntry>, kMaxSchedEntries * ~128 B = 3,072 B). It is asked for only on a
+// schedule REFETCH - once per stop per 10 minutes, not every cycle - and 3 KB is the size this
+// heap has always carried; making it resident would buy a cycle that already succeeds nothing and
+// cost the floor another 3 KB.
 //
 // The ONE buffer the firmware still keeps separately is the transport-level BusSchedules body
 // (net_poller.cpp): that layer buffers the response before transit_core sees it and then copies it
@@ -101,21 +121,82 @@ struct FetchOutcome {
 // nest. Passing a null PollBuffers* (the default everywhere) restores per-call buffers exactly,
 // which is what the host tests and any other consumer of this library get.
 struct PollBuffers {
-  // The shared buffer. Sized for the largest single borrower (the Indego feature buffer at
-  // 6,144 B); the JSON body path may grow it past that for one unusually large response, and
-  // beginCycle() gives that growth back.
+  // The shared byte buffer. Sized for the largest single borrower (the Indego feature buffer at
+  // 6,144 B); the JSON body path may grow it past that for one unusually large response.
   std::vector<uint8_t> scratch;
 
+  // The GTFS-RT retention block, lent to GtfsRtStream::setRetentionBuffer(). Sized by
+  // reserveRetention() from the configured (stop, route) pair count, not by the stream's default
+  // cap.
+  std::vector<StopTimeUpdate> retained;
+
+  // The TransitView vehicle list for a whole cycle - every configured route's vehicles appended
+  // into one vector, which fetchTransitViewAppendEx() parses straight into. Reserved at
+  // kMaxTvVehicles so a rush-hour route cannot make it double. Since 0.3.2-rc3 that is 16 slots
+  // (2,816 B) rather than 32 (5,632 B), because the parse now keeps only the vehicles a
+  // configured stop's realtime updates can actually join to (septa.h TvFilter).
+  std::vector<TvVehicle> tv;
+
+  // Relevant vehicles that did not fit kMaxTvVehicles, since boot. Reported as `tv_dropped` on
+  // GET /api/debug/ui. It should stay at zero: 16 slots is twice what the owner's two-stop
+  // config can retain realtime updates for. A number that moves is this cap biting on a real
+  // config and is the signal to raise kMaxTvVehicles - which is why the count exists rather than
+  // the cap simply being generous. Only FILTERED fetches contribute: an unfiltered one (the
+  // route-liveness refresh) overflows the cap on any busy route by design, and counting that
+  // would drown the signal.
+  uint32_t tv_dropped = 0;
+
   static constexpr size_t kScratchReserve = 6144;
+  // How far the scratch reservation is allowed to RATCHET UP when a response body turns out to be
+  // bigger than kScratchReserve (see beginCycle()). Above this, growth is still given back.
+  // 8 KB and not 10 since 0.3.2-rc2: rc1 of this pass was measured with scratch_max_bytes at 7,035
+  // on the owner's board, so 8 KB covers the real bodies with room to spare while capping what a
+  // single outsized response can make permanent.
+  static constexpr size_t kScratchMaxReserve = 8 * 1024;
+
+  // ...and the ratchet only fires on a heap that has PROVED it can spare the bytes. 0.3.2-rc1 was
+  // measured raising the reservation past 6,144 within four minutes of boot on a board whose
+  // resting free8 was already 22-23 KB - i.e. the one case where growing the resident footprint is
+  // the last thing wanted. 30 KB is comfortably above the resting floor this release is aiming at
+  // and comfortably below a healthy board's, so a rush-hour body grows the reservation on a
+  // healthy heap and is simply handed back on a struggling one.
+  static constexpr size_t kScratchRatchetMinFree8 = 30 * 1024;
+  // Retained updates per configured (stop, route) pair. Matches GtfsRtStream's per-pair cap, which
+  // is what actually bounds how many a pair can hold, so sizing by it loses nothing.
+  static constexpr size_t kRetainedPerPair = 8;
+
+  // High-water marks, for GET /api/debug/ui. `scratch_max_bytes` is the largest body ever
+  // buffered since boot - the number that says whether kScratchReserve is the right size, which
+  // until 0.3.2-rc1 nothing on this device could answer. `scratch_grows` counts the times a body
+  // went past the current reservation and forced a reallocation.
+  uint32_t scratch_max_bytes = 0;
+  uint32_t scratch_grows = 0;
+  // The reservation the scratch is currently held at. Starts at kScratchReserve and ratchets up to
+  // the observed high-water, bounded by kScratchMaxReserve.
+  size_t scratch_reserve = kScratchReserve;
 
   // Call once, before the first cycle, while the heap is unfragmented.
   void reserveAll(size_t scratch_bytes = kScratchReserve);
 
-  // Call at the top of each cycle. Clears without releasing, and releases only growth beyond the
-  // reservation - a one-off large response must not become resident for the life of the device.
-  // Doing it here rather than at the end of a cycle means the replacement block is asked for at
-  // the point in the cycle where the largest free block is at its healthiest.
-  void beginCycle();
+  // Sizes the retention block for `pairs` configured bus/trolley (stop, route) pairs. Idempotent,
+  // and it only ever grows: a config change that adds a stop pays one contiguous request at the
+  // top of the next cycle, where the largest free block is at its best. `pairs == 0` (a
+  // subway/rail-only config) reserves nothing.
+  void reserveRetention(size_t pairs);
+
+  // Call at the top of each cycle. Clears without releasing. Growth beyond the current reservation
+  // is KEPT (the reservation ratchets up to it) only when it is under kScratchMaxReserve AND
+  // `free8_at_poll_start` is at least kScratchRatchetMinFree8; otherwise it is released. Doing this
+  // at poll-start rather than at cycle end means any replacement block is asked for at the point in
+  // the cycle where the largest free block is at its healthiest.
+  //
+  // `free8_at_poll_start` is the caller's MALLOC_CAP_8BIT reading (this library has no Arduino and
+  // cannot take one). The default says "assume plenty", which is what every non-firmware caller and
+  // every host test that is not about the ratchet itself wants.
+  void beginCycle(size_t free8_at_poll_start = static_cast<size_t>(-1));
+
+  // Records that a body reached `bytes`, for the high-water marks above. Called by fetchBuffered().
+  void noteBodyBytes(size_t bytes);
 };
 
 // SEPTA implementation of TransitSource (DESIGN.md 11).
@@ -168,6 +249,19 @@ class SeptaSource : public TransitSource {
                               std::vector<transit::Alert>* out, HttpGetEx http);
   FetchOutcome fetchTransitViewEx(const std::string& route, std::vector<TvVehicle>* out,
                                    HttpGetEx http);
+
+  // The same fetch, APPENDING this route's vehicles to `*out` and parsing straight into it, so a
+  // poll cycle holds ONE TvVehicle vector instead of a per-route one plus the accumulated one
+  // (0.3.2-rc1). `*out` is left exactly as it was if the fetch or the parse fails, which is the
+  // same contract fetchTransitViewEx() has always had. kMaxTvVehicles applies to the total.
+  //
+  // `filter` (septa.h TvFilter) decides which vehicles are built at all; the default keeps every
+  // one, which is what refreshRouteLiveness() and the host tests want. When a PollBuffers is
+  // attached AND a filter is installed, relevant vehicles that did not fit the cap are added to
+  // PollBuffers::tv_dropped; an unfiltered call never adds to it, because on such a call the cap
+  // says nothing about relevance (see the .cpp).
+  FetchOutcome fetchTransitViewAppendEx(const std::string& route, std::vector<TvVehicle>* out,
+                                         HttpGetEx http, const TvFilter& filter = TvFilter());
   FetchOutcome fetchRailArrivalsEx(const std::string& station, std::vector<RailArrival>* out,
                                     HttpGetEx http);
 

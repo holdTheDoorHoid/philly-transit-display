@@ -24,6 +24,8 @@
 #include "cpu_yield.h"  // cpuStretchMsMax() for /api/debug/ui (DESIGN.md SS12.1)
 #include "cxx_exception_pool.h"
 #include "demo_data.h"
+#include "cycle_log.h"  // the per-cycle memory log served by /api/debug/ui?log=1
+#include "wedge_policy.h"  // kOomPollsBeforeReboot for /api/debug/ui
 #include "heap_trace.h"  // the poll-cycle heap ring for /api/debug/ui (diag branch)
 #include "host_match.h"
 #include "heap_reserve.h"
@@ -139,12 +141,32 @@ class GatedWebServer : public AsyncWebServer {
         if (c == nullptr) return;
         try {
           const uint32_t live = sweepInFlight();
-          if (!admitConnection(live, heap_caps_get_free_size(MALLOC_CAP_8BIT),
+          const size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+          // The one sample the per-cycle log takes from OUTSIDE the poller task (cycle_log.h). The
+          // troughs that matter are a poll mid-fetch plus a concurrent request on this task, and
+          // the poller's own stage boundaries cannot see the second half of that. It is free here:
+          // the number has already been read for the admission decision.
+          cycleLogNoteFree8((uint32_t)free8);
+          if (!admitConnection(live, free8,
                                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))) {
             // Zero allocations on this path, which is the entire point: no request, no response,
             // no header list, no send buffer. The client sees a closed connection, which the web
             // app's resilientRead() already treats as retryable (DESIGN.md SS10.2) and the device
             // suite counts against its refusal budget alongside the empty-200 shape.
+            //
+            // Since 0.3.2-rc1 this can no longer be reached with `live == 0`: admission.h admits
+            // the only connection whatever the heap says, because refusing it locked the owner's
+            // board out of /api/debug/ui and /api/reboot for five minutes on 2026-09-17 with a
+            // 3,444 B largest block. A refusal here therefore always means "something else is
+            // already being served".
+            // abort(), not close(): AsyncClient::abort() calls tcp_abort(), which sends an RST
+            // and frees the pcb immediately, so a refused connection leaves NOTHING behind -
+            // no TIME_WAIT, no lwIP pcb held for two minutes out of the sixteen this build has.
+            // A graceful close would FIN and park a pcb in TIME_WAIT, and a client polling a
+            // refusing server every ten seconds would then exhaust them. Checked against
+            // AsyncTCP's own source: abort() nulls _pcb, so the destructor's _close() is skipped
+            // and the delete below is not a double free; _error_cb/_discard_cb are still null on a
+            // connection this new, so nothing can delete the client out from under us either.
             g_admission_refusals.fetch_add(1, std::memory_order_relaxed);
             c->abort();
             delete c;
@@ -473,19 +495,6 @@ bool hostAllowed(const AsyncWebServerRequest *request) {
   return hostNamesDevice(host, g_host_name);
 }
 
-// Reboots shortly after the current request's response has had a chance to
-// go out - calling ESP.restart() directly inside the handler risks cutting
-// the HTTP response off mid-flight.
-void scheduleRestart() {
-  xTaskCreate(
-    [](void *) {
-      vTaskDelay(pdMS_TO_TICKS(300));
-      ESP.restart();
-    },
-    "restart", 2048, nullptr, 1, nullptr
-  );
-}
-
 // Admission floor for the heap-heavy read handlers (/api/state copies the whole Snapshot plus
 // weather and bike views into a JsonDocument; /api/config serializes the whole config): refuse with
 // a fixed-literal 503 (needs almost no heap) when memory is clearly too low to build the response.
@@ -547,7 +556,14 @@ void handleGetState(AsyncWebServerRequest *request) {
   doc["heap_8bit"] = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   doc["largest_block_8bit"] = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
-  Config cfg = getActiveConfig();
+  // BORROWED, not copied (0.3.2-rc3). getActiveConfig() hands back a whole Config - four stops,
+  // their profiles and every string in them - and this handler only reads it. On a burst of
+  // /api/state that copy was a Config per request, each one scattering ~12 small string blocks
+  // into whatever holes the heap had, which is the same churn config saves were doing. Holding
+  // the published pointer keeps the object alive for the life of the handler and allocates
+  // nothing. Same reasoning, same shape, as snapshotPtr() two lines below.
+  std::shared_ptr<const Config> cfg_ptr = activeConfigPtr();
+  const Config &cfg = cfg_ptr ? *cfg_ptr : emptyConfig();
 
   JsonObject wifi = doc["wifi"].to<JsonObject>();
   wifi["ssid"] = WiFi.SSID();
@@ -600,6 +616,13 @@ void handleGetState(AsyncWebServerRequest *request) {
     } else if (note.reason == SelfHeal::HeapWedge) {
       reason = "heap_wedge";
       snprintf(detail, sizeof(detail), "%u failed polls, largest free block %u B", (unsigned)note.a, (unsigned)note.b);
+    } else if (note.reason == SelfHeal::HeapOom) {
+      reason = "heap_oom";
+      snprintf(detail, sizeof(detail), "%u consecutive out-of-memory polls, largest free block %u B", (unsigned)note.a, (unsigned)note.b);
+    } else if (note.reason == SelfHeal::Nightly) {
+      reason = "nightly";
+      snprintf(detail, sizeof(detail), "scheduled nightly restart at %02u:%02u after %u h up",
+               (unsigned)(note.a / 60), (unsigned)(note.a % 60), (unsigned)(note.b / 3600));
     } else if (note.reason == SelfHeal::LvglPool) {
       reason = "lvgl_pool";
       snprintf(detail, sizeof(detail), "LVGL pool exhausted: %u B free, %u B high-water", (unsigned)note.a, (unsigned)note.b);
@@ -663,9 +686,17 @@ void handleGetState(AsyncWebServerRequest *request) {
 
 void handleGetConfig(AsyncWebServerRequest *request) {
   if (refuseIfLowHeap(request)) return;
-  Config cfg = getActiveConfig();
+  // Borrowed, not copied - and this is the GET half of the device suite's PUT+GET config section,
+  // so it is on the exact path whose ~45 rounds fragmented the heap to a 3,060 B largest block.
+  // Serializing straight out of the published Config removes a whole Config's worth of small
+  // allocations from every one of those rounds.
+  std::shared_ptr<const Config> cfg = activeConfigPtr();
+  if (!cfg) {
+    sendError(request, 503, "configuration not available yet", "");
+    return;
+  }
   JsonDocument doc;
-  configToJson(cfg, doc);
+  configToJson(*cfg, doc);
   sendJsonStreamed(request, doc);
 }
 
@@ -713,16 +744,34 @@ void handlePutConfigInner(AsyncWebServerRequest *request, JsonVariant &json, con
     sendError(request, 500, "failed to write config to LittleFS");
     return;
   }
-  bool data_changed = dataSettingsChanged(getActiveConfig(), cfg);
-  setActiveConfig(cfg);
-  setHostName(cfg.device.name);  // a rename changes which Host headers are accepted (review F05)
+  // WHAT A SAVE USED TO COST, AND WHY IT IS THE FRAGMENTATION (runtime audit rec #8). Alive at
+  // once, at this point in the handler: the request body, the parsed document, `cfg`, a
+  // whole-Config copy taken purely to answer dataSettingsChanged(), the copy assigned into
+  // config_store's resident Config, the copy handed to the display task, the copy that task
+  // assigned into ITS resident Config, and then the serialized reply document. Four Config copies,
+  // each freeing ~12 small string blocks and allocating ~12 more wherever the heap had room. The
+  // device suite's ~45 PUT+GET rounds are that, forty-five times over, and they took the largest
+  // free block to 3,060 B with ~19.5 KB still free.
+  //
+  // Now: the comparison BORROWS the published Config rather than copying it, and `cfg` is MOVED
+  // into the publish, so the strings this request parsed become the published ones. One Config
+  // allocated, one freed, none copied.
+  std::shared_ptr<const Config> previous = activeConfigPtr();
+  bool data_changed = previous ? dataSettingsChanged(*previous, cfg) : true;
+  // setActiveConfig() hands back what it published, so `cfg` can be moved into it and still be
+  // read afterwards - no second lock, and no window in which a concurrent save would make this
+  // request answer somebody else's document.
+  std::shared_ptr<const Config> published = setActiveConfig(std::move(cfg));
+  previous.reset();  // the Config this one replaced is freed here, before the reply is built
+  setHostName(published->device.name);  // a rename changes which Host headers are accepted (F05)
   if (onConfigChanged) {
     onConfigChanged(data_changed);
   }
   // Same streamed response as GET /api/config: the 16 KB request document is still alive here, so
-  // this is the moment a second body copy hurt most (SS12.1).
+  // this is the moment a second body copy hurt most (SS12.1). Serialized from the published
+  // Config, which is where `cfg` now lives.
   JsonDocument doc;
-  configToJson(cfg, doc);
+  configToJson(*published, doc);
   sendJsonStreamed(request, doc);
 }
 
@@ -1134,8 +1183,18 @@ void handleProxySchedule(AsyncWebServerRequest *request) {
 // two contiguous bytes at the worst moment. A sampler passes `since` and gets only new rows, which
 // is a few hundred bytes per poll; `?n=64` is there for a one-off full dump on a healthy board.
 constexpr size_t kTraceMaxRows = 32;
+// The per-cycle log (cycle_log.h) renders through the SAME buffer, and `?log=1` therefore returns
+// the log INSTEAD of the stage trace rather than beside it. Two buffers would be ~1.3 KB more
+// .bss for two instruments that are never read in the same breath: the trace answers "where
+// inside this cycle", the log answers "which cycle", and an investigation moves from one to the
+// other. A row is "[2592000,131072,131072,65535,127]," - 34 characters at the widest.
+constexpr size_t kCycleLogMaxRows = 40;
+constexpr size_t kLogRowBytes = 40;
 // "[65535,22,1048576,1048576]," is 27 characters; 32 B a row is slack, not a measurement.
-char g_trace_json[kTraceMaxRows * 32 + 8];
+constexpr size_t kRenderBufBytes =
+  (kTraceMaxRows * 32 > kCycleLogMaxRows * kLogRowBytes ? kTraceMaxRows * 32
+                                                        : kCycleLogMaxRows * kLogRowBytes) + 8;
+char g_trace_json[kRenderBufBytes];
 
 const char *renderTrace(uint32_t since, size_t want, uint32_t *first_seq, size_t *count) {
   if (want == 0 || want > kTraceMaxRows) want = kTraceMaxRows;
@@ -1148,6 +1207,34 @@ const char *renderTrace(uint32_t since, size_t want, uint32_t *first_seq, size_t
     int w = snprintf(g_trace_json + at, sizeof(g_trace_json) - at - 2, "%s[%u,%u,%u,%u]", i ? "," : "",
                      (unsigned)rows[i].cycle, (unsigned)rows[i].stage, (unsigned)rows[i].free8,
                      (unsigned)rows[i].largest);
+    if (w <= 0 || (size_t)w >= sizeof(g_trace_json) - at - 2) break;  // cannot happen at these widths
+    at += (size_t)w;
+    written++;
+  }
+  g_trace_json[at++] = ']';
+  g_trace_json[at] = '\0';
+  *count = written;
+  return g_trace_json;
+}
+
+// The per-cycle memory log (cycle_log.h), rendered the same way and into the same buffer as the
+// stage trace above and for the same reason: hand-written rows injected with serialized(), not
+// nested JsonArrays, so /api/debug/ui does not become the endpoint that cannot answer on a starved
+// heap. Row shape: [uptime_s, free8, largest, min_free8, flags] - min_free8 in BYTES here (the
+// ring stores it in 64-byte units), because a reader should not have to know the scale.
+const char *renderCycleLog(uint32_t since, size_t want, uint32_t *first_seq, size_t *count) {
+  if (want == 0 || want > kCycleLogMaxRows) want = kCycleLogMaxRows;
+  CycleLogEntry rows[kCycleLogMaxRows];  // 640 B on the AsyncTCP task's 8 KB stack, freed on return
+  size_t n = cycleLogRead(since, rows, want, first_seq);
+  size_t at = 0;
+  g_trace_json[at++] = '[';
+  size_t written = 0;
+  for (size_t i = 0; i < n; i++) {
+    int w = snprintf(g_trace_json + at, sizeof(g_trace_json) - at - 2, "%s[%u,%u,%u,%u,%u]",
+                     i ? "," : "", (unsigned)rows[i].uptime_s, (unsigned)rows[i].free8,
+                     (unsigned)rows[i].largest,
+                     (unsigned)((uint32_t)rows[i].min_free8_64 * kMinFreeScale),
+                     (unsigned)rows[i].flags);
     if (w <= 0 || (size_t)w >= sizeof(g_trace_json) - at - 2) break;  // cannot happen at these widths
     at += (size_t)w;
     written++;
@@ -1183,6 +1270,17 @@ uint32_t queryU32(AsyncWebServerRequest *request, const char *name, uint32_t fal
 // from the pool and not from a hole another task opened meanwhile. PIN-gated because it starves
 // every other task for the sub-millisecond it holds the blocks (the poller and the display loop
 // catch their own bad_alloc and carry on; lwIP tolerates a NULL pbuf; LVGL draws from its own pool).
+#ifdef PTD_DEBUG_OOM
+// Compiled OUT of shipping builds (no env defines PTD_DEBUG_OOM), owner's decision 2026-09-18. This
+// endpoint drains the whole 8-bit heap for a sub-millisecond to prove the C++ bad_alloc path (SS12.1)
+// catches once the pool and the per-task eh-globals are in place. But draining to LITERAL zero races
+// any concurrent C-library allocation on the other core, and two of those assert rather than fail
+// soft and are uncatchable by anything: newlib _dtoa_r ("REENT malloc succeeded") from the
+// snprintf("%.4f") that formats a stop's coordinates in refreshWeather, and lwIP's tcp path. That
+// race is reachable ONLY by firing this diagnostic; normal operation never drives free8 to zero
+// (rc7's mid-poll floor is ~28 KB). Rather than carry a PIN-gated "crash my own board" control in a
+// product image, it lives behind this flag for dev builds. The device suite already SKIPs its proof
+// when the endpoint is absent. The exception-pool mechanism itself is unchanged and still active.
 void handleDebugOom(AsyncWebServerRequest *request) {
   if (!requirePin(request)) return;
   constexpr size_t kMaxBlocks = 200;
@@ -1212,6 +1310,7 @@ void handleDebugOom(AsyncWebServerRequest *request) {
            caught ? "true" : "false", (unsigned)n, (unsigned)largest, (unsigned)free_before, (unsigned)ESP.getFreeHeap());
   request->send(200, "application/json", body);
 }
+#endif  // PTD_DEBUG_OOM
 
 // Static list embedded in firmware (transit_core/rail_stations.h) - no network needed, so this
 // runs directly on the web server's own task.
@@ -1470,7 +1569,10 @@ ArRequestHandlerFunction guarded(ArRequestHandlerFunction fn) {
 }
 
 void startWebServer(std::function<void(bool)> onConfigChanged) {
-  setHostName(getActiveConfig().device.name);
+  {
+    std::shared_ptr<const Config> cfg = activeConfigPtr();
+    if (cfg) setHostName(cfg->device.name);
+  }
 
   // THE SERVER'S MIDDLEWARE CHAIN IS DELIBERATELY EMPTY. See HostGuardHandler above: this used to
   // be `g_server.addMiddleware(...)`, and that one registration was an uncatchable reboot path.
@@ -1547,6 +1649,41 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     // trough may fall between two stages.
     doc["heap_8bit"] = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
     doc["min_free8"] = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    // The allocator's own view of the same heap (0.3.2-rc1). `free_blocks` against
+    // `largest_free_block` is the fragmentation figure this device has never had: 40 KB free in
+    // one piece and 40 KB free in thirty pieces read identically on every other line here, and it
+    // is the difference between a healthy board and the one that spent 2026-09-17 refusing every
+    // allocation over 3,444 B. `total_blocks` rising while `allocated_blocks` does not is the
+    // signature of a heap being cut up rather than filled up.
+    {
+      multi_heap_info_t hi;
+      heap_caps_get_info(&hi, MALLOC_CAP_8BIT);
+      JsonObject h8 = doc["heap8_info"].to<JsonObject>();
+      h8["total_free_bytes"] = (uint32_t)hi.total_free_bytes;
+      h8["total_allocated_bytes"] = (uint32_t)hi.total_allocated_bytes;
+      h8["largest_free_block"] = (uint32_t)hi.largest_free_block;
+      h8["minimum_free_bytes"] = (uint32_t)hi.minimum_free_bytes;
+      h8["allocated_blocks"] = (uint32_t)hi.allocated_blocks;
+      h8["free_blocks"] = (uint32_t)hi.free_blocks;
+      h8["total_blocks"] = (uint32_t)hi.total_blocks;
+    }
+    // What the long-lived structures are holding (net_poller.h MemorySizes). The schedule and
+    // alerts caches are the only two things here that legitimately keep data across cycles, so
+    // they are the only two that could legitimately grow - which makes them the first place to
+    // look when the resting floor drifts.
+    {
+      MemorySizes ms = getMemorySizes();
+      doc["sched_cache_bytes"] = ms.sched_cache_bytes;
+      doc["alerts_cache_bytes"] = ms.alerts_cache_bytes;
+      doc["snapshot_bytes"] = ms.snapshot_bytes;
+      doc["retained_slots"] = ms.retained_capacity;
+      doc["tv_slots"] = ms.tv_capacity;
+      // Relevant vehicles the 16-slot list could not hold, since boot (septa.h kMaxTvVehicles).
+      // It should stay at zero; a number that moves is the cap biting on this config, not a
+      // rush-hour route - vehicles no configured stop can join to are never counted here because
+      // they are never built (septa.h TvFilter).
+      doc["tv_dropped"] = ms.tv_dropped;
+    }
     doc["uptime_s"] = (uint32_t)(millis() / 1000);
     doc["reset_reason"] = (int)esp_reset_reason();  // 3 = SW restart, i.e. a self-heal reboot
     // How many published Snapshots are alive (net_poller.h). Since the publish became a move it is
@@ -1556,7 +1693,15 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     // reference nobody is releasing.
     doc["snapshots_live"] = snapshotsLive();
     doc["failed_polls"] = failedPolls();
-    doc["wedged_polls"] = wedgedPolls();  // 15 reboots the board
+    doc["wedged_polls"] = wedgedPolls();  // the non-throwing wedge tally; 15 reboots the board
+    // The OOM tally and which rule is currently saying something (wedge_policy.h). THREE
+    // consecutive out-of-memory cycles reboot, counted from the catch sites rather than re-derived
+    // from a heap reading afterwards - the correction that came out of the 2026-09-17 wedge, where
+    // the old rule would have taken fifty-one minutes to fire because a failed poll backs the
+    // interval off to 240 s.
+    doc["oom_streak"] = oomStreak();
+    doc["wedge_reason"] = wedgeReason();
+    doc["oom_polls_before_reboot"] = (uint32_t)kOomPollsBeforeReboot;
     doc["proxy_queue_depth"] = proxyQueueDepth();  // pinned at 2 = the audit's stuck-queue wedge
     // Error replies that could not be built at all and ended in a closed connection instead
     // (heap_reserve.h). Should be zero; a number that moves means the heap reached a state where
@@ -1576,6 +1721,19 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     doc["in_flight_requests"] = inFlightRequests();
     doc["admission_refusals"] = admissionRefusals();
     doc["max_in_flight_requests"] = (uint32_t)kMaxInFlightRequests;
+    // The shared poll scratch (net_poller.h ScratchStats, DESIGN.md SS5). `scratch_max_bytes` is
+    // the largest response body this device has ever buffered - the measurement that says whether
+    // the 6,144 B reservation is the right size at all, which nothing could previously answer.
+    // `scratch_grows` counts the bodies that went past the reservation; it should settle at a
+    // small number and then stop moving, because the reservation ratchets up to them rather than
+    // being handed back and retaken every cycle.
+    {
+      ScratchStats ss = getScratchStats();
+      doc["scratch_max_bytes"] = ss.max_bytes;
+      doc["scratch_reserve_bytes"] = ss.reserve_bytes;
+      doc["scratch_capacity"] = ss.capacity;
+      doc["scratch_grows"] = ss.grows;
+    }
     // Bytes of stack each task has never gone below. Rules a stack that has quietly eaten into the
     // heap in or out before any of the heap numbers are interpreted.
     JsonObject hwm = doc["stack_hwm"].to<JsonObject>();
@@ -1588,9 +1746,21 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     uint32_t first_seq = 0;
     size_t rows = 0;
     const uint32_t since = queryU32(request, "since", 0);
-    doc["trace"] = serialized(renderTrace(since, (size_t)queryU32(request, "n", kTraceMaxRows), &first_seq, &rows));
-    doc["trace_first"] = first_seq;  // sequence number of trace[0]; > since means the ring wrapped
-    doc["trace_rows"] = (uint32_t)rows;
+    if (request->hasParam("log")) {
+      // ?log=1: the per-cycle memory log (cycle_log.h) INSTEAD of the stage trace, because the two
+      // share a render buffer and are never wanted in the same breath. ?since=<cycle_log_seq> and
+      // ?n=1..40 work the same way. One hour of history at a 30 s cadence, which is what the
+      // 64-entry stage ring - three cycles - cannot give.
+      doc["cycle_log"] = serialized(renderCycleLog(since, (size_t)queryU32(request, "n", kCycleLogMaxRows), &first_seq, &rows));
+      doc["cycle_log_first"] = first_seq;  // sequence number of cycle_log[0]; > since means it wrapped
+      doc["cycle_log_rows"] = (uint32_t)rows;
+      doc["cycle_log_cap"] = (uint32_t)kCycleLogCap;
+    } else {
+      doc["trace"] = serialized(renderTrace(since, (size_t)queryU32(request, "n", kTraceMaxRows), &first_seq, &rows));
+      doc["trace_first"] = first_seq;  // sequence number of trace[0]; > since means the ring wrapped
+      doc["trace_rows"] = (uint32_t)rows;
+    }
+    doc["cycle_log_seq"] = cycleLogSeq();  // pass this back as ?log=1&since= next time
     doc["trace_seq"] = heapTraceSeq();  // pass this back as ?since= next time
     if (request->hasParam("stages")) {
       JsonArray stages = doc["trace_stages"].to<JsonArray>();
@@ -1641,7 +1811,9 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     buf[n] = '\0';
     request->_tempObject = buf;
   });
-  g_server.on("/api/debug/oom", HTTP_POST, guarded(handleDebugOom));  // SS12.1 exception-pool proof; PIN-gated
+#ifdef PTD_DEBUG_OOM
+  g_server.on("/api/debug/oom", HTTP_POST, guarded(handleDebugOom));  // SS12.1 proof; dev builds only (see handler)
+#endif
   g_server.on("/api/wifi/reset", HTTP_POST, guarded(handlePostWifiReset));
 
   g_server.on("/api/proxy/stops", HTTP_GET, guarded(handleProxyStops));
@@ -1687,6 +1859,21 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
 }
 
 bool otaBusy() { return g_ota.busy; }
+
+// Reboots shortly after the current request's response has had a chance to go out - calling
+// ESP.restart() directly inside the handler risks cutting the HTTP response off mid-flight.
+// Declared in web_server.h since 0.3.2-rc1 so main.cpp's nightly restart can use the same path
+// (nightly_restart.h): it has no response to protect, but it wants the same grace for whatever
+// the poller or the display task happens to be in the middle of.
+void scheduleRestart() {
+  xTaskCreate(
+    [](void *) {
+      vTaskDelay(pdMS_TO_TICKS(300));
+      ESP.restart();
+    },
+    "restart", 2048, nullptr, 1, nullptr
+  );
+}
 
 uint32_t inFlightRequests() { return g_in_flight_count.load(std::memory_order_relaxed); }
 

@@ -54,6 +54,12 @@ constexpr size_t kAcceptMinLargestBlock = 4308;  // 1.5 x 2,872, rounded off the
 // so 3 rounds x (7 - N) <= 6 needs N >= 5. A cap of 3 would refuse ~12 and fail that check by
 // construction, however well it protected the heap.
 //
+// AND SINCE 0.3.2-rc3 THE CAP IS CARRYING THAT BUDGET ON ITS OWN, which is what makes the
+// arithmetic above exact rather than a lower bound. While the floors applied from the second
+// request they could refuse on top of the cap, and rc5's section E measured nine refusals against
+// the budget of six for precisely that reason. With kAdmissionFloorsApplyFrom at 2 a seven-deep
+// simultaneous burst loses (7 - 5) = 2 per round to the cap and nothing else, so 3 x 2 = 6.
+//
 // 5 is therefore the tightest cap the acceptance criteria allow, and it is not carrying the whole
 // defence on its own: the free-heap floor above refuses earlier when the heap is genuinely short,
 // refuseIfLowHeap() still turns heavy handlers into cheap 503s, and the queued stats/proxy jobs no
@@ -63,11 +69,71 @@ constexpr size_t kAcceptMinLargestBlock = 4308;  // 1.5 x 2,872, rounded off the
 // revisit the budget with the owner, not to loosen the floors.
 constexpr uint32_t kMaxInFlightRequests = 5;
 
-// The whole decision. `in_flight` is how many AsyncWebServerRequest objects are alive right now;
-// `free8`/`largest` are MALLOC_CAP_8BIT readings taken on the accept path.
+// How many requests must ALREADY be in flight before the heap floors have anything to say.
+//
+// TWO since 0.3.2-rc3, i.e. the floors gate the THIRD concurrent request onward. It was one - the
+// floors applied from the second - and the device suite's section E measured what that costs:
+// NINE aborted connections across three rounds against a budget of six. The floors were refusing
+// the second request of a burst whenever the heap was down, which on a board mid-poll it often
+// is, and a refusal there buys very little: two requests alive at once is not the state that
+// crashed rc2. That needed SEVEN, each holding a document, a response object and a 2,872 B send
+// buffer, and the count cap - not the floors - is what stops a burst reaching seven.
+//
+// So the floors keep doing the job they were derived for (refusing the request that arrives into
+// genuine contention) and stop doing the job the cap already does (bounding the burst). A second
+// concurrent request on a starved heap is still not free: if its own reply will not fit,
+// guarded() catches the throw and answers 503 out of the 1 KB reserve (heap_reserve.h), exactly
+// as it does for the first.
+constexpr uint32_t kAdmissionFloorsApplyFrom = 2;
+
+// THE GUARANTEED SERVICE LEVEL: TWO REQUESTS AT A TIME, ALWAYS (0.3.2-rc1, widened in rc3).
+//
+// What rc3's rule did, measured on the owner's board at v0.3.1 on 2026-09-17 (uptime 2,646 s):
+// the heap fragmented until the largest free block was 3,444 B, which is below
+// kAcceptMinLargestBlock, and from that moment the accept path refused EVERY new connection. The
+// board answered ping and refused all HTTP - including `GET /api/debug/ui`, the one endpoint
+// deliberately kept outside refuseIfLowHeap() precisely so it still answers when the heap is gone
+// (web_server.cpp), and `POST /api/reboot`, which is the recovery path. The only way out was the
+// heap-wedge self-heal, five minutes later, with nobody able to even look at the device in the
+// meantime.
+//
+// That is a worse failure than the one admission control exists to prevent. The crash it prevents
+// needs SEVERAL requests alive at once: rc2 died with seven of them holding documents, response
+// objects and 2,872 B send buffers. ONE request cannot reproduce it - there is no burst, nothing
+// else is about to allocate, and if that single request's own reply cannot be built, guarded()
+// catches the throw and answers 503 out of the 1 KB reserve (heap_reserve.h). So the heap floors
+// are a statement about CONTENTION, and with no contention they have nothing to say.
+//
+// Hence: the floors apply only from kAdmissionFloorsApplyFrom requests already in flight - two
+// since 0.3.2-rc3, so a browser that opens a second connection while the first is still being
+// answered is admitted whatever the heap says. The count cap is unchanged and still hard at
+// kMaxInFlightRequests.
+//
+// WHAT THE SUITE MEASURED, which is why this moved (0.3.2-rc3). Section E fires 7 concurrent
+// requests per round for 3 rounds and allows at most SIX aborted connections in total. rc5
+// produced NINE: the cap accounts for 2 per round (7 - 5), and the extra three were the floors
+// refusing a SECOND request on a heap that was down - which is not the state the floors exist
+// for. At the new threshold the arithmetic is the cap's alone: ~2 refusals per round, 6 total,
+// inside the budget by construction rather than by luck. If a run still exceeds it, the honest
+// fix is to revisit the budget with the owner, not to loosen the floors further.
+//
+// The rule table, which is what test_admission pins:
+//
+//   in_flight == 0                      -> admit, whatever the heap says
+//   in_flight == 1                      -> admit, whatever the heap says (rc3)
+//   2 <= in_flight < cap, heap ok       -> admit
+//   2 <= in_flight < cap, either floor  -> refuse (the burst defence)
+//   in_flight >= cap                    -> refuse, whatever the heap says (unchanged)
+//
+// `in_flight` is how many AsyncWebServerRequest objects are alive right now; `free8`/`largest` are
+// MALLOC_CAP_8BIT readings taken on the accept path.
 constexpr bool admitConnection(uint32_t in_flight, size_t free8, size_t largest) {
-  return in_flight < kMaxInFlightRequests && free8 >= kAcceptMinFree8 &&
-         largest >= kAcceptMinLargestBlock;
+  if (in_flight >= kMaxInFlightRequests) return false;
+  // Not yet contention. Refusing here buys little - the crash the floors exist for needed seven
+  // requests alive at once - and costs the device its diagnostics and its reboot endpoint at
+  // exactly the moment somebody is trying to look at it.
+  if (in_flight < kAdmissionFloorsApplyFrom) return true;
+  return free8 >= kAcceptMinFree8 && largest >= kAcceptMinLargestBlock;
 }
 
 }  // namespace transit_app

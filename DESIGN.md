@@ -146,8 +146,12 @@ verifications) run inline for well under a second each, inside the 5 s budget. B
 the same `Stream::timedRead()` busy-wait the plain path already lives with, capped by the existing
 `kStreamReadTimeoutMs` (4 s). What a TLS handshake adds is **stack**: ~3-4 KB on the poller task
 (mbedTLS's RSA verify keeps a 1 KB buffer on the stack, `ssl_starttls_handshake` 512 B, ECP
-temporaries) - the poller has a 10 KB stack (`net_poller.cpp`), and the device test below reads
-its high-water mark first.
+temporaries) - the poller's stack is sized separately for the two builds in `net_poller.cpp`
+(**12 KB** under `TRANSIT_HTTPS`, **8 KB** in the plain-HTTP build since 0.3.2-rc3, down from
+10 KB against a measured 4,424 B worst-case high-water free), and the device test below reads its
+high-water mark first. The plain build's reduction deliberately does **not** apply here: no
+handshake on this hardware has ever got past `mbedtls_ssl_setup()`, so the 3-4 KB has never
+actually been spent and there is no measurement to shrink towards.
 
 #### Flash and RAM, measured (2026-09-16, this branch after merging `next`)
 
@@ -691,7 +695,36 @@ Supported PlatformIO environments (board JSONs from `rzeldent/platformio-espress
 | `cyd-2432S024R` / `C` | ESP32-2432S024 | 2.4" 320x240 | XPT2046 / CST816S | Pins differ; lower priority. |
 | `native` | host | - | - | Unit tests for `transit_core` and `transit_stats`. |
 
-SD card: SPI (CS 5, MOSI 23, MISO 19, SCK 18 on the 2.8"; confirm for 3.5"). RGB LED pins 4/16/17
+**SD card: its own SPI peripheral, and this is worth knowing before blaming the display for it**
+(confirmed on `esp32-3248S035R` 2026-09-17). The card is on **`VSPI`/`SPI3_HOST`** — `CS 5,
+MOSI 23, MISO 19, SCK 18`, opened by `sd_logger.cpp` as `SPIClass g_sd_spi(VSPI)` and handed to
+`SD.begin(TF_CS, g_sd_spi, 4 MHz, "/sd", 2)`. The **panel and the touch controller share
+`SPI2_HOST`** — `MOSI 13, MISO 12, SCK 14`, CS 15 (ST7796) and 33 (XPT2046). **No pin, no host and
+no bus is common to the two**, and `ST7796_SPI_BUS_MAX_TRANSFER_SZ` — which tracks
+`LVGL_BUFFER_PIXELS`, §5 — is passed to `spi_bus_initialize(ST7796_SPI_HOST, …)` and nowhere else,
+so it sizes SPI2's DMA descriptors and cannot reach the card. A draw-buffer change is therefore
+never an explanation for an SD fault.
+
+What an SD fault looks like in the boot log, and what each line means: `sdCommand(): Card Failed!
+cmd: 0x00` is **CMD0 `GO_IDLE_STATE` receiving no response byte at all** — MISO never went low
+across the retry loop — which is the very first exchange with the card, before FATFS and before any
+allocation this firmware makes. `sdcard_mount(): f_mount failed: (3) The physical drive cannot
+work` is `FR_NOT_READY`, the downstream consequence. Both together mean the card did not answer:
+card, socket or wiring, not software.
+
+**A board with no working card is holding ~12.5 KB LESS heap than a healthy one**, which inflates
+every free-memory figure measured on it. `esp_vfs_fat_register()` allocates the FATFS context and
+both `FIL` slots in one ~12.5 KB block *before* `f_mount`, and `sdcard_mount()` calls
+`esp_vfs_fat_unregister_path()` on every failure path — so the block is taken and given straight
+back. Any resting-floor number taken while `sd.mounted` is false must be read as ~12.5 KB
+optimistic, and re-measured with the card working before it is compared with anything.
+
+The mount is attempted **once, at boot, and never retried** (§9.1): a transient failure therefore
+disables logging until the device is restarted. That is deliberate — the alternative is SPI traffic
+on the poller task for a condition that is almost always physical — but it is why one bad boot
+looks permanent for the life of that boot.
+
+RGB LED pins 4/16/17
 (active low) can show status: blue = connecting, green blink = poll ok, red = error.
 
 The UI must lay out from the runtime display resolution, not hardcoded 480x320.
@@ -987,10 +1020,11 @@ a 200.
 scans for a summary, so downloads take a single-reader lease (`acquireLogReader()`); a second
 concurrent download gets a 503 rather than a truncated file.
 
-Memory rules: no full framebuffer; the LVGL partial buffer is **1/30** of the screen in RGB565 on
+Memory rules: no full framebuffer; the LVGL partial buffer is **1/40** of the screen in RGB565 on
 the 3.5" boards and 1/16 on the 240-tall ones (the library default of 1/4 with 3-byte pixels does
 not fit; `firmware/boards/README.md` has the history, including 1/20 → 1/30 in 0.3.1 for 5,120 B of
-heap — this line said "1/10" until then, which was never any board's value); large long-lived
+heap and 1/30 → 1/40 in 0.3.2-rc3 for 2,560 B more — this line said "1/10" until 0.3.1, which was
+never any board's value); large long-lived
 objects (`ArrivalTracker` **8,040 B** and `StatsAggregator` **8,744 B**, both measured on the target
 ABI rather than the "~16 KB / ~8 KB" this line used to carry) are heap-allocated, never file-scope
 globals, because the ESP32's static .bss budget is separate from and much smaller than the heap; one
@@ -1051,18 +1085,197 @@ moment two really are live at once. It also sits on the path implicated in the c
 four-attempt loop inside `fetchPlausibleSchedule()`'s three, re-entered every two minutes while
 SEPTA answers with the wrong service day — so it keeps a 4 KB reservation of its own.
 
-Two things are deliberately **back to per-cycle**: the GTFS-RT retention block (~4.6 KB) and the
-BusSchedules parse block (~3 KB). Both are `std::vector`s of non-trivially-destructible values and
-cannot share raw bytes without a custom allocator, which would change the types in `transit_core`'s
-public API; and at a ~24 KB resting largest block, a 4.6 KB request is one the heap carries. Keeping
-the floor high is worth more than removing them.
+rc2 left two things deliberately **per-cycle**: the GTFS-RT retention block and the BusSchedules
+parse block, both `std::vector`s of non-trivially-destructible values that cannot share raw bytes
+without a custom allocator. At a ~24 KB resting largest block a 4.9 KB request is one the heap
+carries — and on 2026-09-17 the heap stopped carrying it.
 
-Resident total: **11,264 B** (6,144 shared scratch + 4,096 transport buffer + the 1 KB error-reply
-reserve of §12.1), against ~13 KB reclaimed elsewhere in the same release (draw buffer 1/20 → 1/30,
-the tracker's slot count, `esp_bt_mem_release()`). Measured on the host, a warm cycle's requests of
-4 KB or more go from several to exactly one — the retention block. `min_free8` on
-`GET /api/debug/ui` is the number that says whether the floor is right, and it is the first thing to
-read after flashing.
+**The typed blocks, and why rc2's judgement was wrong (0.3.2-rc1).** v0.3.1 ran healthily for 35–40
+minutes on the owner's board (resting free8 39–40.7 KB, largest ≥22.5 KB at every poll start) and
+then fragmented to free8 17–20 KB with a **3,444 B** largest block. From that point every cycle
+failed in the same place: the ring read `pre-transit → oom-transit` with **no stage in between**,
+which names the allocation exactly — the first contiguous request of the rt-stream stage, which with
+the entity buffer already borrowed is `retainUpdates()`'s `reserved_.reserve(32)`. On-target sizes,
+read out of the image's DWARF rather than estimated: `sizeof(StopTimeUpdate)` **152 B**,
+`sizeof(TvVehicle)` **176 B**, `sizeof(SchedEntry)` **128 B**. So that reservation is **4,864 B**,
+against a 3,444 B largest block, every 30 seconds, forever.
+
+Both typed blocks are now **resident vectors in `PollBuffers`, lent out** the same way the byte
+scratch is — `retained` through `GtfsRtStream::setRetentionBuffer()`, `tv` as the vector
+`fetchTransitViewAppendEx()` parses straight into:
+
+- **The retention block is sized from the config**, not from the 32-slot default cap: 8 slots per
+  configured bus/trolley (stop, route) pair, which is exactly what the stream's per-pair cap allows
+  a pair to hold, so nothing is lost. The owner's two Route 17 stops need 16 slots = **2,432 B**
+  instead of 4,864 B.
+- **The TransitView list is one vector for the whole cycle.** It used to be two — the parser grew
+  its own from `reserve(8)` by doubling, and `tv_all` grew again on `insert()` — so a rush-hour
+  Route 17 (20–30 vehicles) asked for a 5,632 B contiguous block *twice*, with the retention block
+  live. It is reserved once at `kMaxTvVehicles` and every route appends into it.
+  `refreshRouteLiveness()` in the optional tail borrows the same vector rather than taking a local.
+  **Since 0.3.2-rc3 that reservation is 16 slots (2,816 B) and not 32 (5,632 B)**, because the
+  parse now keeps only the vehicles the merge can use — see the filter below.
+- **The TransitView parse keeps only what `mergeStop()` can read (0.3.2-rc3).** `mergeStop()`
+  reaches a `TvVehicle` through exactly one door — `findTvByTrip(tv, u.trip_id)`, for a `u` drawn
+  from the retained GTFS-RT updates — and then reads five fields off it (`late`, `timestamp`,
+  `vehicle_id`, `destination`, `seats`). A vehicle whose trip id is not in those updates is
+  therefore never read by anything, and building it costs nine `std::string`s that are freed
+  unexamined at the end of the cycle. `septa.h`'s `TvFilter` is that test, applied to the trip id
+  **before the `TvVehicle` exists**: a function pointer plus a context pointer, so installing it
+  allocates nothing, and `pollBusStops()` points it at `stream.retained()`, which
+  `setRouteFilter()`/`setStopFilter()` have already scoped to the configured routes and stops.
+  **Not by direction**, which is the filter one reaches for first: `TvVehicle::direction` is a
+  compass word ("Southbound") and `StopConfig::direction` is a GTFS `direction_id` ("0"/"1"), two
+  id spaces with no mapping in this project, so comparing them would be a guess dressed as a
+  filter. Not by route either — TransitView is fetched per route, so every vehicle in a response is
+  on a configured route already. What bounds the kept list is then the *retained updates*
+  (8 per configured (stop, route) pair) rather than how busy the route is, which is what makes
+  `kMaxTvVehicles` = **16** safe where 32 was not. A relevant vehicle that still does not fit is
+  counted and reported as `tv_dropped` on `GET /api/debug/ui`; a filtered-out one is **not** a
+  drop, because it was never wanted. The host test that carries the claim is
+  `test_transitview_trip_filter_changes_nothing_the_merge_reads`: it merges the Route 17 fixture
+  twice, filtered and unfiltered, and compares every output field — so a future merge that starts
+  reading a vehicle some other way fails on the host rather than losing data on the device.
+- **The BusSchedules parse block stays per-cycle** at 24 × 128 = **3,072 B**, because it is asked
+  for only on a schedule *refetch* — once per stop per 10 minutes, not every cycle — and making it
+  resident would cost the floor 3 KB to speed up a path that already succeeds.
+
+**What this costs the resting floor — and the first version of this paragraph under-counted it.**
+The added *heap* residency is **8,064 B** (2,432 + 5,632). But the 240-row cycle log and its render
+buffer are **4,544 B of `.bss`**, and on this chip `.bss` comes out of the same DRAM the heap is
+carved from — so the floor pays for that too. `0.3.2-rc1` was flashed and measured on the owner's
+board on 2026-09-17 and the numbers matched that total, not the 8 KB the first draft claimed:
+resting `free8` **22–23 KB** (v0.3.1: 39–40.7 KB), largest block 11,252–11,764 B, and
+**`min_free8` 156 B** at 224 s of uptime. Four section-A checks of the device suite failed because
+22–23 KB is below the idle-work gate, so every stats/proxy request answered 503. It was rolled back.
+
+**`0.3.2-rc2` pays most of it back from the stop cap.** `kMaxStops` 8 → 4 and
+`transit_stats::kMaxTrackedStops` 8 → 4 (§6) return **4,224 B** of heap — measured from the image's
+DWARF, not estimated. The ledger against v0.3.1, in full:
+
+| | Δ resting free8 |
+|---|---:|
+| GTFS-RT retention block, resident (16 × 152 B) | −2,432 |
+| TransitView vehicle list, resident (32 × 176 B) | −5,632 |
+| cycle log ring + render buffer (`.bss`) | −4,544 |
+| `kMaxTrackedStops` 8 → 4 (`ArrivalTracker` 8,456 → 4,232 B) | **+4,224** |
+| **net vs v0.3.1** | **−8,384** |
+
+**Measured, not predicted:** a two-hour, thirteen-minute run on the owner's board (2026-09-17,
+his own two-stop/weather/Indego/SD-logging configuration) put resting `free8` at **31.6–32.2 KB at
+the start of every single poll for the whole run**, against v0.3.1's 39–40.7 KB — in line with the
+~8.4 KB the ledger above predicts. That is ~8.4 KB of floor spent to remove every per-cycle
+contiguous request above ~1.2 KB, and it holds well above the 12 KB idle-work gate with room to
+spare, but it is **not** a return to the v0.3.1 floor and should not be read as one. Over the same
+run the largest free block held at **14,324 B at every poll start and never moved once** (dipping
+to 9.2–10.2 KB inside Indego downloads and recovering every time), `min_free8` since boot reached
+**4,488 B** — set during the first Indego refresh and never lower afterward — against v0.3.1's
+2,220 B, and there were zero failed polls, zero out-of-memory stages and zero refused connections
+across the whole run. If a future run ever shows the floor trending back down toward that range,
+the levers in order are: the cycle log at 120 rows instead of 240 (+1,920 B, one hour of history
+instead of two), and the TransitView list back to per-cycle (+5,632 B, at the cost of one 5.6 KB
+request per route per cycle).
+
+**`0.3.2-rc3` buys ~10 KB of floor back, and half of it comes from outside the poll cycle.** rc2's
+run was the first on this board that did not fragment at all — but its resting floor is ~32 KB, and
+the device suite's **section B** (≈45 config `PUT`+`GET` pairs in a few minutes, each rebuilding
+the screen) took it to a **3,060 B largest block with ~19.5 KB still free**: every `GET` after a
+`PUT` answered "low memory, retry" from the 12 KB / 7,924 B idle-work gate, two `PUT`s failed
+outright, and the three-strike OOM self-heal rebooted the board mid-suite. The floor was the
+problem, and the config-save churn above was what walked it there.
+
+| | Δ resting free8 vs 0.3.2-rc2 | where it comes from |
+|---|---:|---|
+| cycle log 240 → 120 rows | **+1,920** | `.bss` |
+| TransitView list 32 → 16 slots (`TvFilter`) | **+2,816** | heap, resident |
+| 3.5" draw buffer `/30` → `/40` | **+2,560** | heap, permanent (`smartdisplay_init()`) |
+| `net_poller` task stack 10,240 → 8,192 B | **+2,048** | heap, permanent (task stack) |
+| the display's second resident `Config` | **≈ +1,200** | heap, resident *(the audit's figure, not a measurement — see below)* |
+| file-scope `Config` structs (3 → 1, `emptyConfig()`) | **+624** | `.bss`, measured from the link map |
+| **net vs rc2** | **≈ +11,100** | |
+| **measured resting floor (with the card mounted)** | **≈ 40 KB** | against rc2's measured 31.6–32.2 KB; the ledger below had predicted ≈42–43 KB |
+
+**Confirmed on hardware at almost exactly v0.3.1's 39–40.7 KB, and that still needs the honest
+caveat.** Half of this table is not rc2's residency being handed back — the draw buffer and the
+poller stack were the same size in v0.3.1, and taking 4.6 KB from them is a real cost paid
+elsewhere: more flush passes per repaint (§8, `tick_ms_max` now measured at ~20 ms at `/40`) and
+~2.3 KB of stack margin instead of ~4.4 KB. The two lines that genuinely undo rc2 residency are the
+cycle log and the TransitView
+list, and together they are 4,736 B of the 8,384 rc2 spent. So the right way to read the number is
+"the same fragmentation fix, on a floor that is no longer paying for a two-hour log, a 32-vehicle
+list, a 10 KB draw buffer and a 10 KB stack" — not "the trade turned out to be free".
+
+**The `Config` line is the one estimate in the table and is marked as such.** `sizeof(Config)` is
+**336 B** on this target (from the image's DWARF), and the `.bss` saving is measured: three
+file-scope `Config`s became one shared `emptyConfig()`, and static RAM is **−2,544 B** against
+rc2 in the link map — 1,920 of it the cycle log, 624 the `Config` structs and the two `shared_ptr`s
+that replaced them. The ~1.2 KB is the
+*heap* the display's copy held — a `Config`'s strings and its stops vector — and it is the runtime
+audit's figure carried forward, not something this pass measured. The per-save churn it removes
+(four whole-`Config` copies, each scattering ~12 small blocks) is not in the table at all, because
+it is not a resting-floor number; it is the section-B number, and section B is where it will show.
+
+rc1's lesson is not repealed by any of this, it is respected — but it was nearly repeated, and the
+thing that nearly repeated it was counting only the heap.
+
+Resident total: **16,512 B** (6,144 shared scratch + 4,096 transport buffer + the 1 KB error-reply
+reserve of §12.1 + the 5,248 above — 2,432 retention + 2,816 TransitView at 0.3.2-rc3's 16 slots,
+down from 8,064 at 32). Measured on the host with the allocation probe, a warm cache-hit
+cycle now makes **no** request of 2 KB or more at all; the largest single contiguous request left in
+such a cycle is an arrival vector at ~1.2 KB, and in a schedule-refetch cycle the 3,072 B parse
+block. `min_free8` on `GET /api/debug/ui` is the number that says whether the floor is right, and it
+is the first thing to read after flashing.
+
+**And the shared scratch no longer grows and shrinks.** `kJsonBodyCap` is 16 KB but the reservation
+is 6,144 B, so a body larger than the reservation made the vector *double* past it — a 12,288 B
+contiguous request — and `beginCycle()` then handed that block back and took a fresh 6,144 B one,
+every cycle, for as long as that endpoint kept answering big. Grow, shrink, grow, shrink: exactly
+the churn this section exists to remove, and invisible because nothing recorded how big a body had
+ever been. Now `fetchBuffered()` reserves the rounded-up size in **one** step (no doubling), and the
+reservation **ratchets** up to it and stays there — one reallocation per boot instead of one per
+cycle — bounded by `kScratchMaxReserve` (10 KB) so a pathological response still cannot become
+resident. `scratch_max_bytes`, `scratch_reserve_bytes` and `scratch_grows` on `GET /api/debug/ui`
+are the measurement that says whether `kScratchReserve` should simply be a different number in the
+source, which is better than either behaviour and which this firmware previously could not answer.
+
+**And the config is published the same way, for the same reason (0.3.2-rc3).** The Snapshot
+argument above was made in 0.3.1; the *config* was still being copied, and a config save is the
+one event that copies it several times in the same breath. Alive at once, part-way through a
+`PUT /api/config`: the request body, the parsed document, the newly built `Config`, a whole-Config
+copy taken only to answer `dataSettingsChanged()`, the copy assigned into `config_store`'s
+resident `Config`, the copy handed to the display task, the copy that task assigned into **its own
+resident `Config`**, and then the serialized reply document. Four Config copies, each freeing a
+Config's ~12 small string blocks and allocating ~12 more wherever the heap had room — and two
+`Config`s resident for the life of the device where one would do. That is the churn the device
+suite's config section provokes: ~45 `PUT`+`GET` pairs in a few minutes took the largest free
+block to **3,060 B with ~19.5 KB still free**, under the 12 KB idle-work gate, so every `GET`
+after a `PUT` answered "low memory, retry".
+
+`config_store` now owns **one** `Config`, held in a `shared_ptr<const Config>` and published by
+pointer:
+
+- `setActiveConfig()` takes its `Config` **by value and moves it into `make_shared`**, built
+  outside the lock and swapped in, so what happens under that mutex is a pointer exchange and the
+  outgoing `Config`'s destructor runs after the give. `PUT /api/config` `std::move`s into it, so
+  the strings the request parsed *become* the published ones rather than being duplicated and
+  thrown away. One `Config` allocated per save, one freed, none copied.
+- `activeConfigPtr()` is how the display task reads it — the zero-tick take with a
+  `LastGood<shared_ptr>`, exactly as `snapshotPtr()` does, so a miss costs one frame and never a
+  wait. **`ui.cpp` keeps no `Config` of its own at all**: it holds that pointer, and the screens
+  read through it.
+- The handover is one `volatile bool`. `ui::onConfigChanged()` takes no argument and cannot fail,
+  where the old one copied a whole `Config` under a 200 ms lock and **silently dropped the save**
+  when that timed out. `tick()` decides from the **pointer**, not the flag: a lock miss returns the
+  pointer the task already holds, so clearing the flag on a successful *call* would lose the save —
+  it clears only when the pointer differs. `test_ui_lock` pins both that and the move-out-first
+  rule, because a device cannot be asked to miss a lock on demand.
+- `GET /api/config`, `GET /api/state` and `setHostName()` borrow the pointer instead of copying,
+  which takes a whole `Config` copy off the `/api/state` burst path as well.
+
+Deliberately **not** converted: `net_poller.cpp` and `proxy_worker.cpp` still take a `Config` copy
+per cycle / per job. They are on the poller task, not on the path the suite fragments, and mixing
+them into this change would have made it a refactor rather than a fix. They remain the obvious
+next candidates if per-cycle churn ever needs to come down further.
 
 Two consequences follow the same rule and are worth stating where a reader will look for them.
 `publishSnapshot()` takes its Snapshot **by rvalue and returns the published pointer**, so the
@@ -1071,7 +1284,7 @@ poller holds one Snapshot and not two through the optional tail (§12.1's `snaps
 `startWebServer()`, because the FAT mount is one ~12.5 KB contiguous `calloc` and should come off a
 heap the async web server has not been allocating out of yet.
 
-Flash budget: the app slot is 1,900,544 bytes. As of 2026-09-16, with the §12 hardening, the screen pass, the LVGL pool safety work, the release-candidate fixes and the display task's lock policy (this §), the full feature set uses **1,862,942 B (98.0 %)** on `cyd-3248S035R` — 37,602 B of headroom — and 1,858,614 B (97.8 %) on `cyd-2432S024C`; the tightest env of all is the HTTPS prototype `cyd-3248S035R-https` (§2.1), which ships in no image. (This line read "93.9 % / 93.7 %, ~112 KB headroom" until 2026-09-16, which was the 2026-09-15 measurement left behind by three later passes — the same failure §2.1's threshold note describes, so the figures here are now absolute bytes with the date they were taken.) `firmware/README.md` carries the per-env table and ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
+Flash budget: the app slot is 1,900,544 bytes. As of `0.3.2-rc3` (2026-09-17), with the §12 hardening, the screen pass, the LVGL pool safety work, the release-candidate fixes and the display task's lock policy (this §), the full feature set uses **1,874,866 B (98.6 %)** on `cyd-3248S035R` — 25,678 B of headroom — and 1,870,654 B (98.4 %) on `cyd-2432S024C`; the tightest env of all is the HTTPS prototype `cyd-3248S035R-https` (§2.1), which ships in no image. (This line read "1,862,942 B / 98.0 %, 37,602 B headroom" as of 2026-09-16 — left behind by three further release-candidate passes, the exact recurrence the previous correction here warned about, so treat this as a figure to recheck after any change that touches flash rather than a fact to carry forward.) `firmware/README.md` carries the per-env table and ranks what to cut if more is needed — the largest single item is the setup screen's QR code at 17 KB. Do not grow the app slots without dropping OTA.
 
 Build/flash: `pio run -e cyd-3248S035R`, `pio run -e cyd-3248S035R -t upload --upload-port
 /dev/ttyUSB0`. Releases publish `bootloader.bin`, `partitions.bin`, `firmware.bin` per env plus an
@@ -1098,7 +1311,8 @@ ESP Web Tools `manifest.json` under `flasher/` for GitHub Pages (offsets 0x1000 
     "crowding": "words",
     "crowding_icons": "seats",
     "quiet": { "enabled": false, "start": "23:00", "end": "06:00", "brightness": 0, "wake_seconds": 30 },
-    "night": { "enabled": true, "after_min": 60 }
+    "night": { "enabled": true, "after_min": 60 },
+    "nightly_restart": { "enabled": true, "time": "03:30" }
   },
   "stops": [
     {
@@ -1139,7 +1353,7 @@ ESP Web Tools `manifest.json` under `flasher/` for GitHub Pages (offsets 0x1000 
       "show": 2
     }
   ],
-  "alerts": true,
+  "alerts": false,
   "weather": { "enabled": true, "per_stop": true, "units": "f" },
   "due": { "enabled": true, "minutes": 3, "led": true, "screen": true, "chime": false },
   "profiles": [
@@ -1206,8 +1420,26 @@ because the strip is narrow. `stops[].lat`/`lng` come from the Stops API when a 
 (the two default stops are backfilled on load; the web UI's Stops page offers a lookup for older
 entries). `weather` (§4.8): `enabled`, `per_stop` (the per-panel notes), `units` `f`|`c`.
 `mode` is one of `bus`, `trolley`, `subway`, `rail`. `key` is generated by the UI and must be
-unique and stable; it is the join key in the log. Maximum 8 stops. Validation errors return
-HTTP 400 with `{ "error": "...", "path": "stops[1].stop_id" }`.
+unique and stable; it is the join key in the log. **Maximum 4 stops** (`kMaxStops`, lowered from 8
+in 0.3.2-rc2 — see below). Validation errors return HTTP 400 with
+`{ "error": "...", "path": "stops[1].stop_id" }` — for this one,
+`{ "error": "at most 4 stops are allowed", "path": "stops" }`, and the same limit applies to a
+profile's `stops` list. The web UI's Stops page says "Configured stops (n/4)" and disables
+**+ Add stop** at four, so the form cannot build a config the device will refuse.
+
+**Why four, and what it is worth (0.3.2-rc2).** It is the owner's product decision, and the
+hardware had been saying the same thing for a while: the four-stop arrivals page measures 31,656 B
+of LVGL's 36,864 B pool and the fifth panel does not fit, which is why `main_screen.cpp` carries a
+pool guard and why the 0.3.1 pool sweep kept `LV_MEM_SIZE` at 36 KB rather than trimming it. Making
+the cap match what the screen can actually draw turns a run-time refusal into a save-time error
+with a clear message — and it lets everything sized off the stop count shrink with it. The one that
+matters is `transit_stats::kMaxTrackedStops`, also 8 → 4. Read out of the image's DWARF:
+`sizeof(StopState)` is **1,056 B** on the ESP32 and `sizeof(ArrivalTracker)` is **4,232 B** at four
+slots, so the array is the whole object bar 8 bytes and eight slots would have been 8,456 B —
+**4,224 B of heap returned**. That is less than the 8,064 B §5 makes resident, so it does not pay
+for it on its own; §5 carries the full ledger. It is a *reduction of a documented limit*, so: a
+saved config with five to eight stops is refused by `validateConfig()` on load and the device falls
+back to `/config.prev.json` or the default.
 
 ### 6.1 Validation limits
 
@@ -1217,10 +1449,28 @@ below, so `brightness: 256` and `poll_seconds: 65566` are 400s rather than silen
 and 30 in their `uint8_t`/`uint16_t` fields. The first violation decides the response; its JSON
 path is returned.
 
+- Counts: `stops` ≤ **4** (`kMaxStops`, 0.3.2-rc2; was 8), `profiles` ≤ 4 and each profile's
+  `stops` list ≤ 4, `bike.stations` ≤ 3.
 - Numbers: `poll_seconds` 5–600, `brightness` 0–100, `rotation` 0/90/180/270, `ticker_lines` 1–8,
   `ticker_speed` 5–200, `quiet.brightness` 0–50, `quiet.wake_seconds` 5–300, `night.after_min`
   15–240, `due.minutes` 1–15, `stops[].show` 1–4, `stops[].alt_after_min` 5–60 (when `alt_of` is
   set), `bike.stations[].id` ≥ 1. `lat`/`lng` must be finite and within ±90 / ±180.
+- Clock strings: `quiet.start`, `quiet.end`, `nightly_restart.time` and every `profiles[].start` /
+  `profiles[].end` are local `"HH:MM"`, 24-hour, validated the same way and parsed by the same
+  `daypart::parseClock()`.
+- `device.nightly_restart` (0.3.2-rc1) is `{ "enabled": true, "time": "03:30" }` and is **on by
+  default**. A config saved by older firmware carries no such block and gets exactly those
+  defaults — that is the intended behaviour for an existing device, not a migration, and the web
+  form's fallbacks match it so it cannot show as off while the device has it on. §12.1 explains
+  what it is for and, as importantly, what it is not.
+- `alerts` defaults to **false** since 0.3.2-rc1 (owner decision). A saved config that carries the
+  key keeps whatever it says — and every config this firmware has ever written carries it, because
+  `toJson()` always emits it — so only a hand-written or pre-0.2 config takes the new default.
+  Alerts cost a fetch per configured route every five minutes, a second Snapshot publish whenever
+  one answers, and a cache that is one of only two things on this device that legitimately holds
+  data across cycles, while most of what they bring back is visible only in the web UI and the log.
+  With them off, `collectAlerts()` clears the cache and returns immediately without a fetch
+  (`net_poller.cpp`), so `cachedAlerts()` is empty and every published Snapshot carries no alerts.
 - Strings: `device.name` ≤ 32 and, after lower-casing ("slugifying"), only `[a-z0-9-]` and no
   leading or trailing `-` — it is the mDNS hostname, and a character DNS cannot carry is refused
   rather than guessed at; `device.tz` ≤ 64; every per-stop string (`key`, `route`, `stop_id`,
@@ -1296,7 +1546,7 @@ the Stops page loads Leaflet from a CDN (§10).
 | `POST /api/ota` | multipart `firmware` field; reboots on success. One at a time. No file → 400 `no firmware file`; too little heap or a fragmented one → 503 naming which check failed; an image built for a different board → 400 `firmware is for a different board (expected <board>)`; larger than the OTA slot → 413. Answers 200 only after the final chunk arrived *and* `Update.end()` succeeded |
 | `POST /api/reboot`, `POST /api/wifi/reset` | Maintenance |
 | `POST /api/pin` | Body `{"pin":"new"}`, authenticated with the **current** PIN in `X-Pin`. New PIN: 4–32 printable ASCII, no whitespace. → `{"ok":true}`, or 400 with the rule that was broken. No reset-by-network path: recovery is the serial console or the device info screen (§12) |
-| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB. Also `lock_misses`, `tick_ms`/`tick_ms_max` (§5) and `cpu_stretch_ms_max` — the longest the poller task has run a CPU-bound loop without letting IDLE0 in, since boot, against the task watchdog's 5,000 ms (§12.1). Since 0.3.1 also `heap_8bit` and `min_free8` (the byte-addressable free heap now, and the lowest it has ever been — §2.1), `snapshots_live`, `failed_polls`, `wedged_polls`, `proxy_queue_depth`, `stack_hwm` per task, and `oom_replies_dropped` / `heap_reserve_held` (§12.1, "the 503 for out of memory needs memory"), and `bt_release_rc` / `bt_release_gain_bytes` — `esp_bt_mem_release()`'s return code and the `MALLOC_CAP_8BIT` free-heap delta across it, reported here because the serial console cannot be captured on the owner's bench — and `in_flight_requests` / `admission_refusals` / `max_in_flight_requests` (§12.1, accept-time admission control) |
+| `GET /api/debug/ui` | Test hook (not for the web UI; open, read-only): current page (main/night/stats/device, or `stalled`), dimmed + applied brightness, due/chime counters, active profile, shown stops, hidden alternative panels, ticker text, header weather, resolution, heap, and the LVGL pool: `lv_used`/`lv_free`, `lv_max_used` (high-water since boot), `lv_total` (= `LV_MEM_SIZE`; used + free falls a little short of it, the difference being TLSF's per-block overhead), `lv_frag_pct`, `lv_page_cost` per page, `lv_page_refusals`, and `lv_tight` when the page that is up left under ~3 KB. Also `lock_misses`, `tick_ms`/`tick_ms_max` (§5) and `cpu_stretch_ms_max` — the longest the poller task has run a CPU-bound loop without letting IDLE0 in, since boot, against the task watchdog's 5,000 ms (§12.1). Since 0.3.1 also `heap_8bit` and `min_free8` (the byte-addressable free heap now, and the lowest it has ever been — §2.1), `snapshots_live`, `failed_polls`, `wedged_polls`, `proxy_queue_depth`, `stack_hwm` per task, and `oom_replies_dropped` / `heap_reserve_held` (§12.1, "the 503 for out of memory needs memory"), and `bt_release_rc` / `bt_release_gain_bytes` — `esp_bt_mem_release()`'s return code and the `MALLOC_CAP_8BIT` free-heap delta across it, reported here because the serial console cannot be captured on the owner's bench — and `in_flight_requests` / `admission_refusals` / `max_in_flight_requests` (§12.1, accept-time admission control). Since 0.3.2-rc1 also `scratch_max_bytes` / `scratch_reserve_bytes` / `scratch_capacity` / `scratch_grows` — the largest response body ever buffered, what the shared poll scratch is reserved at, and how often a body went past it (§5); `heap8_info` (`heap_caps_get_info(MALLOC_CAP_8BIT)`: `total_blocks`/`free_blocks`/`allocated_blocks`/`largest_free_block`/`minimum_free_bytes` — 40 KB free in one piece and 40 KB free in thirty pieces read identically on every other line here, and this is the difference); `sched_cache_bytes` / `alerts_cache_bytes` / `snapshot_bytes` / `retained_slots` / `tv_slots` / `tv_dropped` (0.3.2-rc3: vehicles relevant to a configured stop that did not fit the 16-slot list — it should stay at zero, and a filtered-out vehicle is deliberately not counted here); and `?log=1` for the 120-row per-cycle memory log (`cycle_log`, `cycle_log_first`, `cycle_log_rows`, `cycle_log_seq`, `cycle_log_cap`), which returns the log INSTEAD of `trace` because the two share a render buffer. Each log row is `[uptime_s, free8, largest, min_free8, flags]` at poll-start, flags being 1 schedule refetch, 2 alerts fetch, 4 weather, 8 bikes, 16 out of memory, 32 poll failed, 64 clock unsynced. Also `oom_streak` / `wedge_reason` / `oom_polls_before_reboot` (§12.1, the self-heal tallies) |
 | `POST /api/debug/tap` | Test hook (PIN-protected: it changes what the screen shows): simulated touch (press + click on the LVGL task), so page cycling and quiet-hours wake can be exercised without the panel |
 | `POST /api/debug/page` | Test hook (PIN-protected, same reason): go straight to `main` \| `night` \| `stats` \| `device`, named in `?page=`, a `page=` form field or the raw body. Performs exactly the transition a tap does, queued for the LVGL task like `/api/debug/tap` — nothing builds an `lv_obj` on the web server task. It exists because LVGL pool exhaustion cannot be reproduced in the simulator's 512 KB pool (§8) and measuring it wants thirty cycles, not thirty taps |
 | `POST /api/debug/oom` | Test hook (PIN-protected: it starves every other task for under a millisecond): exhausts the heap on purpose, forces a `std::bad_alloc`, frees everything and answers `{"caught":true,"blocks":N,"largest":B,"free_before":X,"free_after":Y}` - the deterministic proof of the emergency exception pool (§12.1). `largest` under ~100 means the exception object could only have come from the pool; without the pool the request reboots the device. Run it on a **fresh boot**: it then also proves the first-throw path (§12.1), which on a task that has already thrown answers `caught:true` either way |
@@ -1436,6 +1686,23 @@ Main screen (portrait by default; every size derives from the runtime resolution
   The `N more stops will not fit` caption is also built **before** the first panel and hidden,
   rather than out of whatever the loop leaves — it is the one allocation that must not fail,
   because it is the one that explains the failure.
+- **The draw buffer is 1/40 of the screen on the 3.5" boards since 0.3.2-rc3, and `tick_ms_max`
+  is now measured against it (2026-09-17, confirmed again on the v0.3.2 device-suite run with the
+  card mounted).** `LVGL_BUFFER_PIXELS` in `boards/esp32-3248S035R.json` and
+  `esp32-3248S035C.json` went `/30` → `/40`: 5,120 px (10,240 B) to 3,840 px (7,680 B), for
+  **2,560 B** of permanent heap back. The owner delegated this number to our judgement, and it is
+  the cheapest block left on the board that costs no functionality — the buffer is a scratchpad the
+  panel driver flushes from, so a smaller one changes *how often* a repaint is flushed and nothing
+  about what is drawn; 3,840 px is still 12 rows of a 320-wide panel against the one row LVGL
+  requires. What it does change is repaint time: 40 partial flushes per full repaint instead of
+  30, at an unchanged 24 MHz pixel clock. **Measured on the owner's board: `tick_ms_max` ~20 ms
+  worst case at `/40`**, against 168 ms at `/30` and 21 ms at `/20`, with a page rebuild the
+  expensive case in all three — comfortably inside the device suite's 500 ms check, which passes.
+  So the buffer is not what costs the redraw; the page build is, and `/40` did not
+  make it worse. This paragraph asked for that measurement before rc3 was flashed and it is now
+  taken; a fourth reduction would need the same question asked again.
+  It is also unrelated to the LVGL pool: the draw buffer comes from the ESP heap
+  (`LVGL_BUFFER_MALLOC_FLAGS`), `LV_MEM_SIZE` is a separate 36 KB static pool and does not move.
 - Pool exhaustion has its own simulator environment, because the normal one cannot show it:
   `pio run -e ui-sim` builds with a 512 KB pool for 64-bit host pointers. `ui-sim-pool` scales
   `LV_MEM_SIZE` to the board's by the measured host/board ratio (0.66, fitted against six figures
@@ -1685,7 +1952,7 @@ configured stop and Indego station (`OverviewAggregator`), rather than one pass 
 The caller passes the **currently configured** stop keys and Indego station keys to
 `OverviewAggregator`, and those get reserved slots, in that order, ahead of anything else in the
 window — a reserved key appears even with zero rows ("just added, no data yet" is a real answer).
-Remaining slots go to other keys in first-seen order, up to config's own caps (8 stops, 3 bike
+Remaining slots go to other keys in first-seen order, up to config's own caps (4 stops, 3 bike
 stations, §6). Keys beyond that are counted in `excluded_stops`/`excluded_bikes`, which the UI
 must disclose rather than present a partial list as the whole truth: without the reservation, a
 month in which the user changed stops filled all eight slots with the stops they *used* to watch
@@ -1883,7 +2150,8 @@ Addendum (2026-09-15): C++ exceptions are enabled in this SDK (`-fexceptions`), 
 growth or `reserve()` that cannot get memory throws `std::bad_alloc`, and an uncaught throw is
 `std::terminate` = reboot. The largest free block between polls on the owner's board is only
 10-32 KB, so a cap-sized `reserve()` (a 64-update or 48-vehicle block is ~10 KB contiguous) turned
-into a boot loop. Rules: retention caps are small (32 feed updates, 32 vehicles) and vectors grow
+into a boot loop. Rules: retention caps are small (32 feed updates, and 16 vehicles since
+0.3.2-rc3 — 32 before it) and vectors grow
 from a few entries instead of reserving the cap; `pollOnce()`, queued proxy/stats jobs and
 `PUT /api/config` catch `std::bad_alloc` and report "out of memory" (a failed poll with per-stop
 errors, or a 503) rather than resetting. Measured after the fix: heap ~54 KB minimum during a
@@ -1938,7 +2206,72 @@ path, though, and for one route that matters: the chain does not run until a req
 been parsed (§12, "Cross-site and rebinding"), so `handleOtaUpload()` warms on its own entry too.
 Without that, a device whose *first* request is a firmware upload ran `checkPin()`, the heap gates,
 `Update.begin()` and `otaFail()`'s `std::string` concatenations on a task that had never thrown -
-precisely the cold-first-throw shape above. Warming only makes the throw catchable, so the upload
+precisely the cold-first-throw shape above.
+
+**And a fourth task, which is not ours, and which every release until 0.3.2-rc4 left cold: lwIP's
+own `tiT`.** Decoded from the 0.3.2-rc3 device-suite serial capture, core 0, during section A's
+`POST /api/debug/oom` on a cold boot — i.e. with the heap deliberately taken to zero:
+
+```
+tcpip_thread <- sys_check_timeouts <- tcp_slowtmr
+  <- AsyncTCP_detail::tcp_poll (AsyncTCP.cpp:454)
+  <- operator new(nothrow) <- operator new <- __cxa_throw
+  <- __cxa_get_globals <- std::terminate
+```
+
+The middle of that is the trap, and it is worth stating on its own line because it reads like a
+contradiction: **libstdc++ implements nothrow `new` as a `try`/`catch` around the *throwing*
+`new`** — `__try { return ::operator new(sz); } __catch(...) { return nullptr; }`. So
+`new (std::nothrow) T` is not a non-throwing allocation; it is a throw and a catch, and it needs the
+calling task's `__cxa_eh_globals` exactly like any other throw. AsyncTCP allocates that way in
+**every one of its lwIP raw callbacks** — `tcp_poll`, `tcp_recv`, `tcp_sent`, `tcp_error`,
+`tcp_connected`, the DNS callback, and `tcp_accept` (which allocates an `AsyncClient` as well) —
+and lwIP runs all of them on the tcpip task. The first allocation failure anywhere in AsyncTCP's
+lwIP half therefore reaches the un-warmed `__cxa_get_globals` malloc with the heap already gone,
+and terminates.
+
+Nothing of ours runs on that task, which is why it stayed invisible: the trap is entirely inside
+library code, reached through a library callback, and the only thing this firmware can do is make
+sure the task is warm before it ever gets there.
+`warmExceptionGlobalsOnTcpipTask()` (`cxx_exception_pool.cpp`) runs `warmExceptionGlobals()` on the
+tcpip task through lwIP's own callback mailbox. `main.cpp` calls it immediately after
+`connectWifiOrPortal()`, because the tcpip task does not exist until the TCP/IP stack is up and
+both branches of that call (joined a network, or brought up the setup AP) start it. The boot line
+is `[heap] eh_globals warmed on tiT`, beside the other three.
+
+**It is written the long way because of two traps in this SDK's lwIP configuration, and either
+would have shipped something worse than the bug.** Both were found by reading the framework's own
+`sdkconfig`, not on hardware:
+
+- **`tcpip_callback_wait()` would have been a silent no-op.** It is the obvious call — "run this on
+  the tcpip task and wait" — but this SDK has **`CONFIG_LWIP_TCPIP_CORE_LOCKING=y`**, and under core
+  locking lwIP does not post that message anywhere: it takes the core mutex and calls the function
+  **inline, on the calling task**. The callback would have run on `loopTask`, found it already warm,
+  returned `false` without printing, and the whole thing would have reported success having warmed
+  nothing — the same shape `throwOnce()` exists to prevent.
+- **Posting without the core lock would have aborted the boot.** `tcpip_callback()` and
+  `tcpip_try_callback()` both open with `LWIP_ASSERT_CORE_LOCKED()`, and with
+  **`CONFIG_LWIP_CHECK_THREAD_SAFETY=y`** and assertions enabled that assert is live — confirmed in
+  the built image, which shows the `sys_thread_tcpip()` check compiled into the call path.
+
+So the sequence is `LOCK_TCPIP_CORE()` → `tcpip_try_callback()` → `UNLOCK_TCPIP_CORE()`, and only
+then the wait. `tcpip_try_callback()` rather than `tcpip_callback()` because the latter uses a
+*blocking* `sys_mbox_post()`, and blocking on the mailbox while holding the very lock the tcpip task
+needs to drain it is a deadlock shape whether or not the mailbox is empty at boot. The wait is
+outside the lock for the same reason. **And then the part that does not depend on any of that being
+right:** the callback records which task it ran on and the caller compares it with its own handle,
+so a future SDK that changes the contract again prints
+`eh_globals NOT warmed on tiT: callback ran INLINE on the caller` instead of quietly doing nothing.
+
+This has been present in every release. 0.3.2-rc3 is only the first build whose heap gates let
+`POST /api/debug/oom` exhaust the heap completely enough to reach it.
+
+**Checked and deliberately not warmed:** `esp_timer` (AsyncTCP touches it only for
+`esp_timer_get_time()`, never a callback, and this firmware registers no esp_timer callbacks) and
+`sys_evt` / the Arduino event task (no `WiFi.onEvent()` handler and no `esp_event` handler in this
+firmware, so no C++ throw exists there). Warming either would be warming a task on which nothing
+can throw. **If a future change registers a callback on any task not in this list, that task must
+warm itself, and this is the paragraph to add it to.** Warming only makes the throw catchable, so the upload
 callback is also wrapped in its own `bad_alloc` guard: nothing in ESPAsyncWebServer catches what
 escapes one, and `guarded()` does not reach it. Two details the implementation depends on and the
 file documents: GCC folds a `try { throw 0; } catch (int) {}` whose handler it can see into a plain
@@ -1983,7 +2316,11 @@ the poller was mid-fetch, and both `assert`-and-panic rather than failing soft: 
 Neither is a C++ exception and no pool or catch block can reach either; the only defence is not to
 exhaust the heap while a fetch is in flight. That is a real constraint on the *test hook*, not on
 normal operation - nothing else takes the whole heap on purpose - so the device suite fires
-`/api/debug/oom` only in the quiet window just after a poll completes (section A0).
+`/api/debug/oom` only in the quiet window just after a poll completes (section A0). **Since
+0.3.2-rc5, `/api/debug/oom` itself is compiled out of shipping builds** (it lives behind a
+dev-only build flag) **so neither of these two asserts is reachable at all in a shipping
+image** - only a development build that still carries the hook can drive the heap to the state
+that triggers them.
 
 **"The 503 for out of memory needs memory" - the third instance, and it is ours (2026-09-17).**
 The list above has carried "a catch block that itself allocates with nothing left (building the 503
@@ -2089,6 +2426,147 @@ no send buffer. `src/app/admission.h` holds the rule as pure arithmetic (host-te
   `HostGuardHandler::canHandle()`, both on the AsyncTCP task, so it needs no lock;
   `in_flight_requests`, `admission_refusals` and `max_in_flight_requests` report it on
   `GET /api/debug/ui`.
+- **The floors apply only under contention: the first TWO connections are always admitted
+  (0.3.2-rc1, widened in rc3).**
+  rc3's rule applied both heap floors unconditionally, and on the owner's board at v0.3.1 that
+  turned a fragmented heap into a total lockout. Measured 2026-09-17, uptime 2,646 s: the largest
+  free block had fallen to **3,444 B**, under `kAcceptMinLargestBlock` (4,308), so the accept path
+  refused **every** new connection - `GET /api/debug/ui`, which is deliberately outside
+  `refuseIfLowHeap()` so that it still answers when the heap is gone, and `POST /api/reboot`, which
+  is the recovery path, along with everything else. The board answered ping and nothing else until
+  the heap-wedge self-heal rebooted it five minutes later. That is a worse outcome than the crash
+  the floors prevent, and it is not a trade that had to be made: the rc2 abort needed **seven**
+  requests alive at once, and a single request cannot reproduce it - nothing else is competing for
+  the heap, and if its own reply will not fit, `guarded()` catches the throw and answers 503 out of
+  the 1 KB reserve. The floors are therefore a statement about *contention*, and with no contention
+  they have nothing to say. The rule is: `in_flight >= cap` refuses (unchanged); `in_flight` below
+  `kAdmissionFloorsApplyFrom` admits whatever the heap says; otherwise both floors apply exactly as
+  before. The count cap is unchanged at 5. `test_admission` pins the rule table so a future edit
+  that reinstates the lockout fails on the host rather than on the hardware.
+
+  **`kAdmissionFloorsApplyFrom` is 2 since 0.3.2-rc3 — the floors gate the *third* concurrent
+  request onward — and the suite is what moved it.** Section E fires 7 simultaneous requests per
+  round for 3 rounds and allows at most **six** aborted connections in total; rc5 produced
+  **nine**. The cap accounts for exactly two per round (7 − 5), so the extra one per round was the
+  floors refusing the **second** request, because the accept-time largest-block reading dipped
+  under 4,308 while the first request was still being answered. A request arriving into *one*
+  other request is not the contention the floors were derived for: the rc2 crash needed **seven**
+  alive at once, and it is the count cap, not the floors, that stops a burst reaching seven. With
+  the threshold at 2 the budget is the cap's alone — **≈2 refusals per round, 6 total**, inside
+  the allowance by construction rather than by luck. A second request on a starved heap is still
+  not unprotected: if its own reply will not fit, `guarded()` answers 503 out of the 1 KB reserve,
+  exactly as it does for the first.
+
+  **Said honestly, because the test says it too:** on a *deeply* fragmented heap — section B's
+  measured 19,528 free / 3,060 largest, under the block floor by a wide margin and for minutes
+  rather than momentarily — the floors still refuse from the third request on, which is five
+  refusals in a seven-deep burst. That is the burst defence working. The fix for section B is that
+  the heap no longer reaches that state (the config-save churn above), not a looser floor, and
+  `test_a_deeply_fragmented_heap_still_refuses_from_the_third` keeps the two cases from being
+  confused.
+
+**The nightly restart, and the honest sentence about it (owner decision, 0.3.2-rc1).**
+`device.nightly_restart` restarts the board at a chosen local time, **on by default at 03:30**.
+`src/app/nightly_restart.h` holds the rule, pure and host-tested (`test_nightly`, 8 cases);
+`main.cpp` reads the clock once a second from the display task, outside `loop()`'s `bad_alloc`
+guard and beside the liveness check, and goes out through the same `scheduleRestart()` the reboot
+endpoint uses.
+
+**It is a mitigation, not a fix, and this document should not be read as saying otherwise.** This
+board has no PSRAM, a ~100–160 KB heap, and nothing that defragments a running one. Two releases of
+work have gone into the per-cycle contiguous demand and 0.3.2-rc1 removes every request above
+~1.2 KB from a cache-hit cycle — and none of that is a guarantee, because fragmentation is
+cumulative and the trigger is still unknown: the owner's board rested at a 22.5 KB largest block for
+thirty-five minutes and was at 3,444 B forty minutes later, and nothing in the record says why. A
+boot is the only defragmentation this hardware has. Taking one at 03:30, when nobody is reading a
+transit display, costs a few seconds of uptime and starts every day on a heap in one piece. It does
+not excuse leaving the real cause unfound, which is what the per-cycle log above exists for.
+
+The guards are each there for a specific failure: **one minute, once** (the check acts only on the
+transition into the matching minute, so a slow minute cannot fire it twice); **uptime > 1 h**
+(without it a board that boots at 03:29 restarts at 03:30, comes up, and can loop); **a sane clock**
+(before NTP the local time is 1970 and "03:30" matches a moment with nothing to do with 03:30); and
+**not during an OTA** (the same hazard the wedge and liveness nets stand down for). An unparseable
+time parses to −1 and the rule treats −1 as *never* — for a rule that restarts the device, the
+failure direction is always "do not restart". The restart is recorded in the RTC note, so
+`GET /api/state`'s `last_restart.reason` reads `nightly` rather than leaving a bare `ESP_RST_SW`
+for someone to puzzle over.
+
+**The heap-wedge self-heal did not fire, and the reason was the failure backoff (0.3.2-rc1).** On
+2026-09-17 the owner's board sat with every poll failing at `oom-transit`, largest free block
+3,444–4,596 B, `wedged_polls` reading 4 at 15:50 — and it was still in that state at 16:07, when it
+had to be hard-reset over USB. The expectation was "15 wedged polls at 30 s → a restart by 15:56".
+The trace, because the answer is not the obvious one:
+
+1. **The tally was not being reset.** `wedged_polls` = 4 was correct; only about four cycles had
+   failed by then. (`failed_polls` = 11 counts every failure since boot, not consecutive ones.)
+2. `getPollStatus()` returning a default-constructed `PollStatus` on a lock miss does not break the
+   rule either: `PollStatus::ok` defaults to **false**, which is the direction that *advances* the
+   tally. Ruled out.
+3. The second publish of a cycle copies `last_poll_ok` from the published Snapshot, so it cannot
+   overwrite a failure with a success. Ruled out.
+4. **The failure backoff.** A failed poll drives `nextIntervalS()`'s backoff, which saturates at
+   `kBaseBackoffS << 3` = **240 s**. Fifteen consecutive failed polls is therefore
+   30 + 60 + 120 + 12 × 240 = **51 minutes**, not seven and a half. The board was doing exactly
+   what was written; the threshold had been written against a cadence a failing board does not run
+   at. The old comment's "which with the failure backoff is several minutes" was out by a factor
+   of eight.
+5. The poller-stall net in `main.cpp` could not help and was not meant to — the poller *was*
+   completing cycles, and that net's window is a multiple of the interval the poller is actually
+   running at, backoff included, so it stretches with the backoff too.
+
+`src/app/wedge_policy.h` now holds the rule, pure and host-tested (`test_wedge`, 8 cases), with two
+tallies:
+
+- **Out-of-memory cycles are counted directly, at the catch site.** A cycle that caught
+  `std::bad_alloc` knows that about itself; the old rule threw that fact away and re-derived it
+  from a largest-block reading taken afterwards, which is a second condition that can lapse on its
+  own. **Three consecutive** such cycles restart the board — about 3½ minutes with the backoff,
+  against the 51 the old rule really cost. A lossless restart beats a stale display: the arrivals
+  are refetched within seconds of boot, the stats log is on the SD card and the config on LittleFS,
+  and the RTC note records why (`last_restart.reason` = `heap_oom`).
+- **The old failed-poll-plus-small-block rule is kept at fifteen** as the slower backstop for a
+  wedge that never throws. Its condition can also be met by an ordinary SEPTA outage on a board
+  whose heap merely happens to be busy, so it must stay hard to trip.
+
+Both tallies stand down and are *forgotten* during an OTA, for the reason the liveness net does the
+same. `oom_streak`, `wedged_polls` and `wedge_reason` on `GET /api/debug/ui` say how close each is.
+The wedge check reads a lock-free mirror of the cycle's own verdict rather than calling
+`getPollStatus()`, which takes the poller's lock and copies a `std::string` on a line that has no
+`try` above it.
+
+**The error-reply reserve could not come back either.** Through the whole wedge `heap_reserve_held`
+read false: free8 17–20 KB with a 3,444 B largest block is under *both* of the old re-arm
+thresholds (20,480 and 4,340), so the kilobyte that exists to make an out-of-memory 503 possible was
+unavailable in exactly the state it is for. The floors are now **13,556** free8 — the smallest value
+on the 512-byte lattice that still clears `kMinHeavyResponseFree8` by more than the reserve is big,
+which is why it is not simply 12 KB — and **2,292** for the block, twice the 1,024 B the reserve
+actually has to be carved out of rather than the 4.2× it was.
+
+**An hour of per-cycle history, because the trigger is still unknown (0.3.2-rc1; two hours until
+0.3.2-rc3, halved to give the resting floor 1,920 B back).** The per-stage
+ring (`heap_trace.h`) holds 64 entries, which on a healthy path is **three cycles**. It is what
+identified the failing allocation on 2026-09-17 — the ring read `pre-transit → oom-transit` with no
+stage between — and it is structurally unable to say what happened *before*: the board rested at
+free8 39–40.7 KB with a largest block never under 22.5 KB for thirty-five minutes and was then
+found at free8 17–20 KB with a largest block of 3,444 B, and every cycle in which that happened had
+scrolled out of the ring. `src/app/cycle_log.h` adds **one 16-byte row per cycle, 120 of them** —
+one hour at a 30 s cadence, far more once the failure backoff stretches the interval — carrying
+the poll-start `free8` and largest block, the lowest `free8` sampled anywhere in that cycle, and a
+flag word for the four things that do *not* happen every cycle (schedule refetch, alerts fetch,
+weather, the 400 KB Indego stream) plus out-of-memory, poll-failed and clock-unsynced. If the
+collapse correlates with one of those, this is the record that shows it. 1,920 B of `.bss`, nothing
+on the heap, and it is served by `GET /api/debug/ui?log=1` through the same fixed-buffer +
+`serialized()` route the stage ring uses, so it cannot be the thing that stops that endpoint
+answering.
+
+The "lowest free8" column is honestly a **floor of the samples this firmware takes** — every stage
+boundary, plus every accept-time admission check on the AsyncTCP task — not a true minimum; a
+trough that opens and closes between two samples is invisible to it, which is exactly how rc1's
+696 B reading was missed by the stage ring. `heap_caps_get_minimum_free_size()` is the true
+minimum and is reported separately as `min_free8`, but it is since *boot* and cannot be attributed
+to a cycle. Read the two together: this column says which cycle was tight, that one says how tight
+the board has ever been.
 
 **And the background jobs had to stop starting inside a burst.** The same run showed why a heap gate
 alone is the wrong question: `[proxy] refusing a queued job: not enough heap to start it (free8
@@ -2171,7 +2649,7 @@ their `_M_manager` bodies contain no calls at all, which is libstdc++'s stored-l
 **Do not add a middleware back.** `g_server.addMiddleware(...)` is a one-line change that
 reintroduces an uncatchable reboot, and it will look completely reasonable to whoever writes it.
 
-A **fourth instance, and the one that matters for normal operation**, turned up on 2026-09-16 on a
+A **sixth instance, and the one that matters for normal operation**, turned up on 2026-09-16 on a
 clean `dcb6353` image with `/api/debug/oom` never fired once (the capture was grepped: the only
 `oom` matches are the bootloader's `ho 8 tail 4 room 4` line matching inside the word "room"). Free
 heap decayed to ~34.5 KB with the largest block down to 164 B under light polling, `main.cpp
@@ -2505,8 +2983,9 @@ per stop. On a network that silently **drops** packets - an ISP outage with DHCP
 captive portal, heavy loss; a network that *refuses* fails in milliseconds and never gets near this
 - a cycle's real cost was minutes per stop, so a device with several configured stops could take
 longer than the window to finish a perfectly legitimate cycle, and the net would restart it
-mid-cycle, over and over, with nothing wrong but the Wi-Fi. `config_store.h` allows eight stops and
-the poller polls `cfg.stops`, not the visible subset, so the worst case was about an hour.
+mid-cycle, over and over, with nothing wrong but the Wi-Fi. `config_store.h` allowed eight stops at
+the time (four since 0.3.2-rc2) and the poller polls `cfg.stops`, not the visible subset, so the
+worst case was about an hour. Halving the cap halves that, and changes nothing about the argument:
 
 No window derived from the stop count can both cover that and still restart a frozen board soon
 enough to matter, so the fix was to measure the right thing and to stop the cost compounding:

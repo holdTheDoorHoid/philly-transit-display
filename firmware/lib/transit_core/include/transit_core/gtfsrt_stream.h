@@ -169,6 +169,26 @@ class GtfsRtStream {
   // container rather than of its storage survives that.
   void setEntityBuffer(std::vector<uint8_t>* borrowed);
 
+  // Retain decoded updates into a vector the CALLER owns, instead of this object's own.
+  //
+  // WHY THIS EXISTS (0.3.2-rc1). retainUpdates() reserves max_total slots, and this object is a
+  // local in pollBusStops() - so that reservation was one contiguous request of
+  // max_total * sizeof(StopTimeUpdate) (about 4.9 KB at 32 slots on the ESP32) EVERY poll cycle.
+  // On the owner's board at v0.3.1 it is the request that failed once the largest free block had
+  // fragmented to 3,444 B: the ring read "pre-transit -> oom-transit" with no stage in between,
+  // which is this allocation and nothing else. Handing the stream a vector that lives across
+  // cycles makes retainUpdates()' reserve() a no-op from the second cycle on.
+  //
+  // Unlike the entity buffer this one is NOT shareable with the byte scratch - a
+  // std::vector<StopTimeUpdate> is a vector of non-trivially-destructible values and cannot be laid
+  // over borrowed bytes without a custom allocator - so it is its own resident block. Size it for
+  // what the caller will actually ask retainUpdates() to keep, not for the default cap.
+  //
+  // The borrow is of the CONTAINER, like setEntityBuffer(), so a reserve() by the stream cannot
+  // dangle it. `borrowed` must outlive the decode AND every read of retained(); passing nullptr
+  // (the default state) puts the stream back on its own vector.
+  void setRetentionBuffer(std::vector<StopTimeUpdate>* borrowed);
+
   // Restricts decoded updates to these route_ids (TripDescriptor.route_id). An empty vector
   // (the default) means "all routes". Call before push(); not safe to change mid-stream.
   void setRouteFilter(std::vector<std::string> routes);
@@ -317,7 +337,13 @@ class GtfsRtStream {
   std::vector<uint8_t>* borrowed_entity_buf_ = nullptr;
   size_t entity_target_ = 0;
 
-  std::vector<StopTimeUpdate> retained_;
+  // Reached through retainedBuf() so it can be the caller's (setRetentionBuffer) rather than
+  // own_retained_. own_retained_ is emptied and released while a borrow is in place, so a
+  // borrowing caller pays for one block and not two.
+  std::vector<StopTimeUpdate>& retainedBuf() { return borrowed_retained_ != nullptr ? *borrowed_retained_ : own_retained_; }
+  const std::vector<StopTimeUpdate>& retainedBuf() const { return borrowed_retained_ != nullptr ? *borrowed_retained_ : own_retained_; }
+  std::vector<StopTimeUpdate> own_retained_;
+  std::vector<StopTimeUpdate>* borrowed_retained_ = nullptr;
   size_t max_retained_ = 0;  // 0 = retention off (callback-only use)
   size_t max_per_stop_route_ = 0;
 

@@ -69,7 +69,19 @@ lv_obj_t *g_wifi_setup_qr = nullptr;
 lv_obj_t *g_connecting_screen = nullptr;       // "Connecting to <ssid>..." while retrying stored creds
 lv_obj_t *g_connecting_ssid_label = nullptr;
 lv_obj_t *g_connecting_detail_label = nullptr;
-Config g_cfg;
+// THE CONFIG THE SCREENS RENDER FROM - a borrowed pointer, not a second resident copy
+// (0.3.2-rc3, runtime audit rec #8). config_store publishes one shared_ptr<const Config>; this
+// task holds a reference to that same object, so the device keeps ONE Config in memory instead of
+// three (the store's, the pending handover's and this one). What a save costs is now one Config
+// allocated and one freed, rather than four copies each scattering ~12 small string blocks into
+// new holes - which is the churn the device suite's config section provokes.
+//
+// Never null after init(); cfg() below is the only reader and it copes with null anyway, because
+// applyRotation()/setTheme() are legitimately called from setup() before init() has run.
+std::shared_ptr<const Config> g_cfg_ptr;
+const Config &cfg() {
+  return g_cfg_ptr ? *g_cfg_ptr : emptyConfig();  // config_store's one set of struct defaults
+}
 Page g_page = Page::Main;
 bool g_initialized = false;
 bool g_night = false;             // night clock is up instead of the arrivals page
@@ -92,10 +104,15 @@ bool g_pool_tight = false;     // the page that is up left under kPageRuntimeHea
 bool g_stalled = false;        // parked on the message screen; only a tap or a config change retries
 UiDebug g_debug;  // written at the end of tick() under g_pending_mutex, read by the web task
 
-// Config handed over from another task (web server); applied on the LVGL task in tick().
+// Guards g_debug only, since 0.3.2-rc3: the config handover no longer needs a mutex of its own
+// (see g_pending). Kept under this name because debugSnapshot() and the end of tick() are the two
+// sides of it and nothing else touches it.
 SemaphoreHandle_t g_pending_mutex = nullptr;
-Config g_pending_cfg;
-bool g_pending = false;
+// "A save has happened; pick up the new pointer." That is the WHOLE handover now - config_store
+// owns the Config and publishes it, so there is nothing here to copy, nothing to move and nothing
+// to lock. One volatile store from whichever task saved, one volatile read per tick, and the
+// pointer comparison in tick() is what actually decides whether anything changed.
+volatile bool g_pending = false;
 
 void onScreenTapped(lv_event_t *e);
 void onScreenPressed(lv_event_t *e);
@@ -252,19 +269,19 @@ lv_obj_t *buildSlot(PageSlot slot, const transit::Snapshot &snap) {
   lv_obj_t *scr = nullptr;
   switch (slot) {
     case kSlotMain:
-      scr = createMainScreen(g_cfg);
-      if (scr != nullptr) refreshMainScreen(scr, g_cfg, snap);
+      scr = createMainScreen(cfg());
+      if (scr != nullptr) refreshMainScreen(scr, cfg(), snap);
       break;
     case kSlotNight:
-      scr = createNightScreen(g_cfg);
-      if (scr != nullptr) refreshNightScreen(scr, g_cfg, snap);
+      scr = createNightScreen(cfg());
+      if (scr != nullptr) refreshNightScreen(scr, cfg(), snap);
       break;
     case kSlotStats:
-      scr = createStatsScreen(g_cfg);
+      scr = createStatsScreen(cfg());
       if (scr != nullptr) refreshStatsScreen(scr);
       break;
     case kSlotDevice:
-      scr = createDeviceInfoScreen(g_cfg);
+      scr = createDeviceInfoScreen(cfg());
       if (scr != nullptr) refreshDeviceInfoScreen(scr);
       break;
     default:
@@ -302,7 +319,7 @@ void hidePoolMessage() {
 // Loads the arrivals page or the night clock, whichever the data calls for (Page::Main only),
 // building it and freeing the other if the answer changed. Returns false when neither would fit.
 bool showMainOrNight(const transit::Snapshot &snap) {
-  bool night = nightConditionMet(g_cfg, snap, g_shown_keys, (transit::Epoch)time(nullptr));
+  bool night = nightConditionMet(cfg(), snap, g_shown_keys, (transit::Epoch)time(nullptr));
   if ((night ? g_night_screen : g_main_screen) == nullptr) {
     parkAndDropPages();
     lv_obj_t *built = buildSlot(night ? kSlotNight : kSlotMain, snap);
@@ -368,14 +385,14 @@ void loadPage(Page target) {
 // Recomputes the profile and the visible stop list. Both feed the page builders, so this runs
 // before anything is built.
 void refreshShownKeys() {
-  g_active_profile = activeProfileIndex(g_cfg, time(nullptr));
+  g_active_profile = activeProfileIndex(cfg(), time(nullptr));
   g_shown_keys.clear();
-  for (const transit::StopConfig &s : visibleStops(g_cfg, time(nullptr))) g_shown_keys.push_back(s.key);
+  for (const transit::StopConfig &s : visibleStops(cfg(), time(nullptr))) g_shown_keys.push_back(s.key);
 }
 
 // DESIGN.md SS6 "quiet": backlight schedule with wake-on-touch. Returns true while dimmed.
 bool applyQuietHours() {
-  const QuietConfig &q = g_cfg.device.quiet;
+  const QuietConfig &q = cfg().device.quiet;
   bool quiet = false;
   if (q.enabled) {
     time_t now = time(nullptr);
@@ -385,7 +402,7 @@ bool applyQuietHours() {
   }
   bool awake = (int32_t)(millis() - g_wake_until_ms) < 0;
   bool dim = quiet && !awake;
-  int target = dim ? q.brightness : g_cfg.device.brightness;
+  int target = dim ? q.brightness : cfg().device.brightness;
   if (target != g_applied_brightness) {
     applyBrightness((uint8_t)target);
     g_applied_brightness = target;
@@ -415,11 +432,11 @@ void onScreenPressed(lv_event_t *e) {
   (void)e;
   if (g_dimmed) {
     // Wake for wake_seconds; the click that follows this press must not cycle pages.
-    g_wake_until_ms = millis() + (uint32_t)g_cfg.device.quiet.wake_seconds * 1000u;
+    g_wake_until_ms = millis() + (uint32_t)cfg().device.quiet.wake_seconds * 1000u;
     g_swallow_click = true;
     applyQuietHours();
   } else if ((int32_t)(millis() - g_wake_until_ms) < 0) {
-    g_wake_until_ms = millis() + (uint32_t)g_cfg.device.quiet.wake_seconds * 1000u;  // keep it awake
+    g_wake_until_ms = millis() + (uint32_t)cfg().device.quiet.wake_seconds * 1000u;  // keep it awake
   }
 }
 
@@ -461,9 +478,10 @@ void onScreenTapped(lv_event_t *e) {
 
 }  // namespace
 
-void init(const Config &cfg) {
-  g_cfg = cfg;
-  setTheme(g_cfg.device.theme);
+void init(std::shared_ptr<const Config> config) {
+  g_cfg_ptr = std::move(config);
+  g_pending = false;  // whatever we were handed IS the current config
+  setTheme(cfg().device.theme);
   if (g_pending_mutex == nullptr) g_pending_mutex = xSemaphoreCreateMutex();
 
   buildParkingScreen();
@@ -601,42 +619,50 @@ void tick() {
   // things it can wait for are the locks it is not allowed to wait for. Two 32-bit words and a
   // subtraction.
   const uint32_t tick_start_ms = millis();
-  // Apply a configuration handed over by the web server task (rotation, brightness, stops).
-  bool apply = false;
-  Config next;
-  // takeShared(): this task does not wait at all; 50 ms is what any OTHER task gets (ui_lock.h).
-  // A miss just means the new config is applied on the next tick, a second later - g_pending
-  // stays set.
+  // Pick up a configuration saved on another task (rotation, brightness, stops).
+  //
+  // THERE IS NO COPY LEFT IN THIS PATH. It used to be two: onConfigChanged() copy-assigned a whole
+  // Config into g_pending_cfg on the web task, and this moved it into a second resident Config
+  // here - so a save left ~1.2 KB of small string blocks in new places twice over, for a value the
+  // device already had (runtime audit rec #8). config_store now owns the one Config and publishes
+  // it by pointer; what happens here is a refcount bump, which cannot allocate and cannot throw.
+  //
+  // activeConfigPtr() takes its lock under the zero-tick rule on this task and keeps a LastGood of
+  // the pointer (ui_lock.h, config_store.cpp). A miss returns the pointer we are already holding,
+  // so `next != g_cfg_ptr` is false and the flag is put back for the next tick. That is the same
+  // "a miss costs one frame" contract every other accessor has - and it is why the test is on the
+  // POINTER and not on whether the call succeeded, which a miss makes indistinguishable.
+  //
+  // THE FLAG IS CLEARED BEFORE THE READ, NOT AFTER, and the order is the whole correctness of the
+  // handover. Clearing afterwards loses a save to this interleaving: this task reads the pointer
+  // (still A), the web task then publishes B and sets the flag, and this task then clears it -
+  // leaving the store on B, the screens on A, and nothing to say so until the next save. Clearing
+  // first inverts that: a publish landing any time after the clear re-arms the flag, and the worst
+  // case is one redundant read next tick.
   if (g_pending) {
-    // SharedLock and not take/give: whatever happens under this lock must not be able to strand it
-    // (ui_lock.h). The handover used to be `next = g_pending_cfg`, a COPY of a whole Config - nine
-    // std::strings per stop - which allocated, could throw, and then left the copy behind in
-    // g_pending_cfg for the life of the device: ~1.2 KB of small blocks held permanently after any
-    // config save, for a value that has already been consumed (runtime audit SS5, "a second copy of
-    // anything"). Moving it hands the buffers over instead: no allocation, nothing to throw, and
-    // g_pending_cfg is left empty - the strings and the stop vector are released here rather than
-    // the next time a save happens to overwrite them. It is only ever read under `g_pending`, and
-    // onConfigChanged() copy-assigns a fresh Config into it, which a moved-from object accepts.
-    SharedLock lk(g_pending_mutex, 50);
-    if (lk && g_pending) {
-      next = std::move(g_pending_cfg);
-      g_pending = false;
-      apply = true;
+    g_pending = false;
+    std::shared_ptr<const Config> next = activeConfigPtr();
+    if (!next || next == g_cfg_ptr) {
+      // A lock miss, almost always - config_store publishes a fresh pointer on every save, so
+      // "unchanged" here means the read did not get through. Look again next tick; uiLockMisses()
+      // on GET /api/debug/ui is what says how often that happens.
+      g_pending = true;
+    } else {
+      const bool rotate = next->device.rotation != cfg().device.rotation;
+      const bool invert = next->device.invert_colors != cfg().device.invert_colors;
+      // The outgoing Config is released by this assignment - nothing else holds it once the store
+      // has published past it - and that free happens here, on this task, outside every lock.
+      g_cfg_ptr = std::move(next);
+      setTheme(cfg().device.theme);  // rebuildScreens() below re-reads every colour
+      if (rotate) applyRotation(cfg().device.rotation);
+      if (invert) applyInvert(cfg().device.invert_colors);
+      g_applied_brightness = -1;  // applyQuietHours() below re-applies whichever brightness applies
+      rebuildScreens();
     }
-  }
-  if (apply) {
-    bool rotate = next.device.rotation != g_cfg.device.rotation;
-    bool invert = next.device.invert_colors != g_cfg.device.invert_colors;
-    g_cfg = next;
-    setTheme(g_cfg.device.theme);  // rebuildScreens() below re-reads every colour
-    if (rotate) applyRotation(g_cfg.device.rotation);
-    if (invert) applyInvert(g_cfg.device.invert_colors);
-    g_applied_brightness = -1;  // applyQuietHours() below re-applies whichever brightness applies
-    rebuildScreens();
   }
 
   // Commute profiles (profiles.h): the visible stop list changed -> rebuild the pages.
-  int profile = activeProfileIndex(g_cfg, time(nullptr));
+  int profile = activeProfileIndex(cfg(), time(nullptr));
   if (profile != g_active_profile) {
     g_active_profile = profile;
     rebuildScreens();
@@ -657,7 +683,7 @@ void tick() {
   // the one it started on.
   std::shared_ptr<const transit::Snapshot> snap_ptr = currentSnapshot();
   const transit::Snapshot &snap = snap_ptr ? *snap_ptr : kNoSnapshot;
-  g_due_active = dueAlertTick(g_cfg, snap, g_shown_keys, dimmed, (transit::Epoch)time(nullptr));
+  g_due_active = dueAlertTick(cfg(), snap, g_shown_keys, dimmed, (transit::Epoch)time(nullptr));
 
   // Parked on the message screen: a build was refused and nothing has changed since. Retrying it
   // every second would just be the same refusal (or, for a page never built, the same crash) at
@@ -670,9 +696,9 @@ void tick() {
         if (!showMainOrNight(snap)) {
           showPoolMessage();
         } else if (g_night) {
-          refreshNightScreen(g_night_screen, g_cfg, snap);
+          refreshNightScreen(g_night_screen, cfg(), snap);
         } else {
-          refreshMainScreen(g_main_screen, g_cfg, snap);
+          refreshMainScreen(g_main_screen, cfg(), snap);
         }
         break;
       case Page::DeviceInfo:
@@ -696,12 +722,12 @@ void tick() {
   d.brightness = g_applied_brightness;
   d.due_active = g_due_active;
   d.chimes = dueChimesPlayed();
-  d.active_profile = g_active_profile >= 0 && (size_t)g_active_profile < g_cfg.profiles.size() ? g_cfg.profiles[(size_t)g_active_profile].name : "";
+  d.active_profile = g_active_profile >= 0 && (size_t)g_active_profile < cfg().profiles.size() ? cfg().profiles[(size_t)g_active_profile].name : "";
   d.shown_stops = g_shown_keys;
   if (g_main_screen != nullptr) {
     mainScreenDebug(g_main_screen, d.hidden_panels, d.ticker, d.rows);
   }
-  d.header_weather = g_cfg.weather.enabled ? headerWeatherText() : "";
+  d.header_weather = cfg().weather.enabled ? headerWeatherText() : "";
   lv_mem_monitor_t m;
   lv_mem_monitor(&m);
   d.lv_used = m.total_size - m.free_size;
@@ -793,13 +819,13 @@ void applyInvert(bool invert) {
   esp_lcd_panel_invert_color(panel, invert);
 }
 
-void onConfigChanged(const Config &cfg) {
-  if (g_pending_mutex == nullptr) return;  // before init(): main.cpp applies the boot config itself
-  SharedLock lk(g_pending_mutex, SharedLock::RawWait{200});  // a whole Config copy: it can throw
-  if (lk) {
-    g_pending_cfg = cfg;
-    g_pending = true;
-  }
+void onConfigChanged() {
+  // One volatile store, from whichever task just saved. No lock, no copy, nothing that can throw
+  // and nothing that can fail - which also removes the old failure mode, where a 200 ms wait that
+  // timed out dropped the save silently and the screen simply never noticed it. config_store has
+  // already published the new Config by the time this is called (web_server.cpp), so the next
+  // tick() reads a different pointer and applies it.
+  g_pending = true;
 }
 
 void logMemory() {

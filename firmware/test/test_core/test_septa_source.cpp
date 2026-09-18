@@ -760,24 +760,58 @@ void test_poll_buffers_return_an_oversized_body_buffer() {
   TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(buf.scratch.size()));
 }
 
+void test_a_poll_cycle_never_fetches_alerts() {
+  // 0.3.2-rc1 turned `alerts` off by default (owner decision), so it is worth pinning what "off"
+  // actually costs: nothing on the arrivals path. The alerts fetch is not part of pollBusStops()
+  // at all - it is net_poller.cpp's collectAlerts(), on its own 5-minute cadence, behind
+  // `if (!alerts_enabled) { clear the cache; return {}; }` - and a poll cycle must therefore never
+  // reach an Alerts URL whatever the config says. Recorded here rather than in the firmware
+  // because this is the layer a host test can hold, and because the separation is the thing that
+  // makes "off" free rather than merely quiet.
+  std::vector<std::string> seen;
+  auto bodies = twoStopRoutes();
+  HttpGet recording = [&seen, bodies](const std::string& url,
+                                      std::function<bool(const uint8_t*, size_t)> onData) -> int {
+    seen.push_back(url);
+    return makePreloadedHttp(bodies)(url, std::move(onData));
+  };
+  FakeScheduleCache cache;
+  Snapshot snap = pollBusStops(twoStopConfigs(), 1789352300, adaptHttpGet(recording), cache, nullptr);
+  TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(snap.stops.size()));
+  TEST_ASSERT_TRUE(!seen.empty());
+  for (const std::string& url : seen) {
+    TEST_ASSERT_TRUE_MESSAGE(url.find("/api/Alerts/") == std::string::npos,
+                              "a poll cycle fetched an Alerts URL");
+  }
+  // And the Snapshot a cycle produces carries no alerts of its own: they are attached by the
+  // caller, from its cache, which is empty when the setting is off.
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(snap.alerts.size()));
+}
+
 void test_poll_buffers_remove_the_large_contiguous_requests() {
   HttpGetEx http = adaptHttpGet(makePreloadedHttp(twoStopRoutes()));
   std::vector<StopConfig> configs = twoStopConfigs();
   Epoch now = 1789352300;
 
-  // Counted rather than measured as a maximum, and the comment in alloc_probe.h says why: the
-  // single biggest request a cycle makes is the GTFS-RT retention block, which is DELIBERATELY
-  // still per-cycle. What the shared scratch removes is every OTHER multi-kilobyte request - the
-  // entity buffer and each buffered response body - so the question is how many there are.
+  // THE MEASUREMENT THIS EXISTS FOR (DESIGN.md SS5). Free heap is not what constrains this board;
+  // the largest free BLOCK is. So the question is not "how many bytes did a cycle use" but "what
+  // is the biggest single thing it asked the allocator for, and how many such things are there".
+  //
+  // Sizes here are HOST sizes (64-bit std::string is 32 B, so every one of these structs is bigger
+  // than on the ESP32). The threshold is therefore deliberately low: what is being pinned is that
+  // a warm buffered cycle asks for NOTHING of this size, not the exact byte count.
+  constexpr size_t kBig = 2048;
+
   FakeScheduleCache plain_cache;
   transit_test::AllocProbe::begin();
   (void)pollBusStops(configs, now, http, plain_cache, nullptr);
   (void)transit_test::AllocProbe::end();
-  const size_t big_without = transit_test::AllocProbe::countAtLeast(4096);
-  TEST_ASSERT_TRUE_MESSAGE(big_without >= 2, "a per-call cycle makes several 4 KB+ requests");
+  const size_t big_without = transit_test::AllocProbe::countAtLeast(kBig);
+  TEST_ASSERT_TRUE_MESSAGE(big_without >= 2, "a per-call cycle makes several multi-KB requests");
 
   PollBuffers buf;
   buf.reserveAll();
+  buf.reserveRetention(configs.size());
   WarmScheduleCache cache;
   buf.beginCycle();
   (void)pollBusStops(configs, now, http, cache, &buf);  // warm-up: fills the schedule cache
@@ -785,12 +819,210 @@ void test_poll_buffers_remove_the_large_contiguous_requests() {
   transit_test::AllocProbe::begin();
   Snapshot snap = pollBusStops(configs, now, http, cache, &buf);
   (void)transit_test::AllocProbe::end();
-  const size_t big_with = transit_test::AllocProbe::countAtLeast(4096);
+  const size_t big_with = transit_test::AllocProbe::countAtLeast(kBig);
 
   TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(snap.stops.size()));
-  // Exactly one left, and it is the retention block: everything else now comes out of the scratch.
-  TEST_ASSERT_EQUAL_UINT32(1, static_cast<uint32_t>(big_with));
+  // NONE left (0.3.2-rc1). Until this release one was: the GTFS-RT retention block, which is a
+  // vector of non-trivially-destructible values and so cannot share the byte scratch. It is now a
+  // resident vector of its own that the stream BORROWS, which is what closes the last one - and
+  // which is the request that failed on the owner's board on 2026-09-17 once the largest free
+  // block had fragmented to 3,444 B.
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(big_with));
   TEST_ASSERT_TRUE(big_with < big_without);
+}
+
+void test_poll_buffers_keep_the_typed_blocks_across_cycles() {
+  // The capacities are asserted EQUAL rather than merely sufficient across three cycles: "it did
+  // not reallocate" is the claim, and a >= test would pass while the vector quietly grew.
+  HttpGetEx http = adaptHttpGet(makePreloadedHttp(twoStopRoutes()));
+  std::vector<StopConfig> configs = twoStopConfigs();
+  Epoch now = 1789352300;
+
+  PollBuffers buf;
+  buf.reserveAll();
+  buf.reserveRetention(configs.size());
+  WarmScheduleCache cache;
+  buf.beginCycle();
+  (void)pollBusStops(configs, now, http, cache, &buf);
+  const size_t retained_cap = buf.retained.capacity();
+  const size_t tv_cap = buf.tv.capacity();
+  const size_t scratch_cap = buf.scratch.capacity();
+  TEST_ASSERT_TRUE(retained_cap >= configs.size() * PollBuffers::kRetainedPerPair);
+  TEST_ASSERT_TRUE(tv_cap >= kMaxTvVehicles);
+
+  for (int i = 0; i < 3; i++) {
+    buf.beginCycle();
+    Snapshot snap = pollBusStops(configs, now, http, cache, &buf);
+    TEST_ASSERT_EQUAL_UINT32(2, static_cast<uint32_t>(snap.stops.size()));
+    TEST_ASSERT_EQUAL_size_t(retained_cap, buf.retained.capacity());
+    TEST_ASSERT_EQUAL_size_t(tv_cap, buf.tv.capacity());
+    TEST_ASSERT_EQUAL_size_t(scratch_cap, buf.scratch.capacity());
+  }
+  // beginCycle() drops the retained updates' identifier strings between cycles without giving the
+  // block back: the elements go, the capacity stays.
+  TEST_ASSERT_TRUE(buf.retained.size() > 0);  // the cycle that just ran filled it
+  buf.beginCycle();
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(buf.retained.size()));
+  TEST_ASSERT_EQUAL_size_t(retained_cap, buf.retained.capacity());
+}
+
+namespace {
+
+// A TransitView body with `n` vehicles, trips "0".."n-1", and an HttpGetEx that replays it for any
+// URL. Built inline rather than as a fixture because the point is the CAP, and no captured SEPTA
+// response is big enough to reach it.
+std::string makeTvBody(size_t n) {
+  std::string body = "{\"bus\":[";
+  for (size_t i = 0; i < n; ++i) {
+    if (i) body += ",";
+    body += "{\"trip\":\"" + std::to_string(i) + "\",\"VehicleID\":\"v\",\"late\":0}";
+  }
+  body += "]}";
+  return body;
+}
+
+bool keepListedTrip(const std::string& trip, const void* ctx) {
+  const auto* wanted = static_cast<const std::vector<std::string>*>(ctx);
+  for (const auto& t : *wanted) {
+    if (t == trip) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+// tv_dropped MEANS "a vehicle a configured stop could have used did not fit" - and that only has a
+// meaning on a filtered fetch. The one caller that brings no filter is the firmware's route
+// liveness refresh (net_poller.cpp), which pulls a whole route's fleet to answer `!tv.empty()`; a
+// rush-hour Route 17 overflows a 16-slot cap on that path by design, and counting it would make
+// tv_dropped climb on every refresh while nothing anybody wanted was lost.
+void test_tv_dropped_counts_relevant_vehicles_only() {
+  const std::string body = makeTvBody(40);
+  HttpGetEx http = adaptHttpGet([body](const std::string&,
+                                        std::function<bool(const uint8_t*, size_t)> onData) -> int {
+    onData(reinterpret_cast<const uint8_t*>(body.data()), body.size());
+    return 200;
+  });
+
+  PollBuffers buf;
+  buf.reserveAll();
+  SeptaSource src(&buf);
+
+  // Unfiltered - the liveness path. The cap bites (24 over) and NOTHING is counted.
+  std::vector<TvVehicle> out;
+  FetchOutcome o = src.fetchTransitViewAppendEx("17", &out, http);
+  TEST_ASSERT_TRUE(o.ok);
+  TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(kMaxTvVehicles),
+                            static_cast<uint32_t>(out.size()));
+  TEST_ASSERT_EQUAL_UINT32(0, buf.tv_dropped);
+
+  // Filtered, wanting 20 of the 40. Sixteen fit; the four that did not ARE counted, because those
+  // four are vehicles a configured stop's realtime updates named.
+  std::vector<std::string> wanted;
+  for (size_t i = 0; i < 40; i += 2) wanted.push_back(std::to_string(i));
+  out.clear();
+  o = src.fetchTransitViewAppendEx("17", &out, http, TvFilter(&keepListedTrip, &wanted));
+  TEST_ASSERT_TRUE(o.ok);
+  TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(kMaxTvVehicles),
+                            static_cast<uint32_t>(out.size()));
+  TEST_ASSERT_EQUAL_UINT32(20 - static_cast<uint32_t>(kMaxTvVehicles), buf.tv_dropped);
+
+  // ...and a filtered fetch that fits adds nothing, which is the state the owner's config is in.
+  std::vector<std::string> few{"1", "3", "5"};
+  out.clear();
+  o = src.fetchTransitViewAppendEx("17", &out, http, TvFilter(&keepListedTrip, &few));
+  TEST_ASSERT_TRUE(o.ok);
+  TEST_ASSERT_EQUAL_UINT32(3, static_cast<uint32_t>(out.size()));
+  TEST_ASSERT_EQUAL_UINT32(20 - static_cast<uint32_t>(kMaxTvVehicles), buf.tv_dropped);  // unchanged
+}
+
+void test_poll_buffers_size_retention_from_the_config() {
+  // 8 slots per configured (stop, route) pair, not the stream's 32-slot default cap: that is what
+  // makes the block 2.4 KB on the owner's two-stop config instead of 4.9 KB. Growth only.
+  PollBuffers buf;
+  buf.reserveRetention(2);
+  const size_t two = buf.retained.capacity();
+  TEST_ASSERT_TRUE(two >= 16);
+  buf.reserveRetention(1);
+  TEST_ASSERT_EQUAL_size_t(two, buf.retained.capacity());  // never shrinks
+  buf.reserveRetention(4);
+  TEST_ASSERT_TRUE(buf.retained.capacity() >= 32);
+  buf.reserveRetention(0);  // a subway/rail-only config asks for nothing
+}
+
+void test_the_scratch_reservation_ratchets_instead_of_churning() {
+  // The grow/shrink cycle this replaces: a body bigger than kScratchReserve made the vector double
+  // past it and beginCycle() gave that block back, every cycle, forever. Now the reservation
+  // ratchets up to what was actually needed - one reallocation per boot - and is only given back
+  // above kScratchMaxReserve, so a pathological response still cannot become resident.
+  PollBuffers buf;
+  buf.reserveAll();
+  const size_t base = buf.scratch.capacity();
+  TEST_ASSERT_TRUE(base >= PollBuffers::kScratchReserve);
+  const size_t roomy = PollBuffers::kScratchRatchetMinFree8 + 1;
+
+  buf.scratch.reserve(PollBuffers::kScratchReserve + 1024);  // a body went past the reservation
+  buf.beginCycle(roomy);
+  TEST_ASSERT_TRUE(buf.scratch.capacity() >= PollBuffers::kScratchReserve + 1024);
+  const size_t kept = buf.scratch.capacity();
+  buf.beginCycle(roomy);
+  TEST_ASSERT_EQUAL_size_t(kept, buf.scratch.capacity());  // and it stays, cycle after cycle
+
+  buf.scratch.reserve(PollBuffers::kScratchMaxReserve + 4096);  // a pathological one
+  buf.beginCycle(roomy);
+  TEST_ASSERT_TRUE(buf.scratch.capacity() <= PollBuffers::kScratchMaxReserve);
+  TEST_ASSERT_TRUE(buf.scratch.capacity() >= kept);
+}
+
+void test_the_ratchet_waits_for_a_heap_that_can_spare_it() {
+  // THE 0.3.2-rc2 CORRECTION, and it is a measurement, not a hunch. rc1 of this pass was flashed
+  // and ratcheted the scratch past 6,144 B (scratch_max_bytes 7,035) within four minutes of boot,
+  // on a board whose resting free8 was already 22-23 KB and whose min_free8 reached 156 B. Keeping
+  // the bigger block is the right answer only on a heap that can spare it; on one that cannot, the
+  // block is handed back and the next oversized body simply pays for it again.
+  PollBuffers buf;
+  buf.reserveAll();
+  const size_t reserved = buf.scratch.capacity();
+
+  // A struggling heap: the growth is released and the reservation does NOT move.
+  buf.scratch.reserve(PollBuffers::kScratchReserve + 1024);
+  buf.beginCycle(PollBuffers::kScratchRatchetMinFree8 - 1);
+  TEST_ASSERT_EQUAL_size_t(reserved, buf.scratch.capacity());
+
+  // Exactly at the floor is enough - it is a minimum, not an exclusive bound.
+  buf.scratch.reserve(PollBuffers::kScratchReserve + 1024);
+  buf.beginCycle(PollBuffers::kScratchRatchetMinFree8);
+  TEST_ASSERT_TRUE(buf.scratch.capacity() > reserved);
+
+  // And the default argument means "assume plenty", which is what every caller outside the
+  // firmware (and every host test that is not about this gate) wants.
+  PollBuffers other;
+  other.reserveAll();
+  other.scratch.reserve(PollBuffers::kScratchReserve + 1024);
+  other.beginCycle();
+  TEST_ASSERT_TRUE(other.scratch.capacity() > PollBuffers::kScratchReserve);
+
+  // The cap came down from 10 KB to 8 KB in the same release: rc1 measured a real high-water of
+  // 7,035 B, so 8 KB covers the real bodies and bounds what one outsized response can make
+  // permanent.
+  TEST_ASSERT_EQUAL_size_t(8u * 1024u, PollBuffers::kScratchMaxReserve);
+}
+
+void test_the_scratch_high_water_is_recorded() {
+  // scratch_max_bytes is the number that says whether kScratchReserve is the right size at all -
+  // which until 0.3.2-rc1 nothing on this device could answer, so the reservation was a guess.
+  HttpGetEx http = adaptHttpGet(makePreloadedHttp(twoStopRoutes()));
+  std::vector<StopConfig> configs = twoStopConfigs();
+  PollBuffers buf;
+  buf.reserveAll();
+  buf.reserveRetention(configs.size());
+  WarmScheduleCache cache;
+  buf.beginCycle();
+  (void)pollBusStops(configs, 1789352300, http, cache, &buf);
+  TEST_ASSERT_TRUE(buf.scratch_max_bytes > 0);
+  // The fixtures are small, so nothing should have had to grow past the reservation.
+  TEST_ASSERT_TRUE(buf.scratch_max_bytes <= PollBuffers::kScratchReserve);
+  TEST_ASSERT_EQUAL_UINT32(0, buf.scratch_grows);
 }
 
 void test_poll_buffers_hand_the_same_storage_to_the_indego_scanner() {

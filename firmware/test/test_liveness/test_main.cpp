@@ -150,8 +150,11 @@ void test_floor_clears_one_fetch_with_margin(void) {
 // progress stamp the clock is `idle_ms`, which never exceeds one fetch while the poller is
 // fetching - so a cycle of any length is survivable, at any supported stop count.
 void test_a_multi_minute_cycle_is_not_a_stall_while_fetches_are_still_starting(void) {
-  // Eight stops (config_store.h kMaxStops), two fetches each after the retry-stacking fix, all
-  // blackholed: the cycle runs for over 20 minutes and completes none of it.
+  // EIGHT stops' worth of fetches, deliberately more than config_store.h's kMaxStops now allows
+  // (4 since 0.3.2-rc2): the property under test is "a cycle of any length is survivable", so the
+  // test should stay at the harsher number rather than get easier every time the cap comes down.
+  // Two fetches each after the retry-stacking fix, all blackholed: the cycle runs for over 20
+  // minutes and completes none of it.
   const uint32_t cycle_ms = 8u * 2u * oneFetchWorstCaseMs() + oneFetchWorstCaseMs();
   TEST_ASSERT_TRUE(cycle_ms > pollerStallTimeoutMs(30000, false));   // the cycle DOES outlast the window
   TEST_ASSERT_TRUE(cycle_ms > pollerStallTimeoutMs(30000, true));    // and the boot grace too
@@ -162,8 +165,8 @@ void test_a_multi_minute_cycle_is_not_a_stall_while_fetches_are_still_starting(v
 }
 
 // A poller that has genuinely stopped is still caught, and within the same few minutes as before -
-// which is the property a stop-count-derived window would have thrown away (eight stops would have
-// needed a window of tens of minutes).
+// which is the property a stop-count-derived window would have thrown away (even four stops would
+// have needed a window of many minutes).
 void test_a_frozen_poller_is_still_caught_within_the_floor(void) {
   TEST_ASSERT_TRUE(pollerHasStalled(kStallFloorMs + 1, 30000, false));
   TEST_ASSERT_EQUAL_UINT32(300000, pollerStallTimeoutMs(30000, false));

@@ -1,5 +1,7 @@
 #include "bike_service.h"
 
+#include "cycle_log.h"
+
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -98,6 +100,7 @@ void refreshBikes(const Config &cfg, const transit::HttpGet &http, std::vector<u
   stream.setFeatureBuffer(scratch);
   stream.reset();
   stream.setStationFilter(ids);
+  cycleLogFlag(kCycleBikes);  // this cycle streamed the ~400 KB Indego feed (cycle_log.h)
   int status = http(indego::statusUrl(), [&](const uint8_t *d, size_t n) { return stream.push(d, n); });
   stream.finish();
 

@@ -57,7 +57,54 @@ bool preallocatePollBuffers();
 // feed scanner (bike_service.h). Null until preallocatePollBuffers() has succeeded.
 std::vector<uint8_t> *pollScratch();
 
-// Creates the poller task (12 KB stack) and its primitives without starting to poll. Call early
+// What the shared scratch has actually been asked to hold (0.3.2-rc1), reported by
+// GET /api/debug/ui. The reservation was a guess - kJsonBodyCap is 16 KB and the reservation is
+// 6 KB, so a bigger body reallocated the vector and poll-start reallocated it back, every cycle -
+// and nothing on this device could say how big a body had ever been. Now it can: if `max_bytes`
+// sits above `reserve_bytes`, the reservation in transit_core is the wrong number and should be
+// changed in the source rather than discovered again at runtime.
+struct ScratchStats {
+  uint32_t max_bytes = 0;      // largest response body buffered since boot
+  uint32_t reserve_bytes = 0;  // the reservation it is currently held at (ratchets up)
+  uint32_t capacity = 0;       // what the vector is holding right now
+  uint32_t grows = 0;          // times a body went past the reservation and forced a realloc
+};
+ScratchStats getScratchStats();
+
+// Roughly how many heap bytes the long-lived structures are holding (0.3.2-rc1), reported by
+// GET /api/debug/ui beside the heap figures. The point is attribution: "free8 fell 4 KB over an
+// hour" is a fact with no owner until these are beside it, and the schedule and alerts caches are
+// the two things on this device that legitimately hold data across cycles and could therefore
+// legitimately grow. Lower bounds, not an audit - only bytes that actually came off the heap are
+// counted (a std::string of 15 characters or fewer lives inside the object), and allocator headers
+// are not. Safe to call from any task; takes the poller's shared lock briefly for the Snapshot.
+struct MemorySizes {
+  uint32_t sched_cache_bytes = 0;
+  uint32_t alerts_cache_bytes = 0;
+  uint32_t snapshot_bytes = 0;      // the currently published Snapshot
+  uint32_t retained_capacity = 0;   // PollBuffers::retained slots (DESIGN.md SS5)
+  uint32_t tv_capacity = 0;         // PollBuffers::tv slots
+  // Vehicles that WERE relevant to a configured stop and did not fit PollBuffers::tv, since boot
+  // (septa.h kMaxTvVehicles, 16 since 0.3.2-rc3). Zero on the owner's config by construction -
+  // two stops can retain at most 16 realtime updates and only a vehicle matching one of those is
+  // kept at all - so a number that moves means the cap is biting on a real config and is the
+  // signal to raise it.
+  uint32_t tv_dropped = 0;
+};
+MemorySizes getMemorySizes();
+
+// Publishes device.nightly_restart in a form the display task can read every second without a
+// lock or an allocation (nightly_restart.h): the enabled flag and the time as minutes since local
+// midnight, -1 when it is unset or unparseable. Called from setup() with the loaded config and
+// again from every poll cycle, so a saved change takes effect within one poll rather than needing
+// a restart of its own - which would be a peculiar way to apply a restart setting.
+void setNightlyRestart(bool enabled, int minute_of_day);
+bool nightlyRestartEnabled();
+int nightlyRestartMinute();
+
+// Creates the poller task (8 KB stack in the plain-HTTP build, 12 KB with TLS - see
+// net_poller.cpp kTaskStackBytes, which is sized from the measured high-water mark and reported
+// as stack_hwm.net_poller) and its primitives without starting to poll. Call early
 // in setup(), before Wi-Fi, for the same heap-fragmentation reason as preallocateTracker().
 void initNetPoller();
 
@@ -132,16 +179,23 @@ enum class SelfHeal : uint8_t {
   HeapWedge = 1,  // pollerTask's consecutive-failed-polls + tiny-largest-block reboot
   PollStall = 2,  // main.cpp's liveness net: the poller did nothing for pollerStallTimeoutMs()
   LvglPool = 3,   // ui/lv_assert_hook.cpp: LVGL's pool ran out and there is no safe way to continue
+  HeapOom = 4,    // pollerTask: three consecutive cycles caught std::bad_alloc (wedge_policy.h).
+                  // Distinct from HeapWedge on purpose - "the cycle could not get memory" is a
+                  // fact the cycle reported, while HeapWedge is an inference from a heap reading
+                  // after a failed poll, and the two want telling apart in a restart note.
+  Nightly = 5,    // main.cpp: the scheduled nightly restart (nightly_restart.h). Not a self-heal
+                  // at all, but it lands in the same note for the same reason - a bare
+                  // ESP_RST_SW with no explanation is the thing this note exists to prevent.
 };
 // captureRestartNote() validates the stored value against this; keep it equal to the last entry.
-constexpr SelfHeal kSelfHealMax = SelfHeal::LvglPool;
+constexpr SelfHeal kSelfHealMax = SelfHeal::Nightly;
 
 struct RestartNote {
   SelfHeal reason = SelfHeal::None;
   uint32_t uptime_s = 0;  // how long that boot had been up
-  uint32_t a = 0;         // HeapWedge: consecutive failed polls. PollStall: seconds of silence.
+  uint32_t a = 0;         // HeapWedge/HeapOom: consecutive polls. PollStall: seconds of silence.
                           // LvglPool: LVGL pool bytes free when the assert fired.
-  uint32_t b = 0;         // HeapWedge: largest free block, bytes. PollStall: active interval, s.
+  uint32_t b = 0;         // HeapWedge/HeapOom: largest free block, bytes. PollStall: interval, s.
                           // LvglPool: the pool's high-water mark, bytes.
 };
 
@@ -207,5 +261,16 @@ uint32_t failedPolls();
 // pollerTask's live wedge tally: consecutive failed cycles with a largest block under 6 KB. Reaches
 // 15 and the board reboots itself, so this is how far through the ~10 minute loop a sample is.
 uint32_t wedgedPolls();
+
+// The OOM tally (wedge_policy.h): consecutive cycles that caught std::bad_alloc. THREE reboots the
+// board - about three and a half minutes once the failure backoff has stretched the interval -
+// against the fifteen the old rule wanted, which with that same backoff was fifty-one minutes.
+// Reported as `oom_streak` on GET /api/debug/ui.
+uint32_t oomStreak();
+
+// Which self-heal rule has something to say about the cycle that just ended, as a short word for
+// GET /api/debug/ui: "none", "oom" or "starved". It is not a prediction - a streak of one is still
+// "oom" - it is what the tallies currently hold.
+const char *wedgeReason();
 
 }  // namespace transit_app

@@ -52,11 +52,24 @@ constexpr size_t kHeapReserveBytes = 1024;
 // to get past (kMinHeavyResponseFree8 12 KB / kMinHeavyResponseBlock 7,924 B in web_server.cpp):
 // re-arming must never be the allocation that pushes a device below the floor it just recovered
 // over, and there is no hurry - the reserve is only needed on a path that is already failing.
-constexpr size_t kHeapReserveRearmFree8 = 20 * 1024;
-// 4,340 and not 4,096: largest-block readings land on a 512-byte lattice at offset 500 (DESIGN.md
-// SS2.1), so a round 4 KB sits 4 B below a real resting value of 4,084 and 244 B under the next one
-// up. 756 + 512k is mid-gap, which is where a threshold belongs.
-constexpr size_t kHeapReserveRearmBlock = 4340;
+// LOWERED IN 0.3.2-rc1, and the measurement says why. On the owner's board on 2026-09-17 the
+// reserve was spent and never came back: `heap_reserve_held` read false with free8 17-20 KB and a
+// largest block of 3,444 B, i.e. under BOTH of the old thresholds (20,480 and 4,340), for the
+// entire wedge. The one state in which the reserve is needed was the one state in which it could
+// not be re-armed - which makes it a reserve that is available exactly when it is not wanted.
+//
+// 13,556 rather than the 20,480 it was: still clear of kMinHeavyResponseFree8 (12 KB) by more than
+// the reserve is big, which is the invariant test_heap_reserve pins and the reason it cannot
+// simply be 12 KB - re-arming at exactly the gate would leave 11,264 B free and make the next
+// /api/state answer 503 for the sake of a kilobyte. 13,312 is that minimum; 13,556 is the first
+// value at or above it that sits mid-gap on the 512-byte lattice (244 mod 512, DESIGN.md SS2.1).
+constexpr size_t kHeapReserveRearmFree8 = 13556;
+// And 2,292 rather than 4,340. The block only has to be big enough to CARVE the 1,024 B reserve
+// out of, and 4,340 was 4.2x that - chosen when the assumption was that a healthy board would be
+// re-arming, not a fragmenting one. 2,292 is 2x the reserve plus a mid-gap lattice offset
+// (244 mod 512, DESIGN.md SS2.1), and it is under the 3,444 B block the wedged board actually had,
+// so on that heap the reserve would have come back rather than staying spent.
+constexpr size_t kHeapReserveRearmBlock = 2292;
 
 // The whole policy, as arithmetic over three inputs. `held` is whether the block is currently
 // held; `free8`/`largest` are MALLOC_CAP_8BIT readings.
