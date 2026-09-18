@@ -96,9 +96,19 @@ def ui():
     code, d = get_json('/api/debug/ui')
     return d or {}
 
-def state():
-    code, d = get_json('/api/state')
-    return d or {}
+def state(retry_s=20):
+    # /api/state is memory-gated: under load it answers 503 {"error":"low memory, retry"} and the
+    # real web client (resilientRead) retries. A test client that reads it once and treats a transient
+    # 503 as missing data is testing the gate's timing, not the firmware. Retry a low-memory refusal
+    # for a bounded window, then give up (returning the error dict so a genuine outage still fails).
+    deadline = time.time() + retry_s
+    while True:
+        code, d = get_json('/api/state')
+        if d and 'error' not in d:
+            return d
+        if time.time() >= deadline:
+            return d or {}
+        time.sleep(2)
 
 def config():
     code, d = get_json('/api/config')
@@ -662,7 +672,7 @@ else:
           int((curl(['-o', '/dev/null', '-w', '%{http_code}', '-X', 'POST',
                      B + '/api/debug/page?page=stats']).stdout or 0)) == 401)
     check('I page endpoint rejects an unknown page', post_page('nope') == 400)
-    uptime_before = state().get('uptime', 0)
+    uptime_before = ui().get('uptime_s', 0)  # ungated, matched to the after-read below
     samples = []
     mismatches = []
     for i in range(POOL_CYCLES):
@@ -701,8 +711,8 @@ else:
         mains = [d['lv_used'] for _, w, d in samples if w == 'main']
         check('I the arrivals page rebuilds to the same size',
               not mains or max(mains) - min(mains) <= 1024, (min(mains), max(mains)) if mains else None)
-        check('I no reboot during the page cycling', state().get('uptime', 0) > uptime_before,
-              (uptime_before, state().get('uptime')))
+        check('I no reboot during the page cycling', ui().get('uptime_s', 0) > uptime_before,
+              (uptime_before, ui().get('uptime_s')))
         print('     pool: total %s, free %s..%s, high-water %s, page costs %s, tight=%s'
               % (pool, min(frees), max(frees), max(peaks), last.get('lv_page_cost'),
                  last.get('lv_tight')))
@@ -761,7 +771,7 @@ else:
 # ---------- E. concurrency ----------
 def hit(u):
     r = curl(['-o', '/dev/null', '-w', '%{http_code} %{size_download}', B + u], 40); return r.stdout.decode()
-u_before = state().get('uptime', 0)
+u_before = ui().get('uptime_s', 0)  # ungated: a 503 from /api/state is the gate, not a reboot
 outcomes = []
 for rnd in range(3):
     with concurrent.futures.ThreadPoolExecutor(7) as ex:
@@ -769,8 +779,8 @@ for rnd in range(3):
     time.sleep(5)
 # A refused /api/state right after seven concurrent requests is the memory gate, not a reboot, and
 # reading uptime as 0 from it used to fail this check for the wrong reason. Wait for a real answer.
-wait_for(lambda: state().get('uptime', 0) > 0, 90, 5)
-u_after = state().get('uptime', 0)
+wait_for(lambda: ui().get('uptime_s', 0) > 0, 90, 5)
+u_after = ui().get('uptime_s', 0)
 check('E no reboot under 3x7 concurrent requests', u_after > u_before, (u_before, u_after, outcomes))
 # Two shapes of the same refusal, counted together against one budget (DESIGN.md SS12.1):
 #   "200 0"   the handler built the answer and the send buffer was not there - the documented
