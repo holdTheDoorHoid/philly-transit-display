@@ -1270,6 +1270,17 @@ uint32_t queryU32(AsyncWebServerRequest *request, const char *name, uint32_t fal
 // from the pool and not from a hole another task opened meanwhile. PIN-gated because it starves
 // every other task for the sub-millisecond it holds the blocks (the poller and the display loop
 // catch their own bad_alloc and carry on; lwIP tolerates a NULL pbuf; LVGL draws from its own pool).
+#ifdef PTD_DEBUG_OOM
+// Compiled OUT of shipping builds (no env defines PTD_DEBUG_OOM), owner's decision 2026-09-18. This
+// endpoint drains the whole 8-bit heap for a sub-millisecond to prove the C++ bad_alloc path (SS12.1)
+// catches once the pool and the per-task eh-globals are in place. But draining to LITERAL zero races
+// any concurrent C-library allocation on the other core, and two of those assert rather than fail
+// soft and are uncatchable by anything: newlib _dtoa_r ("REENT malloc succeeded") from the
+// snprintf("%.4f") that formats a stop's coordinates in refreshWeather, and lwIP's tcp path. That
+// race is reachable ONLY by firing this diagnostic; normal operation never drives free8 to zero
+// (rc7's mid-poll floor is ~28 KB). Rather than carry a PIN-gated "crash my own board" control in a
+// product image, it lives behind this flag for dev builds. The device suite already SKIPs its proof
+// when the endpoint is absent. The exception-pool mechanism itself is unchanged and still active.
 void handleDebugOom(AsyncWebServerRequest *request) {
   if (!requirePin(request)) return;
   constexpr size_t kMaxBlocks = 200;
@@ -1299,6 +1310,7 @@ void handleDebugOom(AsyncWebServerRequest *request) {
            caught ? "true" : "false", (unsigned)n, (unsigned)largest, (unsigned)free_before, (unsigned)ESP.getFreeHeap());
   request->send(200, "application/json", body);
 }
+#endif  // PTD_DEBUG_OOM
 
 // Static list embedded in firmware (transit_core/rail_stations.h) - no network needed, so this
 // runs directly on the web server's own task.
@@ -1799,7 +1811,9 @@ void startWebServer(std::function<void(bool)> onConfigChanged) {
     buf[n] = '\0';
     request->_tempObject = buf;
   });
-  g_server.on("/api/debug/oom", HTTP_POST, guarded(handleDebugOom));  // SS12.1 exception-pool proof; PIN-gated
+#ifdef PTD_DEBUG_OOM
+  g_server.on("/api/debug/oom", HTTP_POST, guarded(handleDebugOom));  // SS12.1 proof; dev builds only (see handler)
+#endif
   g_server.on("/api/wifi/reset", HTTP_POST, guarded(handlePostWifiReset));
 
   g_server.on("/api/proxy/stops", HTTP_GET, guarded(handleProxyStops));

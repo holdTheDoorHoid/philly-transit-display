@@ -194,6 +194,11 @@ reason given there - it is easy to count what changed and miss what else was alr
 Update space (OTA headroom) on the tightest board (the 3.5" capacitive model) is 13,478 bytes,
 above the 12 KB floor.
 
+- **The `/api/debug/oom` diagnostic is no longer in shipping builds.** It deliberately drained the
+  whole heap to prove the out-of-memory safety nets catch, but draining to literal zero races the
+  other core's C-library formatting (a stop coordinate's `snprintf`), which asserts uncatchably - a
+  crash reachable only by firing that PIN-protected hook, never in normal use. It now lives behind a
+  build flag for development images; the safety nets it tested are unchanged and still active.
 **Known residual:** what actually triggers the slow, forty-minute fragmentation has still never
 been caught in the act - not on v0.3.0, not on v0.3.1, and the two-hour clean run above only shows
 it did not happen during that run, not that it cannot happen. The memory log above exists to catch
