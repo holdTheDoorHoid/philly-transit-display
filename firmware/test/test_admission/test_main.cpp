@@ -10,6 +10,7 @@
 
 using transit_app::admitConnection;
 using transit_app::kAcceptMinFree8;
+using transit_app::kAdmissionFloorsApplyFrom;
 using transit_app::kAcceptMinLargestBlock;
 using transit_app::kMaxInFlightRequests;
 using transit_app::kRequestCostBytes;
@@ -24,11 +25,12 @@ void test_a_healthy_board_admits() {
 }
 
 void test_the_floor_still_covers_a_concurrent_request() {
-  // The floors did not move, only when they apply. Once a request is in flight, a second one is
-  // admitted only if the heap can still answer it - which is what rc2's crash was about.
-  TEST_ASSERT_TRUE(admitConnection(1, kAcceptMinFree8, kAcceptMinLargestBlock));
-  TEST_ASSERT_FALSE(admitConnection(1, kAcceptMinFree8 - 1, kAcceptMinLargestBlock));
-  TEST_ASSERT_FALSE(admitConnection(1, kAcceptMinFree8, kAcceptMinLargestBlock - 1));
+  // The floors did not move, only WHEN they apply - which since 0.3.2-rc3 is from the third
+  // concurrent request. With two already in flight, a third is admitted only if the heap can
+  // still answer it, which is what rc2's crash was about.
+  TEST_ASSERT_TRUE(admitConnection(2, kAcceptMinFree8, kAcceptMinLargestBlock));
+  TEST_ASSERT_FALSE(admitConnection(2, kAcceptMinFree8 - 1, kAcceptMinLargestBlock));
+  TEST_ASSERT_FALSE(admitConnection(2, kAcceptMinFree8, kAcceptMinLargestBlock - 1));
 }
 
 void test_the_cap_is_hard() {
@@ -40,27 +42,32 @@ void test_the_cap_is_hard() {
 }
 
 void test_either_heap_floor_refuses_on_its_own() {
-  // ...while a request is already in flight. With none, the floors do not apply at all - see
-  // test_the_only_connection_is_always_admitted below.
-  TEST_ASSERT_FALSE(admitConnection(1, kAcceptMinFree8 - 1, 24 * 1024));
-  TEST_ASSERT_FALSE(admitConnection(1, 40 * 1024, kAcceptMinLargestBlock - 1));
+  // ...once kAdmissionFloorsApplyFrom requests are already in flight. Below that they do not apply
+  // at all - see test_the_first_two_connections_are_always_admitted below.
+  TEST_ASSERT_FALSE(admitConnection(2, kAcceptMinFree8 - 1, 24 * 1024));
+  TEST_ASSERT_FALSE(admitConnection(2, 40 * 1024, kAcceptMinLargestBlock - 1));
   // Exactly at both floors is admitted: they are minimums, not exclusive bounds.
-  TEST_ASSERT_TRUE(admitConnection(1, kAcceptMinFree8, kAcceptMinLargestBlock));
+  TEST_ASSERT_TRUE(admitConnection(2, kAcceptMinFree8, kAcceptMinLargestBlock));
 }
 
-void test_the_only_connection_is_always_admitted() {
+void test_the_first_two_connections_are_always_admitted() {
   // THE 0.3.2-rc1 RULE, and the failure it exists for. On the owner's board at v0.3.1 the largest
   // free block decayed to 3,444 B, which is under kAcceptMinLargestBlock, and the accept path then
   // refused EVERY connection - /api/debug/ui (the endpoint kept outside refuseIfLowHeap so it
   // still answers on a starved heap) and POST /api/reboot (the recovery path) included. The board
   // answered ping and nothing else for five minutes.
   //
-  // One request at a time is the guaranteed service level: it cannot reproduce the concurrent-burst
-  // crash the floors exist for, and if its own reply will not fit, guarded() answers 503 out of the
-  // 1 KB reserve.
+  // rc3 widens the guarantee from one request to two, because rc5's section E measured NINE
+  // aborted connections against a budget of six and the three over budget were the floors refusing
+  // a SECOND request on a heap that was down. Two alive at once is not the state that crashed rc2
+  // (that took seven), and if the second one's own reply will not fit, guarded() answers 503 out
+  // of the 1 KB reserve exactly as it does for the first.
   TEST_ASSERT_TRUE(admitConnection(0, 18320, 3444));  // the measured v0.3.1 lockout state
   TEST_ASSERT_TRUE(admitConnection(0, 2000, 1500));
   TEST_ASSERT_TRUE(admitConnection(0, 0, 0));
+  TEST_ASSERT_TRUE(admitConnection(1, 18320, 3444));
+  TEST_ASSERT_TRUE(admitConnection(1, 2000, 1500));
+  TEST_ASSERT_TRUE(admitConnection(1, 0, 0));
 }
 
 void test_the_state_that_crashed_rc2_is_refused() {
@@ -69,10 +76,11 @@ void test_the_state_that_crashed_rc2_is_refused() {
   // alive. Seven is past the cap whatever the heap says - which is the defence.
   TEST_ASSERT_FALSE(admitConnection(7, 19528, 11252));
   TEST_ASSERT_FALSE(admitConnection(6, 19528, 11252));
-  // And with the heap gone, a SECOND concurrent request is still refused - the lockout fix relaxes
-  // the floors for the first connection only.
-  TEST_ASSERT_FALSE(admitConnection(1, 2000, 1500));
-  TEST_ASSERT_FALSE(admitConnection(1, 18320, 3444));
+  // And with the heap gone, a THIRD concurrent request is still refused - rc3 relaxes the floors
+  // for the first two connections only, so the burst defence is intact from three onwards.
+  TEST_ASSERT_FALSE(admitConnection(2, 2000, 1500));
+  TEST_ASSERT_FALSE(admitConnection(2, 18320, 3444));
+  TEST_ASSERT_FALSE(admitConnection(4, 18320, 3444));
 }
 
 void test_the_rule_table() {
@@ -82,9 +90,13 @@ void test_the_rule_table() {
   static const Row kRows[] = {
     {0, 40 * 1024, 24 * 1024, true},   // idle, healthy
     {0, 1024, 512, true},              // idle, starved: still admitted (the guaranteed service level)
-    {1, 40 * 1024, 24 * 1024, true},   // busy, healthy
-    {1, 40 * 1024, 1024, false},       // busy, fragmented: the burst defence
-    {1, 1024, 24 * 1024, false},       // busy, nearly full
+    {1, 40 * 1024, 24 * 1024, true},   // one in flight, healthy
+    {1, 40 * 1024, 1024, true},        // one in flight, fragmented: ADMITTED since 0.3.2-rc3
+    {1, 1024, 24 * 1024, true},        // one in flight, nearly full: admitted too
+    {2, 40 * 1024, 24 * 1024, true},   // contention, healthy
+    {2, 40 * 1024, 1024, false},       // contention, fragmented: the burst defence
+    {2, 1024, 24 * 1024, false},       // contention, nearly full
+    {3, 40 * 1024, 1024, false},       // and it keeps applying, all the way to the cap
     {kMaxInFlightRequests - 1, 40 * 1024, 24 * 1024, true},   // the last slot
     {kMaxInFlightRequests, 200 * 1024, 100 * 1024, false},    // the cap, whatever the heap says
   };
@@ -113,7 +125,71 @@ void test_the_cap_respects_the_suites_refusal_budget() {
   // cannot go below 5 without failing that check by construction. Written as a test because the
   // number looks arbitrary otherwise, and because lowering it is the obvious "safer" edit.
   const unsigned per_round = 7u > kMaxInFlightRequests ? 7u - kMaxInFlightRequests : 0u;
+  TEST_ASSERT_EQUAL_UINT(2, per_round);
   TEST_ASSERT_TRUE(3u * per_round <= 6u);
+}
+
+void test_the_floors_do_not_add_refusals_on_top_of_the_cap() {
+  // THE rc5 OVERRUN, AS ARITHMETIC. Section E fires 7 simultaneous requests per round, 3 rounds,
+  // and allows at most 6 aborted connections in total. rc5 produced NINE - three per round. The
+  // cap explains exactly two of those three (7 - 5); the extra one was the floors refusing the
+  // SECOND request of the round, because the accept-time heap reading dipped under
+  // kAcceptMinLargestBlock while the first request was still being answered. A request arriving
+  // into one other request is not the contention the floors were derived for.
+  //
+  // Modelled here as the heap reading the accept path actually takes, per request: healthy except
+  // at the moment the second connection arrives.
+  auto refusalsInARound = [](bool floors_from_one) {
+    unsigned refused = 0;
+    for (uint32_t in_flight = 0; in_flight < 7; ++in_flight) {
+      const size_t free8 = 40u * 1024u;
+      // The dip: while one request is alive, the largest block is momentarily under the floor.
+      const size_t largest = in_flight == 1 ? kAcceptMinLargestBlock - 1 : 24u * 1024u;
+      bool admit;
+      if (in_flight >= kMaxInFlightRequests) {
+        admit = false;
+      } else if (in_flight < (floors_from_one ? 1u : kAdmissionFloorsApplyFrom)) {
+        admit = true;
+      } else {
+        admit = free8 >= kAcceptMinFree8 && largest >= kAcceptMinLargestBlock;
+      }
+      if (!admit) ++refused;
+    }
+    return refused;
+  };
+
+  // rc5's rule: three per round, nine across the suite's three rounds - the measured overrun.
+  TEST_ASSERT_EQUAL_UINT(3, refusalsInARound(true));
+  TEST_ASSERT_TRUE(3u * refusalsInARound(true) > 6u);
+
+  // rc3's rule: the cap's two per round and nothing else, six in total, inside the budget.
+  TEST_ASSERT_EQUAL_UINT(2, refusalsInARound(false));
+  TEST_ASSERT_TRUE(3u * refusalsInARound(false) <= 6u);
+}
+
+// AND THE HONEST OTHER HALF, so nobody reads the test above as a promise the rule cannot keep.
+// On a DEEPLY fragmented heap - section B's measured 19,528 free / 3,060 largest, under
+// kAcceptMinLargestBlock by a wide margin and for minutes at a time rather than momentarily - the
+// floors still refuse from the third request onward, which is five per round of a seven-deep
+// burst. That is the burst defence doing its job, not a regression: the two events are different,
+// and the fix for section B is that the heap no longer gets there (the config-save churn), not a
+// looser floor.
+void test_a_deeply_fragmented_heap_still_refuses_from_the_third() {
+  TEST_ASSERT_TRUE(admitConnection(0, 19528, 3060));
+  TEST_ASSERT_TRUE(admitConnection(1, 19528, 3060));
+  TEST_ASSERT_FALSE(admitConnection(2, 19528, 3060));
+  unsigned refused = 0;
+  for (uint32_t in_flight = 0; in_flight < 7; ++in_flight) {
+    if (!admitConnection(in_flight, 19528, 3060)) ++refused;
+  }
+  TEST_ASSERT_EQUAL_UINT(5, refused);
+}
+
+void test_the_floor_threshold_is_two() {
+  // The number itself, so an edit that puts it back to 1 (reinstating the rc5 refusal overrun) or
+  // pushes it to 3 (letting a third request past the floors the rc2 crash needed) fails here.
+  TEST_ASSERT_EQUAL_UINT32(2, kAdmissionFloorsApplyFrom);
+  TEST_ASSERT_TRUE(kAdmissionFloorsApplyFrom < kMaxInFlightRequests);
 }
 
 int main() {
@@ -122,10 +198,13 @@ int main() {
   RUN_TEST(test_the_floor_still_covers_a_concurrent_request);
   RUN_TEST(test_the_cap_is_hard);
   RUN_TEST(test_either_heap_floor_refuses_on_its_own);
-  RUN_TEST(test_the_only_connection_is_always_admitted);
+  RUN_TEST(test_the_first_two_connections_are_always_admitted);
   RUN_TEST(test_the_state_that_crashed_rc2_is_refused);
   RUN_TEST(test_the_rule_table);
   RUN_TEST(test_the_floor_covers_what_one_request_actually_costs);
   RUN_TEST(test_the_cap_respects_the_suites_refusal_budget);
+  RUN_TEST(test_the_floors_do_not_add_refusals_on_top_of_the_cap);
+  RUN_TEST(test_a_deeply_fragmented_heap_still_refuses_from_the_third);
+  RUN_TEST(test_the_floor_threshold_is_two);
   return UNITY_END();
 }

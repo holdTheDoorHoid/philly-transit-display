@@ -2285,7 +2285,8 @@ no send buffer. `src/app/admission.h` holds the rule as pure arithmetic (host-te
   `HostGuardHandler::canHandle()`, both on the AsyncTCP task, so it needs no lock;
   `in_flight_requests`, `admission_refusals` and `max_in_flight_requests` report it on
   `GET /api/debug/ui`.
-- **The floors apply only under contention: the only connection is always admitted (0.3.2-rc1).**
+- **The floors apply only under contention: the first TWO connections are always admitted
+  (0.3.2-rc1, widened in rc3).**
   rc3's rule applied both heap floors unconditionally, and on the owner's board at v0.3.1 that
   turned a fragmented heap into a total lockout. Measured 2026-09-17, uptime 2,646 s: the largest
   free block had fallen to **3,444 B**, under `kAcceptMinLargestBlock` (4,308), so the accept path
@@ -2297,10 +2298,31 @@ no send buffer. `src/app/admission.h` holds the rule as pure arithmetic (host-te
   requests alive at once, and a single request cannot reproduce it - nothing else is competing for
   the heap, and if its own reply will not fit, `guarded()` catches the throw and answers 503 out of
   the 1 KB reserve. The floors are therefore a statement about *contention*, and with no contention
-  they have nothing to say. The rule is now: `in_flight >= cap` refuses (unchanged);
-  `in_flight == 0` admits whatever the heap says; otherwise both floors apply exactly as before.
-  The count cap is unchanged at 5. `test_admission` pins the four-row table so a future edit that
-  reinstates the lockout fails on the host rather than on the hardware.
+  they have nothing to say. The rule is: `in_flight >= cap` refuses (unchanged); `in_flight` below
+  `kAdmissionFloorsApplyFrom` admits whatever the heap says; otherwise both floors apply exactly as
+  before. The count cap is unchanged at 5. `test_admission` pins the rule table so a future edit
+  that reinstates the lockout fails on the host rather than on the hardware.
+
+  **`kAdmissionFloorsApplyFrom` is 2 since 0.3.2-rc3 — the floors gate the *third* concurrent
+  request onward — and the suite is what moved it.** Section E fires 7 simultaneous requests per
+  round for 3 rounds and allows at most **six** aborted connections in total; rc5 produced
+  **nine**. The cap accounts for exactly two per round (7 − 5), so the extra one per round was the
+  floors refusing the **second** request, because the accept-time largest-block reading dipped
+  under 4,308 while the first request was still being answered. A request arriving into *one*
+  other request is not the contention the floors were derived for: the rc2 crash needed **seven**
+  alive at once, and it is the count cap, not the floors, that stops a burst reaching seven. With
+  the threshold at 2 the budget is the cap's alone — **≈2 refusals per round, 6 total**, inside
+  the allowance by construction rather than by luck. A second request on a starved heap is still
+  not unprotected: if its own reply will not fit, `guarded()` answers 503 out of the 1 KB reserve,
+  exactly as it does for the first.
+
+  **Said honestly, because the test says it too:** on a *deeply* fragmented heap — section B's
+  measured 19,528 free / 3,060 largest, under the block floor by a wide margin and for minutes
+  rather than momentarily — the floors still refuse from the third request on, which is five
+  refusals in a seven-deep burst. That is the burst defence working. The fix for section B is that
+  the heap no longer reaches that state (the config-save churn above), not a looser floor, and
+  `test_a_deeply_fragmented_heap_still_refuses_from_the_third` keeps the two cases from being
+  confused.
 
 **The nightly restart, and the honest sentence about it (owner decision, 0.3.2-rc1).**
 `device.nightly_restart` restarts the board at a chosen local time, **on by default at 03:30**.
