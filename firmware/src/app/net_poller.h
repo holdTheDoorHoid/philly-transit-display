@@ -102,7 +102,9 @@ void setNightlyRestart(bool enabled, int minute_of_day);
 bool nightlyRestartEnabled();
 int nightlyRestartMinute();
 
-// Creates the poller task (12 KB stack) and its primitives without starting to poll. Call early
+// Creates the poller task (8 KB stack in the plain-HTTP build, 12 KB with TLS - see
+// net_poller.cpp kTaskStackBytes, which is sized from the measured high-water mark and reported
+// as stack_hwm.net_poller) and its primitives without starting to poll. Call early
 // in setup(), before Wi-Fi, for the same heap-fragmentation reason as preallocateTracker().
 void initNetPoller();
 

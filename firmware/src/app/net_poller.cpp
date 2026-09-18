@@ -72,7 +72,30 @@ constexpr uint32_t kOptionalWorkReserveMs = 5000;
 // SDK-rebuild test pass has to re-measure it (DESIGN.md SS2.1 "Forced gate").
 constexpr uint32_t kTaskStackBytes = 12288;
 #else
-constexpr uint32_t kTaskStackBytes = 10240;
+// 8 KB, MEASURED RATHER THAN CHOSEN (0.3.2-rc3; 10,240 B before).
+//
+// uxTaskGetStackHighWaterMark() reports the smallest number of stack BYTES this task has ever had
+// left. On the owner's board at 10,240 B it read:
+//
+//   4,424 B free   under the device suite (the heaviest load this firmware sees)
+//   4,568-4,600 B  across a two-hour-thirteen-minute run of ordinary use
+//
+// so the deepest this task has ever actually gone is 10,240 - 4,424 = about 5.8 KB, and ordinary
+// use stays ~200 B shallower than that. 8,192 B leaves ~2.3 KB of headroom over the worst reading
+// there is - a wider margin than the 4 KB figure alone suggests, because the suite reading already
+// includes the deepest path the task has (a BusSchedules retry inside a full poll).
+//
+// The +2,048 B goes straight to the resting floor: a FreeRTOS task stack is a heap allocation
+// taken once at xTaskCreatePinnedToCore() and held for the life of the device.
+//
+// IT STAYS VERIFIABLE. taskStackHwm("net_poller") is still reported as stack_hwm.net_poller on
+// GET /api/debug/ui, and the per-cycle serial line below still prints stack_free, so the margin
+// after this change is a reading and not an argument. If that number ever approaches ~1 KB the
+// honest fix is to put the 2 KB back, not to trim what the task does.
+//
+// The HTTPS build above is NOT reduced: a TLS handshake adds 3-4 KB of mbedTLS scratch on this
+// same stack and has never been measured to completion on this hardware (see the caveat above).
+constexpr uint32_t kTaskStackBytes = 8192;
 #endif
 // Priority 1 (above IDLE0, below the ESP-IDF network/timer tasks) - the original value. It was
 // briefly dropped to 0 to stop HTTPClient's header busy-wait (Stream::timedRead, no yield to a
@@ -820,6 +843,10 @@ void logHeapHeartbeat() {
   size_t free_heap = ESP.getFreeHeap();
   size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  // stack_free is uxTaskGetStackHighWaterMark(): the LOWEST this task's free stack has ever been,
+  // not what is free now. It is what sized kTaskStackBytes at 8,192 B and it is how the margin
+  // stays checkable afterwards - the same number appears as stack_hwm.net_poller on
+  // GET /api/debug/ui. Expect ~2.3 KB; near 1 KB means the stack needs the 2 KB back.
   Serial.printf("[net_poller] free_heap=%u free8=%u largest_block=%u stack_free=%u\n", (unsigned)free_heap, (unsigned)free8,
                 (unsigned)largest, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }

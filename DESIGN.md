@@ -146,8 +146,12 @@ verifications) run inline for well under a second each, inside the 5 s budget. B
 the same `Stream::timedRead()` busy-wait the plain path already lives with, capped by the existing
 `kStreamReadTimeoutMs` (4 s). What a TLS handshake adds is **stack**: ~3-4 KB on the poller task
 (mbedTLS's RSA verify keeps a 1 KB buffer on the stack, `ssl_starttls_handshake` 512 B, ECP
-temporaries) - the poller has a 10 KB stack (`net_poller.cpp`), and the device test below reads
-its high-water mark first.
+temporaries) - the poller's stack is sized separately for the two builds in `net_poller.cpp`
+(**12 KB** under `TRANSIT_HTTPS`, **8 KB** in the plain-HTTP build since 0.3.2-rc3, down from
+10 KB against a measured 4,424 B worst-case high-water free), and the device test below reads its
+high-water mark first. The plain build's reduction deliberately does **not** apply here: no
+handshake on this hardware has ever got past `mbedtls_ssl_setup()`, so the 3-4 KB has never
+actually been spent and there is no measurement to shrink towards.
 
 #### Flash and RAM, measured (2026-09-16, this branch after merging `next`)
 

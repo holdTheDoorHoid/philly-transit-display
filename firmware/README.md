@@ -250,7 +250,7 @@ heap region that only 32-bit word access can reach, and `malloc()` never hands t
 | After | `free8` (usable) | `free` (`ESP.getFreeHeap()`) | Largest block |
 |---|---:|---:|---:|
 | display (LVGL + 19 KB draw buffer) | 183 KB | 216 KB | 110 KB |
-| config + arrival tracker (~12 KB) + poller task stack (10 KB) | 145 KB | 178 KB | 110 KB |
+| config + arrival tracker (~12 KB) + poller task stack (8 KB since 0.3.2-rc3, 10 KB when this row was measured) | 145 KB | 178 KB | 110 KB |
 | Wi-Fi connected | 94 KB | 127 KB | 86 KB |
 | web server, mDNS, SNTP | 67 KB | 100 KB | 61 KB |
 | SD card mounted | 36 KB | 69 KB | 32 KB |
